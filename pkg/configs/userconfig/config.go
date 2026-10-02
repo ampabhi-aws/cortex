@@ -106,6 +106,21 @@ type Config struct {
 	AlertmanagerConfig string
 }
 
+// String implements fmt.Stringer with a redacted representation so that
+// accidental logging of a Config (e.g. via %s/%v/%+v) does not leak the raw
+// Alertmanager YAML, which commonly contains third-party notification
+// credentials (Slack webhook URLs, PagerDuty routing keys, SMTP passwords,
+// webhook bearer tokens, etc.).
+func (c Config) String() string {
+	return "userconfig.Config{REDACTED}"
+}
+
+// GoString implements fmt.GoStringer so that %#v also produces a redacted
+// representation instead of dumping struct fields verbatim.
+func (c Config) GoString() string {
+	return "userconfig.Config{REDACTED}"
+}
+
 // configCompat is a compatibility struct to support old JSON config blobs
 // saved in the config DB that didn't have a rule format version yet and
 // just had a top-level field for the rule files.
@@ -191,6 +206,18 @@ func (v View) IsDeleted() bool {
 	return !v.DeletedAt.IsZero()
 }
 
+// String implements fmt.Stringer with a redacted representation. View embeds
+// a Config which carries tenant Alertmanager YAML/credentials; never render
+// those fields in log output.
+func (v View) String() string {
+	return fmt.Sprintf("userconfig.View{ID:%d,REDACTED}", v.ID)
+}
+
+// GoString implements fmt.GoStringer so that %#v is also redacted.
+func (v View) GoString() string {
+	return v.String()
+}
+
 // GetVersionedRulesConfig specializes the view to just the rules config.
 func (v View) GetVersionedRulesConfig() *VersionedRulesConfig {
 	if v.Config.RulesConfig.Files == nil {
@@ -207,6 +234,18 @@ func (v View) GetVersionedRulesConfig() *VersionedRulesConfig {
 type RulesConfig struct {
 	FormatVersion RuleFormatVersion `json:"format_version"`
 	Files         map[string]string `json:"files"`
+}
+
+// String returns a redacted summary of the rules config suitable for logs.
+// Rule file bodies are tenant-controlled and may embed sensitive expressions,
+// so we only report counts.
+func (c RulesConfig) String() string {
+	return fmt.Sprintf("userconfig.RulesConfig{FormatVersion:%d,Files:%d,REDACTED}", c.FormatVersion, len(c.Files))
+}
+
+// GoString ensures %#v also prints the redacted summary.
+func (c RulesConfig) GoString() string {
+	return c.String()
 }
 
 // Equal compares two RulesConfigs for equality.
@@ -340,4 +379,14 @@ type VersionedRulesConfig struct {
 // IsDeleted tells you if the config is deleted.
 func (vr VersionedRulesConfig) IsDeleted() bool {
 	return !vr.DeletedAt.IsZero()
+}
+
+// String returns a redacted summary of the versioned rules config.
+func (vr VersionedRulesConfig) String() string {
+	return fmt.Sprintf("userconfig.VersionedRulesConfig{ID:%d,REDACTED}", vr.ID)
+}
+
+// GoString ensures %#v is also redacted.
+func (vr VersionedRulesConfig) GoString() string {
+	return vr.String()
 }
