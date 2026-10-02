@@ -444,7 +444,7 @@ Displays a web page with the ruler hash ring status, including the state, health
 GET /ruler/rule_groups
 ```
 
-List all tenant rules. This endpoint is not part of ruler-API and is always available regardless of whether ruler-API is enabled or not. It should not be exposed to end users. This endpoint returns a YAML dictionary with all the rule groups for each tenant and `200` status code on success.
+List all tenant rules. This administrative, cross-tenant endpoint is disabled by default: it is only registered when `-ruler.admin-api-enabled=true` and, once enabled, it requires an authenticated tenant (via the `X-Scope-OrgID` header processed by the standard auth middleware). If `-ruler.admin-tenants` is set, only tenants in that comma-separated allow-list are permitted. It must not be exposed to end users; serve it on a separate admin listener/port where possible. On success this endpoint returns a YAML dictionary with all the rule groups for each tenant and `200`; it returns `404` when the admin API is disabled, `401` when no tenant is present in the request context, and `403` when the caller is not in the admin allow-list.
 
 ### List rules
 
@@ -684,7 +684,7 @@ Displays a web page with the current status of the Alertmanager, including the A
 GET /multitenant_alertmanager/configs
 ```
 
-List all Alertmanager configurations. This endpoint is not part of alertmanager-API and is always available regardless of whether alertmanager-API is enabled or not. It should not be exposed to end users. This endpoint returns a YAML dictionary with all the Alertmanager configurations and `200` status code on success.
+List all Alertmanager configurations. This administrative, cross-tenant endpoint is disabled by default: it is only registered when `-alertmanager.admin-api-enabled=true` and, once enabled, it requires an authenticated tenant. If `-alertmanager.admin-tenants` is set, only tenants in that comma-separated allow-list are permitted. It must not be exposed to end users; serve it on a separate admin listener/port where possible. On success this endpoint returns a YAML dictionary with all the Alertmanager configurations and `200`; it returns `404` when the admin API is disabled, `401` when no tenant is present in the request context, and `403` when the caller is not in the admin allow-list.
 
 ### Alertmanager ring status
 

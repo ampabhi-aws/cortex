@@ -116,6 +116,14 @@ type Config struct {
 
 	EnableAPI bool `yaml:"enable_api"`
 
+	// AdminAPIEnabled gates the administrative, cross-tenant endpoints exposed by
+	// the Ruler (currently GET /ruler/rule_groups). Disabled by default so the
+	// endpoint is not reachable from the tenant-facing HTTP listener. When enabled
+	// the handler additionally requires an authenticated tenant and, if
+	// AdminTenants is non-empty, that the tenant is in the allow-list.
+	AdminAPIEnabled bool                   `yaml:"admin_api_enabled"`
+	AdminTenants    flagext.StringSliceCSV `yaml:"admin_tenants"`
+
 	EnabledTenants  flagext.StringSliceCSV `yaml:"enabled_tenants"`
 	DisabledTenants flagext.StringSliceCSV `yaml:"disabled_tenants"`
 
@@ -174,6 +182,8 @@ func (cfg *Config) RegisterFlags(f *flag.FlagSet) {
 	f.DurationVar(&cfg.FlushCheckPeriod, "ruler.flush-period", 1*time.Minute, "Period with which to attempt to flush rule groups.")
 	f.StringVar(&cfg.RulePath, "ruler.rule-path", "/rules", "file path to store temporary rule files for the prometheus rule managers")
 	f.BoolVar(&cfg.EnableAPI, "experimental.ruler.enable-api", false, "Enable the ruler api")
+	f.BoolVar(&cfg.AdminAPIEnabled, "ruler.admin-api-enabled", false, "Enable the cross-tenant Ruler administrative endpoint GET /ruler/rule_groups. Disabled by default: when disabled the endpoint is not registered and the handler returns 404. When enabled, the endpoint is served with authentication required and (if -ruler.admin-tenants is non-empty) only tenants in that allow-list are permitted. The endpoint must only be exposed to operators; see docs/api/_index.md.")
+	f.Var(&cfg.AdminTenants, "ruler.admin-tenants", "Comma-separated list of tenants permitted to call the Ruler administrative endpoint when -ruler.admin-api-enabled is set. If empty and admin API is enabled, any authenticated tenant can call it; set this to restrict to operator tenants only.")
 	f.DurationVar(&cfg.OutageTolerance, "ruler.for-outage-tolerance", time.Hour, `Max time to tolerate outage for restoring "for" state of alert.`)
 	f.DurationVar(&cfg.ForGracePeriod, "ruler.for-grace-period", 10*time.Minute, `Minimum duration between alert and restored "for" state. This is maintained only for alerts with configured "for" time greater than grace period.`)
 	f.DurationVar(&cfg.ResendDelay, "ruler.resend-delay", time.Minute, `Minimum amount of time to wait before resending an alert to Alertmanager.`)
@@ -330,6 +340,14 @@ func enableSharding(r *Ruler, ringStore kv.Client) error {
 	}
 
 	return nil
+}
+
+// GetAdminAPIEnabled reports whether the Ruler's cross-tenant administrative
+// endpoints should be registered. It is used by the API package to avoid
+// mounting the handler on the tenant-facing listener when the operator has
+// not explicitly opted in.
+func (r *Ruler) GetAdminAPIEnabled() bool {
+	return r.cfg.AdminAPIEnabled
 }
 
 func (r *Ruler) starting(ctx context.Context) error {
@@ -862,6 +880,41 @@ func (r *Ruler) DeleteTenantConfiguration(w http.ResponseWriter, req *http.Reque
 
 func (r *Ruler) ListAllRules(w http.ResponseWriter, req *http.Request) {
 	logger := util_log.WithContext(req.Context(), r.logger)
+
+	// This endpoint discloses every tenant's rule groups and must therefore be
+	// treated as an operator-only administrative endpoint. It is disabled by
+	// default (see Config.AdminAPIEnabled / -ruler.admin-api-enabled) so that it
+	// is not reachable through the tenant-facing HTTP listener.
+	if !r.cfg.AdminAPIEnabled {
+		http.Error(w, "not found", http.StatusNotFound)
+		return
+	}
+
+	// Require an authenticated tenant in the request context. When the route is
+	// registered via the API with auth=true, the AuthMiddleware populates this.
+	callerID, err := tenant.TenantID(req.Context())
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusUnauthorized)
+		return
+	}
+
+	// If an explicit admin tenant allow-list is configured, enforce it so that
+	// an arbitrary authenticated tenant cannot enumerate every other tenant's
+	// rules. An empty list preserves backward compatibility for operators who
+	// knowingly turn on the admin API behind their own network controls.
+	if len(r.cfg.AdminTenants) > 0 {
+		allowed := false
+		for _, t := range r.cfg.AdminTenants {
+			if t == callerID {
+				allowed = true
+				break
+			}
+		}
+		if !allowed {
+			http.Error(w, "forbidden", http.StatusForbidden)
+			return
+		}
+	}
 
 	userIDs, err := r.store.ListAllUsers(req.Context())
 	if err != nil {
