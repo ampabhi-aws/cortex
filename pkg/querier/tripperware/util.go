@@ -30,14 +30,25 @@ func DoRequests(ctx context.Context, downstream Handler, reqs []Request, limits 
 	// Feed all requests to a bounded intermediate channel to limit parallelism.
 	intermediate := make(chan Request)
 	go func() {
+		defer close(intermediate)
 		for _, req := range reqs {
-			intermediate <- req
+			select {
+			case intermediate <- req:
+			case <-ctx.Done():
+				return
+			}
 		}
-		close(intermediate)
 	}()
 
 	respChan, errChan := make(chan RequestResponse), make(chan error)
 	parallelism := validation.SmallestPositiveIntPerTenant(tenantIDs, limits.MaxQueryParallelism)
+	// Guard against non-positive parallelism (e.g. an operator setting
+	// `max_query_parallelism: 0` in runtime config). Without this clamp no
+	// worker goroutines would be started and the feeder/collector would block
+	// forever on their channels.
+	if parallelism < 1 {
+		parallelism = 1
+	}
 	if parallelism > len(reqs) {
 		parallelism = len(reqs)
 	}
@@ -46,9 +57,17 @@ func DoRequests(ctx context.Context, downstream Handler, reqs []Request, limits 
 			for req := range intermediate {
 				resp, err := downstream.Do(ctx, req)
 				if err != nil {
-					errChan <- err
+					select {
+					case errChan <- err:
+					case <-ctx.Done():
+						return
+					}
 				} else {
-					respChan <- RequestResponse{req, resp}
+					select {
+					case respChan <- RequestResponse{req, resp}:
+					case <-ctx.Done():
+						return
+					}
 				}
 			}
 		}()
@@ -65,6 +84,8 @@ func DoRequests(ctx context.Context, downstream Handler, reqs []Request, limits 
 				cancel()
 				firstErr = err
 			}
+		case <-ctx.Done():
+			return resps, ctx.Err()
 		}
 	}
 
