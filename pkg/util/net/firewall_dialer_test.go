@@ -45,6 +45,8 @@ func TestFirewallDialer(t *testing.T) {
 				{"127.0.0.1", true},
 				{"192.168.0.1", true},
 				{"10.0.0.1", true},
+				{"0.0.0.0", true},                  // IPv4 unspecified (kernel routes to loopback)
+				{"::", true},                       // IPv6 unspecified (kernel routes to loopback)
 				{"google.com", false},
 				{"172.217.168.78", false},
 				{"fdf8:f53b:82e4::53", true},       // Local
@@ -52,6 +54,7 @@ func TestFirewallDialer(t *testing.T) {
 				{"2001:4860:4860::8844", false},    // Google DNS
 				{"::ffff:172.217.168.78", false},   // IPv6 mapped v4 non-private
 				{"::ffff:192.168.0.1", true},       // IPv6 mapped v4 private
+				{"::ffff:0.0.0.0", true},           // IPv6 mapped v4 unspecified
 			},
 		},
 		"should support blocking custom CIDRs": {

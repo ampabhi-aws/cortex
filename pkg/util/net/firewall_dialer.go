@@ -68,7 +68,11 @@ func (d *FirewallDialer) control(_, address string, _ syscall.RawConn) error {
 }
 
 func isLocal(ip net.IP) bool {
-	return ip.IsLoopback() || ip.IsLinkLocalUnicast() || ip.IsLinkLocalMulticast()
+	// IsUnspecified() covers 0.0.0.0 and ::, which the Linux kernel delivers
+	// to the loopback interface on connect(). Without this check, a
+	// tenant-controlled URL such as http://0.0.0.0:<port>/ bypasses the
+	// private-address firewall and reaches loopback-only services.
+	return ip.IsLoopback() || ip.IsUnspecified() || ip.IsLinkLocalUnicast() || ip.IsLinkLocalMulticast()
 }
 
 // isPrivate reports whether ip is a private address, according to
