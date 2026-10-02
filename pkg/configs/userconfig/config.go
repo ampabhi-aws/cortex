@@ -99,11 +99,52 @@ func (v *RuleFormatVersion) UnmarshalYAML(unmarshal func(interface{}) error) err
 }
 
 // A Config is a Cortex configuration for a single user.
+//
+// SECURITY: Config holds tenant-supplied data that routinely contains
+// third-party credentials (Alertmanager slack_api_url, smtp_auth_password,
+// PagerDuty/OpsGenie/VictorOps keys, webhook bearer tokens, http_config
+// authorization credentials, etc.) and notification template bodies. The
+// String() and GoString() methods below deliberately redact the sensitive
+// payload fields so that accidentally logging a Config (directly or via a
+// containing struct such as View) does not leak those credentials. Debug
+// logging in this package and its callers MUST NEVER include Config,
+// RulesConfig, TemplateFiles, or AlertmanagerConfig payload values — log
+// only non-sensitive metadata (operation name, tenant ID, counts, errors).
 type Config struct {
 	// RulesFiles maps from a rules filename to file contents.
 	RulesConfig        RulesConfig
 	TemplateFiles      map[string]string
 	AlertmanagerConfig string
+}
+
+// redacted is the placeholder emitted in place of sensitive payload fields.
+const redacted = "<redacted>"
+
+// String implements fmt.Stringer. It intentionally hides AlertmanagerConfig,
+// template bodies and rule-file bodies — any of which may embed tenant
+// third-party credentials — while keeping structural metadata useful for
+// diagnostics. This is the defense-in-depth guard against accidental logging
+// of a Config value with %s/%v/%+v.
+func (c Config) String() string {
+	return fmt.Sprintf(
+		"userconfig.Config{RulesConfig: %s, TemplateFiles: %d template(s), AlertmanagerConfig: %s}",
+		c.RulesConfig.String(),
+		len(c.TemplateFiles),
+		alertmanagerConfigPlaceholder(c.AlertmanagerConfig),
+	)
+}
+
+// GoString implements fmt.GoStringer so that the %#v verb — used in some log
+// call sites — does not render the raw credential-bearing fields either.
+func (c Config) GoString() string {
+	return c.String()
+}
+
+func alertmanagerConfigPlaceholder(s string) string {
+	if s == "" {
+		return "<empty>"
+	}
+	return fmt.Sprintf("%s (%d bytes)", redacted, len(s))
 }
 
 // configCompat is a compatibility struct to support old JSON config blobs
@@ -204,9 +245,25 @@ func (v View) GetVersionedRulesConfig() *VersionedRulesConfig {
 }
 
 // RulesConfig is the rules configuration for a particular organization.
+//
+// SECURITY: Files contains tenant-supplied rule bodies which can embed
+// sensitive expressions. The String()/GoString() methods below redact the
+// contents so that accidental logging reveals only structural metadata.
 type RulesConfig struct {
 	FormatVersion RuleFormatVersion `json:"format_version"`
 	Files         map[string]string `json:"files"`
+}
+
+// String implements fmt.Stringer with payload-redaction. See the SECURITY
+// note on Config for context.
+func (c RulesConfig) String() string {
+	return fmt.Sprintf("userconfig.RulesConfig{FormatVersion: %v, Files: %d file(s) %s}", c.FormatVersion, len(c.Files), redacted)
+}
+
+// GoString implements fmt.GoStringer with the same payload-redaction as
+// String, so that %#v also cannot leak rule file bodies.
+func (c RulesConfig) GoString() string {
+	return c.String()
 }
 
 // Equal compares two RulesConfigs for equality.

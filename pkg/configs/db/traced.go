@@ -10,66 +10,75 @@ import (
 	"github.com/go-kit/log/level"
 )
 
-// traced adds log trace lines on each db call
+// traced adds log trace lines on each db call.
+//
+// IMPORTANT: tenant userconfig.Config values embed third-party credentials
+// (Alertmanager slack_api_url, smtp_auth_password, PagerDuty/OpsGenie/VictorOps
+// keys, webhook bearer tokens, etc.) and notification template bodies. These
+// trace helpers MUST only log non-sensitive metadata (operation name, tenant
+// ID, counts, errors). Never pass a userconfig.Config, userconfig.View,
+// userconfig.RulesConfig, or userconfig.VersionedRulesConfig value to trace()
+// — doing so would copy cross-tenant notification credentials into the
+// process log and any downstream log-aggregation pipeline.
 type traced struct {
 	d DB
 }
 
 func (t traced) trace(name string, args ...interface{}) {
-	level.Debug(util_log.Logger).Log("msg", fmt.Sprintf("%s: %#v", name, args))
+	level.Debug(util_log.Logger).Log("msg", name, "args", fmt.Sprintf("%v", args))
 }
 
 func (t traced) GetConfig(ctx context.Context, userID string) (cfg userconfig.View, err error) {
-	defer func() { t.trace("GetConfig", userID, cfg, err) }()
+	defer func() { t.trace("GetConfig", "userID", userID, "err", err) }()
 	return t.d.GetConfig(ctx, userID)
 }
 
 func (t traced) SetConfig(ctx context.Context, userID string, cfg userconfig.Config) (err error) {
-	defer func() { t.trace("SetConfig", userID, cfg, err) }()
+	defer func() { t.trace("SetConfig", "userID", userID, "err", err) }()
 	return t.d.SetConfig(ctx, userID, cfg)
 }
 
 func (t traced) GetAllConfigs(ctx context.Context) (cfgs map[string]userconfig.View, err error) {
-	defer func() { t.trace("GetAllConfigs", cfgs, err) }()
+	defer func() { t.trace("GetAllConfigs", "count", len(cfgs), "err", err) }()
 	return t.d.GetAllConfigs(ctx)
 }
 
 func (t traced) GetConfigs(ctx context.Context, since userconfig.ID) (cfgs map[string]userconfig.View, err error) {
-	defer func() { t.trace("GetConfigs", since, cfgs, err) }()
+	defer func() { t.trace("GetConfigs", "since", since, "count", len(cfgs), "err", err) }()
 	return t.d.GetConfigs(ctx, since)
 }
 
 func (t traced) DeactivateConfig(ctx context.Context, userID string) (err error) {
-	defer func() { t.trace("DeactivateConfig", userID, err) }()
+	defer func() { t.trace("DeactivateConfig", "userID", userID, "err", err) }()
 	return t.d.DeactivateConfig(ctx, userID)
 }
 
 func (t traced) RestoreConfig(ctx context.Context, userID string) (err error) {
-	defer func() { t.trace("RestoreConfig", userID, err) }()
+	defer func() { t.trace("RestoreConfig", "userID", userID, "err", err) }()
 	return t.d.RestoreConfig(ctx, userID)
 }
 
 func (t traced) Close() (err error) {
-	defer func() { t.trace("Close", err) }()
+	defer func() { t.trace("Close", "err", err) }()
 	return t.d.Close()
 }
 
 func (t traced) GetRulesConfig(ctx context.Context, userID string) (cfg userconfig.VersionedRulesConfig, err error) {
-	defer func() { t.trace("GetRulesConfig", userID, cfg, err) }()
+	defer func() { t.trace("GetRulesConfig", "userID", userID, "err", err) }()
 	return t.d.GetRulesConfig(ctx, userID)
 }
 
 func (t traced) SetRulesConfig(ctx context.Context, userID string, oldCfg, newCfg userconfig.RulesConfig) (updated bool, err error) {
-	defer func() { t.trace("SetRulesConfig", userID, oldCfg, newCfg, updated, err) }()
+	defer func() { t.trace("SetRulesConfig", "userID", userID, "updated", updated, "err", err) }()
 	return t.d.SetRulesConfig(ctx, userID, oldCfg, newCfg)
 }
 
 func (t traced) GetAllRulesConfigs(ctx context.Context) (cfgs map[string]userconfig.VersionedRulesConfig, err error) {
-	defer func() { t.trace("GetAllRulesConfigs", cfgs, err) }()
+	defer func() { t.trace("GetAllRulesConfigs", "count", len(cfgs), "err", err) }()
 	return t.d.GetAllRulesConfigs(ctx)
 }
 
 func (t traced) GetRulesConfigs(ctx context.Context, since userconfig.ID) (cfgs map[string]userconfig.VersionedRulesConfig, err error) {
-	defer func() { t.trace("GetConfigs", since, cfgs, err) }()
+	defer func() { t.trace("GetRulesConfigs", "since", since, "count", len(cfgs), "err", err) }()
 	return t.d.GetRulesConfigs(ctx, since)
 }
