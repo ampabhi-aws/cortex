@@ -107,20 +107,41 @@ func (kvs *KVInitService) ServeHTTP(w http.ResponseWriter, req *http.Request) {
 		viewKeyParam        = "viewKey"
 		viewMsgParam        = "viewMsg"
 		deleteMessagesParam = "deleteMessages"
+		verboseParam        = "verbose"
 	)
 
 	if err := req.ParseForm(); err == nil {
+		// verbose=true opts in to disclosing per-instance addresses, tokens and raw
+		// gossip values. The default view omits these so that a bare GET of the
+		// memberlist page cannot be used as a reconnaissance oracle for ring
+		// poisoning (CWE-1212 / CWE-552). The route itself is still subject to
+		// the operator-network / reverse-proxy auth model documented in
+		// docs/architecture.md.
+		verbose := len(req.Form[verboseParam]) > 0 && req.Form[verboseParam][0] == "true"
+
 		if req.Form[downloadKeyParam] != nil {
+			if !verbose {
+				http.Error(w, "raw key download requires ?verbose=true", http.StatusForbidden)
+				return
+			}
 			downloadKey(w, kv, kv.storeCopy(), req.Form[downloadKeyParam][0]) // Use first value, ignore the rest.
 			return
 		}
 
 		if req.Form[viewKeyParam] != nil {
+			if !verbose {
+				http.Error(w, "viewing decoded key values requires ?verbose=true", http.StatusForbidden)
+				return
+			}
 			viewKey(w, kv.storeCopy(), req.Form[viewKeyParam][0], getFormat(req))
 			return
 		}
 
 		if req.Form[viewMsgParam] != nil {
+			if !verbose {
+				http.Error(w, "viewing gossip messages requires ?verbose=true", http.StatusForbidden)
+				return
+			}
 			msgID, err := strconv.Atoi(req.Form[viewMsgParam][0])
 			if err != nil {
 				http.Error(w, err.Error(), http.StatusBadRequest)
@@ -141,6 +162,15 @@ func (kvs *KVInitService) ServeHTTP(w http.ResponseWriter, req *http.Request) {
 		}
 
 		if len(req.Form[deleteMessagesParam]) > 0 && req.Form[deleteMessagesParam][0] == "true" {
+			// Clearing the gossip message history is a server-side state change and
+			// must not be reachable from a GET (including cross-origin image/link
+			// loads in an operator's browser). Require a non-GET method.
+			if req.Method == http.MethodGet || req.Method == http.MethodHead {
+				w.Header().Set("Allow", "POST")
+				http.Error(w, "deleteMessages requires POST", http.StatusMethodNotAllowed)
+				return
+			}
+
 			kv.deleteSentReceivedMessages()
 
 			// Redirect back.
@@ -150,6 +180,10 @@ func (kvs *KVInitService) ServeHTTP(w http.ResponseWriter, req *http.Request) {
 		}
 	}
 
+	// Determine verbose mode for the index page too (ParseForm may have failed above,
+	// in which case we conservatively default to non-verbose).
+	verbose := len(req.Form["verbose"]) > 0 && req.Form["verbose"][0] == "true"
+
 	members := kv.memberlist.Members()
 	sort.Slice(members, func(i, j int) bool {
 		return members[i].Name < members[j].Name
@@ -157,13 +191,23 @@ func (kvs *KVInitService) ServeHTTP(w http.ResponseWriter, req *http.Request) {
 
 	sent, received := kv.getSentAndReceivedMessages()
 
+	sortedMembers := make([]memberInfo, 0, len(members))
+	for _, m := range members {
+		mi := memberInfo{Name: m.Name, State: m.State}
+		if verbose {
+			mi.Address = m.Address()
+		}
+		sortedMembers = append(sortedMembers, mi)
+	}
+
 	v := pageData{
 		Now:              time.Now(),
 		Memberlist:       kv.memberlist,
-		SortedMembers:    members,
+		SortedMembers:    sortedMembers,
 		Store:            kv.storeCopy(),
 		SentMessages:     sent,
 		ReceivedMessages: received,
+		Verbose:          verbose,
 	}
 
 	accept := req.Header.Get("Accept")
@@ -279,10 +323,20 @@ func downloadKey(w http.ResponseWriter, kv *KV, store map[string]valueDesc, key 
 type pageData struct {
 	Now              time.Time
 	Memberlist       *memberlist.Memberlist
-	SortedMembers    []*memberlist.Node
+	SortedMembers    []memberInfo
 	Store            map[string]valueDesc
 	SentMessages     []message
 	ReceivedMessages []message
+	Verbose          bool
+}
+
+// memberInfo is a redactable projection of memberlist.Node used by the status
+// page. Address is only populated when the caller opts in to ?verbose=true, so
+// a bare GET of /memberlist does not leak internal gRPC endpoints.
+type memberInfo struct {
+	Name    string
+	Address string `json:"Address,omitempty"`
+	State   memberlist.NodeStateType
 }
 
 var pageTemplate = template.Must(template.New("webpage").Funcs(template.FuncMap{
@@ -305,6 +359,10 @@ const pageContent = `
 		<li>Members: {{ .Memberlist.NumMembers }}</li>
 		</ul>
 
+		{{ if not .Verbose }}
+		<p><em>Instance addresses, tokens and raw gossip values are hidden by default. Append <code>?verbose=true</code> to this URL to show them (operator-only).</em></p>
+		{{ end }}
+
 		<h2>KV Store</h2>
 
 		<table width="100%" border="1">
@@ -312,7 +370,7 @@ const pageContent = `
 				<tr>
 					<th>Key</th>
 					<th>Value Details</th>
-					<th>Actions</th>
+					{{ if .Verbose }}<th>Actions</th>{{ end }}
 				</tr>
 			</thead>
 
@@ -321,12 +379,14 @@ const pageContent = `
 				<tr>
 					<td>{{ $k }}</td>
 					<td>{{ $v }}</td>
+					{{ if $.Verbose }}
 					<td>
-						<a href="?viewKey={{ $k }}&format=json">json</a>
-						| <a href="?viewKey={{ $k }}&format=json-pretty">json-pretty</a>
-						| <a href="?viewKey={{ $k }}&format=struct">struct</a>
-						| <a href="?downloadKey={{ $k }}">download</a>
+						<a href="?viewKey={{ $k }}&format=json&verbose=true">json</a>
+						| <a href="?viewKey={{ $k }}&format=json-pretty&verbose=true">json-pretty</a>
+						| <a href="?viewKey={{ $k }}&format=struct&verbose=true">struct</a>
+						| <a href="?downloadKey={{ $k }}&verbose=true">download</a>
 					</td>
+					{{ end }}
 				</tr>
 				{{ end }}
 			</tbody>
@@ -340,7 +400,7 @@ const pageContent = `
 			<thead>
 				<tr>
 					<th>Name</th>
-					<th>Address</th>
+					{{ if .Verbose }}<th>Address</th>{{ end }}
 					<th>State</th>
 				</tr>
 			</thead>
@@ -349,7 +409,7 @@ const pageContent = `
 				{{ range .SortedMembers }}
 				<tr>
 					<td>{{ .Name }}</td>
-					<td>{{ .Address }}</td>
+					{{ if $.Verbose }}<td>{{ .Address }}</td>{{ end }}
 					<td>{{ .State }}</td>
 				</tr>
 				{{ end }}
@@ -360,7 +420,9 @@ const pageContent = `
 
 		<h2>Received Messages</h2>
 
-		<a href="?deleteMessages=true">Delete All Messages (received and sent)</a>
+		<form method="POST" action="?deleteMessages=true" style="display:inline">
+			<button type="submit">Delete All Messages (received and sent)</button>
+		</form>
 
 		<table width="100%" border="1">
 			<thead>
@@ -371,7 +433,7 @@ const pageContent = `
 					<th>Value in the Message</th>
 					<th>Version After Update (0 = no change)</th>
 					<th>Changes</th>
-					<th>Actions</th>
+					{{ if .Verbose }}<th>Actions</th>{{ end }}
 				</tr>
 			</thead>
 
@@ -384,11 +446,13 @@ const pageContent = `
 					<td>size: {{ .Pair.Value | len }}, codec: {{ .Pair.Codec }}</td>
 					<td>{{ .Version }}</td>
 					<td>{{ StringsJoin .Changes ", " }}</td>
+					{{ if $.Verbose }}
 					<td>
-						<a href="?viewMsg={{ .ID }}&format=json">json</a>
-						| <a href="?viewMsg={{ .ID }}&format=json-pretty">json-pretty</a>
-						| <a href="?viewMsg={{ .ID }}&format=struct">struct</a>
+						<a href="?viewMsg={{ .ID }}&format=json&verbose=true">json</a>
+						| <a href="?viewMsg={{ .ID }}&format=json-pretty&verbose=true">json-pretty</a>
+						| <a href="?viewMsg={{ .ID }}&format=struct&verbose=true">struct</a>
 					</td>
+					{{ end }}
 				</tr>
 				{{ end }}
 			</tbody>
@@ -396,7 +460,9 @@ const pageContent = `
 
 		<h2>Sent Messages</h2>
 
-		<a href="?deleteMessages=true">Delete All Messages (received and sent)</a>
+		<form method="POST" action="?deleteMessages=true" style="display:inline">
+			<button type="submit">Delete All Messages (received and sent)</button>
+		</form>
 
 		<table width="100%" border="1">
 			<thead>
@@ -407,7 +473,7 @@ const pageContent = `
 					<th>Value</th>
 					<th>Version</th>
 					<th>Changes</th>
-					<th>Actions</th>
+					{{ if .Verbose }}<th>Actions</th>{{ end }}
 				</tr>
 			</thead>
 
@@ -420,11 +486,13 @@ const pageContent = `
 					<td>size: {{ .Pair.Value | len }}, codec: {{ .Pair.Codec }}</td>
 					<td>{{ .Version }}</td>
 					<td>{{ StringsJoin .Changes ", " }}</td>
+					{{ if $.Verbose }}
 					<td>
-						<a href="?viewMsg={{ .ID }}&format=json">json</a>
-						| <a href="?viewMsg={{ .ID }}&format=json-pretty">json-pretty</a>
-						| <a href="?viewMsg={{ .ID }}&format=struct">struct</a>
+						<a href="?viewMsg={{ .ID }}&format=json&verbose=true">json</a>
+						| <a href="?viewMsg={{ .ID }}&format=json-pretty&verbose=true">json-pretty</a>
+						| <a href="?viewMsg={{ .ID }}&format=struct&verbose=true">struct</a>
 					</td>
+					{{ end }}
 				</tr>
 				{{ end }}
 			</tbody>
