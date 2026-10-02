@@ -49,15 +49,16 @@ type state struct {
 	replicator        Replicator
 	store             alertstore.AlertStore
 
-	partialStateMergesTotal  *prometheus.CounterVec
-	partialStateMergesFailed *prometheus.CounterVec
-	stateReplicationTotal    *prometheus.CounterVec
-	stateReplicationFailed   *prometheus.CounterVec
-	fetchReplicaStateTotal   prometheus.Counter
-	fetchReplicaStateFailed  prometheus.Counter
-	initialSyncTotal         prometheus.Counter
-	initialSyncCompleted     *prometheus.CounterVec
-	initialSyncDuration      prometheus.Histogram
+	partialStateMergesTotal      *prometheus.CounterVec
+	partialStateMergesFailed     *prometheus.CounterVec
+	partialStateMergesInvalidKey prometheus.Counter
+	stateReplicationTotal        *prometheus.CounterVec
+	stateReplicationFailed       *prometheus.CounterVec
+	fetchReplicaStateTotal       prometheus.Counter
+	fetchReplicaStateFailed      prometheus.Counter
+	initialSyncTotal             prometheus.Counter
+	initialSyncCompleted         *prometheus.CounterVec
+	initialSyncDuration          prometheus.Histogram
 
 	msgc chan *clusterpb.Part
 }
@@ -84,6 +85,10 @@ func newReplicatedStates(userID string, rf int, re Replicator, st alertstore.Ale
 			Name: "alertmanager_partial_state_merges_failed_total",
 			Help: "Number of times we have failed to merge a partial state received for a key.",
 		}, []string{"key"}),
+		partialStateMergesInvalidKey: promauto.With(r).NewCounter(prometheus.CounterOpts{
+			Name: "alertmanager_partial_state_merges_invalid_key_total",
+			Help: "Number of partial state merges rejected because the key did not match a registered state key. Not labelled by key to keep the metric space closed against untrusted input.",
+		}),
 		stateReplicationTotal: promauto.With(r).NewCounterVec(prometheus.CounterOpts{
 			Name: "alertmanager_state_replication_total",
 			Help: "Number of times we have tried to replicate a state to other alertmanagers.",
@@ -143,17 +148,27 @@ func (s *state) AddState(key string, cs cluster.State, _ prometheus.Registerer) 
 }
 
 // MergePartialState merges a received partial message with an internal state.
+//
+// The key is validated against the small, closed set of keys registered for
+// this tenant *before* it is used as a Prometheus label value. This prevents
+// an untrusted gRPC peer from permanently inflating per-tenant metric
+// cardinality (and in-process memory) by supplying arbitrary / malformed
+// (including non-UTF-8) keys via the replication RPC.
 func (s *state) MergePartialState(p *clusterpb.Part) error {
-	s.partialStateMergesTotal.WithLabelValues(p.Key).Inc()
-
 	s.mtx.Lock()
 	defer s.mtx.Unlock()
+
 	st, ok := s.states[p.Key]
 	if !ok {
-		s.partialStateMergesFailed.WithLabelValues(p.Key).Inc()
+		// Do NOT use p.Key as a label value here: it is attacker-controlled
+		// and would otherwise create an unbounded number of retained label
+		// children on the per-tenant registry.
+		s.partialStateMergesInvalidKey.Inc()
 		return fmt.Errorf("key not found while merging")
 	}
 
+	// Safe: p.Key is one of the keys registered via AddState for this tenant.
+	s.partialStateMergesTotal.WithLabelValues(p.Key).Inc()
 	if err := st.Merge(p.Data); err != nil {
 		s.partialStateMergesFailed.WithLabelValues(p.Key).Inc()
 		return err

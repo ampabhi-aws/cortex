@@ -1159,6 +1159,20 @@ func (am *MultitenantAlertmanager) UpdateState(ctx context.Context, part *cluste
 		return nil, err
 	}
 
+	// Validate the key against the small, closed set of keys that the per-tenant
+	// Alertmanager registers (see pkg/alertmanager/alertmanager.go: "nfl:<user>"
+	// and "sil:<user>"). Rejecting here keeps attacker-controlled, unbounded
+	// strings from reaching MergePartialState, which otherwise would use them as
+	// a Prometheus label value and permanently inflate per-tenant metric
+	// cardinality (and process memory). This also protects against non-UTF-8
+	// keys that would panic prometheus/client_golang's WithLabelValues.
+	if part == nil || !isValidPartialStateKey(part.Key, userID) {
+		return &alertmanagerpb.UpdateStateResponse{
+			Status: alertmanagerpb.MERGE_ERROR,
+			Error:  "invalid key",
+		}, nil
+	}
+
 	am.alertmanagersMtx.Lock()
 	userAM, ok := am.alertmanagers[userID]
 	am.alertmanagersMtx.Unlock()
@@ -1180,6 +1194,14 @@ func (am *MultitenantAlertmanager) UpdateState(ctx context.Context, part *cluste
 	}
 
 	return &alertmanagerpb.UpdateStateResponse{Status: alertmanagerpb.OK}, nil
+}
+
+// isValidPartialStateKey reports whether key is one of the fixed partial-state
+// keys registered for the given user. These are the only keys ever added to
+// state.states (see Alertmanager.New). Any other value is treated as untrusted
+// input and must be rejected before being used as a Prometheus label value.
+func isValidPartialStateKey(key, userID string) bool {
+	return key == "nfl:"+userID || key == "sil:"+userID
 }
 
 // deleteUnusedRemoteUserState deletes state objects in remote storage for users that are no longer configured.
