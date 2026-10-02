@@ -10,6 +10,7 @@ import (
 	"io"
 	"mime"
 	"net/http"
+	"path/filepath"
 	"strconv"
 	"strings"
 
@@ -249,6 +250,12 @@ func validateRulesFiles(c userconfig.Config) error {
 
 func validateTemplateFiles(c userconfig.Config) error {
 	for fn, content := range c.TemplateFiles {
+		// Template filenames are later used by the alertmanager to build on-disk paths
+		// per-tenant. Reject any key that contains a path component so a tenant cannot
+		// smuggle in a traversal-style filename via the legacy configs API.
+		if fn == "" || fn == "." || fn == ".." || filepath.Base(fn) != fn || filepath.Dir(filepath.Clean(fn)) != "." {
+			return fmt.Errorf("invalid template name %q: the template name cannot contain any path", fn)
+		}
 		if _, err := template.New(fn).Funcs(template.FuncMap(amtemplate.DefaultFuncs)).Parse(content); err != nil {
 			return err
 		}
