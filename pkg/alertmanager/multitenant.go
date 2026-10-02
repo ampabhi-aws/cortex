@@ -1216,16 +1216,21 @@ func (am *MultitenantAlertmanager) deleteUnusedLocalUserState() {
 
 	// And delete remaining files.
 	for userID, dir := range userDirs {
+		// Hold alertmanagersMtx across both the existence check and the
+		// os.RemoveAll so that a concurrent setConfig()/newAlertmanager()
+		// for the same tenant (which also runs under alertmanagersMtx)
+		// cannot interleave and have its freshly created per-tenant
+		// directory unlinked out from under it. See CWE-367 TOCTOU.
 		am.alertmanagersMtx.Lock()
-		userAM := am.alertmanagers[userID]
-		am.alertmanagersMtx.Unlock()
-
-		// Don't delete directory if AM for user still exists.
-		if userAM != nil {
+		if _, exists := am.alertmanagers[userID]; exists {
+			am.alertmanagersMtx.Unlock()
+			// Don't delete directory if AM for user still exists.
 			continue
 		}
 
 		err := os.RemoveAll(dir)
+		am.alertmanagersMtx.Unlock()
+
 		if err != nil {
 			level.Warn(am.logger).Log("msg", "failed to delete directory for user", "dir", dir, "user", userID, "err", err)
 		} else {
