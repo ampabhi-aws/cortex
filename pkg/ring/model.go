@@ -301,16 +301,20 @@ func normalizeIngestersMap(inputRing *Desc) {
 			sort.Sort(Tokens(ing.Tokens))
 		}
 
-		// tokens are sorted now, we can easily remove duplicates.
-		prev := ing.Tokens[0]
-		for ix := 1; ix < len(ing.Tokens); {
-			if ing.Tokens[ix] == prev {
-				ing.Tokens = append(ing.Tokens[:ix], ing.Tokens[ix+1:]...)
-			} else {
-				prev = ing.Tokens[ix]
-				ix++
+		// Tokens are sorted now, so we can remove duplicates in a single O(n) pass
+		// using a two-pointer compaction. The previous implementation deleted one
+		// element at a time with append(s[:i], s[i+1:]...), which is O(n^2) in the
+		// number of duplicate tokens. Because the token slice comes from an
+		// attacker-controllable gossip message, a run of identical packed-varint
+		// tokens could pin a CPU for minutes while the KV storeMu is held.
+		write := 1
+		for read := 1; read < len(ing.Tokens); read++ {
+			if ing.Tokens[read] != ing.Tokens[write-1] {
+				ing.Tokens[write] = ing.Tokens[read]
+				write++
 			}
 		}
+		ing.Tokens = ing.Tokens[:write]
 
 		// write updated value back to map
 		inputRing.Ingesters[n] = ing
