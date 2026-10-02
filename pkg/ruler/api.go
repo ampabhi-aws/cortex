@@ -24,6 +24,7 @@ import (
 	"github.com/cortexproject/cortex/pkg/ruler/rulespb"
 	"github.com/cortexproject/cortex/pkg/ruler/rulestore"
 	"github.com/cortexproject/cortex/pkg/tenant"
+	"github.com/cortexproject/cortex/pkg/util"
 	util_log "github.com/cortexproject/cortex/pkg/util/log"
 )
 
@@ -447,14 +448,27 @@ func (a *API) CreateRuleGroup(w http.ResponseWriter, req *http.Request) {
 		return
 	}
 
-	payload, err := io.ReadAll(req.Body)
+	body := req.Body
+	if limit := a.ruler.cfg.APIBodyLimit; limit > 0 {
+		body = http.MaxBytesReader(w, req.Body, limit)
+	}
+
+	payload, err := io.ReadAll(body)
 	if err != nil {
+		if util.IsRequestBodyTooLarge(err) {
+			level.Warn(logger).Log("msg", "rule group payload too large", "user", userID, "limit", a.ruler.cfg.APIBodyLimit)
+			http.Error(w, "request body too large", http.StatusRequestEntityTooLarge)
+			return
+		}
 		level.Error(logger).Log("msg", "unable to read rule group payload", "err", err.Error())
 		http.Error(w, err.Error(), http.StatusBadRequest)
 		return
 	}
 
-	level.Debug(logger).Log("msg", "attempting to unmarshal rulegroup", "userID", userID, "group", string(payload))
+	// Use a log.Valuer so the body bytes are only converted to a string if the
+	// debug level is actually enabled: otherwise `string(payload)` would allocate
+	// a full second copy of a potentially large body at every call.
+	level.Debug(logger).Log("msg", "attempting to unmarshal rulegroup", "userID", userID, "group", log.Valuer(func() interface{} { return string(payload) }))
 
 	rg := rulefmt.RuleGroup{}
 	err = yaml.Unmarshal(payload, &rg)
