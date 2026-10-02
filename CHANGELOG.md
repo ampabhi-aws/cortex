@@ -2,6 +2,8 @@
 
 ## master / unreleased
 
+* [BUGFIX] Config: mask Swift object-store password, etcd KV password, Ruler Alertmanager HTTP basic-auth password and the configs-DB connection URI in the output of `GET /config` by switching their types from plain `string` to `flagext.Secret`. Previously these credential-bearing fields were emitted in cleartext while the rest of the storage/KV secrets were correctly masked. #security
+
   **This release removes support for chunks storage. See below for more.**
 * [CHANGE] Remove support for chunks storage entirely. If you are using chunks storage on a previous version, you must [migrate your data](https://github.com/cortexproject/cortex/blob/v1.11.1/docs/blocks-storage/migrate-from-chunks-to-blocks.md) on version 1.12 or earlier. Before upgrading to this release, you should also remove any deprecated chunks-related configuration, as this release will no longer accept that. The following flags are gone:
   - `-dynamodb.*`
