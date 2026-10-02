@@ -73,6 +73,32 @@ func (cfg *ClientConfig) GetTLSConfig() (*tls.Config, error) {
 	return config, nil
 }
 
+// GetServerTLSConfig initialises a server-side tls.Config suitable for
+// listeners that must authenticate their peers via mutual TLS (for example
+// the memberlist gossip listener). It builds on GetTLSConfig but requires a
+// CA to be configured and populates the server-only ClientCAs / ClientAuth
+// fields that GetTLSConfig (a client builder) does not set. The reused
+// RootCAs/ClientCAs pool means the same CA bundle authenticates both
+// directions of the mTLS handshake.
+func (cfg *ClientConfig) GetServerTLSConfig() (*tls.Config, error) {
+	c, err := cfg.GetTLSConfig()
+	if err != nil {
+		return nil, err
+	}
+	if cfg.CAPath == "" {
+		return nil, errors.New("tls_ca_path is required to verify peer certificates on a TLS server listener")
+	}
+	if len(c.Certificates) == 0 {
+		return nil, errors.New("tls_cert_path and tls_key_path are required for a TLS server listener")
+	}
+	c.ClientCAs = c.RootCAs
+	c.ClientAuth = tls.RequireAndVerifyClientCert
+	if c.MinVersion == 0 {
+		c.MinVersion = tls.VersionTLS12
+	}
+	return c, nil
+}
+
 // GetGRPCDialOptions creates GRPC DialOptions for TLS
 func (cfg *ClientConfig) GetGRPCDialOptions(enabled bool) ([]grpc.DialOption, error) {
 	if !enabled {
