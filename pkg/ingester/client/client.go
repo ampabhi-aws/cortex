@@ -12,6 +12,21 @@ import (
 	"github.com/cortexproject/cortex/pkg/util/grpcclient"
 )
 
+// AllUserStatsOperatorTenantID is the sentinel tenant ID that must be injected
+// into the gRPC context by trusted operator callers (currently the distributor's
+// admin aggregation path) when invoking the cross-tenant
+// cortex.Ingester/AllUserStats RPC. The ingester rejects callers that do not
+// present this exact tenant ID in the X-Scope-OrgID header.
+//
+// IMPORTANT: Cortex's authentication model trusts the X-Scope-OrgID header
+// completely and delegates verification to an external auth proxy (see
+// docs/guides/authentication-and-authorisation.md). Operators MUST configure
+// the external auth proxy / network policy to reject this sentinel on
+// tenant-facing listeners so that untrusted callers cannot forge the header
+// and recover cross-tenant metadata. Internal, non-tenant-facing gRPC traffic
+// originating from the distributor is the only intended consumer.
+const AllUserStatsOperatorTenantID = "__system_operator__"
+
 var ingesterClientRequestDuration = promauto.NewHistogramVec(prometheus.HistogramOpts{
 	Namespace: "cortex",
 	Name:      "ingester_client_request_duration_seconds",
