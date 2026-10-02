@@ -3,6 +3,7 @@ package configdb
 import (
 	"context"
 	"errors"
+	"path/filepath"
 
 	"github.com/cortexproject/cortex/pkg/alertmanager/alertspb"
 	"github.com/cortexproject/cortex/pkg/configs/client"
@@ -127,6 +128,13 @@ func (c *Store) reloadConfigs(ctx context.Context) (map[string]alertspb.AlertCon
 
 		var templates []*alertspb.TemplateDesc
 		for fn, template := range cfg.Config.TemplateFiles {
+			// Skip template filenames that contain any path component. These are tenant-controlled
+			// map keys from the configs DB which have not otherwise been validated as filenames,
+			// and the alertmanager later uses them to build on-disk paths. Dropping them here is
+			// defence-in-depth; the alertmanager setConfig call will also reject them.
+			if fn == "" || fn == "." || fn == ".." || filepath.Base(fn) != fn || filepath.Dir(filepath.Clean(fn)) != "." {
+				continue
+			}
 			templates = append(templates, &alertspb.TemplateDesc{
 				Filename: fn,
 				Body:     template,
