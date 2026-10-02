@@ -261,6 +261,37 @@ func validateUserConfig(logger log.Logger, cfg alertspb.AlertConfigDesc, limits 
 
 func (am *MultitenantAlertmanager) ListAllConfigs(w http.ResponseWriter, r *http.Request) {
 	logger := util_log.WithContext(r.Context(), am.logger)
+
+	// This endpoint discloses every tenant's Alertmanager configuration and must
+	// be treated as operator-only. Disabled by default (see
+	// MultitenantAlertmanagerConfig.AdminAPIEnabled /
+	// -alertmanager.admin-api-enabled) so that it is not reachable through the
+	// tenant-facing HTTP listener.
+	if !am.cfg.AdminAPIEnabled {
+		http.Error(w, "not found", http.StatusNotFound)
+		return
+	}
+
+	callerID, err := tenant.TenantID(r.Context())
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusUnauthorized)
+		return
+	}
+
+	if len(am.cfg.AdminTenants) > 0 {
+		allowed := false
+		for _, t := range am.cfg.AdminTenants {
+			if t == callerID {
+				allowed = true
+				break
+			}
+		}
+		if !allowed {
+			http.Error(w, "forbidden", http.StatusForbidden)
+			return
+		}
+	}
+
 	userIDs, err := am.store.ListAllUsers(r.Context())
 	if err != nil {
 		level.Error(logger).Log("msg", "failed to list users of alertmanager", "err", err)

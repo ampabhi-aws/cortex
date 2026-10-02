@@ -1101,6 +1101,9 @@ type ruleGroupKey struct {
 func TestRuler_ListAllRules(t *testing.T) {
 	store := newMockRuleStore(mockRules)
 	cfg := defaultRulerConfig(t)
+	// The handler is now gated: enable the admin API so the test exercises the
+	// successful enumeration path.
+	cfg.AdminAPIEnabled = true
 
 	r := newTestRuler(t, cfg, store, nil)
 	defer services.StopAndAwaitTerminated(context.Background(), r) //nolint:errcheck
@@ -1108,7 +1111,9 @@ func TestRuler_ListAllRules(t *testing.T) {
 	router := mux.NewRouter()
 	router.Path("/ruler/rule_groups").Methods(http.MethodGet).HandlerFunc(r.ListAllRules)
 
-	req := requestFor(t, http.MethodGet, "https://localhost:8080/ruler/rule_groups", nil, "")
+	// The handler now requires an authenticated tenant; supply one in context
+	// (the admin tenant allow-list is empty, so any authenticated tenant works).
+	req := requestFor(t, http.MethodGet, "https://localhost:8080/ruler/rule_groups", nil, "admin")
 	w := httptest.NewRecorder()
 	router.ServeHTTP(w, req)
 

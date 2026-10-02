@@ -80,6 +80,14 @@ type MultitenantAlertmanagerConfig struct {
 
 	EnableAPI bool `yaml:"enable_api"`
 
+	// AdminAPIEnabled gates the administrative, cross-tenant endpoint
+	// GET /multitenant_alertmanager/configs. Disabled by default so the
+	// endpoint is not reachable from the tenant-facing HTTP listener. When
+	// enabled the handler additionally requires an authenticated tenant and,
+	// if AdminTenants is non-empty, that the tenant is in the allow-list.
+	AdminAPIEnabled bool                   `yaml:"admin_api_enabled"`
+	AdminTenants    flagext.StringSliceCSV `yaml:"admin_tenants"`
+
 	// For distributor.
 	AlertmanagerClient ClientConfig `yaml:"alertmanager_client"`
 
@@ -114,6 +122,9 @@ func (cfg *MultitenantAlertmanagerConfig) RegisterFlags(f *flag.FlagSet) {
 	f.DurationVar(&cfg.PollInterval, "alertmanager.configs.poll-interval", 15*time.Second, "How frequently to poll Cortex configs")
 
 	f.BoolVar(&cfg.EnableAPI, "experimental.alertmanager.enable-api", false, "Enable the experimental alertmanager config api.")
+
+	f.BoolVar(&cfg.AdminAPIEnabled, "alertmanager.admin-api-enabled", false, "Enable the cross-tenant Alertmanager administrative endpoint GET /multitenant_alertmanager/configs. Disabled by default: when disabled the endpoint is not registered and the handler returns 404. When enabled, the endpoint is served with authentication required and (if -alertmanager.admin-tenants is non-empty) only tenants in that allow-list are permitted.")
+	f.Var(&cfg.AdminTenants, "alertmanager.admin-tenants", "Comma-separated list of tenants permitted to call the Alertmanager administrative endpoint when -alertmanager.admin-api-enabled is set.")
 
 	f.BoolVar(&cfg.ShardingEnabled, "alertmanager.sharding-enabled", false, "Shard tenants across multiple alertmanager instances.")
 
@@ -435,6 +446,14 @@ type handlerForGRPCServer struct {
 
 func (h *handlerForGRPCServer) ServeHTTP(w http.ResponseWriter, req *http.Request) {
 	h.am.serveRequest(w, req)
+}
+
+// GetAdminAPIEnabled reports whether the Alertmanager's cross-tenant
+// administrative endpoints should be registered. The API package uses this to
+// avoid mounting GET /multitenant_alertmanager/configs on the tenant-facing
+// listener unless the operator has explicitly opted in.
+func (am *MultitenantAlertmanager) GetAdminAPIEnabled() bool {
+	return am.cfg.AdminAPIEnabled
 }
 
 func (am *MultitenantAlertmanager) starting(ctx context.Context) (err error) {

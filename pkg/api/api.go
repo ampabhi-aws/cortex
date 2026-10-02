@@ -187,7 +187,13 @@ func (a *API) RegisterAlertmanager(am *alertmanager.MultitenantAlertmanager, tar
 	a.indexPage.AddLink(SectionAdminEndpoints, "/multitenant_alertmanager/ring", "Alertmanager Ring Status")
 	// Ensure this route is registered before the prefixed AM route
 	a.RegisterRoute("/multitenant_alertmanager/status", am.GetStatusHandler(), false, "GET")
-	a.RegisterRoute("/multitenant_alertmanager/configs", http.HandlerFunc(am.ListAllConfigs), false, "GET")
+	// Administrative, cross-tenant endpoint. Only registered when the operator
+	// has explicitly enabled it; the handler additionally requires
+	// authentication (and optionally an admin tenant allow-list) to refuse
+	// cross-tenant disclosure from the tenant-facing listener.
+	if am.GetAdminAPIEnabled() {
+		a.RegisterRoute("/multitenant_alertmanager/configs", http.HandlerFunc(am.ListAllConfigs), true, "GET")
+	}
 	a.RegisterRoute("/multitenant_alertmanager/ring", http.HandlerFunc(am.RingHandler), false, "GET", "POST")
 	a.RegisterRoute("/multitenant_alertmanager/delete_tenant_config", http.HandlerFunc(am.DeleteUserConfig), true, "POST")
 
@@ -291,8 +297,14 @@ func (a *API) RegisterRuler(r *ruler.Ruler) {
 	// Legacy Ring Route
 	a.RegisterRoute("/ruler_ring", r, false, "GET", "POST")
 
-	// List all user rule groups
-	a.RegisterRoute("/ruler/rule_groups", http.HandlerFunc(r.ListAllRules), false, "GET")
+	// List all user rule groups. Administrative, cross-tenant endpoint;
+	// disabled by default. When enabled, authentication is required (and the
+	// handler further enforces an optional admin tenant allow-list) so the
+	// endpoint cannot be used from the tenant-facing listener to exfiltrate
+	// other tenants' rules.
+	if r.GetAdminAPIEnabled() {
+		a.RegisterRoute("/ruler/rule_groups", http.HandlerFunc(r.ListAllRules), true, "GET")
+	}
 
 	ruler.RegisterRulerServer(a.server.GRPC, r)
 }

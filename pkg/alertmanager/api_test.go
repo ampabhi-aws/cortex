@@ -670,6 +670,9 @@ receivers:
 	// Create the Multitenant Alertmanager.
 	reg := prometheus.NewPedanticRegistry()
 	cfg := mockAlertmanagerConfig(t)
+	// Enable the admin API so this test exercises the successful enumeration
+	// path; the handler is now gated by AdminAPIEnabled and 404s by default.
+	cfg.AdminAPIEnabled = true
 	am, err := createMultitenantAlertmanager(cfg, nil, nil, alertStore, nil, nil, log.NewNopLogger(), reg)
 	require.NoError(t, err)
 	require.NoError(t, services.StartAndAwaitRunning(context.Background(), am))
@@ -682,6 +685,8 @@ receivers:
 	router := mux.NewRouter()
 	router.Path("/multitenant_alertmanager/configs").Methods(http.MethodGet).HandlerFunc(am.ListAllConfigs)
 	req := httptest.NewRequest("GET", "https://localhost:8080/multitenant_alertmanager/configs", nil)
+	// The handler now requires an authenticated tenant; inject one.
+	req = req.WithContext(user.InjectOrgID(req.Context(), "admin"))
 	w := httptest.NewRecorder()
 	router.ServeHTTP(w, req)
 
