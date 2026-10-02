@@ -265,6 +265,16 @@ func (s *Scheduler) frontendDisconnected(frontendAddress string) {
 }
 
 func (s *Scheduler) enqueueRequest(frontendContext context.Context, frontendAddr string, msg *schedulerpb.FrontendToScheduler) error {
+	// Reject ENQUEUE messages that omit the (optional-on-the-wire) HttpRequest
+	// field. Without this guard a nil *httpgrpc.HTTPRequest would be passed to
+	// the tracing carrier (which can panic with a real tracer) and ultimately
+	// dispatched to a querier whose handler dereferences r.Method/r.Url/r.Body
+	// and crashes the process. FrontendLoop is unauthenticated, so an attacker
+	// could trigger this at will.
+	if msg.HttpRequest == nil {
+		return errors.New("missing HttpRequest in ENQUEUE message")
+	}
+
 	// Create new context for this request, to support cancellation.
 	ctx, cancel := context.WithCancel(frontendContext)
 	shouldCancel := true
