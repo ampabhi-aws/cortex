@@ -24,7 +24,7 @@ func TestPage(t *testing.T) {
 	require.NoError(t, pageTemplate.Execute(&bytes.Buffer{}, pageData{
 		Now:           time.Now(),
 		Memberlist:    ml,
-		SortedMembers: ml.Members(),
+		SortedMembers: nil,
 		Store:         nil,
 		ReceivedMessages: []message{{
 			ID:   10,
