@@ -7,6 +7,7 @@ import (
 	"html/template"
 	"math"
 	"net/http"
+	"net/url"
 	"sort"
 	"strings"
 	"time"
@@ -90,6 +91,11 @@ func init() {
 	pageTemplate = template.Must(t.Parse(pageContent))
 }
 
+// errInstanceStillHealthy is returned by forget when the target instance's
+// heartbeat is still fresh, meaning it is not actually gone and must not be
+// evicted from the ring.
+var errInstanceStillHealthy = fmt.Errorf("refusing to forget instance with a fresh heartbeat")
+
 func (r *Ring) forget(ctx context.Context, id string) error {
 	unregister := func(in interface{}) (out interface{}, retry bool, err error) {
 		if in == nil {
@@ -97,10 +103,43 @@ func (r *Ring) forget(ctx context.Context, id string) error {
 		}
 
 		ringDesc := in.(*Desc)
+
+		// Defence-in-depth: refuse to forget an instance that is still heart-
+		// beating. Such an instance is not actually gone and will immediately
+		// re-register itself on its next heartbeat; evicting it only causes a
+		// transient re-shuffle that can be abused to repeatedly drop replicas.
+		if ing, ok := ringDesc.Ingesters[id]; ok {
+			if ing.IsHeartbeatHealthy(r.cfg.HeartbeatTimeout, time.Now()) {
+				return nil, false, errInstanceStillHealthy
+			}
+		}
+
 		ringDesc.RemoveIngester(id)
 		return ringDesc, true, nil
 	}
 	return r.KVClient.CAS(ctx, r.key, unregister)
+}
+
+// sameOriginRequest reports whether a mutating request appears to originate
+// from the same host that is serving it, based on the Origin/Referer headers.
+// This is a lightweight CSRF defence: it blocks the "any origin can POST a
+// form" primitive without requiring external middleware. Requests that carry
+// no Origin or Referer header are allowed through so that direct admin tools
+// (curl, ops scripts) keep working; browsers always attach one of these
+// headers to cross-origin form submissions.
+func sameOriginRequest(req *http.Request) bool {
+	origin := req.Header.Get("Origin")
+	if origin == "" {
+		origin = req.Header.Get("Referer")
+	}
+	if origin == "" {
+		return true
+	}
+	u, err := url.Parse(origin)
+	if err != nil || u.Host == "" {
+		return false
+	}
+	return strings.EqualFold(u.Host, req.Host)
 }
 
 type ingesterDesc struct {
@@ -123,9 +162,53 @@ type httpResponse struct {
 
 func (r *Ring) ServeHTTP(w http.ResponseWriter, req *http.Request) {
 	if req.Method == http.MethodPost {
-		ingesterID := req.FormValue("forget")
+		// CSRF defence: reject POSTs whose Origin/Referer, when present, does
+		// not match the request's own host. This blocks the trivial cross-
+		// origin-form primitive without requiring a cookie or token flow.
+		if !sameOriginRequest(req) {
+			level.Warn(r.logger).Log(
+				"msg", "refused ring forget POST from a cross-origin caller",
+				"caller", req.RemoteAddr,
+				"origin", req.Header.Get("Origin"),
+				"referer", req.Header.Get("Referer"),
+			)
+			http.Error(w, "forbidden", http.StatusForbidden)
+			return
+		}
+
+		ingesterID := strings.TrimSpace(req.FormValue("forget"))
+		if ingesterID == "" {
+			http.Error(w, "missing instance id", http.StatusBadRequest)
+			return
+		}
+
+		// Audit every attempt — success and failure — so that the action is
+		// detectable even when it is initiated via a legitimate admin reverse
+		// proxy. Logging happens before the CAS so a crash mid-call is still
+		// attributable to a caller.
+		level.Warn(r.logger).Log(
+			"msg", "ring forget requested",
+			"instance", ingesterID,
+			"caller", req.RemoteAddr,
+		)
+
 		if err := r.forget(req.Context(), ingesterID); err != nil {
-			level.Error(r.logger).Log("msg", "error forgetting instance", "err", err)
+			level.Error(r.logger).Log(
+				"msg", "error forgetting instance",
+				"instance", ingesterID,
+				"caller", req.RemoteAddr,
+				"err", err,
+			)
+			if err == errInstanceStillHealthy {
+				http.Error(w, "refusing to forget instance with a fresh heartbeat", http.StatusConflict)
+				return
+			}
+		} else {
+			level.Warn(r.logger).Log(
+				"msg", "forgot ring instance",
+				"instance", ingesterID,
+				"caller", req.RemoteAddr,
+			)
 		}
 
 		// Implement PRG pattern to prevent double-POST and work with CSRF middleware.
