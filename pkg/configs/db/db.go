@@ -29,6 +29,23 @@ func (cfg *Config) RegisterFlags(f *flag.FlagSet) {
 	f.StringVar(&cfg.PasswordFile, "configs.database.password-file", "", "File containing password (username goes in URI)")
 }
 
+// MarshalYAML implements yaml.Marshaler. It strips any password component out
+// of the URI before marshalling so credentials embedded inline (e.g.
+// postgres://user:pass@host/db) are not disclosed by endpoints that dump the
+// configuration (such as the unauthenticated GET /config admin endpoint).
+func (cfg Config) MarshalYAML() (interface{}, error) {
+	// Use an alias type to avoid infinite recursion through MarshalYAML.
+	type plain Config
+	redacted := plain(cfg)
+	if u, err := url.Parse(cfg.URI); err == nil && u.User != nil {
+		if _, hasPassword := u.User.Password(); hasPassword {
+			u.User = url.UserPassword(u.User.Username(), "********")
+			redacted.URI = u.String()
+		}
+	}
+	return redacted, nil
+}
+
 // DB is the interface for the database.
 type DB interface {
 	// GetRulesConfig gets the user's ruler config
