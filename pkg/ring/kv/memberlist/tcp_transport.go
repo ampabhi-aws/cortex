@@ -126,11 +126,22 @@ func NewTCPTransport(config TCPTransportConfig, logger log.Logger) (*TCPTranspor
 	}
 
 	var err error
+	var serverTLSConfig *tls.Config
 	if config.TLSEnabled {
 		t.tlsConfig, err = config.TLS.GetTLSConfig()
 		if err != nil {
 			return nil, errors.Wrap(err, "unable to create TLS config")
 		}
+		// The listener must authenticate incoming gossip peers via mutual TLS,
+		// which requires server-side fields (ClientCAs/ClientAuth) that the
+		// client TLS builder does not set. Build a dedicated server config so
+		// unauthenticated peers cannot inject ring state.
+		serverTLSConfig, err = config.TLS.GetServerTLSConfig()
+		if err != nil {
+			return nil, errors.Wrap(err, "unable to create server TLS config for memberlist gossip listener")
+		}
+	} else {
+		level.Warn(logger).Log("msg", "memberlist TLS is disabled; gossip traffic is unauthenticated and unencrypted. Enable -memberlist.tls-enabled with mutual TLS to require verified peer certificates on the gossip transport.")
 	}
 
 	t.registerMetrics(config.MetricsRegisterer)
@@ -151,7 +162,7 @@ func NewTCPTransport(config TCPTransportConfig, logger log.Logger) (*TCPTranspor
 
 		var tcpLn net.Listener
 		if config.TLSEnabled {
-			tcpLn, err = tls.Listen("tcp", tcpAddr.String(), t.tlsConfig)
+			tcpLn, err = tls.Listen("tcp", tcpAddr.String(), serverTLSConfig)
 			if err != nil {
 				return nil, errors.Wrapf(err, "failed to start TLS TCP listener on %q port %d", addr, port)
 			}
