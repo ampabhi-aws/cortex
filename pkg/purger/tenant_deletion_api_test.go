@@ -27,6 +27,25 @@ func TestDeleteTenant(t *testing.T) {
 	}
 
 	{
+		// Tenant has no objects in the bucket: refuse to create a phantom
+		// prefix via the deletion marker.
+		ctx := context.Background()
+		ctx = user.InjectOrgID(ctx, "fake")
+
+		req := &http.Request{}
+		resp := httptest.NewRecorder()
+		api.DeleteTenant(resp, req.WithContext(ctx))
+
+		require.Equal(t, http.StatusNotFound, resp.Code)
+		objs := bkt.Objects()
+		require.Nil(t, objs[path.Join("fake", tsdb.TenantDeletionMarkPath)])
+	}
+
+	{
+		// Seed the tenant with a block so that it is a "real" tenant with
+		// data in the bucket, then the deletion marker must be written.
+		require.NoError(t, bkt.Upload(context.Background(), path.Join("fake", "01EQK4QKFHVSZYVJ908Y7HH9E0", "meta.json"), bytes.NewReader([]byte("data"))))
+
 		ctx := context.Background()
 		ctx = user.InjectOrgID(ctx, "fake")
 
@@ -37,6 +56,19 @@ func TestDeleteTenant(t *testing.T) {
 		require.Equal(t, http.StatusOK, resp.Code)
 		objs := bkt.Objects()
 		require.NotNil(t, objs[path.Join("fake", tsdb.TenantDeletionMarkPath)])
+	}
+
+	{
+		// A repeated call for an already-marked tenant must still succeed
+		// (idempotent re-mark), because the markers/ prefix is now present.
+		ctx := context.Background()
+		ctx = user.InjectOrgID(ctx, "fake")
+
+		req := &http.Request{}
+		resp := httptest.NewRecorder()
+		api.DeleteTenant(resp, req.WithContext(ctx))
+
+		require.Equal(t, http.StatusOK, resp.Code)
 	}
 }
 
