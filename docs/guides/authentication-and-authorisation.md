@@ -51,3 +51,37 @@ This can help to run Cortex in a trusted environment where you want to separate 
 into distinct namespaces by some criteria (e.g. teams, applications, etc).
 
 Be advised that **cortex-tenant** is a third-party community project and it's not maintained by Cortex team.
+
+## Protecting administrative endpoints
+
+Cortex registers a number of administrative endpoints on the same HTTP listener
+used for tenant traffic (there is no separate admin port). These endpoints are
+intended for operators only, must not be exposed to end users and -- for
+endpoints that aggregate state across tenants -- must not be callable from a
+tenant-scoped context either. The administrative path prefixes you must deny
+at your reverse proxy (or otherwise restrict to trusted operators) include:
+
+- `/multitenant_alertmanager/*` -- Alertmanager admin endpoints, including
+  `GET /multitenant_alertmanager/configs`, which returns every tenant's
+  Alertmanager configuration. Cortex now registers this endpoint with
+  authentication required and redacts secret fields (`<secret>`) before
+  returning them, but the aggregated response still lists every tenant's
+  configuration and templates and so must only be reachable by operators.
+- `/distributor/*`, `/ingester/*`, `/compactor/*`, `/store-gateway/*`,
+  `/ruler/ring`, `/alertmanager/ring` -- component status, ring and lifecycle
+  endpoints (including destructive ones such as `/ingester/shutdown`).
+- `/services`, `/ready`, `/config`, `/runtime_config`, `/memberlist`, `/debug/*`,
+  `/metrics` -- process-level introspection.
+
+A minimal nginx example that denies tenant access to the Alertmanager admin
+namespace while still permitting the per-tenant `/alertmanager/*` UI and the
+per-tenant `/api/v1/alerts` config API is:
+
+```
+location ~ ^/multitenant_alertmanager(/|$) {
+    deny all;
+}
+```
+
+Similar rules should be configured for the other administrative prefixes
+listed above.

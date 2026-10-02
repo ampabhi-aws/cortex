@@ -283,10 +283,34 @@ func (am *MultitenantAlertmanager) ListAllConfigs(w http.ResponseWriter, r *http
 		} else if err != nil {
 			return errors.Wrapf(err, "failed to fetch alertmanager config for user %s", userID)
 		}
+
+		// Redact secrets before returning the config. Parsing the raw YAML and
+		// re-marshalling it causes alertmanager's config.Secret/SecretURL types to
+		// emit `<secret>` via their MarshalYAML implementations, so plaintext
+		// third-party credentials (slack_api_url, smtp_auth_password, pagerduty/
+		// opsgenie/victorops keys, basic_auth passwords, bearer tokens, etc.) are
+		// not disclosed through this administrative endpoint.
+		redactedConfig := cfg.RawConfig
+		if cfg.RawConfig != "" {
+			amCfg, parseErr := config.Load(cfg.RawConfig)
+			if parseErr != nil {
+				level.Warn(logger).Log("msg", "failed to parse alertmanager config for secret redaction; omitting raw config", "user", userID, "err", parseErr)
+				redactedConfig = ""
+			} else {
+				marshalled, marshalErr := yaml.Marshal(amCfg)
+				if marshalErr != nil {
+					level.Warn(logger).Log("msg", "failed to marshal alertmanager config for secret redaction; omitting raw config", "user", userID, "err", marshalErr)
+					redactedConfig = ""
+				} else {
+					redactedConfig = string(marshalled)
+				}
+			}
+		}
+
 		data := map[string]*UserConfig{
 			userID: {
 				TemplateFiles:      alertspb.ParseTemplates(cfg),
-				AlertmanagerConfig: cfg.RawConfig,
+				AlertmanagerConfig: redactedConfig,
 			},
 		}
 

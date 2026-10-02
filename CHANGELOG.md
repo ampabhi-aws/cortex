@@ -2,6 +2,8 @@
 
 ## master / unreleased
 
+* [SECURITY] Alertmanager: the `GET /multitenant_alertmanager/configs` administrative endpoint now requires the `X-Scope-OrgID` header (`auth=true`) and redacts secret fields (`<secret>`) in the returned Alertmanager configurations by re-marshalling each config through `alertmanager/config`. Previously this endpoint was reachable with `auth=false` and streamed each tenant's raw YAML -- including plaintext Slack webhook URLs, SMTP auth passwords, PagerDuty / OpsGenie / VictorOps API keys, basic-auth passwords, and bearer tokens -- to any caller that could reach the Cortex HTTP port. Operators must still deny this administrative path at the ingress layer; see `docs/guides/authentication-and-authorisation.md`.
+
   **This release removes support for chunks storage. See below for more.**
 * [CHANGE] Remove support for chunks storage entirely. If you are using chunks storage on a previous version, you must [migrate your data](https://github.com/cortexproject/cortex/blob/v1.11.1/docs/blocks-storage/migrate-from-chunks-to-blocks.md) on version 1.12 or earlier. Before upgrading to this release, you should also remove any deprecated chunks-related configuration, as this release will no longer accept that. The following flags are gone:
   - `-dynamodb.*`
