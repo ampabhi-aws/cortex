@@ -1557,9 +1557,26 @@ func (i *Ingester) UserStats(ctx context.Context, req *client.UserStatsRequest) 
 }
 
 // AllUserStats returns ingestion statistics for all users known to this ingester.
-func (i *Ingester) AllUserStats(_ context.Context, _ *client.UserStatsRequest) (*client.UsersStatsResponse, error) {
+//
+// This is a cross-tenant aggregation RPC intended only for the distributor's
+// operator admin page (`/distributor/all_user_stats`). To prevent any caller
+// that is able to set the X-Scope-OrgID header from enumerating the full
+// tenant inventory (tenant IDs, cardinality, ingestion rate), the method
+// requires the caller to present the dedicated operator tenant sentinel
+// (client.AllUserStatsOperatorTenantID) rather than any tenant ID. Operators
+// MUST configure the external auth proxy / network policy to reject this
+// sentinel on tenant-facing listeners.
+func (i *Ingester) AllUserStats(ctx context.Context, _ *client.UserStatsRequest) (*client.UsersStatsResponse, error) {
 	if err := i.checkRunning(); err != nil {
 		return nil, err
+	}
+
+	callerID, err := tenant.TenantID(ctx)
+	if err != nil {
+		return nil, err
+	}
+	if callerID != client.AllUserStatsOperatorTenantID {
+		return nil, status.Error(codes.PermissionDenied, "not authorized for cross-tenant statistics")
 	}
 
 	i.stoppedMtx.RLock()

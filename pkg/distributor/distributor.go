@@ -1206,7 +1206,12 @@ func (d *Distributor) AllUserStats(ctx context.Context) ([]UserIDStats, error) {
 	perUserTotals := make(map[string]UserStats)
 
 	req := &ingester_client.UserStatsRequest{}
-	ctx = user.InjectOrgID(ctx, "1") // fake: ingester insists on having an org ID
+	// Inject the operator sentinel tenant ID. The ingester's AllUserStats RPC
+	// requires this exact value in X-Scope-OrgID so that untrusted callers
+	// cannot use it to enumerate the full tenant inventory. The external auth
+	// proxy / network policy must reject this sentinel on tenant-facing
+	// listeners (see pkg/ingester/client.AllUserStatsOperatorTenantID).
+	ctx = user.InjectOrgID(ctx, ingester_client.AllUserStatsOperatorTenantID)
 	// Not using d.ForReplicationSet(), so we can fail after first error.
 	replicationSet, err := d.ingestersRing.GetAllHealthy(ring.Read)
 	if err != nil {
