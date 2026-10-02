@@ -690,7 +690,19 @@ receivers:
 	require.Equal(t, "application/yaml", resp.Header.Get("Content-Type"))
 	body, err := io.ReadAll(resp.Body)
 	require.NoError(t, err)
-	old, err := yaml.Marshal(testCases)
+
+	// ListAllConfigs parses each tenant's raw YAML and re-marshals it so that
+	// alertmanager's config.Secret/SecretURL types redact to `<secret>`. Expect
+	// the same transformation applied to the test fixtures.
+	expected := map[string]*UserConfig{}
+	for user, uc := range testCases {
+		amCfg, err := config.Load(uc.AlertmanagerConfig)
+		require.NoError(t, err)
+		redacted, err := yaml.Marshal(amCfg)
+		require.NoError(t, err)
+		expected[user] = &UserConfig{AlertmanagerConfig: string(redacted)}
+	}
+	old, err := yaml.Marshal(expected)
 	require.NoError(t, err)
 	require.YAMLEq(t, string(old), string(body))
 }
