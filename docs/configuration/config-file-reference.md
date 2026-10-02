@@ -2488,9 +2488,19 @@ The `memberlist_config` configures the Gossip memberlist.
 # CLI flag: -memberlist.packet-write-timeout
 [packet_write_timeout: <duration> | default = 5s]
 
-# Enable TLS on the memberlist transport layer.
+# Enable TLS on the memberlist transport layer. When enabled, the listener
+# requires and verifies client certificates (mutual TLS); a server certificate
+# (-memberlist.tls-cert-path/-memberlist.tls-key-path) and a client CA bundle
+# (-memberlist.tls-client-ca-path, defaulting to -memberlist.tls-ca-path) must
+# be configured.
 # CLI flag: -memberlist.tls-enabled
 [tls_enabled: <boolean> | default = false]
+
+# Path to the CA certificates file used to validate the client certificates
+# presented to the memberlist TLS listener. If empty, -memberlist.tls-ca-path
+# is used. Required when -memberlist.tls-enabled is true.
+# CLI flag: -memberlist.tls-client-ca-path
+[tls_client_ca_path: <string> | default = ""]
 
 # Path to the client certificate file, which will be used for authenticating
 # with the server. Also requires the key path to be configured.
