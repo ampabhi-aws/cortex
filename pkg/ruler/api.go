@@ -2,6 +2,7 @@ package ruler
 
 import (
 	"encoding/json"
+	"fmt"
 	io "io"
 	"net/http"
 	"net/url"
@@ -447,14 +448,33 @@ func (a *API) CreateRuleGroup(w http.ResponseWriter, req *http.Request) {
 		return
 	}
 
-	payload, err := io.ReadAll(req.Body)
+	// Bound the request body before buffering it so an oversized rule group
+	// configuration cannot cause the shared multi-tenant ruler process to
+	// exhaust memory. Mirrors MultitenantAlertmanager.SetUserConfig.
+	var input io.Reader = req.Body
+	maxSize := a.ruler.limits.RulerMaxRuleGroupConfigSize(userID)
+	if maxSize > 0 {
+		// MaxBytesReader also closes the request body and will respond with 413
+		// if the client keeps streaming. LimitReader guarantees ReadAll will
+		// return at most maxSize+1 bytes, which lets us detect oversize bodies.
+		input = io.LimitReader(http.MaxBytesReader(w, req.Body, int64(maxSize)+1), int64(maxSize)+1)
+	}
+
+	payload, err := io.ReadAll(input)
 	if err != nil {
 		level.Error(logger).Log("msg", "unable to read rule group payload", "err", err.Error())
 		http.Error(w, err.Error(), http.StatusBadRequest)
 		return
 	}
 
-	level.Debug(logger).Log("msg", "attempting to unmarshal rulegroup", "userID", userID, "group", string(payload))
+	if maxSize > 0 && len(payload) > maxSize {
+		msg := fmt.Sprintf("rule group configuration is too big, limit: %d bytes", maxSize)
+		level.Warn(logger).Log("msg", msg, "user", userID)
+		http.Error(w, msg, http.StatusRequestEntityTooLarge)
+		return
+	}
+
+	level.Debug(logger).Log("msg", "attempting to unmarshal rulegroup", "userID", userID, "payload_bytes", len(payload))
 
 	rg := rulefmt.RuleGroup{}
 	err = yaml.Unmarshal(payload, &rg)
