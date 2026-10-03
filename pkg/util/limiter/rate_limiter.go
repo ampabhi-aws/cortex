@@ -92,6 +92,16 @@ func (l *RateLimiter) getTenantLimiter(now time.Time, tenantID string) *rate.Lim
 	return entry.limiter
 }
 
+// RemoveTenant removes the per-tenant limiter entry, if any. It is intended
+// to be called by an inactivity-based cleanup (e.g. the distributor's
+// ActiveUsersCleanup) so that the tenants map does not grow without bound
+// when the tenant ID is attacker-controlled.
+func (l *RateLimiter) RemoveTenant(tenantID string) {
+	l.tenantsLock.Lock()
+	delete(l.tenants, tenantID)
+	l.tenantsLock.Unlock()
+}
+
 func (l *RateLimiter) recheckTenantLimiter(now time.Time, tenantID string) *rate.Limiter {
 	limit := rate.Limit(l.strategy.Limit(tenantID))
 	burst := l.strategy.Burst(tenantID)
