@@ -326,20 +326,6 @@ func (am *Alertmanager) ApplyConfig(userID string, conf *config.Config, rawCfg s
 	}
 	tmpl.ExternalURL = am.cfg.ExternalURL
 
-	am.api.Update(conf, func(_ model.LabelSet) {})
-
-	// Ensure inhibitor is set before being called
-	if am.inhibitor != nil {
-		am.inhibitor.Stop()
-	}
-
-	// Ensure dispatcher is set before being called
-	if am.dispatcher != nil {
-		am.dispatcher.Stop()
-	}
-
-	am.inhibitor = inhibit.NewInhibitor(am.alerts, conf.InhibitRules, am.marker, log.With(am.logger, "component", "inhibitor"))
-
 	waitFunc := clusterWait(am.state.Position, am.cfg.PeerTimeout)
 
 	timeoutFunc := func(d time.Duration) time.Duration {
@@ -352,6 +338,10 @@ func (am *Alertmanager) ApplyConfig(userID string, conf *config.Config, rawCfg s
 	// Create a firewall binded to the per-tenant config.
 	firewallDialer := util_net.NewFirewallDialer(newFirewallDialerConfigProvider(userID, am.cfg.Limits))
 
+	// Build the integrations map BEFORE stopping the existing inhibitor/dispatcher.
+	// If this step fails we want to keep the previously-working configuration intact
+	// rather than leaving the Alertmanager half-configured (nil dispatcher / stopped
+	// pipeline) while callers see a successful reload.
 	integrationsMap, err := buildIntegrationsMap(conf.Receivers, tmpl, firewallDialer, am.logger, func(integrationName string, notifier notify.Notifier) notify.Notifier {
 		if am.cfg.Limits != nil {
 			rl := &tenantRateLimits{
@@ -365,8 +355,22 @@ func (am *Alertmanager) ApplyConfig(userID string, conf *config.Config, rawCfg s
 		return notifier
 	})
 	if err != nil {
-		return nil
+		return errors.Wrap(err, "failed to build integrations map")
 	}
+
+	am.api.Update(conf, func(_ model.LabelSet) {})
+
+	// Ensure inhibitor is set before being called
+	if am.inhibitor != nil {
+		am.inhibitor.Stop()
+	}
+
+	// Ensure dispatcher is set before being called
+	if am.dispatcher != nil {
+		am.dispatcher.Stop()
+	}
+
+	am.inhibitor = inhibit.NewInhibitor(am.alerts, conf.InhibitRules, am.marker, log.With(am.logger, "component", "inhibitor"))
 
 	muteTimes := make(map[string][]timeinterval.TimeInterval, len(conf.MuteTimeIntervals))
 	for _, ti := range conf.MuteTimeIntervals {
