@@ -17,6 +17,27 @@ var (
 	expectedSamplesPerSeries   = 10
 	expectedExemplarsPerSeries = 1
 
+	// maxPreallocatedTimeseries bounds the capacity of []PreallocTimeseries
+	// slices returned to slicePool so a single oversized request cannot
+	// pin a large backing array in the global sync.Pool. Chosen comfortably
+	// above the common expectedTimeseries default so steady-state workloads
+	// still benefit from reuse.
+	maxPreallocatedTimeseries = 10000
+
+	// maxPreallocatedLabelsPerSeries bounds the capacity of the pooled
+	// TimeSeries.Labels backing array that is returned to timeSeriesPool.
+	// It must be at least as large as max_label_names_per_series, but is
+	// deliberately capped so that an attacker who grows the slice to
+	// millions of entries during Unmarshal cannot park the oversized array
+	// in the global pool.
+	maxPreallocatedLabelsPerSeries = 1024
+
+	// maxPreallocatedSamplesPerSeries / maxPreallocatedExemplarsPerSeries
+	// bound the capacity of the Samples / Exemplars slices returned to the
+	// pool for the same reason.
+	maxPreallocatedSamplesPerSeries   = 10000
+	maxPreallocatedExemplarsPerSeries = 10000
+
 	/*
 		We cannot pool these as pointer-to-slice because the place we use them is in WriteRequest which is generated from Protobuf
 		and we don't have an option to make it a pointer. There is overhead here 24 bytes of garbage every time a PreallocTimeseries
@@ -279,6 +300,14 @@ func ReuseSlice(ts []PreallocTimeseries) {
 		ReuseTimeseries(ts[i].TimeSeries)
 	}
 
+	// Don't retain oversized backing arrays in the global pool. A single
+	// large request would otherwise pin a huge []PreallocTimeseries that
+	// would be kept alive indefinitely by the pool's hot/victim cycle as
+	// long as there is enough traffic to redraw it.
+	if cap(ts) > maxPreallocatedTimeseries {
+		return
+	}
+
 	slicePool.Put(ts[:0]) //nolint:staticcheck //see comment on slicePool for more details
 }
 
@@ -290,6 +319,21 @@ func TimeseriesFromPool() *TimeSeries {
 
 // ReuseTimeseries puts the timeseries back into a sync.Pool for reuse.
 func ReuseTimeseries(ts *TimeSeries) {
+	// Don't retain oversized backing arrays in the global pool. An attacker
+	// can grow Labels / Samples / Exemplars during protobuf Unmarshal (the
+	// only bound is -distributor.max-recv-msg-size) and this function would
+	// otherwise park a potentially multi-hundred-megabyte array in the
+	// pool, where it would be kept alive by subsequent legitimate pushes
+	// (defeating the sync.Pool victim-cache reclamation) and inflate the
+	// process's steady-state heap. Dropping the TimeSeries entirely lets
+	// the GC reclaim the oversized backing arrays; the pool's New function
+	// will allocate a right-sized replacement on the next Get.
+	if cap(ts.Labels) > maxPreallocatedLabelsPerSeries ||
+		cap(ts.Samples) > maxPreallocatedSamplesPerSeries ||
+		cap(ts.Exemplars) > maxPreallocatedExemplarsPerSeries {
+		return
+	}
+
 	// Name and Value may point into a large gRPC buffer, so clear the reference to allow GC
 	for i := 0; i < len(ts.Labels); i++ {
 		ts.Labels[i].Name = ""

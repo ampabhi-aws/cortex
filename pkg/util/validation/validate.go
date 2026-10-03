@@ -172,9 +172,31 @@ type LabelValidationConfig interface {
 	MaxLabelsSizeBytes(userID string) int
 }
 
+// ValidateLabelsCount enforces the max_label_names_per_series limit on a
+// label slice without touching any individual label. It exists so that
+// callers (for example, Distributor.Push) can reject attacker-sized label
+// slices before performing any O(K log K) sort or O(K) hashing / scanning
+// over the slice. The returned error retains the series labels, matching
+// the behaviour of ValidateLabels.
+func ValidateLabelsCount(cfg LabelValidationConfig, userID string, ls []cortexpb.LabelAdapter) ValidationError {
+	limit := cfg.MaxLabelNamesPerSeries(userID)
+	if len(ls) > limit {
+		DiscardedSamples.WithLabelValues(maxLabelNamesPerSeries, userID).Inc()
+		return newTooManyLabelsError(ls, limit)
+	}
+	return nil
+}
+
 // ValidateLabels returns an err if the labels are invalid.
 // The returned error may retain the provided series labels.
 func ValidateLabels(cfg LabelValidationConfig, userID string, ls []cortexpb.LabelAdapter, skipLabelNameValidation bool) ValidationError {
+	// Enforce the cardinality limit first so that callers which invoke this
+	// function with an attacker-sized label slice do not incur any further
+	// per-label work before the series is rejected.
+	if err := ValidateLabelsCount(cfg, userID, ls); err != nil {
+		return err
+	}
+
 	if cfg.EnforceMetricName(userID) {
 		unsafeMetricName, err := extract.UnsafeMetricNameFromLabelAdapters(ls)
 		if err != nil {
@@ -190,6 +212,9 @@ func ValidateLabels(cfg LabelValidationConfig, userID string, ls []cortexpb.Labe
 
 	numLabelNames := len(ls)
 	if numLabelNames > cfg.MaxLabelNamesPerSeries(userID) {
+		// This should normally not fire because ValidateLabelsCount above has
+		// already enforced the same bound, but it is kept as a defence in
+		// depth in case callers rewire ValidateLabels in the future.
 		DiscardedSamples.WithLabelValues(maxLabelNamesPerSeries, userID).Inc()
 		return newTooManyLabelsError(ls, cfg.MaxLabelNamesPerSeries(userID))
 	}

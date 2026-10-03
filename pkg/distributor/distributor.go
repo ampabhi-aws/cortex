@@ -673,6 +673,21 @@ func (d *Distributor) Push(ctx context.Context, req *cortexpb.WriteRequest) (*co
 			continue
 		}
 
+		// Enforce the per-series label-count limit BEFORE any O(K log K) sort or
+		// O(K) hashing work. Without this, an attacker-sized label slice (bounded
+		// only by the message-size cap, which can yield millions of labels in a
+		// single series) would force sort.Slice and tokenForLabels to scan every
+		// element before validateSeries ever rejects the series for exceeding
+		// max_label_names_per_series. See CWE-770.
+		if validationErr := validation.ValidateLabelsCount(d.limits, userID, ts.Labels); validationErr != nil {
+			if firstPartialErr == nil {
+				// The series labels may be retained by validationErr but that's not a problem for this
+				// use case because we format it calling Error() and then we discard it.
+				firstPartialErr = httpgrpc.Errorf(http.StatusBadRequest, validationErr.Error())
+			}
+			continue
+		}
+
 		// We rely on sorted labels in different places:
 		// 1) When computing token for labels, and sharding by all labels. Here different order of labels returns
 		// different tokens, which is bad.
