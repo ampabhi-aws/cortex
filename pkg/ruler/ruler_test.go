@@ -1101,6 +1101,11 @@ type ruleGroupKey struct {
 func TestRuler_ListAllRules(t *testing.T) {
 	store := newMockRuleStore(mockRules)
 	cfg := defaultRulerConfig(t)
+	// Enable the operator-only endpoint and allowlist a synthetic operator
+	// tenant so the test can exercise the full handler. See
+	// pkg/api/api.go RegisterRuler and -ruler.enable-all-tenant-rules-endpoint.
+	cfg.EnableAllTenantRulesEndpoint = true
+	cfg.AllTenantRulesAllowedTenants = []string{"operator"}
 
 	r := newTestRuler(t, cfg, store, nil)
 	defer services.StopAndAwaitTerminated(context.Background(), r) //nolint:errcheck
@@ -1108,7 +1113,7 @@ func TestRuler_ListAllRules(t *testing.T) {
 	router := mux.NewRouter()
 	router.Path("/ruler/rule_groups").Methods(http.MethodGet).HandlerFunc(r.ListAllRules)
 
-	req := requestFor(t, http.MethodGet, "https://localhost:8080/ruler/rule_groups", nil, "")
+	req := requestFor(t, http.MethodGet, "https://localhost:8080/ruler/rule_groups", nil, "operator")
 	w := httptest.NewRecorder()
 	router.ServeHTTP(w, req)
 
@@ -1133,6 +1138,76 @@ func TestRuler_ListAllRules(t *testing.T) {
 	expectedResponse, err := yaml.Marshal(gs)
 	require.NoError(t, err)
 	require.YAMLEq(t, string(expectedResponse), string(body))
+}
+
+// TestRuler_ListAllRules_DisabledByDefault asserts that the all-tenant
+// rules dump endpoint is refused when -ruler.enable-all-tenant-rules-endpoint
+// is not set (the default), regardless of whether a tenant identity is
+// present in the request. This is the primary regression test for the
+// cross-tenant disclosure vulnerability.
+func TestRuler_ListAllRules_DisabledByDefault(t *testing.T) {
+	store := newMockRuleStore(mockRules)
+	cfg := defaultRulerConfig(t)
+	// EnableAllTenantRulesEndpoint intentionally left false.
+
+	r := newTestRuler(t, cfg, store, nil)
+	defer services.StopAndAwaitTerminated(context.Background(), r) //nolint:errcheck
+
+	router := mux.NewRouter()
+	router.Path("/ruler/rule_groups").Methods(http.MethodGet).HandlerFunc(r.ListAllRules)
+
+	// 1. Anonymous request: must be refused.
+	req := requestFor(t, http.MethodGet, "https://localhost:8080/ruler/rule_groups", nil, "")
+	w := httptest.NewRecorder()
+	router.ServeHTTP(w, req)
+	resp := w.Result()
+	require.Equal(t, http.StatusNotFound, resp.StatusCode)
+	body, _ := io.ReadAll(resp.Body)
+	for userID := range mockRules {
+		require.NotContains(t, string(body), userID, "disabled endpoint must not leak any tenant ID")
+	}
+
+	// 2. Request with a tenant header: still must be refused because the
+	// operator opt-in has not been granted.
+	req = requestFor(t, http.MethodGet, "https://localhost:8080/ruler/rule_groups", nil, "operator")
+	w = httptest.NewRecorder()
+	router.ServeHTTP(w, req)
+	resp = w.Result()
+	require.Equal(t, http.StatusNotFound, resp.StatusCode)
+}
+
+// TestRuler_ListAllRules_EnforcesAllowlist asserts that even when the
+// endpoint is enabled, callers whose tenant ID is not on the operator
+// allowlist cannot read other tenants' rule groups.
+func TestRuler_ListAllRules_EnforcesAllowlist(t *testing.T) {
+	store := newMockRuleStore(mockRules)
+	cfg := defaultRulerConfig(t)
+	cfg.EnableAllTenantRulesEndpoint = true
+	cfg.AllTenantRulesAllowedTenants = []string{"operator"}
+
+	r := newTestRuler(t, cfg, store, nil)
+	defer services.StopAndAwaitTerminated(context.Background(), r) //nolint:errcheck
+
+	router := mux.NewRouter()
+	router.Path("/ruler/rule_groups").Methods(http.MethodGet).HandlerFunc(r.ListAllRules)
+
+	// Missing tenant -> 401 (matches DeleteTenantConfiguration behaviour).
+	req := requestFor(t, http.MethodGet, "https://localhost:8080/ruler/rule_groups", nil, "")
+	w := httptest.NewRecorder()
+	router.ServeHTTP(w, req)
+	require.Equal(t, http.StatusUnauthorized, w.Result().StatusCode)
+
+	// Non-allowlisted tenant (e.g. a tenant proxied in via the auth gateway)
+	// must be refused with 403 and must not receive any other tenant's data.
+	req = requestFor(t, http.MethodGet, "https://localhost:8080/ruler/rule_groups", nil, "attacker")
+	w = httptest.NewRecorder()
+	router.ServeHTTP(w, req)
+	resp := w.Result()
+	require.Equal(t, http.StatusForbidden, resp.StatusCode)
+	body, _ := io.ReadAll(resp.Body)
+	for userID := range mockRules {
+		require.NotContains(t, string(body), userID, "non-allowlisted tenant must not see any tenant ID in the response")
+	}
 }
 
 type senderFunc func(alerts ...*notifier.Alert)
