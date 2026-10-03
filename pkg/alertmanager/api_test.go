@@ -36,8 +36,9 @@ func TestAMConfigValidationAPI(t *testing.T) {
 		maxTemplates    int
 		maxTemplateSize int
 
-		response string
-		err      error
+		response      string
+		err           error
+		errStatusCode int
 	}{
 		{
 			name: "Should return error if the alertmanager config contains no receivers",
@@ -452,6 +453,7 @@ alertmanager_config: |
 `,
 			maxConfigSize: 10,
 			err:           fmt.Errorf(errConfigurationTooBig, 10),
+			errStatusCode: http.StatusRequestEntityTooLarge,
 		},
 		{
 			name: "config size OK",
@@ -560,7 +562,11 @@ template_files:
 				require.Equal(t, http.StatusCreated, resp.StatusCode)
 				require.Equal(t, "", string(body))
 			} else {
-				require.Equal(t, http.StatusBadRequest, resp.StatusCode)
+				expectedStatus := tc.errStatusCode
+				if expectedStatus == 0 {
+					expectedStatus = http.StatusBadRequest
+				}
+				require.Equal(t, expectedStatus, resp.StatusCode)
 				require.Equal(t, tc.err.Error()+"\n", string(body))
 			}
 		})

@@ -36,6 +36,15 @@ const (
 	errTooManyTemplates      = "too many templates in the configuration: %d (limit: %d)"
 	errTemplateTooBig        = "template %s is too big: %d bytes (limit: %d bytes)"
 
+	// maxConfigSizeHardLimit is an unconditional ceiling on the size of the
+	// Alertmanager tenant configuration that can be uploaded via the HTTP API.
+	// This cap is applied regardless of per-tenant overrides so that a tenant
+	// (or anyone able to supply an X-Scope-OrgID header) cannot exhaust memory
+	// or disk on the shared multitenant Alertmanager by uploading a huge
+	// config/template payload. Operators can configure a smaller limit per
+	// tenant via -alertmanager.max-config-size-bytes.
+	maxConfigSizeHardLimit = 8 << 20 // 8 MiB
+
 	fetchConcurrency = 16
 )
 
@@ -100,27 +109,40 @@ func (am *MultitenantAlertmanager) SetUserConfig(w http.ResponseWriter, r *http.
 		return
 	}
 
-	var input io.Reader
+	// Always bound the request body, independent of per-tenant overrides. A
+	// hard ceiling is applied unconditionally so that an unset/`0 = no limit`
+	// per-tenant override cannot be used to upload an arbitrarily large
+	// configuration and OOM the shared multitenant Alertmanager.
 	maxConfigSize := am.limits.AlertmanagerMaxConfigSize(userID)
-	if maxConfigSize > 0 {
-		// LimitReader will return EOF after reading specified number of bytes. To check if
-		// we have read too many bytes, allow one extra byte.
-		input = io.LimitReader(r.Body, int64(maxConfigSize)+1)
-	} else {
-		input = r.Body
+	if maxConfigSize <= 0 || maxConfigSize > maxConfigSizeHardLimit {
+		maxConfigSize = maxConfigSizeHardLimit
 	}
+	// MaxBytesReader caps the amount of data read from the request body (and
+	// closes the connection when the limit is exceeded). We allow one extra
+	// byte so that we can distinguish "exactly the limit" from "over the
+	// limit" after reading.
+	body := http.MaxBytesReader(w, r.Body, int64(maxConfigSize)+1)
 
-	payload, err := io.ReadAll(input)
+	payload, err := io.ReadAll(body)
 	if err != nil {
+		// http.MaxBytesReader returns a *MaxBytesError when the limit is hit;
+		// surface it as 413 so that callers (and operators tailing logs) can
+		// clearly see this is a size issue rather than a transport error.
+		if len(payload) > maxConfigSize {
+			msg := fmt.Sprintf(errConfigurationTooBig, maxConfigSize)
+			level.Warn(logger).Log("msg", msg)
+			http.Error(w, msg, http.StatusRequestEntityTooLarge)
+			return
+		}
 		level.Error(logger).Log("msg", errReadingConfiguration, "err", err.Error())
 		http.Error(w, fmt.Sprintf("%s: %s", errReadingConfiguration, err.Error()), http.StatusBadRequest)
 		return
 	}
 
-	if maxConfigSize > 0 && len(payload) > maxConfigSize {
+	if len(payload) > maxConfigSize {
 		msg := fmt.Sprintf(errConfigurationTooBig, maxConfigSize)
 		level.Warn(logger).Log("msg", msg)
-		http.Error(w, msg, http.StatusBadRequest)
+		http.Error(w, msg, http.StatusRequestEntityTooLarge)
 		return
 	}
 
