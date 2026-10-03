@@ -143,6 +143,10 @@ func (cfg *MultitenantAlertmanagerConfig) Validate(storageCfg alertstore.Config)
 		return err
 	}
 
+	if err := cfg.AlertmanagerClient.Validate(); err != nil {
+		return err
+	}
+
 	if cfg.ShardingEnabled {
 		if !storageCfg.IsFullStateSupported() {
 			return errShardingUnsupportedStorage

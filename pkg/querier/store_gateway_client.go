@@ -104,3 +104,10 @@ func (cfg *ClientConfig) RegisterFlagsWithPrefix(prefix string, f *flag.FlagSet)
 	f.BoolVar(&cfg.TLSEnabled, prefix+".tls-enabled", cfg.TLSEnabled, "Enable TLS for gRPC client connecting to store-gateway.")
 	cfg.TLS.RegisterFlagsWithPrefix(prefix, f)
 }
+
+// Validate returns an error if TLS material has been configured on this client
+// without the companion `tls_enabled` flag being set, preventing a silent
+// downgrade to an insecure connection.
+func (cfg *ClientConfig) Validate() error {
+	return cfg.TLS.Validate(cfg.TLSEnabled)
+}

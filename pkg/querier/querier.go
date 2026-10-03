@@ -118,6 +118,10 @@ func (cfg *Config) Validate() error {
 		}
 	}
 
+	if err := cfg.StoreGatewayClient.Validate(); err != nil {
+		return fmt.Errorf("invalid store_gateway_client config: %w", err)
+	}
+
 	return nil
 }
 
