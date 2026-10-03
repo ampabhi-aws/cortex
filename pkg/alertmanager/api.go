@@ -304,6 +304,18 @@ func (am *MultitenantAlertmanager) ListAllConfigs(w http.ResponseWriter, r *http
 	<-done
 }
 
+// ValidateAlertmanagerConfig is the public entry point for the recursive
+// alertmanager-config validator. It parses the YAML (if a string is passed) and
+// then runs the same checks as the Alertmanager API path, rejecting settings
+// such as receiver TLS *_file fields that would later cause
+// buildIntegrationsMap to fail inside Alertmanager.ApplyConfig and leave the
+// tenant with a nil dispatcher. External packages (e.g. the configs-service
+// store) should call this so that every tenant config reaching ApplyConfig has
+// been validated identically regardless of the storage backend.
+func ValidateAlertmanagerConfig(cfg interface{}) error {
+	return validateAlertmanagerConfig(cfg)
+}
+
 // validateAlertmanagerConfig recursively scans the input config looking for data types for which
 // we have a specific validation and, whenever encountered, it runs their validation. Returns the
 // first error or nil if validation succeeds.

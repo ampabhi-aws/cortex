@@ -20,6 +20,7 @@ import (
 	amconfig "github.com/prometheus/alertmanager/config"
 	amtemplate "github.com/prometheus/alertmanager/template"
 
+	"github.com/cortexproject/cortex/pkg/alertmanager"
 	"github.com/cortexproject/cortex/pkg/configs/db"
 	"github.com/cortexproject/cortex/pkg/configs/userconfig"
 	"github.com/cortexproject/cortex/pkg/tenant"
@@ -237,6 +238,16 @@ func validateAlertmanagerConfig(cfg string, noCfg NotificationsConfig) error {
 		if noCfg.DisableWebHook && len(recv.WebhookConfigs) > 0 {
 			return ErrWebhookNotificationsAreDisabled
 		}
+	}
+
+	// Reuse the pkg/alertmanager validation so that tenant configs reaching
+	// Alertmanager.ApplyConfig via the configs-service (configdb) backend are
+	// validated identically to configs stored through the object-store API.
+	// This rejects settings (such as receiver tls_config file references) that
+	// would otherwise cause buildIntegrationsMap to fail at apply time and
+	// leave the tenant Alertmanager with a nil dispatcher.
+	if err := alertmanager.ValidateAlertmanagerConfig(amCfg); err != nil {
+		return err
 	}
 
 	return nil
