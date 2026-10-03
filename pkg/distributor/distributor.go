@@ -412,6 +412,8 @@ func (d *Distributor) cleanupInactiveUser(userID string) {
 	}
 
 	validation.DeletePerUserValidationMetrics(userID, d.log)
+
+	d.ingestionRateLimiter.RemoveTenant(userID)
 }
 
 // Called after distributor is asked to stop via StopAsync.
