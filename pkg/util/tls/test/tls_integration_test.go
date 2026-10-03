@@ -28,11 +28,12 @@ import (
 )
 
 type tcIntegrationClientServer struct {
-	name            string
-	tlsGrpcEnabled  bool
-	tlsConfig       tls.ClientConfig
-	httpExpectError func(*testing.T, error)
-	grpcExpectError func(*testing.T, error)
+	name                     string
+	tlsGrpcEnabled           bool
+	tlsConfig                tls.ClientConfig
+	httpExpectError          func(*testing.T, error)
+	grpcDialOptionExpectError func(*testing.T, error)
+	grpcExpectError          func(*testing.T, error)
 }
 
 type grpcHealthCheck struct {
@@ -142,6 +143,10 @@ func newIntegrationClientServer(
 			clientConfig.TLS = tc.tlsConfig
 
 			dialOptions, err := clientConfig.DialOption(nil, nil)
+			if tc.grpcDialOptionExpectError != nil {
+				tc.grpcDialOptionExpectError(t, err)
+				return
+			}
 			assert.NoError(t, err, tc.name)
 			dialOptions = append([]grpc.DialOption{grpc.WithDefaultCallOptions(clientConfig.CallOptions()...)}, dialOptions...)
 
@@ -241,7 +246,7 @@ func TestServerWithLocalhostCertNoClientCertAuth(t *testing.T) {
 				tlsConfig: tls.ClientConfig{
 					InsecureSkipVerify: true,
 				},
-				grpcExpectError: unavailableDescErr,
+				grpcDialOptionExpectError: errorContainsString("TLS certificate / key / CA / server name / insecure-skip-verify fields are configured, but TLS is not enabled"),
 			},
 			{
 				name:           "ca-path-set",
@@ -256,7 +261,7 @@ func TestServerWithLocalhostCertNoClientCertAuth(t *testing.T) {
 				tlsConfig: tls.ClientConfig{
 					CAPath: certs.caCertFile,
 				},
-				grpcExpectError: unavailableDescErr,
+				grpcDialOptionExpectError: errorContainsString("TLS certificate / key / CA / server name / insecure-skip-verify fields are configured, but TLS is not enabled"),
 			},
 		},
 	)

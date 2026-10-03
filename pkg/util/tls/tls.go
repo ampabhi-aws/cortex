@@ -22,9 +22,40 @@ type ClientConfig struct {
 }
 
 var (
-	errKeyMissing  = errors.New("certificate given but no key configured")
-	errCertMissing = errors.New("key given but no certificate configured")
+	errKeyMissing      = errors.New("certificate given but no key configured")
+	errCertMissing     = errors.New("key given but no certificate configured")
+	errInvalidCABundle = errors.New("failed to parse any certificates from the CA bundle")
+	// ErrTLSFieldsSetButDisabled is returned when TLS material (cert/key/CA/server name/insecure-skip-verify)
+	// has been configured but TLS itself has not been enabled on the containing client.
+	// Returning an error — rather than silently falling back to an insecure connection — avoids a fail-open
+	// configuration where an operator believes transport security is in effect because the paths are set.
+	ErrTLSFieldsSetButDisabled = errors.New("TLS certificate / key / CA / server name / insecure-skip-verify fields are configured, but TLS is not enabled on this client; set the corresponding `.tls-enabled` flag (or `tls_enabled: true`) to use them, or clear the TLS fields to use an insecure connection")
 )
+
+// IsConfigured reports whether any TLS material has been set on the config.
+// It is used to detect the fail-open case where TLS fields are populated but
+// the companion `*.tls-enabled` boolean has not been set.
+func (cfg *ClientConfig) IsConfigured() bool {
+	if cfg == nil {
+		return false
+	}
+	return cfg.CertPath != "" ||
+		cfg.KeyPath != "" ||
+		cfg.CAPath != "" ||
+		cfg.ServerName != "" ||
+		cfg.InsecureSkipVerify
+}
+
+// Validate returns an error when TLS material is configured but TLS has not been
+// enabled, preventing the silently-insecure fail-open where configured
+// certificates/CA/server-name are discarded and the connection is downgraded to
+// cleartext.
+func (cfg *ClientConfig) Validate(enabled bool) error {
+	if !enabled && cfg.IsConfigured() {
+		return ErrTLSFieldsSetButDisabled
+	}
+	return nil
+}
 
 // RegisterFlagsWithPrefix registers flags with prefix.
 func (cfg *ClientConfig) RegisterFlagsWithPrefix(prefix string, f *flag.FlagSet) {
@@ -50,7 +81,9 @@ func (cfg *ClientConfig) GetTLSConfig() (*tls.Config, error) {
 			return nil, errors.Wrapf(err, "error loading ca cert: %s", cfg.CAPath)
 		}
 		caCertPool = x509.NewCertPool()
-		caCertPool.AppendCertsFromPEM(caCert)
+		if !caCertPool.AppendCertsFromPEM(caCert) {
+			return nil, errors.Wrapf(errInvalidCABundle, "CA file %s", cfg.CAPath)
+		}
 
 		config.RootCAs = caCertPool
 	}
@@ -76,6 +109,15 @@ func (cfg *ClientConfig) GetTLSConfig() (*tls.Config, error) {
 // GetGRPCDialOptions creates GRPC DialOptions for TLS
 func (cfg *ClientConfig) GetGRPCDialOptions(enabled bool) ([]grpc.DialOption, error) {
 	if !enabled {
+		// Refuse to silently discard configured TLS material. Falling back to an
+		// insecure cleartext connection while cert/key/CA/server-name/insecure-skip-verify
+		// are populated would be a fail-open configuration: the operator mounted
+		// certificates expecting transport security, so returning
+		// `insecure.NewCredentials()` here without surfacing an error would send
+		// tenant data in cleartext with no indication of the downgrade.
+		if cfg.IsConfigured() {
+			return nil, ErrTLSFieldsSetButDisabled
+		}
 		return []grpc.DialOption{grpc.WithTransportCredentials(insecure.NewCredentials())}, nil
 	}
 
