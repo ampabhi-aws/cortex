@@ -116,6 +116,20 @@ type Config struct {
 
 	EnableAPI bool `yaml:"enable_api"`
 
+	// EnableAllTenantRulesEndpoint controls whether the operator-only
+	// `/ruler/rule_groups` endpoint is registered on the HTTP server. It is
+	// opt-in and defaults to disabled because the endpoint dumps every
+	// tenant's rule groups and can only be safely used from an operator
+	// network behind a reverse proxy. When disabled the route is not
+	// registered at all. When enabled the route is registered behind the
+	// AuthMiddleware and gated by AllTenantRulesAllowedTenants.
+	EnableAllTenantRulesEndpoint bool `yaml:"enable_all_tenant_rules_endpoint"`
+	// AllTenantRulesAllowedTenants is an explicit operator allowlist of
+	// X-Scope-OrgID values permitted to call `/ruler/rule_groups` when it is
+	// enabled. Empty means no tenant is allowed, which effectively keeps the
+	// endpoint disabled even if EnableAllTenantRulesEndpoint is true.
+	AllTenantRulesAllowedTenants flagext.StringSliceCSV `yaml:"all_tenant_rules_allowed_tenants"`
+
 	EnabledTenants  flagext.StringSliceCSV `yaml:"enabled_tenants"`
 	DisabledTenants flagext.StringSliceCSV `yaml:"disabled_tenants"`
 
@@ -174,6 +188,8 @@ func (cfg *Config) RegisterFlags(f *flag.FlagSet) {
 	f.DurationVar(&cfg.FlushCheckPeriod, "ruler.flush-period", 1*time.Minute, "Period with which to attempt to flush rule groups.")
 	f.StringVar(&cfg.RulePath, "ruler.rule-path", "/rules", "file path to store temporary rule files for the prometheus rule managers")
 	f.BoolVar(&cfg.EnableAPI, "experimental.ruler.enable-api", false, "Enable the ruler api")
+	f.BoolVar(&cfg.EnableAllTenantRulesEndpoint, "ruler.enable-all-tenant-rules-endpoint", false, "Enable the operator-only /ruler/rule_groups HTTP endpoint, which dumps every tenant's rule groups. Disabled by default; when disabled the route is not registered. When enabled the route is registered behind the AuthMiddleware and only tenant IDs listed in -ruler.all-tenant-rules-allowed-tenants are permitted to call it.")
+	f.Var(&cfg.AllTenantRulesAllowedTenants, "ruler.all-tenant-rules-allowed-tenants", "Comma separated list of tenant IDs (X-Scope-OrgID values) permitted to call /ruler/rule_groups when -ruler.enable-all-tenant-rules-endpoint is set. Empty means no tenant is permitted.")
 	f.DurationVar(&cfg.OutageTolerance, "ruler.for-outage-tolerance", time.Hour, `Max time to tolerate outage for restoring "for" state of alert.`)
 	f.DurationVar(&cfg.ForGracePeriod, "ruler.for-grace-period", 10*time.Minute, `Minimum duration between alert and restored "for" state. This is maintained only for alerts with configured "for" time greater than grace period.`)
 	f.DurationVar(&cfg.ResendDelay, "ruler.resend-delay", time.Minute, `Minimum amount of time to wait before resending an alert to Alertmanager.`)
@@ -860,8 +876,40 @@ func (r *Ruler) DeleteTenantConfiguration(w http.ResponseWriter, req *http.Reque
 	w.WriteHeader(http.StatusOK)
 }
 
+// Cfg returns a copy of the Ruler's configuration. It is intended for use
+// by HTTP route registration which needs to decide whether to register the
+// operator-only /ruler/rule_groups endpoint. Config fields are read-only
+// after NewRuler returns, so returning the value is safe.
+func (r *Ruler) Cfg() Config {
+	return r.cfg
+}
+
 func (r *Ruler) ListAllRules(w http.ResponseWriter, req *http.Request) {
 	logger := util_log.WithContext(req.Context(), r.logger)
+
+	// Enforce the operator opt-in and tenant allowlist for this all-tenant
+	// dump. This is defence-in-depth: the route is only registered when
+	// EnableAllTenantRulesEndpoint is true (see pkg/api/api.go), but we
+	// still refuse to serve the response unless the request carries an
+	// explicit tenant identity that appears on the operator allowlist.
+	if !r.cfg.EnableAllTenantRulesEndpoint {
+		http.Error(w, "the /ruler/rule_groups endpoint is disabled; set -ruler.enable-all-tenant-rules-endpoint=true to enable it", http.StatusNotFound)
+		return
+	}
+
+	userID, err := tenant.TenantID(req.Context())
+	if err != nil {
+		// When Cortex is running, it uses Auth Middleware for checking X-Scope-OrgID and injecting tenant into context.
+		// Auth Middleware sends http.StatusUnauthorized if X-Scope-OrgID is missing, so we do too here, for consistency.
+		http.Error(w, err.Error(), http.StatusUnauthorized)
+		return
+	}
+
+	if !tenantInList(userID, r.cfg.AllTenantRulesAllowedTenants) {
+		level.Warn(logger).Log("msg", "denied /ruler/rule_groups: tenant not on operator allowlist", "user", userID)
+		http.Error(w, "forbidden: tenant is not permitted to list all rule groups", http.StatusForbidden)
+		return
+	}
 
 	userIDs, err := r.store.ListAllUsers(req.Context())
 	if err != nil {
@@ -901,4 +949,15 @@ func (r *Ruler) ListAllRules(w http.ResponseWriter, req *http.Request) {
 	}
 	close(iter)
 	<-done
+}
+
+// tenantInList reports whether tenant appears in list. The comparison is
+// exact and case-sensitive to match how Cortex compares X-Scope-OrgID values.
+func tenantInList(tenant string, list []string) bool {
+	for _, t := range list {
+		if t == tenant {
+			return true
+		}
+	}
+	return false
 }

@@ -97,6 +97,76 @@ type API struct {
 	sourceIPs            *middleware.SourceIPExtractor
 	indexPage            *IndexPageContent
 	HTTPHeaderMiddleware *HTTPHeaderMiddleware
+
+	// registeredRoutes records every route registered through RegisterRoute
+	// and RegisterRoutesWithPrefix together with the auth flag the caller
+	// supplied. It exists so that regression tests can enumerate the route
+	// table and assert that every anonymous (auth=false) route is on the
+	// explicit UnauthenticatedRoutesAllowlist below. Callers must not depend
+	// on this field at runtime; it is for test/introspection use only.
+	registeredRoutes []RegisteredRoute
+}
+
+// RegisteredRoute captures a single HTTP route registration together with the
+// auth flag that was supplied at registration time. See API.RegisteredRoutes.
+type RegisteredRoute struct {
+	Path    string
+	Prefix  bool
+	Methods []string
+	Auth    bool
+}
+
+// RegisteredRoutes returns a snapshot of the routes registered on this API,
+// in registration order. It is intended for tests and operator diagnostics.
+func (a *API) RegisteredRoutes() []RegisteredRoute {
+	out := make([]RegisteredRoute, len(a.registeredRoutes))
+	copy(out, a.registeredRoutes)
+	return out
+}
+
+// UnauthenticatedRoutesAllowlist enumerates every route path that is
+// intentionally registered without authentication. New operator/admin
+// endpoints that must stay accessible from the operator network belong on
+// this list; new all-tenant data endpoints MUST NOT be added here and MUST
+// be registered with auth=true (or gated behind an explicit opt-in flag
+// backed by a tenant allowlist). The regression test
+// TestUnauthenticatedRoutesAreOnAllowlist in api_test.go enforces this.
+var UnauthenticatedRoutesAllowlist = map[string]struct{}{
+	// Index / debug / config dumps.
+	"/":              {},
+	"/config":        {},
+	"/runtime_config": {},
+	"/debug/fgprof":  {},
+	"/status":        {},
+
+	// Dangerous lifecycle endpoints (operator-only).
+	"/ingester/flush":    {},
+	"/ingester/shutdown": {},
+	"/flush":             {},
+	"/shutdown":          {},
+
+	// Ring / membership / per-component status pages (operator-only).
+	"/distributor/ring":            {},
+	"/distributor/all_user_stats":  {},
+	"/distributor/ha_tracker":      {},
+	"/all_user_stats":              {},
+	"/ha-tracker":                  {},
+	"/ingester/ring":               {},
+	"/ring":                        {},
+	"/ruler/ring":                  {},
+	"/ruler_ring":                  {},
+	"/store-gateway/ring":          {},
+	"/compactor/ring":              {},
+
+	// Multitenant Alertmanager operator-only endpoints.
+	"/multitenant_alertmanager/status":  {},
+	"/multitenant_alertmanager/configs": {},
+	"/multitenant_alertmanager/ring":    {},
+
+	// NOTE: /ruler/rule_groups is deliberately NOT on this allowlist. It
+	// dumps every tenant's rule groups and is now registered behind the
+	// AuthMiddleware and gated by -ruler.enable-all-tenant-rules-endpoint
+	// plus -ruler.all-tenant-rules-allowed-tenants. See RegisterRuler.
 }
 
 func New(cfg Config, serverCfg server.Config, s *server.Server, logger log.Logger) (*API, error) {
@@ -140,6 +210,8 @@ func (a *API) RegisterRoute(path string, handler http.Handler, auth bool, method
 
 	level.Debug(a.logger).Log("msg", "api: registering route", "methods", strings.Join(methods, ","), "path", path, "auth", auth)
 
+	a.registeredRoutes = append(a.registeredRoutes, RegisteredRoute{Path: path, Methods: append([]string(nil), methods...), Auth: auth})
+
 	if auth {
 		handler = a.AuthMiddleware.Wrap(handler)
 	}
@@ -160,6 +232,7 @@ func (a *API) RegisterRoute(path string, handler http.Handler, auth bool, method
 
 func (a *API) RegisterRoutesWithPrefix(prefix string, handler http.Handler, auth bool, methods ...string) {
 	level.Debug(a.logger).Log("msg", "api: registering route", "methods", strings.Join(methods, ","), "prefix", prefix, "auth", auth)
+	a.registeredRoutes = append(a.registeredRoutes, RegisteredRoute{Path: prefix, Prefix: true, Methods: append([]string(nil), methods...), Auth: auth})
 	if auth {
 		handler = a.AuthMiddleware.Wrap(handler)
 	}
@@ -291,8 +364,16 @@ func (a *API) RegisterRuler(r *ruler.Ruler) {
 	// Legacy Ring Route
 	a.RegisterRoute("/ruler_ring", r, false, "GET", "POST")
 
-	// List all user rule groups
-	a.RegisterRoute("/ruler/rule_groups", http.HandlerFunc(r.ListAllRules), false, "GET")
+	// List all user rule groups. This endpoint dumps every tenant's
+	// recording and alerting rule groups and must not be exposed to end
+	// users. It is now registered behind the AuthMiddleware and is only
+	// enabled when the operator explicitly opts in via
+	// -ruler.enable-all-tenant-rules-endpoint. The handler further
+	// enforces -ruler.all-tenant-rules-allowed-tenants and will refuse
+	// unauthenticated or non-allowlisted callers (defence in depth).
+	if r.Cfg().EnableAllTenantRulesEndpoint {
+		a.RegisterRoute("/ruler/rule_groups", http.HandlerFunc(r.ListAllRules), true, "GET")
+	}
 
 	ruler.RegisterRulerServer(a.server.GRPC, r)
 }

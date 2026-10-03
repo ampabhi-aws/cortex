@@ -2,6 +2,8 @@
 
 ## master / unreleased
 
+* [SECURITY/CHANGE] Ruler: the operator-only `/ruler/rule_groups` endpoint, which dumps every tenant's recording and alerting rule groups, is no longer registered by default. It is now opt-in via `-ruler.enable-all-tenant-rules-endpoint` (default `false`), is registered behind the HTTP `AuthMiddleware`, and the handler further requires the caller's tenant ID to appear in `-ruler.all-tenant-rules-allowed-tenants`. Operators that still need this endpoint must set both flags; otherwise clients receive `404 Not Found` and the full all-tenant dump is suppressed. See the mitigation for CWE-1220 (insufficient granularity of access control) on `/ruler/rule_groups`.
+
   **This release removes support for chunks storage. See below for more.**
 * [CHANGE] Remove support for chunks storage entirely. If you are using chunks storage on a previous version, you must [migrate your data](https://github.com/cortexproject/cortex/blob/v1.11.1/docs/blocks-storage/migrate-from-chunks-to-blocks.md) on version 1.12 or earlier. Before upgrading to this release, you should also remove any deprecated chunks-related configuration, as this release will no longer accept that. The following flags are gone:
   - `-dynamodb.*`
