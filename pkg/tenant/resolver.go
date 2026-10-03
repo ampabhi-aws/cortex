@@ -6,6 +6,7 @@ import (
 	"net/http"
 	"strings"
 
+	"github.com/weaveworks/common/httpgrpc"
 	"github.com/weaveworks/common/user"
 )
 
@@ -99,14 +100,22 @@ func (t *SingleResolver) TenantIDs(ctx context.Context) ([]string, error) {
 }
 
 type MultiResolver struct {
+	// maxTenants caps the number of tenant IDs that may appear in a single
+	// request. Values <= 0 disable the cap.
+	maxTenants int
 }
 
 // NewMultiResolver creates a tenant resolver, which allows request to have
 // multiple tenant ids submitted separated by a '|' character. This enforces
 // further limits on the character set allowed within tenants as detailed here:
 // https://cortexmetrics.io/docs/guides/limitations/#tenant-id-naming)
-func NewMultiResolver() *MultiResolver {
-	return &MultiResolver{}
+//
+// maxTenants caps the number of tenant IDs accepted in a single request;
+// requests exceeding the cap are rejected with an HTTP 400 error so that one
+// cheap HTTP request cannot be amplified into an unbounded fan-out of
+// per-tenant queries. A value of 0 (or lower) disables the cap.
+func NewMultiResolver(maxTenants int) *MultiResolver {
+	return &MultiResolver{maxTenants: maxTenants}
 }
 
 func (t *MultiResolver) TenantID(ctx context.Context) (string, error) {
@@ -130,6 +139,13 @@ func (t *MultiResolver) TenantIDs(ctx context.Context) ([]string, error) {
 	}
 
 	orgIDs := strings.Split(orgID, tenantIDsLabelSeparator)
+	// Reject early (before any backend work) when the request names more
+	// tenants than the configured cap. Returning an httpgrpc error with
+	// StatusBadRequest ensures the HTTP transport maps this to 400 rather
+	// than the default 500 for an opaque internal error.
+	if t.maxTenants > 0 && len(orgIDs) > t.maxTenants {
+		return nil, httpgrpc.Errorf(http.StatusBadRequest, "too many tenant IDs present in the request, max: %d", t.maxTenants)
+	}
 	for _, orgID := range orgIDs {
 		if err := ValidTenantID(orgID); err != nil {
 			return nil, err

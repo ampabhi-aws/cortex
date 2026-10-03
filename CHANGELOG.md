@@ -2,6 +2,8 @@
 
 ## master / unreleased
 
+* [FEATURE] Tenant federation: added `-tenant-federation.max-tenants` (default `10`) which caps the number of tenant IDs accepted in a single `X-Scope-OrgID` header. Requests exceeding the cap are rejected with HTTP 400 before any backend fan-out happens. Set to `0` to disable the cap.
+
   **This release removes support for chunks storage. See below for more.**
 * [CHANGE] Remove support for chunks storage entirely. If you are using chunks storage on a previous version, you must [migrate your data](https://github.com/cortexproject/cortex/blob/v1.11.1/docs/blocks-storage/migrate-from-chunks-to-blocks.md) on version 1.12 or earlier. Before upgrading to this release, you should also remove any deprecated chunks-related configuration, as this release will no longer accept that. The following flags are gone:
   - `-dynamodb.*`

@@ -2,9 +2,12 @@ package tenant
 
 import (
 	"context"
+	"net/http"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
+	"github.com/weaveworks/common/httpgrpc"
 	"github.com/weaveworks/common/user"
 )
 
@@ -105,7 +108,7 @@ func TestSingleResolver(t *testing.T) {
 }
 
 func TestMultiResolver(t *testing.T) {
-	r := NewMultiResolver()
+	r := NewMultiResolver(0)
 	for _, tc := range append(commonResolverTestCases, []resolverTestCase{
 		{
 			name:        "multi-tenant",
@@ -146,4 +149,43 @@ func TestMultiResolver(t *testing.T) {
 	}...) {
 		t.Run(tc.name, tc.test(r))
 	}
+}
+
+// TestMultiResolver_MaxTenants verifies that NewMultiResolver enforces the
+// configured maximum number of tenants and returns an httpgrpc error with
+// HTTP status 400 (not 500) when the limit is exceeded.
+func TestMultiResolver_MaxTenants(t *testing.T) {
+	t.Run("within-limit", func(t *testing.T) {
+		r := NewMultiResolver(2)
+		ctx := user.InjectOrgID(context.Background(), "tenant-a|tenant-b")
+		ids, err := r.TenantIDs(ctx)
+		require.NoError(t, err)
+		assert.Equal(t, []string{"tenant-a", "tenant-b"}, ids)
+	})
+
+	t.Run("at-limit", func(t *testing.T) {
+		r := NewMultiResolver(3)
+		ctx := user.InjectOrgID(context.Background(), "tenant-a|tenant-b|tenant-c")
+		ids, err := r.TenantIDs(ctx)
+		require.NoError(t, err)
+		assert.Equal(t, []string{"tenant-a", "tenant-b", "tenant-c"}, ids)
+	})
+
+	t.Run("exceeds-limit", func(t *testing.T) {
+		r := NewMultiResolver(2)
+		ctx := user.InjectOrgID(context.Background(), "tenant-a|tenant-b|tenant-c")
+		_, err := r.TenantIDs(ctx)
+		require.Error(t, err)
+		resp, ok := httpgrpc.HTTPResponseFromError(err)
+		require.True(t, ok, "expected an httpgrpc error, got %T: %v", err, err)
+		assert.Equal(t, int32(http.StatusBadRequest), resp.Code)
+	})
+
+	t.Run("disabled", func(t *testing.T) {
+		r := NewMultiResolver(0)
+		ctx := user.InjectOrgID(context.Background(), "tenant-a|tenant-b|tenant-c|tenant-d|tenant-e")
+		ids, err := r.TenantIDs(ctx)
+		require.NoError(t, err)
+		assert.Equal(t, []string{"tenant-a", "tenant-b", "tenant-c", "tenant-d", "tenant-e"}, ids)
+	})
 }
