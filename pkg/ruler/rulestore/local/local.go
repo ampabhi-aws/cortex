@@ -3,8 +3,10 @@ package local
 import (
 	"context"
 	"flag"
+	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 
 	"github.com/pkg/errors"
 	promRules "github.com/prometheus/prometheus/rules"
@@ -168,11 +170,14 @@ func (l *Client) loadAllRulesGroupsForUser(ctx context.Context, userID string) (
 }
 
 func (l *Client) loadAllRulesGroupsForUserAndNamespace(_ context.Context, userID string, namespace string) (rulespb.RuleGroupList, error) {
-	filename := filepath.Join(l.cfg.Directory, userID, namespace)
+	filename, err := safeJoin(l.cfg.Directory, userID, namespace)
+	if err != nil {
+		return nil, err
+	}
 
 	rulegroups, allErrors := l.loader.Load(filename)
 	if len(allErrors) > 0 {
-		return nil, errors.Wrapf(allErrors[0], "error parsing %s", filename)
+		return nil, errors.Wrapf(allErrors[0], "error parsing namespace %q for user %q", namespace, userID)
 	}
 
 	var list rulespb.RuleGroupList
@@ -183,4 +188,49 @@ func (l *Client) loadAllRulesGroupsForUserAndNamespace(_ context.Context, userID
 	}
 
 	return list, nil
+}
+
+// safeJoin builds the on-disk path for a tenant's namespace file and ensures
+// that the resulting path cannot escape the per-tenant directory
+// (<rootDir>/<userID>). This is a defense-in-depth check: callers are
+// expected to have already validated userID and namespace, but filesystem
+// writes should never trust those invariants silently.
+func safeJoin(rootDir, userID, namespace string) (string, error) {
+	if userID == "" || containsUnsafeSegment(userID) {
+		return "", fmt.Errorf("invalid user id")
+	}
+	if namespace == "" || containsUnsafeSegment(namespace) {
+		return "", fmt.Errorf("invalid namespace")
+	}
+
+	userDir, err := filepath.Abs(filepath.Join(rootDir, userID))
+	if err != nil {
+		return "", err
+	}
+
+	filename, err := filepath.Abs(filepath.Join(userDir, namespace))
+	if err != nil {
+		return "", err
+	}
+
+	// Ensure the resolved path is strictly inside the per-tenant directory.
+	// Compare against userDir + separator to avoid prefix-collision false
+	// positives (e.g. "/data/tenant" vs "/data/tenant-other").
+	if filename != userDir && !strings.HasPrefix(filename, userDir+string(filepath.Separator)) {
+		return "", fmt.Errorf("invalid namespace %q: path escapes the per-tenant directory", namespace)
+	}
+	if filename == userDir {
+		return "", fmt.Errorf("invalid namespace %q: must not resolve to the per-tenant directory", namespace)
+	}
+
+	return filename, nil
+}
+
+// containsUnsafeSegment reports whether s contains characters that must not
+// appear in a single path segment supplied by an untrusted caller.
+func containsUnsafeSegment(s string) bool {
+	if s == "." || s == ".." {
+		return true
+	}
+	return strings.ContainsAny(s, "\\/\x00")
 }
