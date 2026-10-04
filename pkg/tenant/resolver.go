@@ -83,6 +83,18 @@ func (t *SingleResolver) TenantID(ctx context.Context) (string, error) {
 		return "", err
 	}
 
+	// Enforce the documented tenant ID charset and length. This is required
+	// for correctness in downstream sinks that compose tenant IDs with
+	// delimiter characters (for example the results-cache key uses ':' and
+	// the tenant-federation separator is '|'); allowing those bytes in a
+	// tenant ID lets an attacker forge field boundaries and collide cache
+	// keys across tenants. ValidTenantID forbids ':', '|', whitespace,
+	// control characters and other unsafe runes, and caps the length at
+	// 150 bytes. See https://cortexmetrics.io/docs/guides/limitations/
+	if err := ValidTenantID(id); err != nil {
+		return "", err
+	}
+
 	if containsUnsafePathSegments(id) {
 		return "", errInvalidTenantID
 	}

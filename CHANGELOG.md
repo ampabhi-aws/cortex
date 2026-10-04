@@ -2,6 +2,8 @@
 
 ## master / unreleased
 
+* [CHANGE] Tenant: `SingleResolver.TenantID` (the default resolver when `-tenant-federation.enabled=false`) now enforces the documented tenant-ID charset and 150-byte length limit via `ValidTenantID`. Previously only `.`, `..`, `/` and `\` were rejected, which let tenant IDs contain `:`, `|`, whitespace and other unsafe runes and allowed cross-tenant collisions in the query-frontend results-cache key (`fmt.Sprintf("%s:%s:%d:%d", userID, query, step, interval)`). Deployments that previously used tenant IDs containing characters outside `[A-Za-z0-9!-_.*'()]` must rename those tenants before upgrading.
+
   **This release removes support for chunks storage. See below for more.**
 * [CHANGE] Remove support for chunks storage entirely. If you are using chunks storage on a previous version, you must [migrate your data](https://github.com/cortexproject/cortex/blob/v1.11.1/docs/blocks-storage/migrate-from-chunks-to-blocks.md) on version 1.12 or earlier. Before upgrading to this release, you should also remove any deprecated chunks-related configuration, as this release will no longer accept that. The following flags are gone:
   - `-dynamodb.*`
