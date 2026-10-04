@@ -1851,6 +1851,17 @@ func (i *Ingester) createTSDB(userID string) (*userTSDB, error) {
 	level.Info(userLogger).Log("msg", "Running compaction after WAL replay")
 	err = db.Compact()
 	if err != nil {
+		// Compact() failed after tsdb.Open() already fully opened the DB (WAL file
+		// descriptors, chunks_head mmaps, head series restored by WAL replay, and
+		// background goroutines). Since getOrCreateTSDB only registers the handle
+		// in TSDBState.dbs on success, no later cleanup (closeAllTSDB,
+		// closeAndDeleteUserTSDBIfIdle) can ever reach this DB. Close it here to
+		// release those resources and to let the head's PostDeletion callback
+		// decrement the shared TSDBState.seriesCount for every series PostCreation
+		// incremented during WAL replay.
+		if closeErr := db.Close(); closeErr != nil {
+			level.Warn(userLogger).Log("msg", "failed to close TSDB after compaction error", "err", closeErr)
+		}
 		return nil, errors.Wrapf(err, "failed to compact TSDB: %s", udir)
 	}
 
