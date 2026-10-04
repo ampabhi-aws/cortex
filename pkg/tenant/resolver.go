@@ -83,6 +83,15 @@ func (t *SingleResolver) TenantID(ctx context.Context) (string, error) {
 		return "", err
 	}
 
+	// Reject empty tenant IDs. The upstream user.ExtractFromGRPCRequest accepts
+	// a present-but-empty x-scope-orgid gRPC metadata value, which would
+	// otherwise flow through unchanged. An empty tenant ID collapses
+	// per-tenant on-disk paths (e.g. filepath.Join(root, "") == root) and
+	// object-store prefixes, enabling cross-tenant pollution and data loss.
+	if id == "" {
+		return "", user.ErrNoOrgID
+	}
+
 	if containsUnsafePathSegments(id) {
 		return "", errInvalidTenantID
 	}
@@ -127,6 +136,14 @@ func (t *MultiResolver) TenantIDs(ctx context.Context) ([]string, error) {
 	orgID, err := user.ExtractOrgID(ctx)
 	if err != nil {
 		return nil, err
+	}
+
+	// Reject a present-but-empty x-scope-orgid header. ValidTenantID("")
+	// otherwise returns nil (the character-set loop is empty), which would
+	// let an empty tenant ID collapse per-tenant on-disk paths and
+	// object-store prefixes.
+	if orgID == "" {
+		return nil, user.ErrNoOrgID
 	}
 
 	orgIDs := strings.Split(orgID, tenantIDsLabelSeparator)
