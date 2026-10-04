@@ -3,7 +3,10 @@ package worker
 import (
 	"context"
 	"fmt"
+	"net"
 	"net/http"
+	"strconv"
+	"strings"
 	"time"
 
 	"github.com/go-kit/log"
@@ -152,6 +155,14 @@ func (sp *schedulerProcessor) querierLoop(c schedulerpb.SchedulerForQuerier_Quer
 }
 
 func (sp *schedulerProcessor) runRequest(ctx context.Context, logger log.Logger, queryID uint64, frontendAddress string, statsEnabled bool, request *httpgrpc.HTTPRequest) {
+	// Defense-in-depth: the scheduler already rejects malformed addresses on
+	// the frontend side, but queriers must not blindly dial attacker-
+	// controlled addresses relayed via SchedulerToQuerier.FrontendAddress.
+	if err := validateFrontendAddress(frontendAddress); err != nil {
+		level.Error(logger).Log("msg", "refusing to process query: invalid frontend address", "frontend", frontendAddress, "err", err)
+		return
+	}
+
 	var stats *querier_stats.Stats
 	if statsEnabled {
 		stats, ctx = querier_stats.ContextWithEmptyStats(ctx)
@@ -195,6 +206,13 @@ func (sp *schedulerProcessor) runRequest(ctx context.Context, logger log.Logger,
 }
 
 func (sp *schedulerProcessor) createFrontendClient(addr string) (client.PoolClient, error) {
+	// Defense-in-depth: never dial a frontend address that does not pass
+	// basic sanity validation. This is also enforced in runRequest, but the
+	// pool factory is the last line of defense before grpc.Dial.
+	if err := validateFrontendAddress(addr); err != nil {
+		return nil, fmt.Errorf("invalid frontend address %q: %w", addr, err)
+	}
+
 	opts, err := sp.grpcConfig.DialOption([]grpc.UnaryClientInterceptor{
 		otgrpc.OpenTracingClientInterceptor(opentracing.GlobalTracer()),
 		middleware.ClientUserHeaderInterceptor,
@@ -225,4 +243,72 @@ type frontendClient struct {
 
 func (fc *frontendClient) Close() error {
 	return fc.conn.Close()
+}
+
+// validateFrontendAddress mirrors scheduler.validateFrontendAddress: the
+// querier receives the frontend address relayed by the scheduler, which in
+// turn originates from an unauthenticated FrontendLoop peer, so the same
+// restrictions must apply before using it as a gRPC dial target.
+func validateFrontendAddress(addr string) error {
+	if addr == "" {
+		return fmt.Errorf("empty address")
+	}
+	if len(addr) > 253 {
+		return fmt.Errorf("address too long")
+	}
+	if strings.Contains(addr, "//") {
+		return fmt.Errorf("address must not contain '//' (gRPC resolver schemes are not allowed)")
+	}
+	for _, r := range addr {
+		if r <= 0x20 || r == 0x7f {
+			return fmt.Errorf("address contains whitespace or control characters")
+		}
+		switch r {
+		case '/', '?', '#', '@', '\\', '"', '\'':
+			return fmt.Errorf("address contains disallowed character")
+		}
+	}
+	host, port, err := net.SplitHostPort(addr)
+	if err != nil {
+		return fmt.Errorf("address must be in host:port form: %w", err)
+	}
+	if host == "" {
+		return fmt.Errorf("host part is empty")
+	}
+	p, err := strconv.Atoi(port)
+	if err != nil {
+		return fmt.Errorf("port is not numeric: %w", err)
+	}
+	if p < 1 || p > 65535 {
+		return fmt.Errorf("port out of range")
+	}
+	if net.ParseIP(host) == nil {
+		if !isValidDNSName(host) {
+			return fmt.Errorf("host is not a valid IP or DNS name")
+		}
+	}
+	return nil
+}
+
+func isValidDNSName(name string) bool {
+	if name == "" || len(name) > 253 {
+		return false
+	}
+	for _, label := range strings.Split(name, ".") {
+		if label == "" || len(label) > 63 {
+			return false
+		}
+		for i, r := range label {
+			switch {
+			case r >= 'a' && r <= 'z':
+			case r >= 'A' && r <= 'Z':
+			case r >= '0' && r <= '9':
+			case r == '-' && i != 0 && i != len(label)-1:
+			case r == '_' && i != 0 && i != len(label)-1:
+			default:
+				return false
+			}
+		}
+	}
+	return true
 }

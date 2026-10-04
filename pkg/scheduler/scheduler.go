@@ -4,7 +4,10 @@ import (
 	"context"
 	"flag"
 	"io"
+	"net"
 	"net/http"
+	"strconv"
+	"strings"
 	"sync"
 	"time"
 
@@ -235,6 +238,17 @@ func (s *Scheduler) frontendConnected(frontend schedulerpb.SchedulerForFrontend_
 	if msg.Type != schedulerpb.INIT || msg.FrontendAddress == "" {
 		return "", nil, errors.New("no frontend address")
 	}
+	if err := validateFrontendAddress(msg.FrontendAddress); err != nil {
+		// Address came from an unauthenticated peer and will later be used as
+		// a gRPC dial target by the scheduler and every querier handling a
+		// query from this frontend. Reject anything that isn't a plain
+		// host:port (e.g. gRPC resolver schemes such as dns:///, unix://,
+		// kubernetes:///, xds:///) to prevent attacker-controlled outbound
+		// gRPC connections (blind SSRF, client-credential exposure, forced
+		// persistent health-check beacons).
+		level.Warn(s.log).Log("msg", "rejecting frontend connection with invalid frontend address", "frontend", msg.FrontendAddress, "err", err)
+		return "", nil, errors.Wrap(err, "invalid frontend address")
+	}
 
 	s.connectedFrontendsMu.Lock()
 	defer s.connectedFrontendsMu.Unlock()
@@ -442,6 +456,14 @@ func (s *Scheduler) forwardRequestToQuerier(querier schedulerpb.SchedulerForQuer
 }
 
 func (s *Scheduler) forwardErrorToFrontend(ctx context.Context, req *schedulerRequest, requestErr error) {
+	// Defense-in-depth: although frontendConnected rejects invalid frontend
+	// addresses up front, re-validate here before issuing an outbound dial
+	// using a peer-supplied address.
+	if err := validateFrontendAddress(req.frontendAddress); err != nil {
+		level.Warn(s.log).Log("msg", "refusing to dial invalid frontend address", "frontend", req.frontendAddress, "err", err, "requestErr", requestErr)
+		return
+	}
+
 	opts, err := s.cfg.GRPCClientConfig.DialOption([]grpc.UnaryClientInterceptor{
 		otgrpc.OpenTracingClientInterceptor(opentracing.GlobalTracer()),
 		middleware.ClientUserHeaderInterceptor},
@@ -508,6 +530,88 @@ func (s *Scheduler) running(ctx context.Context) error {
 func (s *Scheduler) stopping(_ error) error {
 	// This will also stop the requests queue, which stop accepting new requests and errors out any pending requests.
 	return services.StopManagerAndAwaitStopped(context.Background(), s.subservices)
+}
+
+// validateFrontendAddress ensures that an unauthenticated FrontendLoop peer
+// cannot smuggle a gRPC resolver scheme (dns:///, unix://, kubernetes:///,
+// xds:///, passthrough:///, ...) or a non-dialable string through the
+// FrontendAddress field, which is used verbatim as a gRPC dial target by the
+// scheduler itself (forwardErrorToFrontend) and relayed to every querier
+// (createFrontendClient). The accepted form is a plain host:port, where host
+// is a DNS name or an IP (IPv6 addresses must be bracketed) and port is a
+// numeric 1-65535. This purposefully refuses any address containing a gRPC
+// scheme separator ("//"), path, query, fragment, user-info, whitespace, or
+// control characters.
+func validateFrontendAddress(addr string) error {
+	if addr == "" {
+		return errors.New("empty address")
+	}
+	if len(addr) > 253 {
+		return errors.New("address too long")
+	}
+	// Reject gRPC resolver schemes and URL-like forms outright.
+	if strings.Contains(addr, "//") {
+		return errors.New("address must not contain '//' (gRPC resolver schemes are not allowed)")
+	}
+	for _, r := range addr {
+		if r <= 0x20 || r == 0x7f {
+			return errors.New("address contains whitespace or control characters")
+		}
+		switch r {
+		case '/', '?', '#', '@', '\\', '"', '\'', ' ', '\t', '\n', '\r':
+			return errors.New("address contains disallowed character")
+		}
+	}
+	host, port, err := net.SplitHostPort(addr)
+	if err != nil {
+		return errors.Wrap(err, "address must be in host:port form")
+	}
+	if host == "" {
+		return errors.New("host part is empty")
+	}
+	p, err := strconv.Atoi(port)
+	if err != nil {
+		return errors.Wrap(err, "port is not numeric")
+	}
+	if p < 1 || p > 65535 {
+		return errors.New("port out of range")
+	}
+	// Host must be either a textual IP (SplitHostPort already strips [] from
+	// bracketed IPv6 literals) or a DNS-style name. Reject anything that is
+	// neither.
+	if net.ParseIP(host) == nil {
+		if !isValidDNSName(host) {
+			return errors.New("host is not a valid IP or DNS name")
+		}
+	}
+	return nil
+}
+
+// isValidDNSName performs a minimal RFC-1123-ish validation sufficient to
+// exclude obviously malformed hostnames while still accepting the names used
+// by Cortex deployments (service DNS names, pod IPs rendered as hostnames,
+// etc.).
+func isValidDNSName(name string) bool {
+	if name == "" || len(name) > 253 {
+		return false
+	}
+	for _, label := range strings.Split(name, ".") {
+		if label == "" || len(label) > 63 {
+			return false
+		}
+		for i, r := range label {
+			switch {
+			case r >= 'a' && r <= 'z':
+			case r >= 'A' && r <= 'Z':
+			case r >= '0' && r <= '9':
+			case r == '-' && i != 0 && i != len(label)-1:
+			case r == '_' && i != 0 && i != len(label)-1:
+			default:
+				return false
+			}
+		}
+	}
+	return true
 }
 
 func (s *Scheduler) cleanupMetricsForInactiveUser(user string) {
