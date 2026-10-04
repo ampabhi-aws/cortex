@@ -1,8 +1,8 @@
 package alertmanager
 
 import (
+	"html/template"
 	"net/http"
-	"text/template"
 
 	"github.com/go-kit/log/level"
 
@@ -56,6 +56,7 @@ var (
 )
 
 func writeRingStatusMessage(w http.ResponseWriter, message string) {
+	w.Header().Set("Content-Type", "text/html; charset=utf-8")
 	w.WriteHeader(http.StatusOK)
 	err := ringStatusPageTemplate.Execute(w, struct {
 		Message string
@@ -100,6 +101,8 @@ func (s StatusHandler) ServeHTTP(w http.ResponseWriter, _ *http.Request) {
 	if s.am.peer != nil {
 		clusterInfo = s.am.peer.Info()
 	}
+	w.Header().Set("Content-Type", "text/html; charset=utf-8")
+	w.Header().Set("X-Content-Type-Options", "nosniff")
 	err := statusTemplate.Execute(w, struct {
 		ClusterInfo map[string]interface{}
 	}{
