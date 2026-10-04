@@ -1040,16 +1040,37 @@ func (am *MultitenantAlertmanager) serveRequest(w http.ResponseWriter, req *http
 }
 
 func (am *MultitenantAlertmanager) alertmanagerFromFallbackConfig(userID string) (*Alertmanager, error) {
-	// Upload an empty config so that the Alertmanager is no de-activated in the next poll
-	cfgDesc := alertspb.ToProto("", nil, userID)
-	err := am.store.SetAlertConfig(context.Background(), cfgDesc)
-	if err != nil {
+	// Make sure we do not overwrite a tenant's stored configuration. The absence
+	// of the tenant from the instance-local am.alertmanagers map does NOT imply
+	// the tenant has no stored configuration: under sharding, non-owning
+	// replicas never populate the map for that tenant, and even without
+	// sharding there is a window between an API upload and the next config
+	// poll where the map is stale. Reading the store first ensures we only
+	// provision the fallback descriptor when the tenant genuinely has no
+	// stored configuration, preventing a request served by a non-owner (or
+	// during the poll window) from destroying the tenant's committed
+	// Alertmanager configuration and templates (see CWE-367).
+	cfgDesc, err := am.store.GetAlertConfig(context.Background(), userID)
+	switch {
+	case err == nil:
+		// A configuration already exists in the store; do NOT overwrite it.
+		// Use it to materialize a local Alertmanager so this instance can
+		// serve the request without clobbering the stored config. The next
+		// poll on the owning replica(s) will reconcile authoritatively.
+	case errors.Is(err, alertspb.ErrNotFound):
+		// No configuration exists in the store for this tenant. Upload an
+		// empty descriptor so that the Alertmanager is not de-activated in
+		// the next poll.
+		cfgDesc = alertspb.ToProto("", nil, userID)
+		if err := am.store.SetAlertConfig(context.Background(), cfgDesc); err != nil {
+			return nil, err
+		}
+	default:
 		return nil, err
 	}
 
 	// Calling setConfig with an empty configuration will use the fallback config.
-	err = am.setConfig(cfgDesc)
-	if err != nil {
+	if err := am.setConfig(cfgDesc); err != nil {
 		return nil, err
 	}
 
