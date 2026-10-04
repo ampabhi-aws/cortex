@@ -123,10 +123,32 @@ type httpResponse struct {
 
 func (r *Ring) ServeHTTP(w http.ResponseWriter, req *http.Request) {
 	if req.Method == http.MethodPost {
-		ingesterID := req.FormValue("forget")
-		if err := r.forget(req.Context(), ingesterID); err != nil {
-			level.Error(r.logger).Log("msg", "error forgetting instance", "err", err)
+		// The ring HTTP endpoint is registered on the tenant-facing HTTP mux without
+		// an in-process authentication gate (Cortex delegates authn/authz to an
+		// external reverse proxy; see docs/guides/authentication-and-authorisation.md).
+		// Accepting POST on this path lets any caller that can reach the HTTP port
+		// mutate the shared ring KV store via `forget=<instance>`, evicting arbitrary
+		// ingesters/rulers/store-gateways/compactors/alertmanagers cluster-wide. The
+		// mutation is therefore disabled by default and must be explicitly opted into
+		// via -ring.http-admin-enabled after operators have put an external auth or
+		// network-level boundary in front of this endpoint.
+		if !r.cfg.HTTPAdminEnabled {
+			level.Warn(r.logger).Log("msg", "rejecting ring forget request: ring HTTP admin is disabled; set -ring.http-admin-enabled=true only when an external auth/network boundary protects this endpoint", "remote", req.RemoteAddr, "path", req.URL.Path)
+			http.Error(w, "ring HTTP admin is disabled; set -ring.http-admin-enabled=true to allow instance forget via POST", http.StatusForbidden)
+			return
 		}
+
+		ingesterID := strings.TrimSpace(req.FormValue("forget"))
+		if ingesterID == "" {
+			http.Error(w, "missing or empty 'forget' form value", http.StatusBadRequest)
+			return
+		}
+		if err := r.forget(req.Context(), ingesterID); err != nil {
+			level.Error(r.logger).Log("msg", "error forgetting instance", "err", err, "instance", ingesterID)
+			http.Error(w, "failed to forget instance", http.StatusInternalServerError)
+			return
+		}
+		level.Info(r.logger).Log("msg", "ring instance forgotten via HTTP admin", "instance", ingesterID, "remote", req.RemoteAddr, "path", req.URL.Path)
 
 		// Implement PRG pattern to prevent double-POST and work with CSRF middleware.
 		// https://en.wikipedia.org/wiki/Post/Redirect/Get
