@@ -7,6 +7,7 @@ import (
 	"html/template"
 	"math"
 	"net/http"
+	"net/url"
 	"sort"
 	"strings"
 	"time"
@@ -25,7 +26,6 @@ const pageContent = `
 		<h1>Ring Status</h1>
 		<p>Current time: {{ .Now }}</p>
 		<form action="" method="POST">
-			<input type="hidden" name="csrf_token" value="$__CSRF_TOKEN_PLACEHOLDER__">
 			<table width="100%" border="1">
 				<thead>
 					<tr>
@@ -122,13 +122,26 @@ type httpResponse struct {
 }
 
 func (r *Ring) ServeHTTP(w http.ResponseWriter, req *http.Request) {
+	// Harden admin pages against clickjacking / cross-origin framing.
+	setAdminSecurityHeaders(w)
+
 	if req.Method == http.MethodPost {
+		// Reject cross-site POSTs to the destructive "forget" action.
+		// This is a minimum origin-validation defence: in the absence of a real
+		// per-session CSRF token, require that any state-changing request comes
+		// from a same-origin context (or from a non-browser client that sends no
+		// Origin/Sec-Fetch-Site headers at all).
+		if !isSameOriginRequest(req) {
+			http.Error(w, "cross-origin request blocked", http.StatusForbidden)
+			return
+		}
+
 		ingesterID := req.FormValue("forget")
 		if err := r.forget(req.Context(), ingesterID); err != nil {
 			level.Error(r.logger).Log("msg", "error forgetting instance", "err", err)
 		}
 
-		// Implement PRG pattern to prevent double-POST and work with CSRF middleware.
+		// Implement PRG pattern to prevent double-POST.
 		// https://en.wikipedia.org/wiki/Post/Redirect/Get
 
 		// http.Redirect() would convert our relative URL to absolute, which is not what we want.
@@ -186,6 +199,65 @@ func (r *Ring) ServeHTTP(w http.ResponseWriter, req *http.Request) {
 		Now:        now,
 		ShowTokens: tokensParam == "true",
 	}, pageTemplate, req)
+}
+
+// setAdminSecurityHeaders adds a conservative set of response headers to admin
+// pages. These are defence-in-depth measures: they do not replace proper
+// authentication, but they frustrate clickjacking and limit the damage from a
+// stray reflected injection in these admin pages.
+func setAdminSecurityHeaders(w http.ResponseWriter) {
+	h := w.Header()
+	if h.Get("X-Frame-Options") == "" {
+		h.Set("X-Frame-Options", "DENY")
+	}
+	if h.Get("X-Content-Type-Options") == "" {
+		h.Set("X-Content-Type-Options", "nosniff")
+	}
+	if h.Get("Content-Security-Policy") == "" {
+		h.Set("Content-Security-Policy", "default-src 'self'; frame-ancestors 'none'; form-action 'self'")
+	}
+}
+
+// isSameOriginRequest returns true if the request can be safely treated as
+// coming from a same-origin context. It uses the Fetch metadata header
+// Sec-Fetch-Site when the client provides one (modern browsers always do), and
+// falls back to a hostname comparison against the Origin / Referer headers.
+// Non-browser clients that send none of these headers are allowed through so
+// that automation and curl-based admin workflows continue to work.
+func isSameOriginRequest(req *http.Request) bool {
+	if site := req.Header.Get("Sec-Fetch-Site"); site != "" {
+		// Browsers set this on every fetch. Only "same-origin" and "none"
+		// (user-initiated top-level navigation) are safe for a state-changing
+		// POST; "same-site", "cross-site" and anything unknown are rejected.
+		if site != "same-origin" && site != "none" {
+			return false
+		}
+	}
+
+	if origin := req.Header.Get("Origin"); origin != "" && origin != "null" {
+		if !originMatchesHost(origin, req.Host) {
+			return false
+		}
+	}
+
+	if referer := req.Header.Get("Referer"); referer != "" {
+		if !originMatchesHost(referer, req.Host) {
+			return false
+		}
+	}
+
+	return true
+}
+
+// originMatchesHost returns true if the host component of rawURL matches
+// requestHost. The scheme is intentionally not checked: an admin may legitimately
+// front Cortex with a TLS-terminating proxy that forwards plaintext upstream.
+func originMatchesHost(rawURL, requestHost string) bool {
+	u, err := url.Parse(rawURL)
+	if err != nil || u.Host == "" {
+		return false
+	}
+	return strings.EqualFold(u.Host, requestHost)
 }
 
 // RenderHTTPResponse either responds with json or a rendered html page using the passed in template

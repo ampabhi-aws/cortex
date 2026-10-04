@@ -23,9 +23,7 @@ const tpl = `
 		<h1>Cortex Ingester Stats</h1>
 		<p>Current time: {{ .Now }}</p>
 		<p><b>NB stats do not account for replication factor, which is currently set to {{ .ReplicationFactor }}</b></p>
-		<form action="" method="POST">
-			<input type="hidden" name="csrf_token" value="$__CSRF_TOKEN_PLACEHOLDER__">
-			<table border="1">
+		<table border="1">
 				<thead>
 					<tr>
 						<th>User</th>
@@ -46,8 +44,7 @@ const tpl = `
 					</tr>
 					{{ end }}
 				</tbody>
-			</table>
-		</form>
+		</table>
 	</body>
 </html>`
 
