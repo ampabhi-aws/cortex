@@ -2388,6 +2388,18 @@ func (i *Ingester) appendMetadata(userID string, m *cortexpb.MetricMetadata) err
 	}
 	i.stoppedMtx.RUnlock()
 
+	// Defense-in-depth: enforce per-tenant metadata size limits (metric name,
+	// HELP and UNIT) here as well as in the distributor, because the ingester's
+	// own HTTP/gRPC push endpoints (e.g. /ingester/push, /push) can be reached
+	// without going through the distributor and would otherwise retain
+	// arbitrary-size strings as map keys inside userMetricsMetadata, bounded
+	// only by count-based quotas. This mirrors the validation performed by the
+	// distributor (see pkg/distributor/distributor.go) and is required to keep
+	// ingester memory bounded in bytes, not just by item count.
+	if err := validation.ValidateMetadata(i.limits, userID, m); err != nil {
+		return err
+	}
+
 	userMetadata := i.getOrCreateUserMetadata(userID)
 
 	return userMetadata.add(m.GetMetricFamilyName(), m)
