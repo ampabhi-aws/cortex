@@ -83,6 +83,17 @@ func (t *SingleResolver) TenantID(ctx context.Context) (string, error) {
 		return "", err
 	}
 
+	// Reject an empty tenant ID. An empty ID would collapse the at-rest
+	// tenant boundary (object-storage prefix and local TSDB directory
+	// are derived by concatenating / joining the tenant ID), so even
+	// though the HTTP ingress layer rejects an empty X-Scope-OrgID,
+	// defensively reject it here as well — the gRPC extractor accepts
+	// an empty metadata value, and this is the single choke-point for
+	// every tenant-scoped code path.
+	if id == "" {
+		return "", user.ErrNoOrgID
+	}
+
 	if containsUnsafePathSegments(id) {
 		return "", errInvalidTenantID
 	}
@@ -131,6 +142,13 @@ func (t *MultiResolver) TenantIDs(ctx context.Context) ([]string, error) {
 
 	orgIDs := strings.Split(orgID, tenantIDsLabelSeparator)
 	for _, orgID := range orgIDs {
+		// Reject empty tenant IDs. strings.Split returns a slice containing
+		// an empty string for an empty input, and "a||b" yields an empty
+		// element in the middle — both must be rejected so the empty prefix
+		// never reaches the storage layer.
+		if orgID == "" {
+			return nil, user.ErrNoOrgID
+		}
 		if err := ValidTenantID(orgID); err != nil {
 			return nil, err
 		}

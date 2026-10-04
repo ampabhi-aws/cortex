@@ -35,7 +35,16 @@ func NewUsersScanner(bucketClient objstore.Bucket, isOwned func(userID string) (
 // If sharding is enabled, returned lists contains only the users owned by this instance.
 func (s *UsersScanner) ScanUsers(ctx context.Context) (users, markedForDeletion []string, err error) {
 	err = s.bucketClient.Iter(ctx, "", func(entry string) error {
-		users = append(users, strings.TrimSuffix(entry, "/"))
+		userID := strings.TrimSuffix(entry, "/")
+		// Defensively ignore entries that cannot be a valid tenant ID.
+		// An empty userID (produced e.g. by a bucket entry of "/" or "")
+		// would otherwise cause downstream code (compactor, blocks-cleaner,
+		// store-gateway, querier) to operate on the bucket root as if it
+		// were a tenant, destroying the at-rest tenant boundary.
+		if userID == "" {
+			return nil
+		}
+		users = append(users, userID)
 		return nil
 	})
 	if err != nil {
