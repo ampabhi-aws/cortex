@@ -29,6 +29,14 @@ func Handler(maxRecvMsgSize int, sourceIPs *middleware.SourceIPExtractor, push F
 			}
 		}
 		var req cortexpb.PreallocWriteRequest
+		// Enforce the max message size at the transport layer so the server,
+		// not the attacker-controlled Content-Length header, bounds how many
+		// bytes we are willing to read from the request body. This defends
+		// against a client that advertises a large Content-Length but trickles
+		// the body to hold heap and goroutines live for the HTTP read timeout.
+		if maxRecvMsgSize > 0 {
+			r.Body = http.MaxBytesReader(w, r.Body, int64(maxRecvMsgSize))
+		}
 		err := util.ParseProtoReader(ctx, r.Body, int(r.ContentLength), maxRecvMsgSize, &req, util.RawSnappy)
 		if err != nil {
 			level.Error(logger).Log("err", err.Error())
