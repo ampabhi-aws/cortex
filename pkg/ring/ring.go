@@ -125,6 +125,18 @@ type Config struct {
 	ZoneAwarenessEnabled bool                   `yaml:"zone_awareness_enabled"`
 	ExcludedZones        flagext.StringSliceCSV `yaml:"excluded_zones"`
 
+	// HTTPAdminEnabled, when true, allows mutating ring admin operations (currently the
+	// `forget` POST on the ring HTTP endpoint) to be served. Because the ring HTTP routes
+	// are registered on the tenant-facing HTTP mux without any in-process authentication
+	// (Cortex delegates authentication/authorisation to an external reverse proxy, see
+	// docs/guides/authentication-and-authorisation.md), accepting POST mutations on this
+	// path would let anyone with network access to the HTTP port evict arbitrary
+	// instances from the shared ring KV store. Default: false (POST mutations rejected
+	// with 403 Forbidden). Operators who have deployed the required external
+	// auth/network boundary can set this to true to re-enable the operator "Forget"
+	// action.
+	HTTPAdminEnabled bool `yaml:"http_admin_enabled"`
+
 	// Whether the shuffle-sharding subring cache is disabled. This option is set
 	// internally and never exposed to the user.
 	SubringCacheDisabled bool `yaml:"-"`
@@ -143,6 +155,7 @@ func (cfg *Config) RegisterFlagsWithPrefix(prefix string, f *flag.FlagSet) {
 	f.IntVar(&cfg.ReplicationFactor, prefix+"distributor.replication-factor", 3, "The number of ingesters to write to and read from.")
 	f.BoolVar(&cfg.ZoneAwarenessEnabled, prefix+"distributor.zone-awareness-enabled", false, "True to enable the zone-awareness and replicate ingested samples across different availability zones.")
 	f.Var(&cfg.ExcludedZones, prefix+"distributor.excluded-zones", "Comma-separated list of zones to exclude from the ring. Instances in excluded zones will be filtered out from the ring.")
+	f.BoolVar(&cfg.HTTPAdminEnabled, prefix+"ring.http-admin-enabled", false, "When true, the ring HTTP endpoint accepts POST requests to forget (evict) instances from the ring. Disabled by default because the ring HTTP routes are mounted on the tenant-facing HTTP mux without any in-process authentication; only enable when an external authentication/authorisation boundary (e.g. reverse proxy, network ACL) protects the admin surface.")
 }
 
 type instanceInfo struct {
