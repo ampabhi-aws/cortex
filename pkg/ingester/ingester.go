@@ -62,6 +62,7 @@ const (
 	errTSDBCreateIncompatibleState = "cannot create a new TSDB while the ingester is not in active state (current state: %s)"
 	errTSDBIngest                  = "err: %v. timestamp=%s, series=%s" // Using error.Wrap puts the message before the error and if the series is too long, its truncated.
 	errTSDBIngestExemplar          = "err: %v. timestamp=%s, series=%s, exemplar=%s"
+	errEmptyUserID                 = "empty tenant ID is not allowed"
 
 	// Jitter applied to the idle timeout to prevent compaction in all ingesters concurrently.
 	compactionIdleTimeoutJitter = 0.25
@@ -1756,6 +1757,15 @@ func (i *Ingester) getTSDBUsers() []string {
 }
 
 func (i *Ingester) getOrCreateTSDB(userID string, force bool) (*userTSDB, error) {
+	// Defense in depth: never allow an empty tenant ID to reach TSDB creation.
+	// filepath.Join(cfg.Dir, "") == cfg.Dir, which would collapse the
+	// pseudo-tenant's TSDB onto the shared TSDB root and (with
+	// close-idle-tsdb-timeout) make os.RemoveAll destroy every co-located
+	// tenant's local data. The tenant resolver already rejects this, but we
+	// guard here too in case a caller bypasses the resolver.
+	if userID == "" {
+		return nil, errors.New(errEmptyUserID)
+	}
 	db := i.getTSDB(userID)
 	if db != nil {
 		return db, nil
