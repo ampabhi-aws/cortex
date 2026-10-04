@@ -872,6 +872,38 @@ func (am *MultitenantAlertmanager) setConfig(cfg alertspb.AlertConfigDesc) error
 			// working configuration.
 			return fmt.Errorf("invalid Cortex configuration for %v: %v", cfg.User, err)
 		}
+
+		// Re-enforce the Alertmanager configuration deny-list on the
+		// read/instantiate path. The deny-list (validateReceiverHTTPConfig,
+		// validateReceiverTLSConfig, validateSlackConfig, validateVictorOpsConfig,
+		// validateGlobalConfig) is otherwise only enforced on the experimental
+		// POST /api/v1/alerts write path (see validateUserConfig in api.go), which
+		// means configs sourced from a weaker write path (e.g. the deprecated
+		// configs service with -alertmanager-storage.backend=configdb) or already
+		// present in the bucket from an older Cortex version could otherwise
+		// reference arbitrary host files via *_file settings (password_file,
+		// bearer_token_file, credentials_file, oauth2.client_secret_file, TLS
+		// ca_file/cert_file/key_file, slack_api_url_file, opsgenie_api_key_file,
+		// victorops api_key_file) and exfiltrate their contents to a
+		// tenant-controlled receiver (CVE-2021-31232).
+		if userAmConfig != nil {
+			if validateErr := validateAlertmanagerConfig(userAmConfig); validateErr != nil {
+				return fmt.Errorf("invalid Cortex configuration for %v: %v", cfg.User, validateErr)
+			}
+			// Also re-validate template filenames referenced from the loaded
+			// config and from the stored template files, matching
+			// validateUserConfig in api.go.
+			for _, name := range userAmConfig.Templates {
+				if validateErr := validateTemplateFilename(name); validateErr != nil {
+					return fmt.Errorf("invalid Cortex configuration for %v: %v", cfg.User, validateErr)
+				}
+			}
+			for _, tmpl := range cfg.Templates {
+				if validateErr := validateTemplateFilename(tmpl.Filename); validateErr != nil {
+					return fmt.Errorf("invalid Cortex configuration for %v: %v", cfg.User, validateErr)
+				}
+			}
+		}
 	}
 
 	// We can have an empty configuration here if:
