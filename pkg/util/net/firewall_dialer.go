@@ -34,6 +34,56 @@ func (d *FirewallDialer) DialContext(ctx context.Context, network, address strin
 	return d.parent.DialContext(ctx, network, address)
 }
 
+// ValidateHostPort resolves the host part of a "host:port" address and
+// returns an error if any resolved IP would be blocked by the firewall
+// policy. It is intended for integrations (e.g. the Alertmanager email
+// notifier) that perform their own dialing and cannot have a net.Dialer
+// Control hook injected. Callers should use this to pre-flight connections
+// so the firewall is enforced before any TCP/TLS handshake begins.
+func (d *FirewallDialer) ValidateHostPort(ctx context.Context, address string) error {
+	blockPrivateAddresses := d.cfgProvider.BlockPrivateAddresses()
+	blockCIDRNetworks := d.cfgProvider.BlockCIDRNetworks()
+
+	// Skip any control if no firewall has been configured.
+	if !blockPrivateAddresses && len(blockCIDRNetworks) == 0 {
+		return nil
+	}
+
+	host, _, err := net.SplitHostPort(address)
+	if err != nil {
+		return errInvalidAddress
+	}
+
+	var ips []net.IP
+	if ip := net.ParseIP(host); ip != nil {
+		ips = []net.IP{ip}
+	} else {
+		addrs, err := net.DefaultResolver.LookupIPAddr(ctx, host)
+		if err != nil {
+			return errors.Wrap(err, "resolving address for firewall validation")
+		}
+		if len(addrs) == 0 {
+			return errBlockedAddress
+		}
+		for _, a := range addrs {
+			ips = append(ips, a.IP)
+		}
+	}
+
+	for _, ip := range ips {
+		if blockPrivateAddresses && (isPrivate(ip) || isLocal(ip)) {
+			return errBlockedAddress
+		}
+		for _, cidr := range blockCIDRNetworks {
+			if cidr.Value.Contains(ip) {
+				return errBlockedAddress
+			}
+		}
+	}
+
+	return nil
+}
+
 func (d *FirewallDialer) control(_, address string, _ syscall.RawConn) error {
 	blockPrivateAddresses := d.cfgProvider.BlockPrivateAddresses()
 	blockCIDRNetworks := d.cfgProvider.BlockCIDRNetworks()

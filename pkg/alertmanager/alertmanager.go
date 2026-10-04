@@ -496,7 +496,16 @@ func buildReceiverIntegrations(nc *config.Receiver, tmpl *template.Template, fir
 		add("webhook", i, c, func(l log.Logger) (notify.Notifier, error) { return webhook.New(c, tmpl, l, httpOps...) })
 	}
 	for i, c := range nc.EmailConfigs {
-		add("email", i, c, func(l log.Logger) (notify.Notifier, error) { return email.New(c, tmpl, l), nil })
+		add("email", i, c, func(l log.Logger) (notify.Notifier, error) {
+			// The upstream email notifier dials the configured smarthost
+			// itself using a bare net.Dialer / tls.Dial and does not accept
+			// a DialContext hook, so we cannot thread the per-tenant
+			// firewall dialer through as we do for every HTTP-based
+			// receiver. Wrap the notifier to enforce the firewall against
+			// the tenant-supplied smarthost before any connection is
+			// established.
+			return newFirewalledEmailNotifier(c, firewallDialer, l, email.New(c, tmpl, l)), nil
+		})
 	}
 	for i, c := range nc.PagerdutyConfigs {
 		add("pagerduty", i, c, func(l log.Logger) (notify.Notifier, error) { return pagerduty.New(c, tmpl, l, httpOps...) })
