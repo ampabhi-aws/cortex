@@ -690,7 +690,17 @@ receivers:
 	require.Equal(t, "application/yaml", resp.Header.Get("Content-Type"))
 	body, err := io.ReadAll(resp.Body)
 	require.NoError(t, err)
-	old, err := yaml.Marshal(testCases)
+	// The handler parses each tenant's config and re-marshals it so that
+	// receiver secrets are redacted. Build the expected payload the same way
+	// so the comparison tolerates default-field insertion by the upstream
+	// Alertmanager config package.
+	expected := map[string]*UserConfig{}
+	for u, cfg := range testCases {
+		redacted, rerr := redactAlertmanagerConfig(cfg.AlertmanagerConfig)
+		require.NoError(t, rerr)
+		expected[u] = &UserConfig{AlertmanagerConfig: redacted}
+	}
+	old, err := yaml.Marshal(expected)
 	require.NoError(t, err)
 	require.YAMLEq(t, string(old), string(body))
 }
