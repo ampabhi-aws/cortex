@@ -10,6 +10,7 @@ import (
 	"io"
 	"mime"
 	"net/http"
+	"reflect"
 	"strconv"
 	"strings"
 
@@ -19,6 +20,7 @@ import (
 	"github.com/gorilla/mux"
 	amconfig "github.com/prometheus/alertmanager/config"
 	amtemplate "github.com/prometheus/alertmanager/template"
+	commoncfg "github.com/prometheus/common/config"
 
 	"github.com/cortexproject/cortex/pkg/configs/db"
 	"github.com/cortexproject/cortex/pkg/configs/userconfig"
@@ -30,6 +32,16 @@ import (
 var (
 	ErrEmailNotificationsAreDisabled   = errors.New("email notifications are disabled")
 	ErrWebhookNotificationsAreDisabled = errors.New("webhook notifications are disabled")
+
+	// These errors mirror the deny-list enforced by the supported Alertmanager
+	// API (pkg/alertmanager/api.go). They prevent a tenant from making Cortex
+	// read arbitrary host files and exfiltrate their contents to a
+	// tenant-chosen receiver (CVE-2021-31232 and related).
+	errPasswordFileNotAllowed        = errors.New("setting password_file, bearer_token_file and credentials_file is not allowed")
+	errOAuth2SecretFileNotAllowed    = errors.New("setting OAuth2 client_secret_file is not allowed")
+	errTLSFileNotAllowed             = errors.New("setting TLS ca_file, cert_file and key_file is not allowed")
+	errSlackAPIURLFileNotAllowed     = errors.New("setting Slack api_url_file and global slack_api_url_file is not allowed")
+	errVictorOpsAPIKeyFileNotAllowed = errors.New("setting VictorOps api_key_file is not allowed")
 )
 
 // Config configures Configs API
@@ -239,6 +251,163 @@ func validateAlertmanagerConfig(cfg string, noCfg NotificationsConfig) error {
 		}
 	}
 
+	// Reject tenant configs that reference host files for credentials or TLS
+	// material. The maintained Alertmanager API enforces the same deny-list
+	// (pkg/alertmanager/api.go). Without this check a tenant can make Cortex
+	// read arbitrary local files (e.g. Kubernetes service-account tokens,
+	// object-store credentials, TLS private keys) and exfiltrate them via a
+	// tenant-chosen receiver when the multitenant Alertmanager runs with
+	// -alertmanager.storage.backend=configdb.
+	if err := validateAlertmanagerFileFields(amCfg); err != nil {
+		return err
+	}
+
+	return nil
+}
+
+// validateAlertmanagerFileFields recursively scans the input config looking
+// for data types for which we have a specific validation and, whenever
+// encountered, runs it. Returns the first error or nil if validation succeeds.
+func validateAlertmanagerFileFields(cfg interface{}) error {
+	v := reflect.ValueOf(cfg)
+	if !v.IsValid() {
+		return nil
+	}
+	t := v.Type()
+
+	// Skip the zero value or a nil pointer (checked by zero value).
+	if v.IsZero() {
+		return nil
+	}
+
+	// If the input config is a pointer then we need to get its value.
+	// At this point the pointer value can't be nil.
+	if v.Kind() == reflect.Ptr {
+		v = v.Elem()
+		t = v.Type()
+	}
+
+	// Check if the input config is a data type for which we have a specific
+	// validation. At this point the value can't be a pointer anymore.
+	switch t {
+	case reflect.TypeOf(amconfig.GlobalConfig{}):
+		if err := validateGlobalConfigFileFields(v.Interface().(amconfig.GlobalConfig)); err != nil {
+			return err
+		}
+
+	case reflect.TypeOf(commoncfg.HTTPClientConfig{}):
+		if err := validateReceiverHTTPConfigFileFields(v.Interface().(commoncfg.HTTPClientConfig)); err != nil {
+			return err
+		}
+
+	case reflect.TypeOf(commoncfg.TLSConfig{}):
+		if err := validateReceiverTLSConfigFileFields(v.Interface().(commoncfg.TLSConfig)); err != nil {
+			return err
+		}
+
+	case reflect.TypeOf(amconfig.SlackConfig{}):
+		if err := validateSlackConfigFileFields(v.Interface().(amconfig.SlackConfig)); err != nil {
+			return err
+		}
+
+	case reflect.TypeOf(amconfig.VictorOpsConfig{}):
+		if err := validateVictorOpsConfigFileFields(v.Interface().(amconfig.VictorOpsConfig)); err != nil {
+			return err
+		}
+	}
+
+	// If the input config is a struct, recursively iterate on all fields.
+	if t.Kind() == reflect.Struct {
+		for i := 0; i < t.NumField(); i++ {
+			field := t.Field(i)
+			fieldValue := v.FieldByIndex(field.Index)
+
+			// Skip any field value which can't be converted to interface
+			// (eg. unexported primitive fields).
+			if fieldValue.CanInterface() {
+				if err := validateAlertmanagerFileFields(fieldValue.Interface()); err != nil {
+					return err
+				}
+			}
+		}
+	}
+
+	if t.Kind() == reflect.Slice || t.Kind() == reflect.Array {
+		for i := 0; i < v.Len(); i++ {
+			fieldValue := v.Index(i)
+			if fieldValue.CanInterface() {
+				if err := validateAlertmanagerFileFields(fieldValue.Interface()); err != nil {
+					return err
+				}
+			}
+		}
+	}
+
+	if t.Kind() == reflect.Map {
+		for _, key := range v.MapKeys() {
+			fieldValue := v.MapIndex(key)
+			if fieldValue.CanInterface() {
+				if err := validateAlertmanagerFileFields(fieldValue.Interface()); err != nil {
+					return err
+				}
+			}
+		}
+	}
+
+	return nil
+}
+
+// validateReceiverHTTPConfigFileFields rejects HTTP client configurations that
+// reference host files for authentication credentials.
+func validateReceiverHTTPConfigFileFields(cfg commoncfg.HTTPClientConfig) error {
+	if cfg.BasicAuth != nil && cfg.BasicAuth.PasswordFile != "" {
+		return errPasswordFileNotAllowed
+	}
+	if cfg.Authorization != nil && cfg.Authorization.CredentialsFile != "" {
+		return errPasswordFileNotAllowed
+	}
+	if cfg.BearerTokenFile != "" {
+		return errPasswordFileNotAllowed
+	}
+	if cfg.OAuth2 != nil && cfg.OAuth2.ClientSecretFile != "" {
+		return errOAuth2SecretFileNotAllowed
+	}
+	return validateReceiverTLSConfigFileFields(cfg.TLSConfig)
+}
+
+// validateReceiverTLSConfigFileFields rejects TLS configurations that
+// reference host files for CA, certificate or key material.
+func validateReceiverTLSConfigFileFields(cfg commoncfg.TLSConfig) error {
+	if cfg.CAFile != "" || cfg.CertFile != "" || cfg.KeyFile != "" {
+		return errTLSFileNotAllowed
+	}
+	return nil
+}
+
+// validateGlobalConfigFileFields rejects global configurations that reference
+// host files for sensitive URLs.
+func validateGlobalConfigFileFields(cfg amconfig.GlobalConfig) error {
+	if cfg.SlackAPIURLFile != "" {
+		return errSlackAPIURLFileNotAllowed
+	}
+	return nil
+}
+
+// validateSlackConfigFileFields rejects Slack receivers that reference host
+// files for the API URL.
+func validateSlackConfigFileFields(cfg amconfig.SlackConfig) error {
+	if cfg.APIURLFile != "" {
+		return errSlackAPIURLFileNotAllowed
+	}
+	return nil
+}
+
+// validateVictorOpsConfigFileFields rejects VictorOps receivers that
+// reference host files for the API key.
+func validateVictorOpsConfigFileFields(cfg amconfig.VictorOpsConfig) error {
+	if cfg.APIKeyFile != "" {
+		return errVictorOpsAPIKeyFileNotAllowed
+	}
 	return nil
 }
 
