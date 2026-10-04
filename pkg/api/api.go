@@ -18,6 +18,7 @@ import (
 	"github.com/cortexproject/cortex/pkg/alertmanager"
 	"github.com/cortexproject/cortex/pkg/alertmanager/alertmanagerpb"
 	"github.com/cortexproject/cortex/pkg/compactor"
+	configAPI "github.com/cortexproject/cortex/pkg/configs/api"
 	"github.com/cortexproject/cortex/pkg/cortexpb"
 	"github.com/cortexproject/cortex/pkg/distributor"
 	"github.com/cortexproject/cortex/pkg/distributor/distributorpb"
@@ -322,6 +323,18 @@ func (a *API) RegisterRulerAPI(r *ruler.API) {
 	a.RegisterRoute(path.Join(a.cfg.LegacyHTTPPrefix, "/rules/{namespace}"), http.HandlerFunc(r.CreateRuleGroup), true, "POST")
 	a.RegisterRoute(path.Join(a.cfg.LegacyHTTPPrefix, "/rules/{namespace}/{groupName}"), http.HandlerFunc(r.DeleteRuleGroup), true, "DELETE")
 	a.RegisterRoute(path.Join(a.cfg.LegacyHTTPPrefix, "/rules/{namespace}"), http.HandlerFunc(r.DeleteNamespace), true, "DELETE")
+}
+
+// RegisterConfigAPI registers the deprecated configs service routes with
+// the operator-configured HTTP auth middleware applied to every per-tenant
+// endpoint. This replaces the previous raw-mux registration
+// (ConfigAPI.RegisterRoutes), which left /api/prom/configs/* unprotected
+// and reading the tenant identity from the client-supplied X-Scope-OrgID
+// header, bypassing any authenticator plugged into AuthMiddleware.
+func (a *API) RegisterConfigAPI(c *configAPI.API) {
+	for _, route := range c.Routes() {
+		a.RegisterRoute(route.Path, route.Handler, route.Auth, route.Method)
+	}
 }
 
 // RegisterRing registers the ring UI page associated with the distributor for writes.
