@@ -1,6 +1,7 @@
 package api
 
 import (
+	"crypto/subtle"
 	"database/sql"
 	"encoding/json"
 	"errors"
@@ -12,6 +13,7 @@ import (
 	"net/http"
 	"strconv"
 	"strings"
+	"sync"
 
 	"gopkg.in/yaml.v2"
 
@@ -35,6 +37,17 @@ var (
 // Config configures Configs API
 type Config struct {
 	Notifications NotificationsConfig `yaml:"notifications"`
+
+	// PrivateAPISharedSecret, when non-empty, is required as a bearer
+	// credential (Authorization: Bearer <secret>) on the internal
+	// /private/api/prom/configs/* endpoints, which otherwise return every
+	// tenant's rules and Alertmanager configuration (including receiver
+	// credentials such as webhook URLs, PagerDuty / OpsGenie keys, SMTP
+	// passwords and bearer tokens) to any caller that can reach the HTTP
+	// listener. When left empty the historical behaviour is preserved and
+	// a warning is logged at startup; operators are strongly encouraged
+	// to either set this secret or block /private/* at an edge proxy.
+	PrivateAPISharedSecret string `yaml:"private_api_shared_secret"`
 }
 
 // NotificationsConfig configures Alertmanager notifications method.
@@ -47,13 +60,15 @@ type NotificationsConfig struct {
 func (cfg *Config) RegisterFlags(f *flag.FlagSet) {
 	f.BoolVar(&cfg.Notifications.DisableEmail, "configs.notifications.disable-email", false, "Disable Email notifications for Alertmanager.")
 	f.BoolVar(&cfg.Notifications.DisableWebHook, "configs.notifications.disable-webhook", false, "Disable WebHook notifications for Alertmanager.")
+	f.StringVar(&cfg.PrivateAPISharedSecret, "configs.api.private-api-shared-secret", "", "If non-empty, callers of the internal /private/api/prom/configs/{rules,alertmanager} endpoints must present this value as a bearer token (Authorization: Bearer <secret>). These endpoints return every tenant's rules and Alertmanager configuration (including receiver credentials) and are intended for the in-cluster ruler/alertmanager configdb client only; leave empty only when /private/* is blocked at an upstream proxy.")
 }
 
 // API implements the configs api.
 type API struct {
 	http.Handler
-	db  db.DB
-	cfg Config
+	db               db.DB
+	cfg              Config
+	insecureWarnOnce sync.Once
 }
 
 // New creates a new API
@@ -267,6 +282,33 @@ func (a *API) getConfigs(w http.ResponseWriter, r *http.Request) {
 	var cfgs map[string]userconfig.View
 	var cfgErr error
 	logger := util_log.WithContext(r.Context(), util_log.Logger)
+
+	// Authorize access to the all-tenant /private/* dump.
+	//
+	// getConfigs returns every tenant's rules and raw Alertmanager
+	// configuration (including receiver credentials such as Slack webhook
+	// URLs, PagerDuty / OpsGenie keys, SMTP passwords and bearer tokens).
+	// Because the surrounding route table is registered on the raw HTTP
+	// mux and is not wrapped by Cortex's auth middleware, an anonymous
+	// caller that can reach the HTTP listener would otherwise be able to
+	// dump every tenant's secrets. We require a bearer token matching the
+	// operator-configured shared secret when one is set; when it is unset
+	// we preserve the historical behaviour (needed by not-yet-upgraded
+	// in-cluster ruler/alertmanager configdb clients) and emit a one-shot
+	// warning so the insecure state is clearly visible in logs.
+	if a.cfg.PrivateAPISharedSecret != "" {
+		if !hasValidBearer(r, a.cfg.PrivateAPISharedSecret) {
+			http.Error(w, "unauthorized", http.StatusUnauthorized)
+			return
+		}
+	} else {
+		a.insecureWarnOnce.Do(func() {
+			level.Warn(logger).Log(
+				"msg", "configs.api.private-api-shared-secret is unset: the /private/api/prom/configs/{rules,alertmanager} endpoints return every tenant's configuration (including receiver credentials) to any caller that can reach the HTTP listener; configure a shared secret or block /private/* at an upstream proxy",
+			)
+		})
+	}
+
 	rawSince := r.FormValue("since")
 	if rawSince == "" {
 		cfgs, cfgErr = a.db.GetAllConfigs(r.Context())
@@ -364,4 +406,24 @@ func parseConfigFormat(v string, defaultFormat string) string {
 		}
 	}
 	return defaultFormat
+}
+
+// hasValidBearer reports whether the request carries an
+// `Authorization: Bearer <secret>` header whose token matches the
+// expected value, using a constant-time comparison to avoid leaking the
+// secret through timing side-channels.
+func hasValidBearer(r *http.Request, expected string) bool {
+	if expected == "" {
+		return false
+	}
+	auth := r.Header.Get("Authorization")
+	const prefix = "Bearer "
+	if len(auth) <= len(prefix) || !strings.EqualFold(auth[:len(prefix)], prefix) {
+		return false
+	}
+	token := strings.TrimSpace(auth[len(prefix):])
+	if token == "" {
+		return false
+	}
+	return subtle.ConstantTimeCompare([]byte(token), []byte(expected)) == 1
 }
