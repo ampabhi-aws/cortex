@@ -87,6 +87,21 @@ func (t *SingleResolver) TenantID(ctx context.Context) (string, error) {
 		return "", errInvalidTenantID
 	}
 
+	// Enforce the documented tenant-ID length limit
+	// (https://cortexmetrics.io/docs/guides/limitations/#tenant-id-naming).
+	// This is a defense-in-depth check: without it, callers that use the
+	// resolved tenant ID as a Prometheus metric label value or map key
+	// (e.g. the query-frontend queries-per-tenant vector and the distributor
+	// incoming/received samples vectors) can be forced to retain arbitrarily
+	// large strings (up to Go's 1 MiB default MaxHeaderBytes) per distinct
+	// X-Scope-OrgID until the active-user cleanup fires. The SingleResolver
+	// intentionally allows a wider character set than ValidTenantID, so only
+	// the length cap is enforced here; the charset check remains exclusive
+	// to the MultiResolver as documented.
+	if len(id) > 150 {
+		return "", errTenantIDTooLong
+	}
+
 	return id, nil
 }
 
