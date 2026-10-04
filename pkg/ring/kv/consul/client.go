@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"math/rand"
 	"net/http"
+	"strings"
 	"time"
 
 	"github.com/go-kit/log"
@@ -20,6 +21,7 @@ import (
 	"github.com/cortexproject/cortex/pkg/ring/kv/codec"
 	"github.com/cortexproject/cortex/pkg/util/backoff"
 	"github.com/cortexproject/cortex/pkg/util/flagext"
+	cortextls "github.com/cortexproject/cortex/pkg/util/tls"
 )
 
 const (
@@ -40,12 +42,14 @@ var (
 
 // Config to create a ConsulClient
 type Config struct {
-	Host              string         `yaml:"host"`
-	ACLToken          flagext.Secret `yaml:"acl_token"`
-	HTTPClientTimeout time.Duration  `yaml:"http_client_timeout"`
-	ConsistentReads   bool           `yaml:"consistent_reads"`
-	WatchKeyRateLimit float64        `yaml:"watch_rate_limit"` // Zero disables rate limit
-	WatchKeyBurstSize int            `yaml:"watch_burst_size"` // Burst when doing rate-limit, defaults to 1
+	Host              string                 `yaml:"host"`
+	ACLToken          flagext.Secret         `yaml:"acl_token"`
+	HTTPClientTimeout time.Duration          `yaml:"http_client_timeout"`
+	ConsistentReads   bool                   `yaml:"consistent_reads"`
+	WatchKeyRateLimit float64                `yaml:"watch_rate_limit"` // Zero disables rate limit
+	WatchKeyBurstSize int                    `yaml:"watch_burst_size"` // Burst when doing rate-limit, defaults to 1
+	EnableTLS         bool                   `yaml:"tls_enabled"`
+	TLS               cortextls.ClientConfig `yaml:",inline"`
 
 	// Used in tests only.
 	MaxCasRetries int           `yaml:"-"`
@@ -78,16 +82,49 @@ func (cfg *Config) RegisterFlags(f *flag.FlagSet, prefix string) {
 	f.BoolVar(&cfg.ConsistentReads, prefix+"consul.consistent-reads", false, "Enable consistent reads to Consul.")
 	f.Float64Var(&cfg.WatchKeyRateLimit, prefix+"consul.watch-rate-limit", 1, "Rate limit when watching key or prefix in Consul, in requests per second. 0 disables the rate limit.")
 	f.IntVar(&cfg.WatchKeyBurstSize, prefix+"consul.watch-burst-size", 1, "Burst size used in rate limit. Values less than 1 are treated as 1.")
+	f.BoolVar(&cfg.EnableTLS, prefix+"consul.tls-enabled", false, "Enable TLS when talking to Consul. If true, the Consul HTTP API client will use HTTPS and the TLS flags below are honored.")
+	cfg.TLS.RegisterFlagsWithPrefix(prefix+"consul", f)
+}
+
+// addressUsesHTTPS reports whether the configured address explicitly requests https.
+func addressUsesHTTPS(addr string) bool {
+	return strings.HasPrefix(strings.ToLower(addr), "https://")
 }
 
 // NewClient returns a new Client.
 func NewClient(cfg Config, codec codec.Codec, logger log.Logger, registerer prometheus.Registerer) (*Client, error) {
+	// Choose the request scheme: explicit TLS flag, or an https:// prefix on
+	// the address, enables HTTPS. The vendored Consul client will also
+	// override Scheme from an https:// address prefix, but we honor it here
+	// so that we can build a transport with the operator-supplied TLS config.
+	scheme := "http"
+	tlsEnabled := cfg.EnableTLS || addressUsesHTTPS(cfg.Host)
+	if tlsEnabled {
+		scheme = "https"
+	}
+
+	transport := cleanhttp.DefaultPooledTransport()
+	if tlsEnabled {
+		tlsCfg, err := cfg.TLS.GetTLSConfig()
+		if err != nil {
+			return nil, fmt.Errorf("unable to initialise TLS configuration for consul: %w", err)
+		}
+		transport.TLSClientConfig = tlsCfg
+	}
+
+	// Warn when a secret ACL token would be transmitted without transport
+	// security. Consul's ACL token is a bearer credential for the ring KV;
+	// sending it over plaintext HTTP leaks it to any passive on-path observer.
+	if !tlsEnabled && cfg.ACLToken.Value != "" {
+		level.Warn(logger).Log("msg", "consul ACL token configured but TLS is disabled; the token will be transmitted in cleartext. Set -<prefix>consul.tls-enabled=true (and the -<prefix>consul.tls-* flags) or use an https:// hostname to enable TLS.")
+	}
+
 	client, err := consul.NewClient(&consul.Config{
 		Address: cfg.Host,
 		Token:   cfg.ACLToken.Value,
-		Scheme:  "http",
+		Scheme:  scheme,
 		HttpClient: &http.Client{
-			Transport: cleanhttp.DefaultPooledTransport(),
+			Transport: transport,
 			// See https://blog.cloudflare.com/the-complete-guide-to-golang-net-http-timeouts/
 			Timeout: cfg.HTTPClientTimeout,
 		},
