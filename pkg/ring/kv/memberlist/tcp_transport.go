@@ -302,6 +302,11 @@ func (t *TCPTransport) handleConnection(conn net.Conn) {
 		if !bytes.Equal(receivedDigest, expectedDigest[:]) {
 			t.receivedPacketsErrors.Inc()
 			level.Warn(t.logger).Log("msg", "packet digest mismatch", "expected", fmt.Sprintf("%x", expectedDigest), "received", fmt.Sprintf("%x", receivedDigest), "data_length", len(buf), "remote", conn.RemoteAddr())
+			// Drop the packet: the digest serves as a truncation/corruption check and a mismatch
+			// means the frame is not what the sender produced. Previously the packet was still
+			// delivered to memberlist, which turned the check into a no-op and left the ring
+			// CRDT exposed to malformed or truncated gossip frames.
+			return
 		}
 
 		t.debugLog().Log("msg", "Received packet", "addr", addr(addrBuf), "size", len(buf), "hash", fmt.Sprintf("%x", receivedDigest))
