@@ -277,6 +277,15 @@ func PreallocTimeseriesSliceFromPool() []PreallocTimeseries {
 func ReuseSlice(ts []PreallocTimeseries) {
 	for i := range ts {
 		ReuseTimeseries(ts[i].TimeSeries)
+		ts[i].TimeSeries = nil
+	}
+
+	// Clear any stale *TimeSeries pointers up to cap so they do not keep
+	// previously-pooled series (and the request bodies their labels may still
+	// reference) reachable through the slice stored in slicePool.
+	tail := ts[len(ts):cap(ts)]
+	for i := range tail {
+		tail[i].TimeSeries = nil
 	}
 
 	slicePool.Put(ts[:0]) //nolint:staticcheck //see comment on slicePool for more details
@@ -290,19 +299,28 @@ func TimeseriesFromPool() *TimeSeries {
 
 // ReuseTimeseries puts the timeseries back into a sync.Pool for reuse.
 func ReuseTimeseries(ts *TimeSeries) {
-	// Name and Value may point into a large gRPC buffer, so clear the reference to allow GC
-	for i := 0; i < len(ts.Labels); i++ {
-		ts.Labels[i].Name = ""
-		ts.Labels[i].Value = ""
+	// Name and Value may point into a large gRPC buffer, so clear the reference to allow GC.
+	// Clear up to cap, not just len, because callers (e.g. the distributor's removeLabel
+	// and in-place relabel compaction) may have shrunk ts.Labels while keeping the same
+	// backing array, leaving stale LabelAdapters at indexes [len:cap] whose unsafe
+	// yoloStrings still point into the decompressed remote-write request body.
+	labels := ts.Labels[:cap(ts.Labels)]
+	for i := range labels {
+		labels[i].Name = ""
+		labels[i].Value = ""
 	}
 	ts.Labels = ts.Labels[:0]
 	ts.Samples = ts.Samples[:0]
-	// Name and Value may point into a large gRPC buffer, so clear the reference in each exemplar to allow GC
-	for i := range ts.Exemplars {
-		for j := range ts.Exemplars[i].Labels {
-			ts.Exemplars[i].Labels[j].Name = ""
-			ts.Exemplars[i].Labels[j].Value = ""
+	// Name and Value may point into a large gRPC buffer, so clear the reference in each exemplar to allow GC.
+	// Walk up to cap for the same reason as above.
+	exemplars := ts.Exemplars[:cap(ts.Exemplars)]
+	for i := range exemplars {
+		exLabels := exemplars[i].Labels[:cap(exemplars[i].Labels)]
+		for j := range exLabels {
+			exLabels[j].Name = ""
+			exLabels[j].Value = ""
 		}
+		exemplars[i].Labels = exemplars[i].Labels[:0]
 	}
 	ts.Exemplars = ts.Exemplars[:0]
 	timeSeriesPool.Put(ts)
