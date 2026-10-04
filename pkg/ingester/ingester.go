@@ -1203,11 +1203,17 @@ func (i *Ingester) Query(ctx context.Context, req *client.QueryRequest) (*client
 
 	numSamples := 0
 
+	maxSeriesPerQuery := i.limiter.MaxSeriesPerQuery(userID)
+
 	result := &client.QueryResponse{}
 	for ss.Next() {
 		series := ss.At()
 		if sm.IsSharded() && !sm.MatchesLabels(series.Labels()) {
 			continue
+		}
+
+		if maxSeriesPerQuery > 0 && len(result.Timeseries) >= maxSeriesPerQuery {
+			return nil, i.limiter.FormatError(userID, errMaxSeriesPerQueryLimitExceeded)
 		}
 
 		ts := cortexpb.TimeSeries{
@@ -1628,7 +1634,7 @@ func (i *Ingester) QueryStream(req *client.QueryRequest, stream client.Ingester_
 
 	numSamples := 0
 	numSeries := 0
-	numSeries, numSamples, err = i.queryStreamChunks(ctx, db, int64(from), int64(through), matchers, shardMatcher, stream)
+	numSeries, numSamples, err = i.queryStreamChunks(ctx, db, int64(from), int64(through), matchers, shardMatcher, stream, userID)
 
 	if err != nil {
 		return err
@@ -1641,7 +1647,7 @@ func (i *Ingester) QueryStream(req *client.QueryRequest, stream client.Ingester_
 }
 
 // queryStreamChunks streams metrics from a TSDB. This implements the client.IngesterServer interface
-func (i *Ingester) queryStreamChunks(ctx context.Context, db *userTSDB, from, through int64, matchers []*labels.Matcher, sm *storepb.ShardMatcher, stream client.Ingester_QueryStreamServer) (numSeries, numSamples int, _ error) {
+func (i *Ingester) queryStreamChunks(ctx context.Context, db *userTSDB, from, through int64, matchers []*labels.Matcher, sm *storepb.ShardMatcher, stream client.Ingester_QueryStreamServer, userID string) (numSeries, numSamples int, _ error) {
 	q, err := db.ChunkQuerier(ctx, from, through)
 	if err != nil {
 		return 0, 0, err
@@ -1656,11 +1662,16 @@ func (i *Ingester) queryStreamChunks(ctx context.Context, db *userTSDB, from, th
 
 	chunkSeries := make([]client.TimeSeriesChunk, 0, queryStreamBatchSize)
 	batchSizeBytes := 0
+	maxSeriesPerQuery := i.limiter.MaxSeriesPerQuery(userID)
 	for ss.Next() {
 		series := ss.At()
 
 		if sm.IsSharded() && !sm.MatchesLabels(series.Labels()) {
 			continue
+		}
+
+		if maxSeriesPerQuery > 0 && numSeries >= maxSeriesPerQuery {
+			return 0, 0, i.limiter.FormatError(userID, errMaxSeriesPerQueryLimitExceeded)
 		}
 
 		// convert labels to LabelAdapter

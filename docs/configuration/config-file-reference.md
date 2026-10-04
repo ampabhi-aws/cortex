@@ -2616,9 +2616,9 @@ The `limits_config` configures default and per-tenant limits imposed by Cortex s
 
 # The maximum number of series for which a query can fetch samples from each
 # ingester. This limit is enforced only in the ingesters (when querying samples
-# not flushed to the storage yet) and it's a per-instance limit. This limit is
-# ignored when running the Cortex blocks storage. When running Cortex with
-# blocks storage use -querier.max-fetched-series-per-query limit instead.
+# not flushed to the storage yet) and it's a per-instance limit. 0 to disable.
+# In addition to this limit, consider -querier.max-fetched-series-per-query
+# which is enforced in the querier.
 # CLI flag: -ingester.max-series-per-query
 [max_series_per_query: <int> | default = 100000]
 
