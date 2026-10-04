@@ -16,6 +16,7 @@ var (
 	errMaxMetadataPerMetricLimitExceeded = errors.New("per-metric metadata limit exceeded")
 	errMaxSeriesPerUserLimitExceeded     = errors.New("per-user series limit exceeded")
 	errMaxMetadataPerUserLimitExceeded   = errors.New("per-user metric metadata limit exceeded")
+	errMaxSeriesPerQueryLimitExceeded    = errors.New("max series per query limit exceeded")
 )
 
 // RingCount is the interface exposed by a ring implementation which allows
@@ -100,6 +101,19 @@ func (l *Limiter) MaxSeriesPerQuery(userID string) int {
 	return l.limits.MaxSeriesPerQuery(userID)
 }
 
+// AssertMaxSeriesPerQuery returns an error when the already-accumulated series
+// count has reached the configured per-query limit. A limit value of 0 disables
+// the check. This is enforced inside the ingester so that an unbounded result
+// set cannot be materialised in memory before downstream (querier-side) limits
+// get a chance to run.
+func (l *Limiter) AssertMaxSeriesPerQuery(userID string, series int) error {
+	actualLimit := l.limits.MaxSeriesPerQuery(userID)
+	if actualLimit == 0 || series < actualLimit {
+		return nil
+	}
+	return errMaxSeriesPerQueryLimitExceeded
+}
+
 // FormatError returns the input error enriched with the actual limits for the given user.
 // It acts as pass-through if the input error is unknown.
 func (l *Limiter) FormatError(userID string, err error) error {
@@ -112,9 +126,16 @@ func (l *Limiter) FormatError(userID string, err error) error {
 		return l.formatMaxMetadataPerUserError(userID)
 	case errMaxMetadataPerMetricLimitExceeded:
 		return l.formatMaxMetadataPerMetricError(userID)
+	case errMaxSeriesPerQueryLimitExceeded:
+		return l.formatMaxSeriesPerQueryError(userID)
 	default:
 		return err
 	}
+}
+
+func (l *Limiter) formatMaxSeriesPerQueryError(userID string) error {
+	actualLimit := l.limits.MaxSeriesPerQuery(userID)
+	return fmt.Errorf("max series per query limit of %d exceeded, please contact administrator to raise it (-ingester.max-series-per-query)", actualLimit)
 }
 
 func (l *Limiter) formatMaxSeriesPerUserError(userID string) error {
