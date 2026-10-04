@@ -9,6 +9,7 @@ import (
 	"net/http/httptest"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/go-kit/log"
 	"github.com/gorilla/mux"
@@ -399,6 +400,75 @@ rules:
 	for _, tt := range tc {
 		t.Run(tt.name, func(t *testing.T) {
 			// POST
+			req := requestFor(t, http.MethodPost, "https://localhost:8080/api/v1/rules/namespace", strings.NewReader(tt.input), "user1")
+			w := httptest.NewRecorder()
+
+			router.ServeHTTP(w, req)
+			require.Equal(t, tt.status, w.Code)
+			require.Equal(t, tt.output, w.Body.String())
+		})
+	}
+}
+
+func TestRuler_MinRuleEvaluationInterval(t *testing.T) {
+	store := newMockRuleStore(make(map[string]rulespb.RuleGroupList))
+	cfg := defaultRulerConfig(t)
+
+	r := newTestRuler(t, cfg, store, nil)
+	defer services.StopAndAwaitTerminated(context.Background(), r) //nolint:errcheck
+
+	r.limits = ruleLimits{minRuleEvalInterval: 10 * time.Second}
+
+	a := NewAPI(r, r.store, log.NewNopLogger())
+
+	tc := []struct {
+		name   string
+		input  string
+		output string
+		status int
+	}{
+		{
+			name:   "interval below the per-user minimum is rejected",
+			status: 400,
+			input: `
+name: hot
+interval: 1ms
+rules:
+- record: hot:spin
+  expr: up
+`,
+			output: "rule group evaluation interval (actual: 1ms) is below the per-user minimum (limit: 10s)\n",
+		},
+		{
+			name:   "interval at or above the minimum is accepted",
+			status: 202,
+			input: `
+name: ok_interval
+interval: 10s
+rules:
+- record: up_rule
+  expr: up
+`,
+			output: "{\"status\":\"success\",\"data\":null,\"errorType\":\"\",\"error\":\"\"}",
+		},
+		{
+			name:   "omitted interval falls back to the operator default and is accepted",
+			status: 202,
+			input: `
+name: no_interval
+rules:
+- record: up_rule
+  expr: up
+`,
+			output: "{\"status\":\"success\",\"data\":null,\"errorType\":\"\",\"error\":\"\"}",
+		},
+	}
+
+	router := mux.NewRouter()
+	router.Path("/api/v1/rules/{namespace}").Methods("POST").HandlerFunc(a.CreateRuleGroup)
+
+	for _, tt := range tc {
+		t.Run(tt.name, func(t *testing.T) {
 			req := requestFor(t, http.MethodPost, "https://localhost:8080/api/v1/rules/namespace", strings.NewReader(tt.input), "user1")
 			w := httptest.NewRecorder()
 
