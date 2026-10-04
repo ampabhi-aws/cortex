@@ -463,15 +463,25 @@ func shardByAllLabels(userID string, labels []cortexpb.LabelAdapter) uint32 {
 	return h
 }
 
-// Remove the label labelname from a slice of LabelPairs if it exists.
+// Remove all occurrences of the label labelName from a slice of LabelPairs.
+//
+// It is important to strip every occurrence (not just the first one): if a
+// client sends the same label name twice, removing only the first occurrence
+// would leave a surviving copy behind. After the subsequent sort, that lone
+// surviving copy is no longer adjacent to a sibling and the positional
+// duplicate-label check in validation.ValidateLabels would not reject it,
+// which would allow operator policies such as -distributor.drop-label and
+// the HA __replica__ label removal to be bypassed by sending duplicate
+// label names.
 func removeLabel(labelName string, labels *[]cortexpb.LabelAdapter) {
-	for i := 0; i < len(*labels); i++ {
-		pair := (*labels)[i]
-		if pair.Name == labelName {
-			*labels = append((*labels)[:i], (*labels)[i+1:]...)
-			return
+	ls := *labels
+	out := ls[:0]
+	for _, pair := range ls {
+		if pair.Name != labelName {
+			out = append(out, pair)
 		}
 	}
+	*labels = out
 }
 
 // Returns a boolean that indicates whether or not we want to remove the replica label going forward,
@@ -676,8 +686,12 @@ func (d *Distributor) Push(ctx context.Context, req *cortexpb.WriteRequest) (*co
 		// We rely on sorted labels in different places:
 		// 1) When computing token for labels, and sharding by all labels. Here different order of labels returns
 		// different tokens, which is bad.
-		// 2) In validation code, when checking for duplicate label names. As duplicate label names are rejected
-		// later in the validation phase, we ignore them here.
+		// 2) In validation code, when checking for duplicate label names. The duplicate-label check in
+		// validation.ValidateLabels is positional (it compares each label with the previous one after
+		// sorting), so it only rejects duplicates that are still present in ts.Labels at this point.
+		// Any policy-driven mutation above (HA replica removal, drop-label) that removes a label must
+		// therefore remove every occurrence of that label name — otherwise a surviving duplicate would
+		// slip past validation after sorting. removeLabel() enforces this.
 		sortLabelsIfNeeded(ts.Labels)
 
 		// Generate the sharding token based on the series labels without the HA replica
