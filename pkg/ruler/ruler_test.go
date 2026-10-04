@@ -1108,7 +1108,16 @@ func TestRuler_ListAllRules(t *testing.T) {
 	router := mux.NewRouter()
 	router.Path("/ruler/rule_groups").Methods(http.MethodGet).HandlerFunc(r.ListAllRules)
 
-	req := requestFor(t, http.MethodGet, "https://localhost:8080/ruler/rule_groups", nil, "")
+	// Missing X-Scope-OrgID must be rejected: the endpoint is tenant-scoped
+	// and must not leak cross-tenant rule groups to unauthenticated callers.
+	reqNoTenant := httptest.NewRequest(http.MethodGet, "https://localhost:8080/ruler/rule_groups", nil)
+	wNoTenant := httptest.NewRecorder()
+	router.ServeHTTP(wNoTenant, reqNoTenant)
+	require.Equal(t, http.StatusUnauthorized, wNoTenant.Result().StatusCode)
+
+	// A tenant request must only return that tenant's rule groups and must
+	// never contain any other tenant's rule data.
+	req := requestFor(t, http.MethodGet, "https://localhost:8080/ruler/rule_groups", nil, "user1")
 	w := httptest.NewRecorder()
 	router.ServeHTTP(w, req)
 
@@ -1119,9 +1128,9 @@ func TestRuler_ListAllRules(t *testing.T) {
 	require.Equal(t, http.StatusOK, resp.StatusCode)
 	require.Equal(t, "application/yaml", resp.Header.Get("Content-Type"))
 
-	gs := make(map[string]map[string][]rulefmt.RuleGroup) // user:namespace:[]rulefmt.RuleGroup
-	for userID := range mockRules {
-		gs[userID] = mockRules[userID].Formatted()
+	// Response must only include user1's rule groups, scoped to the caller.
+	gs := map[string]map[string][]rulefmt.RuleGroup{
+		"user1": mockRules["user1"].Formatted(),
 	}
 
 	// check for unnecessary fields
@@ -1133,6 +1142,10 @@ func TestRuler_ListAllRules(t *testing.T) {
 	expectedResponse, err := yaml.Marshal(gs)
 	require.NoError(t, err)
 	require.YAMLEq(t, string(expectedResponse), string(body))
+
+	// Explicit cross-tenant isolation: user1's response must not reference
+	// another tenant's identifier at all.
+	require.NotContains(t, string(body), "user2")
 }
 
 type senderFunc func(alerts ...*notifier.Alert)
