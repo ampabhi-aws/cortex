@@ -1323,10 +1323,17 @@ func safeTemplateFilepath(dir, templateName string) (string, error) {
 		return "", err
 	}
 
-	// Ensure the actual path of the template is within the expected directory.
-	// This check is a counter-measure to make sure the tenant is not trying to
-	// escape its own directory on disk.
-	if !strings.HasPrefix(actualPath, containerDir) {
+	// Ensure the actual path of the template is strictly within the expected
+	// directory (i.e. a proper descendant, not the directory itself and not a
+	// sibling that happens to share the same path prefix). We require the
+	// resolved path to begin with containerDir followed by a path separator;
+	// this both anchors the prefix check against sibling-prefix bypasses
+	// (e.g. "../templates-x/evil.tmpl" resolving to "<containerDir>-x/...")
+	// and rejects names such as "." that resolve to containerDir itself
+	// (which would otherwise cause storeTemplateFile to create a regular
+	// file where the templates directory is expected and permanently wedge
+	// subsequent config reloads for the tenant).
+	if actualPath == containerDir || !strings.HasPrefix(actualPath, containerDir+string(os.PathSeparator)) {
 		return "", fmt.Errorf("invalid template name %q: the template filepath is escaping the per-tenant local directory", templateName)
 	}
 
