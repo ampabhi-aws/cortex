@@ -283,10 +283,24 @@ func (am *MultitenantAlertmanager) ListAllConfigs(w http.ResponseWriter, r *http
 		} else if err != nil {
 			return errors.Wrapf(err, "failed to fetch alertmanager config for user %s", userID)
 		}
+
+		// Redact receiver secrets (slack_api_url, routing_key, service_key,
+		// api_key, auth_password, bearer_token, http_config.basic_auth.password,
+		// etc.) before serving the config. We rely on upstream Alertmanager's
+		// Secret/SecretURL YAML marshallers, which emit "<secret>" instead of
+		// the raw value. If the stored config cannot be parsed (e.g. legacy or
+		// malformed), fall back to omitting the raw YAML entirely for that
+		// tenant so secrets are never exposed.
+		redacted, redactErr := redactAlertmanagerConfig(cfg.RawConfig)
+		if redactErr != nil {
+			level.Warn(logger).Log("msg", "failed to parse alertmanager config for redaction; omitting raw config in listing", "user", userID, "err", redactErr)
+			redacted = ""
+		}
+
 		data := map[string]*UserConfig{
 			userID: {
 				TemplateFiles:      alertspb.ParseTemplates(cfg),
-				AlertmanagerConfig: cfg.RawConfig,
+				AlertmanagerConfig: redacted,
 			},
 		}
 
@@ -302,6 +316,27 @@ func (am *MultitenantAlertmanager) ListAllConfigs(w http.ResponseWriter, r *http
 	}
 	close(iter)
 	<-done
+}
+
+// redactAlertmanagerConfig parses a raw tenant-supplied Alertmanager
+// configuration and re-marshals it, which replaces every receiver secret
+// (passwords, API keys, bearer tokens, routing/service keys, Slack webhook
+// URLs, etc.) with the "<secret>" placeholder via upstream Alertmanager's
+// Secret / SecretURL YAML marshallers. The input is kept untouched in the
+// store; only responses served from ListAllConfigs are redacted.
+func redactAlertmanagerConfig(rawCfg string) (string, error) {
+	if rawCfg == "" {
+		return "", nil
+	}
+	amCfg, err := config.Load(rawCfg)
+	if err != nil {
+		return "", err
+	}
+	out, err := yaml.Marshal(amCfg)
+	if err != nil {
+		return "", err
+	}
+	return string(out), nil
 }
 
 // validateAlertmanagerConfig recursively scans the input config looking for data types for which

@@ -187,7 +187,13 @@ func (a *API) RegisterAlertmanager(am *alertmanager.MultitenantAlertmanager, tar
 	a.indexPage.AddLink(SectionAdminEndpoints, "/multitenant_alertmanager/ring", "Alertmanager Ring Status")
 	// Ensure this route is registered before the prefixed AM route
 	a.RegisterRoute("/multitenant_alertmanager/status", am.GetStatusHandler(), false, "GET")
-	a.RegisterRoute("/multitenant_alertmanager/configs", http.HandlerFunc(am.ListAllConfigs), false, "GET")
+	// Require an authenticated (tenant-scoped) context so the admin dump is not
+	// reachable with a single unauthenticated GET. The handler itself streams every
+	// tenant's raw Alertmanager YAML (including receiver secrets); gating it on the
+	// AuthMiddleware forces the request to carry X-Scope-OrgID (or go through the
+	// deployment's authenticating gateway), matching the admin surface used by
+	// /multitenant_alertmanager/delete_tenant_config below.
+	a.RegisterRoute("/multitenant_alertmanager/configs", http.HandlerFunc(am.ListAllConfigs), true, "GET")
 	a.RegisterRoute("/multitenant_alertmanager/ring", http.HandlerFunc(am.RingHandler), false, "GET", "POST")
 	a.RegisterRoute("/multitenant_alertmanager/delete_tenant_config", http.HandlerFunc(am.DeleteUserConfig), true, "POST")
 
