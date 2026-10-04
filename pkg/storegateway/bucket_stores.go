@@ -33,6 +33,7 @@ import (
 
 	"github.com/cortexproject/cortex/pkg/storage/bucket"
 	"github.com/cortexproject/cortex/pkg/storage/tsdb"
+	"github.com/cortexproject/cortex/pkg/tenant"
 	"github.com/cortexproject/cortex/pkg/util/backoff"
 	util_log "github.com/cortexproject/cortex/pkg/util/log"
 	"github.com/cortexproject/cortex/pkg/util/spanlogger"
@@ -276,9 +277,9 @@ func (u *BucketStores) Series(req *storepb.SeriesRequest, srv storepb.Store_Seri
 	spanLog, spanCtx := spanlogger.New(srv.Context(), "BucketStores.Series")
 	defer spanLog.Span.Finish()
 
-	userID := getUserIDFromGRPCContext(spanCtx)
-	if userID == "" {
-		return fmt.Errorf("no userID")
+	userID, err := getUserIDFromGRPCContext(spanCtx)
+	if err != nil {
+		return err
 	}
 
 	store := u.getStore(userID)
@@ -297,9 +298,9 @@ func (u *BucketStores) LabelNames(ctx context.Context, req *storepb.LabelNamesRe
 	spanLog, spanCtx := spanlogger.New(ctx, "BucketStores.LabelNames")
 	defer spanLog.Span.Finish()
 
-	userID := getUserIDFromGRPCContext(spanCtx)
-	if userID == "" {
-		return nil, fmt.Errorf("no userID")
+	userID, err := getUserIDFromGRPCContext(spanCtx)
+	if err != nil {
+		return nil, err
 	}
 
 	store := u.getStore(userID)
@@ -315,9 +316,9 @@ func (u *BucketStores) LabelValues(ctx context.Context, req *storepb.LabelValues
 	spanLog, spanCtx := spanlogger.New(ctx, "BucketStores.LabelValues")
 	defer spanLog.Span.Finish()
 
-	userID := getUserIDFromGRPCContext(spanCtx)
-	if userID == "" {
-		return nil, fmt.Errorf("no userID")
+	userID, err := getUserIDFromGRPCContext(spanCtx)
+	if err != nil {
+		return nil, err
 	}
 
 	store := u.getStore(userID)
@@ -548,18 +549,41 @@ func (u *BucketStores) deleteLocalFilesForExcludedTenants(includeUserIDs map[str
 	}
 }
 
-func getUserIDFromGRPCContext(ctx context.Context) string {
-	meta, ok := metadata.FromIncomingContext(ctx)
-	if !ok {
-		return ""
+// getUserIDFromGRPCContext returns the tenant ID for a store-gateway gRPC
+// request. The tenant is resolved from the authenticated identity injected by
+// the gRPC auth interceptor (middleware.ServerUserHeaderInterceptor, i.e. the
+// "x-scope-orgid" metadata header), NOT from the raw caller-supplied
+// "__org_id__" (tsdb.TenantIDExternalLabel) metadata key.
+//
+// Historically this function only consulted "__org_id__", which is a
+// user-controlled gRPC metadata key no auth interceptor reads, rewrites, or
+// validates. That allowed any client able to dial the store-gateway gRPC port
+// to read another tenant's TSDB block data by supplying any value for
+// "x-scope-orgid" (to satisfy the auth interceptor) and the victim tenant in
+// "__org_id__". The authenticated tenant must be the sole source of truth for
+// which per-tenant BucketStore is served (CWE-639).
+//
+// For defense in depth, when the legacy "__org_id__" metadata key is also
+// present on the incoming request (e.g. appended by the querier at
+// pkg/querier/blocks_store_queryable.go), it must match the authenticated
+// tenant exactly; otherwise the request is rejected.
+func getUserIDFromGRPCContext(ctx context.Context) (string, error) {
+	userID, err := tenant.TenantID(ctx)
+	if err != nil {
+		return "", err
 	}
 
-	values := meta.Get(tsdb.TenantIDExternalLabel)
-	if len(values) != 1 {
-		return ""
+	if meta, ok := metadata.FromIncomingContext(ctx); ok {
+		if values := meta.Get(tsdb.TenantIDExternalLabel); len(values) > 0 {
+			for _, v := range values {
+				if v != userID {
+					return "", fmt.Errorf("tenant ID in %q metadata (%q) does not match authenticated tenant", tsdb.TenantIDExternalLabel, v)
+				}
+			}
+		}
 	}
 
-	return values[0]
+	return userID, nil
 }
 
 // ReplicaLabelRemover is a BaseFetcher modifier modifies external labels of existing blocks, it removes given replica labels from the metadata of blocks that have it.
