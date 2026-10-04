@@ -288,7 +288,27 @@ var (
 	ErrNoRuleGroups = errors.New("no rule groups found")
 	// ErrBadRuleGroup is returned when the provided rule group can not be unmarshalled
 	ErrBadRuleGroup = errors.New("unable to decoded rule group")
+	// ErrInvalidNamespace is returned when the namespace path segment contains
+	// unsafe path characters that could be used to escape the per-tenant directory
+	// (e.g. '/', '\\', '.', '..', or a NUL byte).
+	ErrInvalidNamespace = errors.New("invalid namespace: must not contain path separators or relative path references")
+	// ErrInvalidGroupName is returned when the group name path segment contains
+	// unsafe path characters.
+	ErrInvalidGroupName = errors.New("invalid group name: must not contain path separators or relative path references")
 )
+
+// containsUnsafePathSegments returns true if the string is a relative path
+// reference like '.' or '..', is empty, or contains a path separator ('/',
+// '\\') or a NUL byte. It mirrors pkg/tenant.containsUnsafePathSegments and
+// is used to prevent tenant-controlled URL path segments (namespace, group
+// name) from escaping the per-tenant on-disk directory in filesystem-backed
+// rule stores.
+func containsUnsafePathSegments(s string) bool {
+	if s == "." || s == ".." {
+		return true
+	}
+	return strings.ContainsAny(s, "\\/\x00")
+}
 
 func marshalAndSend(output interface{}, w http.ResponseWriter, logger log.Logger) {
 	d, err := yaml.Marshal(&output)
@@ -336,6 +356,13 @@ func parseNamespace(params map[string]string) (string, error) {
 		return "", err
 	}
 
+	// Reject tenant-controlled namespaces that could be used to escape the
+	// per-tenant directory when the namespace is used as a filesystem path
+	// component (e.g. with the local rule store backend).
+	if containsUnsafePathSegments(namespace) {
+		return "", ErrInvalidNamespace
+	}
+
 	return namespace, nil
 }
 
@@ -350,6 +377,10 @@ func parseGroupName(params map[string]string) (string, error) {
 	groupName, err := url.PathUnescape(groupName)
 	if err != nil {
 		return "", err
+	}
+
+	if containsUnsafePathSegments(groupName) {
+		return "", ErrInvalidGroupName
 	}
 
 	return groupName, nil
