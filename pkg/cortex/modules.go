@@ -302,17 +302,26 @@ func (t *Cortex) initQuerier() (serv services.Service, err error) {
 	)
 
 	// If the querier is running standalone without the query-frontend or query-scheduler, we must register it's internal
-	// HTTP handler externally and provide the external Cortex Server HTTP handler to the frontend worker
-	// to ensure requests it processes use the default middleware instrumentation.
+	// HTTP handler externally (so that operators can hit the Prometheus API directly on the querier) but we must NOT
+	// hand the full external router (which includes unauthenticated admin routes such as /config, /ingester/ring,
+	// /memberlist, /services and /debug/*) to the httpgrpc frontend/scheduler worker. The httpgrpc server reconstructs
+	// an attacker-defined http.Request from the protobuf and dispatches it in-process via httptest.NewRecorder, which
+	// bypasses every network ACL, gateway and TLS policy protecting the querier's HTTP port. The worker must therefore
+	// receive only the narrow Prometheus querier handler, wrapped with the same auth/tracing/header middleware as the
+	// non-standalone branch.
 	if !t.Cfg.isModuleEnabled(QueryFrontend) && !t.Cfg.isModuleEnabled(QueryScheduler) && !t.Cfg.isModuleEnabled(All) {
-		// First, register the internal querier handler with the external HTTP server
+		// Register the internal querier handler with the external HTTP server so operators can still
+		// query the standalone querier directly over its HTTP port (with the server's default middleware
+		// instrumentation applied by t.Server.HTTPServer).
 		t.API.RegisterQueryAPI(internalQuerierRouter)
+	}
 
-		// Second, set the http.Handler that the frontend worker will use to process requests to point to
-		// the external HTTP server. This will allow the querier to consolidate query metrics both external
-		// and internal using the default instrumentation when running as a standalone service.
-		internalQuerierRouter = t.Server.HTTPServer.Handler
-	} else {
+	// For both standalone and non-standalone modes, when a frontend/scheduler worker is configured we must
+	// hand it a handler restricted to the Prometheus querier routes only (never t.Server.HTTPServer.Handler),
+	// wrapped with the auth middleware so the tenant ID is parsed from X-Scope-OrgID. This prevents the
+	// auth-exempt scheduler/frontend gRPC channel from being used to invoke arbitrary routes on the querier
+	// (including admin routes registered with auth=false) via httpgrpc.Server.Handle.
+	if t.Cfg.isModuleEnabled(QueryFrontend) || t.Cfg.isModuleEnabled(QueryScheduler) || t.Cfg.isModuleEnabled(All) {
 		// Single binary mode requires a query frontend endpoint for the worker. If no frontend and scheduler endpoint
 		// is configured, Cortex will default to using frontend on localhost on it's own GRPC listening port.
 		if t.Cfg.Worker.FrontendAddress == "" && t.Cfg.Worker.SchedulerAddress == "" {
@@ -320,20 +329,21 @@ func (t *Cortex) initQuerier() (serv services.Service, err error) {
 			level.Warn(util_log.Logger).Log("msg", "Worker address is empty in single binary mode.  Attempting automatic worker configuration.  If queries are unresponsive consider configuring the worker explicitly.", "address", address)
 			t.Cfg.Worker.FrontendAddress = address
 		}
+	}
 
-		// Add a middleware to extract the trace context and add a header.
-		internalQuerierRouter = nethttp.MiddlewareFunc(opentracing.GlobalTracer(), internalQuerierRouter.ServeHTTP, nethttp.OperationNameFunc(func(r *http.Request) string {
-			return "internalQuerier"
-		}))
+	// Add a middleware to extract the trace context and add a header.
+	internalQuerierRouter = nethttp.MiddlewareFunc(opentracing.GlobalTracer(), internalQuerierRouter.ServeHTTP, nethttp.OperationNameFunc(func(r *http.Request) string {
+		return "internalQuerier"
+	}))
 
-		// If queries are processed using the external HTTP Server, we need wrap the internal querier with
-		// HTTP router with middleware to parse the tenant ID from the HTTP header and inject it into the
-		// request context.
-		internalQuerierRouter = t.API.AuthMiddleware.Wrap(internalQuerierRouter)
+	// Wrap the internal querier with middleware that parses the tenant ID from the HTTP header and injects
+	// it into the request context. This is required for every path into the querier worker — including the
+	// standalone case — because without it the httpgrpc dispatch (which is auth-exempt at the gRPC layer)
+	// would otherwise reach the Prometheus API without a resolved tenant.
+	internalQuerierRouter = t.API.AuthMiddleware.Wrap(internalQuerierRouter)
 
-		if len(t.Cfg.API.HTTPRequestHeadersToLog) > 0 {
-			internalQuerierRouter = t.API.HTTPHeaderMiddleware.Wrap(internalQuerierRouter)
-		}
+	if len(t.Cfg.API.HTTPRequestHeadersToLog) > 0 {
+		internalQuerierRouter = t.API.HTTPHeaderMiddleware.Wrap(internalQuerierRouter)
 	}
 
 	// If neither frontend address or scheduler address is configured, no worker is needed.
