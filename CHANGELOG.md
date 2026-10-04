@@ -2,6 +2,8 @@
 
 ## master / unreleased
 
+* [BUGFIX / SECURITY] configs: the (deprecated) `configs` module no longer attaches its HTTP routes directly to the raw server mux - every route, including the cross-tenant `/private/api/prom/configs/{rules,alertmanager}` endpoints used by the `configdb` ruler/alertmanager stores, is now wired through the standard HTTP auth middleware, and the `getConfigs` handler itself rejects requests that do not carry an `X-Scope-OrgID` header. This closes an unauthenticated cross-tenant configuration dump that previously allowed any caller reaching the configs listener to retrieve every tenant's recording/alerting rules and raw Alertmanager YAML (including receiver credentials). The internal `pkg/configs/client` consumer now sends a sentinel `X-Scope-OrgID: __cortex_configs__` header so that the configdb polling path continues to work with the new authentication requirement.
+
   **This release removes support for chunks storage. See below for more.**
 * [CHANGE] Remove support for chunks storage entirely. If you are using chunks storage on a previous version, you must [migrate your data](https://github.com/cortexproject/cortex/blob/v1.11.1/docs/blocks-storage/migrate-from-chunks-to-blocks.md) on version 1.12 or earlier. Before upgrading to this release, you should also remove any deprecated chunks-related configuration, as this release will no longer accept that. The following flags are gone:
   - `-dynamodb.*`

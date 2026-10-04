@@ -591,7 +591,14 @@ func (t *Cortex) initConfig() (serv services.Service, err error) {
 	}
 
 	t.ConfigAPI = configAPI.New(t.ConfigDB, t.Cfg.Configs.API)
-	t.ConfigAPI.RegisterRoutes(t.Server.HTTP)
+	// Register the configs API routes via t.API.RegisterConfigAPI (not directly
+	// on t.Server.HTTP) so that every route - including the cross-tenant
+	// /private/... endpoints used by the configdb ruler/alertmanager stores -
+	// is wrapped by the configured HTTP auth middleware. Attaching the routes
+	// to the raw server mux (as this previously did) bypassed authentication
+	// entirely and allowed anonymous callers to dump every tenant's
+	// Alertmanager configuration and recording/alerting rules.
+	t.API.RegisterConfigAPI(t.ConfigAPI)
 	return services.NewIdleService(nil, func(_ error) error {
 		t.ConfigDB.Close()
 		return nil
