@@ -170,6 +170,12 @@ func (s *Scheduler) FrontendLoop(frontend schedulerpb.SchedulerForFrontend_Front
 	}
 	defer s.frontendDisconnected(frontendAddress)
 
+	// Per-connection ownership table of query IDs enqueued on this stream.
+	// CANCEL is only honored for query IDs that this specific connection enqueued,
+	// so a peer that merely claims the same self-asserted FrontendAddress cannot
+	// cancel another stream's requests (CWE-283: Unverified Ownership).
+	ownedQueryIDs := map[uint64]struct{}{}
+
 	// Response to INIT. If scheduler is not running, we skip for-loop, send SHUTTING_DOWN and exit this method.
 	if s.State() == services.Running {
 		if err := frontend.Send(&schedulerpb.SchedulerToFrontend{Status: schedulerpb.OK}); err != nil {
@@ -200,6 +206,8 @@ func (s *Scheduler) FrontendLoop(frontend schedulerpb.SchedulerForFrontend_Front
 			err = s.enqueueRequest(frontendCtx, frontendAddress, msg)
 			switch {
 			case err == nil:
+				// Record ownership so a later CANCEL on this same stream is honored.
+				ownedQueryIDs[msg.QueryID] = struct{}{}
 				resp = &schedulerpb.SchedulerToFrontend{Status: schedulerpb.OK}
 			case err == queue.ErrTooManyRequests:
 				resp = &schedulerpb.SchedulerToFrontend{Status: schedulerpb.TOO_MANY_REQUESTS_PER_TENANT}
@@ -208,7 +216,16 @@ func (s *Scheduler) FrontendLoop(frontend schedulerpb.SchedulerForFrontend_Front
 			}
 
 		case schedulerpb.CANCEL:
-			s.cancelRequestAndRemoveFromPending(frontendAddress, msg.QueryID)
+			// Only honor CANCEL for query IDs enqueued on THIS connection.
+			// Replies OK unconditionally to preserve the existing wire contract
+			// (clients treat CANCEL as fire-and-forget), but silently ignore
+			// cancellation requests for queries not owned by this stream.
+			if _, owned := ownedQueryIDs[msg.QueryID]; owned {
+				s.cancelRequestAndRemoveFromPending(frontendAddress, msg.QueryID)
+				delete(ownedQueryIDs, msg.QueryID)
+			} else {
+				level.Warn(s.log).Log("msg", "ignoring CANCEL for query not enqueued on this connection", "addr", frontendAddress, "queryID", msg.QueryID)
+			}
 			resp = &schedulerpb.SchedulerToFrontend{Status: schedulerpb.OK}
 
 		default:
@@ -257,6 +274,12 @@ func (s *Scheduler) frontendDisconnected(frontendAddress string) {
 	defer s.connectedFrontendsMu.Unlock()
 
 	cf := s.connectedFrontends[frontendAddress]
+	// Guard against a missing map entry (e.g. if frontendConnected failed to
+	// register this address or the entry was already cleaned up): without this
+	// check, dereferencing cf would panic.
+	if cf == nil {
+		return
+	}
 	cf.connections--
 	if cf.connections == 0 {
 		delete(s.connectedFrontends, frontendAddress)
