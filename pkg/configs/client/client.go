@@ -27,6 +27,13 @@ var (
 	errBadURL = errors.New("configs_api_url is not set or valid")
 )
 
+// internalTenantID is sent on the X-Scope-OrgID header by the configdb
+// polling client when it fetches the cross-tenant /private/... endpoints.
+// The configs server does not treat this value as privileged; it is only
+// used to satisfy the tenant-ID presence check that stops the private
+// endpoints from being queryable by anonymous callers.
+const internalTenantID = "__cortex_configs__"
+
 // Config says where we can find the ruler userconfig.
 type Config struct {
 	ConfigsAPIURL flagext.URLValue     `yaml:"configs_api_url"`
@@ -142,6 +149,14 @@ func doRequest(endpoint string, timeout time.Duration, tlsConfig *tls.Config, si
 	}
 
 	req.Header.Set("User-Agent", fmt.Sprintf("Cortex/%s", version.Version))
+	// The configs server's /private/... endpoints require an X-Scope-OrgID
+	// header so that they cannot be dumped by anonymous callers reaching the
+	// HTTP listener. The internal configdb polling client is not acting on
+	// behalf of a particular end tenant - it legitimately needs every tenant
+	// in a single response - so we send a stable sentinel org ID that the
+	// configs server does not special-case but which satisfies the tenant
+	// extraction check.
+	req.Header.Set("X-Scope-OrgID", internalTenantID)
 
 	resp, err := client.Do(req)
 	if err != nil {

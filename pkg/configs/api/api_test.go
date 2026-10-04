@@ -143,13 +143,25 @@ func Test_PostConfig_MultipleUsers(t *testing.T) {
 	}
 }
 
+// Private endpoints reject anonymous requests to prevent unauthenticated,
+// cross-tenant configuration disclosure.
+func Test_GetAllConfigs_Anonymous(t *testing.T) {
+	setup(t)
+	defer cleanup(t)
+
+	for _, c := range allClients {
+		w := request(t, "GET", c.PrivateEndpoint, nil)
+		assert.Equal(t, http.StatusUnauthorized, w.Code)
+	}
+}
+
 // GetAllConfigs returns an empty list of configs if there aren't any.
 func Test_GetAllConfigs_Empty(t *testing.T) {
 	setup(t)
 	defer cleanup(t)
 
 	for _, c := range allClients {
-		w := request(t, "GET", c.PrivateEndpoint, nil)
+		w := requestAsUser(t, makeUserID(), "GET", c.PrivateEndpoint, "", nil)
 		assert.Equal(t, http.StatusOK, w.Code)
 		var found ConfigsView
 		err := json.Unmarshal(w.Body.Bytes(), &found)
@@ -168,7 +180,7 @@ func Test_GetAllConfigs(t *testing.T) {
 
 	for _, c := range allClients {
 		view := c.post(t, userID, config)
-		w := request(t, "GET", c.PrivateEndpoint, nil)
+		w := requestAsUser(t, makeUserID(), "GET", c.PrivateEndpoint, "", nil)
 		assert.Equal(t, http.StatusOK, w.Code)
 		var found ConfigsView
 		err := json.Unmarshal(w.Body.Bytes(), &found)
@@ -191,7 +203,7 @@ func Test_GetAllConfigs_Newest(t *testing.T) {
 		c.post(t, userID, makeConfig())
 		lastCreated := c.post(t, userID, makeConfig())
 
-		w := request(t, "GET", c.PrivateEndpoint, nil)
+		w := requestAsUser(t, makeUserID(), "GET", c.PrivateEndpoint, "", nil)
 		assert.Equal(t, http.StatusOK, w.Code)
 		var found ConfigsView
 		err := json.Unmarshal(w.Body.Bytes(), &found)
@@ -212,7 +224,7 @@ func Test_GetConfigs_IncludesNewerConfigsAndExcludesOlder(t *testing.T) {
 		userID3 := makeUserID()
 		config3 := c.post(t, userID3, makeConfig())
 
-		w := request(t, "GET", fmt.Sprintf("%s?since=%d", c.PrivateEndpoint, config2.ID), nil)
+		w := requestAsUser(t, makeUserID(), "GET", fmt.Sprintf("%s?since=%d", c.PrivateEndpoint, config2.ID), "", nil)
 		assert.Equal(t, http.StatusOK, w.Code)
 		var found ConfigsView
 		err := json.Unmarshal(w.Body.Bytes(), &found)

@@ -68,6 +68,36 @@ func New(database db.DB, cfg Config) *API {
 	return a
 }
 
+// AdminHandler returns the handler for the configs admin landing page.
+func (a *API) AdminHandler() http.Handler { return http.HandlerFunc(a.admin) }
+
+// GetConfigHandler returns the handler for the tenant-scoped get-config route.
+func (a *API) GetConfigHandler() http.Handler { return http.HandlerFunc(a.getConfig) }
+
+// SetConfigHandler returns the handler for the tenant-scoped set-config route.
+func (a *API) SetConfigHandler() http.Handler { return http.HandlerFunc(a.setConfig) }
+
+// ValidateAlertmanagerConfigHandler returns the handler for the Alertmanager
+// config validation route.
+func (a *API) ValidateAlertmanagerConfigHandler() http.Handler {
+	return http.HandlerFunc(a.validateAlertmanagerConfig)
+}
+
+// DeactivateConfigHandler returns the handler for the tenant-scoped
+// deactivate-config route.
+func (a *API) DeactivateConfigHandler() http.Handler {
+	return http.HandlerFunc(a.deactivateConfig)
+}
+
+// RestoreConfigHandler returns the handler for the tenant-scoped
+// restore-config route.
+func (a *API) RestoreConfigHandler() http.Handler { return http.HandlerFunc(a.restoreConfig) }
+
+// GetConfigsHandler returns the handler for the (cross-tenant) /private/...
+// configs endpoints. Callers must ensure the handler is protected by HTTP auth
+// middleware before exposing it on a listener: see pkg/api.API.RegisterConfigAPI.
+func (a *API) GetConfigsHandler() http.Handler { return http.HandlerFunc(a.getConfigs) }
+
 func (a *API) admin(w http.ResponseWriter, r *http.Request) {
 	w.Header().Add("Content-Type", "text/html")
 	fmt.Fprintf(w, `
@@ -82,6 +112,13 @@ func (a *API) admin(w http.ResponseWriter, r *http.Request) {
 }
 
 // RegisterRoutes registers the configs API HTTP routes with the provided Router.
+//
+// Note: callers that want HTTP auth middleware to wrap these routes should
+// instead use pkg/api.API.RegisterConfigAPI, which wires each route through
+// pkg/api.API.RegisterRoute so that the configured auth middleware applies.
+// Attaching the routes directly to the raw server mux (as this method does)
+// does not apply any middleware, so the /private/... cross-tenant endpoints
+// are only safe to expose through this method inside tests.
 func (a *API) RegisterRoutes(r *mux.Router) {
 	for _, route := range []struct {
 		name, method, path string
@@ -263,10 +300,27 @@ type ConfigsView struct {
 	Configs map[string]userconfig.View `json:"configs"`
 }
 
+// getConfigs returns configurations for all tenants, or configurations that
+// have changed since the given config ID when the since parameter is
+// provided. It is used by the (deprecated) configdb-backed ruler and
+// alertmanager stores to poll the configs service. Because the response is
+// cross-tenant, it must be protected by HTTP auth middleware: the routes are
+// registered via api.RegisterRoute with auth=true in pkg/cortex/modules.go
+// so that this handler can only be reached by callers that have passed the
+// operator-configured HTTP authentication policy. We additionally require a
+// non-empty tenant ID on the inbound request as a belt-and-braces check,
+// which protects against regressions that would otherwise re-expose the
+// unauthenticated cross-tenant dump through the raw server mux.
 func (a *API) getConfigs(w http.ResponseWriter, r *http.Request) {
+	logger := util_log.WithContext(r.Context(), util_log.Logger)
+
+	if _, _, err := tenant.ExtractTenantIDFromHTTPRequest(r); err != nil {
+		http.Error(w, err.Error(), http.StatusUnauthorized)
+		return
+	}
+
 	var cfgs map[string]userconfig.View
 	var cfgErr error
-	logger := util_log.WithContext(r.Context(), util_log.Logger)
 	rawSince := r.FormValue("since")
 	if rawSince == "" {
 		cfgs, cfgErr = a.db.GetAllConfigs(r.Context())

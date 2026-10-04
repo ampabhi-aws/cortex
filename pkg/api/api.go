@@ -280,6 +280,49 @@ func (a *API) RegisterTenantDeletion(api *purger.TenantDeletionAPI) {
 	a.RegisterRoute("/purger/delete_tenant_status", http.HandlerFunc(api.DeleteTenantStatus), true, "GET")
 }
 
+// ConfigAPI is the minimal interface the api package needs from pkg/configs/api
+// to wire the (deprecated) configs service's HTTP routes through RegisterRoute
+// so that they are subject to the configured HTTP auth middleware. Keeping it
+// as an interface here avoids introducing an import cycle between pkg/api and
+// pkg/configs/api.
+type ConfigAPI interface {
+	AdminHandler() http.Handler
+	GetConfigHandler() http.Handler
+	SetConfigHandler() http.Handler
+	ValidateAlertmanagerConfigHandler() http.Handler
+	DeactivateConfigHandler() http.Handler
+	RestoreConfigHandler() http.Handler
+	GetConfigsHandler() http.Handler
+}
+
+// RegisterConfigAPI registers the (deprecated) configs service HTTP routes.
+// Every route - including the cross-tenant /private/... endpoints that were
+// historically attached directly to the raw server mux - goes through
+// RegisterRoute so that the operator-supplied HTTP auth middleware (or the
+// default middleware.AuthenticateUser) wraps the handler. This closes the
+// unauthenticated cross-tenant configuration dump that bypassed middleware
+// when the configs API registered itself directly on t.Server.HTTP.
+func (a *API) RegisterConfigAPI(c ConfigAPI) {
+	a.RegisterRoute("/", c.AdminHandler(), false, "GET")
+
+	// Dedicated APIs for updating rules config.
+	a.RegisterRoute("/api/prom/configs/rules", c.GetConfigHandler(), true, "GET")
+	a.RegisterRoute("/api/prom/configs/rules", c.SetConfigHandler(), true, "POST")
+	a.RegisterRoute("/api/prom/configs/templates", c.GetConfigHandler(), true, "GET")
+	a.RegisterRoute("/api/prom/configs/templates", c.SetConfigHandler(), true, "POST")
+	a.RegisterRoute("/api/prom/configs/alertmanager", c.GetConfigHandler(), true, "GET")
+	a.RegisterRoute("/api/prom/configs/alertmanager", c.SetConfigHandler(), true, "POST")
+	a.RegisterRoute("/api/prom/configs/alertmanager/validate", c.ValidateAlertmanagerConfigHandler(), true, "POST")
+	a.RegisterRoute("/api/prom/configs/deactivate", c.DeactivateConfigHandler(), true, "DELETE")
+	a.RegisterRoute("/api/prom/configs/restore", c.RestoreConfigHandler(), true, "POST")
+
+	// Internal APIs. These historically bypassed the HTTP auth middleware; now
+	// they are wrapped like every other authenticated route to prevent anonymous
+	// cross-tenant configuration disclosure.
+	a.RegisterRoute("/private/api/prom/configs/rules", c.GetConfigsHandler(), true, "GET")
+	a.RegisterRoute("/private/api/prom/configs/alertmanager", c.GetConfigsHandler(), true, "GET")
+}
+
 // RegisterRuler registers routes associated with the Ruler service.
 func (a *API) RegisterRuler(r *ruler.Ruler) {
 	a.indexPage.AddLink(SectionAdminEndpoints, "/ruler/ring", "Ruler Ring Status")
