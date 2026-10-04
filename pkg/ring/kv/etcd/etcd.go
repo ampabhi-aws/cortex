@@ -83,6 +83,13 @@ func New(cfg Config, codec codec.Codec, logger log.Logger) (*Client, error) {
 	if err != nil {
 		return nil, errors.Wrapf(err, "unable to initialise TLS configuration for etcd")
 	}
+
+	// Warn when a password would be transmitted to etcd without TLS. etcd
+	// client v3 sends Username/Password to the Auth/Authenticate RPC over
+	// the established gRPC connection; if TLS is disabled this is plaintext.
+	if cfg.Password != "" && !cfg.EnableTLS {
+		level.Warn(logger).Log("msg", "etcd password configured but TLS is disabled; credentials will be transmitted in cleartext. Set -<prefix>etcd.tls-enabled=true (and the -<prefix>etcd.tls-* flags) to enable TLS.")
+	}
 	cli, err := clientv3.New(clientv3.Config{
 		Endpoints:   cfg.Endpoints,
 		DialTimeout: cfg.DialTimeout,
