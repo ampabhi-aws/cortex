@@ -230,9 +230,31 @@ func (a *API) RegisterRuntimeConfig(runtimeConfigHandler http.HandlerFunc) {
 	a.RegisterRoute("/runtime_config", runtimeConfigHandler, false, "GET")
 }
 
+// distributorPushServer is a thin wrapper around *distributor.Distributor that
+// neutralises the client-controllable WriteRequest.SkipLabelNameValidation
+// field before delegating to the real Push implementation. This mirrors the
+// behaviour of the HTTP remote-write handler (see pkg/util/push/push.go) and
+// ensures the operator-only distributor.Config.SkipLabelNameValidation setting
+// is the only way to disable label-name validation when the gRPC service is
+// exposed on the network.
+type distributorPushServer struct {
+	*distributor.Distributor
+}
+
+// Push implements distributorpb.DistributorServer by stripping the
+// SkipLabelNameValidation request field (which is set by the caller and must
+// not influence a security-relevant decision on the server) and then
+// delegating to the embedded *distributor.Distributor.
+func (s distributorPushServer) Push(ctx context.Context, req *cortexpb.WriteRequest) (*cortexpb.WriteResponse, error) {
+	if req != nil {
+		req.SkipLabelNameValidation = false
+	}
+	return s.Distributor.Push(ctx, req)
+}
+
 // RegisterDistributor registers the endpoints associated with the distributor.
 func (a *API) RegisterDistributor(d *distributor.Distributor, pushConfig distributor.Config) {
-	distributorpb.RegisterDistributorServer(a.server.GRPC, d)
+	distributorpb.RegisterDistributorServer(a.server.GRPC, distributorPushServer{Distributor: d})
 
 	a.RegisterRoute("/api/v1/push", push.Handler(pushConfig.MaxRecvMsgSize, a.sourceIPs, a.cfg.wrapDistributorPush(d)), true, "POST")
 
