@@ -51,7 +51,7 @@ func NewShuffleShardingPlanner(
 	}
 }
 
-func (p *ShuffleShardingPlanner) Plan(_ context.Context, metasByMinTime []*metadata.Meta) ([]*metadata.Meta, error) {
+func (p *ShuffleShardingPlanner) Plan(ctx context.Context, metasByMinTime []*metadata.Meta) ([]*metadata.Meta, error) {
 	// Ensure all blocks fits within the largest range. This is a double check
 	// to ensure there's no bug in the previous blocks grouping, given this Plan()
 	// is just a pass-through.
@@ -72,7 +72,7 @@ func (p *ShuffleShardingPlanner) Plan(_ context.Context, metasByMinTime []*metad
 			return nil, fmt.Errorf("block %s with time range %d:%d is outside the largest expected range %d:%d", blockID, b.MinTime, b.MaxTime, rangeStart, rangeEnd)
 		}
 
-		blockVisitMarker, err := ReadBlockVisitMarker(p.ctx, p.bkt, p.logger, blockID, p.blockVisitMarkerReadFailed)
+		blockVisitMarker, err := ReadBlockVisitMarker(ctx, p.bkt, p.logger, blockID, p.blockVisitMarkerReadFailed)
 		if err != nil {
 			// shuffle_sharding_grouper should put visit marker file for blocks ready for
 			// compaction. So error should be returned if visit marker file does not exist.
@@ -89,7 +89,21 @@ func (p *ShuffleShardingPlanner) Plan(_ context.Context, metasByMinTime []*metad
 		return nil, nil
 	}
 
-	go markBlocksVisitedHeartBeat(p.ctx, p.bkt, p.logger, resultMetas, p.ringLifecyclerID, p.blockVisitMarkerFileUpdateInterval, p.blockVisitMarkerWriteFailed)
+	// Start a block visit-marker heartbeat scoped to BOTH the per-group work
+	// context handed in by Thanos AND the planner's own context. This ensures
+	// the heartbeat goroutine is reliably cancelled when either the per-group
+	// work ends or the compactor shuts down, rather than being leaked and left
+	// to re-upload visit-marker objects for the remainder of the tenant's
+	// compaction run.
+	heartbeatCtx, cancelHeartbeat := context.WithCancel(ctx)
+	go func() {
+		select {
+		case <-p.ctx.Done():
+			cancelHeartbeat()
+		case <-heartbeatCtx.Done():
+		}
+	}()
+	go markBlocksVisitedHeartBeat(heartbeatCtx, p.bkt, p.logger, resultMetas, p.ringLifecyclerID, p.blockVisitMarkerFileUpdateInterval, p.blockVisitMarkerWriteFailed)
 
 	return resultMetas, nil
 }
