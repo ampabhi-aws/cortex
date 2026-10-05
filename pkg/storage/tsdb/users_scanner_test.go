@@ -31,21 +31,28 @@ func TestUsersScanner_ScanUsers_ShouldReturnedOwnedUsersOnly(t *testing.T) {
 
 }
 
-func TestUsersScanner_ScanUsers_ShouldReturnUsersForWhichOwnerCheckOrTenantDeletionCheckFailed(t *testing.T) {
-	expected := []string{"user-1", "user-2"}
-
+func TestUsersScanner_ScanUsers_ShouldSkipUsersForWhichOwnerCheckOrTenantDeletionCheckFailed(t *testing.T) {
+	// The scanner must fail closed on ownership or tenant-deletion-mark errors so that the
+	// compactor's blocks cleaner does not run destructive cleanup for a tenant whose
+	// ownership (or deletion state) could not be determined on this replica.
 	bucketClient := &bucket.ClientMock{}
-	bucketClient.MockIter("", expected, nil)
+	bucketClient.MockIter("", []string{"user-1", "user-2", "user-3"}, nil)
 	bucketClient.MockExists(path.Join("user-1", TenantDeletionMarkPath), false, nil)
-	bucketClient.MockExists(path.Join("user-2", TenantDeletionMarkPath), false, errors.New("fail"))
+	bucketClient.MockExists(path.Join("user-3", TenantDeletionMarkPath), false, errors.New("fail"))
 
 	isOwned := func(userID string) (bool, error) {
-		return false, errors.New("failed to check if user is owned")
+		if userID == "user-2" {
+			return false, errors.New("failed to check if user is owned")
+		}
+		return true, nil
 	}
 
 	s := NewUsersScanner(bucketClient, isOwned, log.NewNopLogger())
 	actual, deleted, err := s.ScanUsers(context.Background())
 	require.NoError(t, err)
-	assert.Equal(t, expected, actual)
+	// user-1 has no errors and is owned -> returned.
+	// user-2 fails the ownership check -> skipped.
+	// user-3 fails the deletion-mark check -> skipped.
+	assert.Equal(t, []string{"user-1"}, actual)
 	assert.Empty(t, deleted)
 }
