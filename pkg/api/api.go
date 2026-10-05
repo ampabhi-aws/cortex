@@ -18,6 +18,7 @@ import (
 	"github.com/cortexproject/cortex/pkg/alertmanager"
 	"github.com/cortexproject/cortex/pkg/alertmanager/alertmanagerpb"
 	"github.com/cortexproject/cortex/pkg/compactor"
+	configAPI "github.com/cortexproject/cortex/pkg/configs/api"
 	"github.com/cortexproject/cortex/pkg/cortexpb"
 	"github.com/cortexproject/cortex/pkg/distributor"
 	"github.com/cortexproject/cortex/pkg/distributor/distributorpb"
@@ -278,6 +279,20 @@ func (a *API) RegisterIngester(i Ingester, pushConfig distributor.Config) {
 func (a *API) RegisterTenantDeletion(api *purger.TenantDeletionAPI) {
 	a.RegisterRoute("/purger/delete_tenant", http.HandlerFunc(api.DeleteTenant), true, "POST")
 	a.RegisterRoute("/purger/delete_tenant_status", http.HandlerFunc(api.DeleteTenantStatus), true, "GET")
+}
+
+// RegisterConfigAPI registers the legacy configs API routes on the shared
+// Cortex HTTP server, routing each handler through API.RegisterRoute so that
+// the central authentication middleware chain and the shared route inventory
+// (auth=true vs auth=false logging) are applied uniformly. This replaces
+// the historical pattern of handing the raw gorilla mux to
+// configAPI.API.RegisterRoutes, which registered handlers directly on the
+// router and silently bypassed a.AuthMiddleware for every configs route
+// including the all-tenant /private/* endpoints.
+func (a *API) RegisterConfigAPI(c *configAPI.API) {
+	for _, route := range c.Routes() {
+		a.RegisterRoute(route.Path, route.Handler, route.Authenticated, route.Method)
+	}
 }
 
 // RegisterRuler registers routes associated with the Ruler service.
