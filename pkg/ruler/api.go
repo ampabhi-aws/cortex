@@ -447,8 +447,13 @@ func (a *API) CreateRuleGroup(w http.ResponseWriter, req *http.Request) {
 		return
 	}
 
-	payload, err := io.ReadAll(req.Body)
+	payload, err := io.ReadAll(maxBytesReader(w, req.Body, a.ruler.cfg.APIMaxRuleGroupSize))
 	if err != nil {
+		if isRequestBodyTooLarge(err) {
+			level.Warn(logger).Log("msg", "rule group payload too large", "err", err.Error(), "user", userID, "limit", a.ruler.cfg.APIMaxRuleGroupSize)
+			http.Error(w, err.Error(), http.StatusRequestEntityTooLarge)
+			return
+		}
 		level.Error(logger).Log("msg", "unable to read rule group payload", "err", err.Error())
 		http.Error(w, err.Error(), http.StatusBadRequest)
 		return
@@ -550,4 +555,25 @@ func (a *API) DeleteRuleGroup(w http.ResponseWriter, req *http.Request) {
 	}
 
 	respondAccepted(w, logger)
+}
+
+// maxBytesReader wraps req.Body with http.MaxBytesReader when a positive
+// limit is configured. A limit of zero or negative disables the cap.
+func maxBytesReader(w http.ResponseWriter, body io.ReadCloser, limit int64) io.Reader {
+	if limit <= 0 {
+		return body
+	}
+	return http.MaxBytesReader(w, body, limit)
+}
+
+// isRequestBodyTooLarge reports whether err originates from
+// http.MaxBytesReader rejecting an oversize request body. The sentinel error
+// used by net/http is unexported and its concrete type (http.MaxBytesError)
+// was only introduced in Go 1.19, so we match on the stable error message
+// to support older Go toolchains as well.
+func isRequestBodyTooLarge(err error) bool {
+	if err == nil {
+		return false
+	}
+	return strings.Contains(err.Error(), "request body too large")
 }

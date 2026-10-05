@@ -123,6 +123,12 @@ type Config struct {
 
 	EnableQueryStats      bool `yaml:"query_stats_enabled"`
 	DisableRuleGroupLabel bool `yaml:"disable_rule_group_label"`
+
+	// APIMaxRuleGroupSize caps the maximum rule-group YAML payload (in bytes)
+	// accepted by the ruler's configuration API, protecting the process from
+	// unbounded memory allocation when parsing a tenant-supplied rule group.
+	// A value <= 0 disables the limit (not recommended).
+	APIMaxRuleGroupSize int64 `yaml:"api_max_rule_group_size"`
 }
 
 // Validate config and returns error on failure
@@ -174,6 +180,7 @@ func (cfg *Config) RegisterFlags(f *flag.FlagSet) {
 	f.DurationVar(&cfg.FlushCheckPeriod, "ruler.flush-period", 1*time.Minute, "Period with which to attempt to flush rule groups.")
 	f.StringVar(&cfg.RulePath, "ruler.rule-path", "/rules", "file path to store temporary rule files for the prometheus rule managers")
 	f.BoolVar(&cfg.EnableAPI, "experimental.ruler.enable-api", false, "Enable the ruler api")
+	f.Int64Var(&cfg.APIMaxRuleGroupSize, "ruler.api-max-rule-group-size", 10*1024*1024, "Maximum size, in bytes, of a rule group YAML payload accepted by the ruler configuration API (POST /api/v1/rules/{namespace}). Protects the ruler from unbounded memory allocation when parsing a tenant-supplied rule group. 0 to disable.")
 	f.DurationVar(&cfg.OutageTolerance, "ruler.for-outage-tolerance", time.Hour, `Max time to tolerate outage for restoring "for" state of alert.`)
 	f.DurationVar(&cfg.ForGracePeriod, "ruler.for-grace-period", 10*time.Minute, `Minimum duration between alert and restored "for" state. This is maintained only for alerts with configured "for" time greater than grace period.`)
 	f.DurationVar(&cfg.ResendDelay, "ruler.resend-delay", time.Minute, `Minimum amount of time to wait before resending an alert to Alertmanager.`)
