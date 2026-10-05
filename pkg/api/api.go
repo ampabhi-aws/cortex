@@ -53,6 +53,16 @@ type Config struct {
 	LegacyHTTPPrefix   string               `yaml:"-"`
 	HTTPAuthMiddleware middleware.Interface `yaml:"-"`
 
+	// HTTPAdminAuthMiddleware is an optional middleware used to authorize access to
+	// cross-tenant / operator-only HTTP endpoints (e.g. GET /ruler/rule_groups).
+	// It is distinct from HTTPAuthMiddleware, which only resolves the tenant from
+	// the X-Scope-OrgID header and performs no credential verification. When this
+	// middleware is nil, Cortex refuses access (HTTP 403) to admin-only routes by
+	// default, so operators must explicitly opt in by injecting a middleware that
+	// verifies an operator credential (e.g. bearer token, mTLS client-certificate
+	// subject allow-list, or an upstream authenticating proxy signal).
+	HTTPAdminAuthMiddleware middleware.Interface `yaml:"-"`
+
 	// This allows downstream projects to wrap the distributor push function
 	// and access the deserialized write requests before/after they are pushed.
 	DistributorPushWrapper DistributorPushWrapper `yaml:"-"`
@@ -91,6 +101,7 @@ func (cfg *Config) wrapDistributorPush(d *distributor.Distributor) push.Func {
 
 type API struct {
 	AuthMiddleware       middleware.Interface
+	AdminAuthMiddleware  middleware.Interface
 	cfg                  Config
 	server               *server.Server
 	logger               log.Logger
@@ -114,23 +125,64 @@ func New(cfg Config, serverCfg server.Config, s *server.Server, logger log.Logge
 	}
 
 	api := &API{
-		cfg:            cfg,
-		AuthMiddleware: cfg.HTTPAuthMiddleware,
-		server:         s,
-		logger:         logger,
-		sourceIPs:      sourceIPs,
-		indexPage:      newIndexPageContent(),
+		cfg:                 cfg,
+		AuthMiddleware:      cfg.HTTPAuthMiddleware,
+		AdminAuthMiddleware: cfg.HTTPAdminAuthMiddleware,
+		server:              s,
+		logger:              logger,
+		sourceIPs:           sourceIPs,
+		indexPage:           newIndexPageContent(),
 	}
 
 	// If no authentication middleware is present in the config, use the default authentication middleware.
 	if cfg.HTTPAuthMiddleware == nil {
 		api.AuthMiddleware = middleware.AuthenticateUser
 	}
+	// If no admin-auth middleware is injected, fall back to a secure default that
+	// denies the request. Operators must explicitly opt in to exposing
+	// cross-tenant/operator-only endpoints by configuring HTTPAdminAuthMiddleware.
+	if cfg.HTTPAdminAuthMiddleware == nil {
+		api.AdminAuthMiddleware = denyAdminAuthMiddleware(logger)
+	}
 	if len(cfg.HTTPRequestHeadersToLog) > 0 {
 		api.HTTPHeaderMiddleware = &HTTPHeaderMiddleware{TargetHeaders: cfg.HTTPRequestHeadersToLog}
 	}
 
 	return api, nil
+}
+
+// adminOnly wraps a handler so that only requests authorized by the configured
+// admin-auth middleware can reach it. It is intended for cross-tenant and
+// operator-only endpoints (e.g. GET /ruler/rule_groups) that must never be
+// exposed to tenants, including tenants authenticated behind the documented
+// reverse-proxy model that only sets X-Scope-OrgID.
+//
+// When no admin-auth middleware is injected via Config.HTTPAdminAuthMiddleware,
+// the fall-back middleware denies every request with HTTP 403, so admin
+// endpoints are closed by default.
+func (a *API) adminOnly(handler http.Handler) http.Handler {
+	if a.AdminAuthMiddleware == nil {
+		return denyAdminAuthMiddleware(a.logger).Wrap(handler)
+	}
+	return a.AdminAuthMiddleware.Wrap(handler)
+}
+
+// denyAdminAuthMiddleware is the secure default admin-auth middleware: it
+// unconditionally responds with HTTP 403 Forbidden. It is used when no
+// operator-supplied admin-auth middleware is configured, which keeps
+// cross-tenant/operator-only endpoints closed by default rather than silently
+// accessible to any caller that can reach the HTTP listener.
+func denyAdminAuthMiddleware(logger log.Logger) middleware.Interface {
+	return middleware.Func(func(next http.Handler) http.Handler {
+		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			level.Warn(logger).Log(
+				"msg", "blocked request to admin-only endpoint: no HTTPAdminAuthMiddleware configured",
+				"path", r.URL.Path,
+				"method", r.Method,
+			)
+			http.Error(w, "forbidden: admin endpoint is not enabled on this listener", http.StatusForbidden)
+		})
+	})
 }
 
 // RegisterRoute registers a single route enforcing HTTP methods. A single
@@ -291,8 +343,14 @@ func (a *API) RegisterRuler(r *ruler.Ruler) {
 	// Legacy Ring Route
 	a.RegisterRoute("/ruler_ring", r, false, "GET", "POST")
 
-	// List all user rule groups
-	a.RegisterRoute("/ruler/rule_groups", http.HandlerFunc(r.ListAllRules), false, "GET")
+	// List all user rule groups. This is a cross-tenant operator-only endpoint:
+	// its handler (Ruler.ListAllRules) enumerates every tenant in the rule store
+	// and streams each tenant's complete rule groups. It must therefore be gated
+	// behind both tenant-header authentication (so an upstream authenticating
+	// proxy, if any, sees it as an authenticated route) and an operator-only
+	// authorization check that returns 403 when no admin credential is presented.
+	// By default (no HTTPAdminAuthMiddleware configured) this endpoint is closed.
+	a.RegisterRoute("/ruler/rule_groups", a.adminOnly(http.HandlerFunc(r.ListAllRules)), true, "GET")
 
 	ruler.RegisterRulerServer(a.server.GRPC, r)
 }
