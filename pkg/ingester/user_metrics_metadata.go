@@ -88,6 +88,12 @@ func (mm *userMetricsMetadata) toClientMetadata() []*cortexpb.MetricMetadata {
 	r := make([]*cortexpb.MetricMetadata, 0, len(mm.metricToMetadata))
 	for _, set := range mm.metricToMetadata {
 		for m := range set {
+			// Take a copy to avoid aliasing the range variable; under the
+			// module's declared language version (pre-go1.22), `m` is a single
+			// variable reused across iterations, so appending `&m` directly
+			// would make every pointer for this family alias the same storage
+			// and all entries would serialise as the last iterated key.
+			m := m
 			r = append(r, &m)
 		}
 	}
