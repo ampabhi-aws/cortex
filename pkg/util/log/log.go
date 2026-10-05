@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"net/http"
 	"os"
+	"strings"
 
 	"github.com/go-kit/log"
 	kitlog "github.com/go-kit/log"
@@ -150,8 +151,15 @@ func ContextWithHeaderMap(ctx context.Context, headerMap map[string]string) cont
 }
 
 // InjectHeadersIntoHTTPRequest injects the logging header map from the context into the request headers.
+// Credential-bearing header names (see IsSensitiveRequestHeader) are silently
+// skipped so a compromised or misconfigured upstream cannot cause end-user
+// bearer tokens or session cookies to be re-propagated onto outbound internal
+// HTTP requests.
 func InjectHeadersIntoHTTPRequest(headerMap map[string]string, request *http.Request) {
 	for header, contents := range headerMap {
+		if IsSensitiveRequestHeader(header) {
+			continue
+		}
 		request.Header.Add(header, contents)
 	}
 }
@@ -164,8 +172,59 @@ func ContextWithHeaderMapFromMetadata(ctx context.Context, md metadata.MD) conte
 
 	headerMap := make(map[string]string)
 	for i := 0; i < len(headersSlice); i += 2 {
+		// Drop credential-bearing header names that were propagated to us via
+		// gRPC metadata so they cannot be re-logged on this component or
+		// re-forwarded further downstream.
+		if IsSensitiveRequestHeader(headersSlice[i]) {
+			continue
+		}
 		headerMap[headersSlice[i]] = headersSlice[i+1]
 	}
 
 	return ContextWithHeaderMap(ctx, headerMap)
+}
+
+// sensitiveRequestHeaderDenyList is the set of HTTP request header names whose
+// values must never be captured into logs, re-injected into outbound HTTP
+// requests, or propagated to downstream Cortex components via gRPC metadata.
+// The feature backed by -api.http-request-headers-to-log stores the raw value
+// as a structured log field on every request log line; naming a credential-
+// bearing header would therefore write end-user bearer tokens or session
+// cookies verbatim into service logs. Header names are compared
+// case-insensitively.
+var sensitiveRequestHeaderDenyList = map[string]struct{}{
+	"authorization":                  {},
+	"proxy-authorization":            {},
+	"cookie":                         {},
+	"set-cookie":                     {},
+	"x-amz-security-token":           {},
+	"x-auth-token":                   {},
+	"x-api-key":                      {},
+	"x-csrf-token":                   {},
+	"x-xsrf-token":                   {},
+	"x-vault-token":                  {},
+	"x-goog-iam-authorization-token": {},
+}
+
+// IsSensitiveRequestHeader reports whether the given HTTP header name is on
+// the credential-header deny-list and must not be captured for logging or
+// propagation. Comparison is case-insensitive and tolerant of surrounding
+// whitespace.
+func IsSensitiveRequestHeader(name string) bool {
+	_, ok := sensitiveRequestHeaderDenyList[strings.ToLower(strings.TrimSpace(name))]
+	return ok
+}
+
+// FilterSensitiveHeaderNames returns the subset of the given operator-supplied
+// header names that are safe to log, together with the list of names that were
+// rejected because they are on the credential-header deny-list.
+func FilterSensitiveHeaderNames(names []string) (safe []string, rejected []string) {
+	for _, name := range names {
+		if IsSensitiveRequestHeader(name) {
+			rejected = append(rejected, name)
+			continue
+		}
+		safe = append(safe, name)
+	}
+	return safe, rejected
 }

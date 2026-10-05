@@ -88,6 +88,13 @@ func injectForwardedHeadersIntoMetadata(ctx context.Context) context.Context {
 	if _, ok := md[util_log.HeaderPropagationStringForRequestLogging]; !ok {
 		var mdContent []string
 		for header, content := range headerMap {
+			// Never propagate credential-bearing headers to downstream
+			// components via gRPC metadata; even if one slipped into the
+			// local header map, we refuse to amplify it to peers whose logs
+			// may have a broader reader population.
+			if util_log.IsSensitiveRequestHeader(header) {
+				continue
+			}
 			mdContent = append(mdContent, header, content)
 		}
 		md = md.Copy()

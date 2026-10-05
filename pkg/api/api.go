@@ -70,7 +70,7 @@ type Config struct {
 // RegisterFlags adds the flags required to config this to the given FlagSet.
 func (cfg *Config) RegisterFlags(f *flag.FlagSet) {
 	f.BoolVar(&cfg.ResponseCompression, "api.response-compression-enabled", false, "Use GZIP compression for API responses. Some endpoints serve large YAML or JSON blobs which can benefit from compression.")
-	f.Var(&cfg.HTTPRequestHeadersToLog, "api.http-request-headers-to-log", "Which HTTP Request headers to add to logs")
+	f.Var(&cfg.HTTPRequestHeadersToLog, "api.http-request-headers-to-log", "Which HTTP Request headers to add to logs. WARNING: do not list credential-bearing headers such as Authorization, Proxy-Authorization, Cookie, X-Amz-Security-Token, X-Api-Key or X-Auth-Token; such names are refused at startup because their values would be written verbatim to logs and propagated to downstream components.")
 	cfg.RegisterFlagsWithPrefix("", f)
 }
 
@@ -127,7 +127,7 @@ func New(cfg Config, serverCfg server.Config, s *server.Server, logger log.Logge
 		api.AuthMiddleware = middleware.AuthenticateUser
 	}
 	if len(cfg.HTTPRequestHeadersToLog) > 0 {
-		api.HTTPHeaderMiddleware = &HTTPHeaderMiddleware{TargetHeaders: cfg.HTTPRequestHeadersToLog}
+		api.HTTPHeaderMiddleware = NewHTTPHeaderMiddleware(cfg.HTTPRequestHeadersToLog, logger)
 	}
 
 	return api, nil
