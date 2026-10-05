@@ -3,6 +3,7 @@ package memberlist
 import (
 	"bytes"
 	"crypto/md5"
+	"crypto/subtle"
 	"crypto/tls"
 	"flag"
 	"fmt"
@@ -299,9 +300,11 @@ func (t *TCPTransport) handleConnection(conn net.Conn) {
 
 		expectedDigest := md5.Sum(buf)
 
-		if !bytes.Equal(receivedDigest, expectedDigest[:]) {
+		if subtle.ConstantTimeCompare(receivedDigest, expectedDigest[:]) != 1 {
 			t.receivedPacketsErrors.Inc()
 			level.Warn(t.logger).Log("msg", "packet digest mismatch", "expected", fmt.Sprintf("%x", expectedDigest), "received", fmt.Sprintf("%x", receivedDigest), "data_length", len(buf), "remote", conn.RemoteAddr())
+			// Fail closed: drop packets that fail the integrity check instead of forwarding them to memberlist.
+			return
 		}
 
 		t.debugLog().Log("msg", "Received packet", "addr", addr(addrBuf), "size", len(buf), "hash", fmt.Sprintf("%x", receivedDigest))
