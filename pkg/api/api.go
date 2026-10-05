@@ -291,8 +291,12 @@ func (a *API) RegisterRuler(r *ruler.Ruler) {
 	// Legacy Ring Route
 	a.RegisterRoute("/ruler_ring", r, false, "GET", "POST")
 
-	// List all user rule groups
-	a.RegisterRoute("/ruler/rule_groups", http.HandlerFunc(r.ListAllRules), false, "GET")
+	// List all user rule groups. This is an administrative endpoint that
+	// exposes every tenant's rule groups; it requires a tenant/operator
+	// identity via the standard X-Scope-OrgID header (auth=true) and must
+	// still be fronted by an authenticating/authorizing proxy that restricts
+	// it to operators, as documented in docs/api/_index.md.
+	a.RegisterRoute("/ruler/rule_groups", http.HandlerFunc(r.ListAllRules), true, "GET")
 
 	ruler.RegisterRulerServer(a.server.GRPC, r)
 }
