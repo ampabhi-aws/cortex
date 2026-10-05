@@ -140,10 +140,39 @@ type CacheSplitter interface {
 // constSplitter is a utility for using a constant split interval when determining cache keys
 type constSplitter time.Duration
 
+// escapeCacheKeyField escapes the delimiter ':' and the escape character '\\'
+// inside a field that will be joined into a ':'-separated cache key. Without
+// this escaping the key grammar is not injective: a tenant ID such as
+// "team:prod" would be indistinguishable from a tenant "team" asking for a
+// query that happens to start with "prod:" (':' is legal in PromQL metric
+// names and the default tenant resolver does not reject ':' in tenant IDs),
+// enabling cross-tenant results-cache poisoning and disclosure.
+func escapeCacheKeyField(s string) string {
+	if !strings.ContainsAny(s, "\\:") {
+		return s
+	}
+	var b strings.Builder
+	b.Grow(len(s) + 4)
+	for i := 0; i < len(s); i++ {
+		c := s[i]
+		if c == '\\' || c == ':' {
+			b.WriteByte('\\')
+		}
+		b.WriteByte(c)
+	}
+	return b.String()
+}
+
 // GenerateCacheKey generates a cache key based on the userID, Request and interval.
+//
+// The userID (and query) are escaped so that the resulting ':'-separated key is
+// an injective function of (userID, query, step, interval). This prevents a
+// cross-tenant cache-key collision where a hierarchical tenant ID containing
+// ':' (e.g. "team:prod") could otherwise share a cache entry with a different
+// tenant (e.g. "team" querying a metric named "prod:...").
 func (t constSplitter) GenerateCacheKey(userID string, r tripperware.Request) string {
 	currentInterval := r.GetStart() / int64(time.Duration(t)/time.Millisecond)
-	return fmt.Sprintf("%s:%s:%d:%d", userID, r.GetQuery(), r.GetStep(), currentInterval)
+	return fmt.Sprintf("%s:%s:%d:%d", escapeCacheKeyField(userID), escapeCacheKeyField(r.GetQuery()), r.GetStep(), currentInterval)
 }
 
 // ShouldCacheFn checks whether the current request should go to cache
