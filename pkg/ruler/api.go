@@ -8,6 +8,7 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/go-kit/log"
@@ -124,16 +125,45 @@ type API struct {
 	ruler *Ruler
 	store rulestore.RuleStore
 
+	// createRuleGroupLocks serialises CreateRuleGroup requests for the same tenant
+	// within a single ruler process so that the per-tenant rule-group quota check
+	// (list -> AssertMaxRuleGroups -> SetRuleGroup) cannot be bypassed by firing
+	// several concurrent requests that all observe the same stale listing.
+	// Note: this does not provide cross-process coordination; horizontally scaled
+	// rulers can still race against each other. A compare-and-set / lease on the
+	// object store would be required for a complete fix, but the in-process lock
+	// significantly narrows the race window and makes the trivially-scriptable
+	// single-process bypass infeasible.
+	createRuleGroupLocksMtx sync.Mutex
+	createRuleGroupLocks    map[string]*sync.Mutex
+
 	logger log.Logger
 }
 
 // NewAPI returns a new API struct with the provided ruler and rule store
 func NewAPI(r *Ruler, s rulestore.RuleStore, logger log.Logger) *API {
 	return &API{
-		ruler:  r,
-		store:  s,
-		logger: logger,
+		ruler:                r,
+		store:                s,
+		createRuleGroupLocks: map[string]*sync.Mutex{},
+		logger:               logger,
 	}
+}
+
+// lockUserForCreateRuleGroup returns a per-tenant mutex used to serialise the
+// list/assert/write sequence in CreateRuleGroup. The returned mutex is locked;
+// the caller MUST Unlock() it when done. The lock is retained in the map so
+// repeated requests for the same tenant reuse the same mutex.
+func (a *API) lockUserForCreateRuleGroup(userID string) *sync.Mutex {
+	a.createRuleGroupLocksMtx.Lock()
+	mtx, ok := a.createRuleGroupLocks[userID]
+	if !ok {
+		mtx = &sync.Mutex{}
+		a.createRuleGroupLocks[userID] = mtx
+	}
+	a.createRuleGroupLocksMtx.Unlock()
+	mtx.Lock()
+	return mtx
 }
 
 func (a *API) PrometheusRules(w http.ResponseWriter, req *http.Request) {
@@ -482,6 +512,13 @@ func (a *API) CreateRuleGroup(w http.ResponseWriter, req *http.Request) {
 		return
 	}
 
+	// Serialise concurrent CreateRuleGroup requests for the same tenant within this
+	// process so the list -> AssertMaxRuleGroups -> SetRuleGroup sequence is not
+	// subject to a TOCTOU race that would allow the per-tenant rule-group quota to
+	// be exceeded by firing several concurrent requests.
+	userLock := a.lockUserForCreateRuleGroup(userID)
+	defer userLock.Unlock()
+
 	rgs, err := a.store.ListRuleGroupsForUserAndNamespace(req.Context(), userID, "")
 	if err != nil {
 		level.Error(logger).Log("msg", "unable to fetch current rule groups for validation", "err", err.Error(), "user", userID)
@@ -489,7 +526,18 @@ func (a *API) CreateRuleGroup(w http.ResponseWriter, req *http.Request) {
 		return
 	}
 
-	if err := a.ruler.AssertMaxRuleGroups(userID, len(rgs)+1); err != nil {
+	// Only count the new group towards the limit if a group with the same
+	// (namespace, name) does not already exist, since SetRuleGroup is an
+	// upsert and overwriting an existing group does not increase the total.
+	newGroupCount := len(rgs) + 1
+	for _, existing := range rgs {
+		if existing.GetNamespace() == namespace && existing.GetName() == rg.Name {
+			newGroupCount = len(rgs)
+			break
+		}
+	}
+
+	if err := a.ruler.AssertMaxRuleGroups(userID, newGroupCount); err != nil {
 		level.Error(logger).Log("msg", "limit validation failure", "err", err.Error(), "user", userID)
 		http.Error(w, err.Error(), http.StatusBadRequest)
 		return
