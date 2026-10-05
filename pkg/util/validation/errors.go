@@ -2,6 +2,7 @@ package validation
 
 import (
 	"fmt"
+	"sort"
 	"strconv"
 	"strings"
 
@@ -9,6 +10,79 @@ import (
 
 	"github.com/cortexproject/cortex/pkg/cortexpb"
 )
+
+// maxLabelValueByteLen is the per-label-value byte cap applied when rendering
+// attacker-controlled label sets inside validation error messages. The value
+// is large enough to be useful for debugging but small enough that an
+// attacker cannot amplify a request into a multi-hundred-MiB error string
+// that would be logged and echoed back in the HTTP response
+// (CWE-779 / CWE-1210).
+const maxLabelValueByteLen = 200
+
+// maxFormattedLabelSetByteLen is the overall byte cap applied to the
+// serialised label set used inside validation error messages. Together with
+// the per-value cap above, this bounds the resulting error string so that
+// formatting an arbitrarily large request cannot blow up the heap, the logs,
+// or the HTTP response body.
+const maxFormattedLabelSetByteLen = 1024
+
+// truncateString returns s truncated to max bytes with an ellipsis suffix if
+// anything was dropped. The returned string is never longer than max plus the
+// 3-byte ellipsis.
+func truncateString(s string, max int) string {
+	if len(s) <= max {
+		return s
+	}
+	return s[:max] + "..."
+}
+
+// safeFormatMetric renders a []cortexpb.LabelAdapter in the same format as
+// cortexpb.FromLabelAdaptersToMetric(ls).String() but with each label value
+// truncated to maxLabelValueRuneLen bytes and the overall result truncated to
+// maxFormattedLabelSetLen bytes. Used by validation error formatters to avoid
+// response/log amplification on attacker-controlled label sets.
+func safeFormatMetric(ls []cortexpb.LabelAdapter) string {
+	metricName := ""
+	hasMetricName := false
+	labelStrings := make([]string, 0, len(ls))
+	for _, l := range ls {
+		if l.Name == model.MetricNameLabel && !hasMetricName {
+			metricName = l.Value
+			hasMetricName = true
+			continue
+		}
+		labelStrings = append(labelStrings, fmt.Sprintf("%s=%q", l.Name, truncateString(l.Value, maxLabelValueByteLen)))
+	}
+	if len(labelStrings) == 0 {
+		if hasMetricName {
+			return truncateString(metricName, maxFormattedLabelSetByteLen)
+		}
+		return "{}"
+	}
+	sort.Strings(labelStrings)
+	return truncateString(fmt.Sprintf("%s{%s}", metricName, strings.Join(labelStrings, ", ")), maxFormattedLabelSetByteLen)
+}
+
+// safeFormatLabels renders a []cortexpb.LabelAdapter in the same format as
+// cortexpb.FromLabelAdaptersToLabels(ls).String() (i.e. preserving the input
+// order and keeping __name__ as a regular label) but with each value truncated
+// to maxLabelValueRuneLen bytes and the overall result truncated to
+// maxFormattedLabelSetLen bytes.
+func safeFormatLabels(ls []cortexpb.LabelAdapter) string {
+	var b strings.Builder
+	b.WriteByte('{')
+	for i, l := range ls {
+		if i > 0 {
+			b.WriteByte(',')
+			b.WriteByte(' ')
+		}
+		b.WriteString(l.Name)
+		b.WriteByte('=')
+		b.WriteString(strconv.Quote(truncateString(l.Value, maxLabelValueByteLen)))
+	}
+	b.WriteByte('}')
+	return truncateString(b.String(), maxFormattedLabelSetByteLen)
+}
 
 // ValidationError is an error returned by series validation.
 //
@@ -130,7 +204,7 @@ func newTooManyLabelsError(series []cortexpb.LabelAdapter, limit int) Validation
 func (e *tooManyLabelsError) Error() string {
 	return fmt.Sprintf(
 		"series has too many labels (actual: %d, limit: %d) series: '%s'",
-		len(e.series), e.limit, cortexpb.FromLabelAdaptersToMetric(e.series).String())
+		len(e.series), e.limit, safeFormatMetric(e.series))
 }
 
 type noMetricNameError struct{}
@@ -193,7 +267,7 @@ type exemplarValidationError struct {
 }
 
 func (e *exemplarValidationError) Error() string {
-	return fmt.Sprintf(e.message, e.timestamp, cortexpb.FromLabelAdaptersToLabels(e.seriesLabels).String(), cortexpb.FromLabelAdaptersToLabels(e.exemplarLabels).String())
+	return fmt.Sprintf(e.message, e.timestamp, safeFormatLabels(e.seriesLabels), safeFormatLabels(e.exemplarLabels))
 }
 
 func newExemplarEmtpyLabelsError(seriesLabels []cortexpb.LabelAdapter, exemplarLabels []cortexpb.LabelAdapter, timestamp int64) ValidationError {
