@@ -322,8 +322,23 @@ func (m *mergeQuerier) Select(sortSeries bool, hints *storage.SelectHints, match
 		if !ok {
 			return fmt.Errorf("unexpected type %T", jobIntf)
 		}
+		// Pass a shallow copy of hints to each per-tenant querier. Downstream
+		// queriers (e.g. pkg/querier.querier.Select) read and write
+		// sp.Start / sp.End after clamping them against per-tenant limits
+		// (max_query_lookback, max_query_into_future). Because each per-tenant
+		// querier is a lazyquery.LazyQuerier that executes Select in its own
+		// goroutine, sharing the single *storage.SelectHints pointer across
+		// tenants would cause an unsynchronised read/modify/write data race
+		// and allow one tenant's clamped time range to silently truncate or
+		// widen another tenant's query window. Giving every goroutine its
+		// own copy preserves per-tenant isolation of the time range.
+		var jobHints *storage.SelectHints
+		if hints != nil {
+			hintsCopy := *hints
+			jobHints = &hintsCopy
+		}
 		seriesSets[job.pos] = &addLabelsSeriesSet{
-			upstream: job.querier.Select(sortSeries, hints, filteredMatchers...),
+			upstream: job.querier.Select(sortSeries, jobHints, filteredMatchers...),
 			labels: labels.Labels{
 				{
 					Name:  m.idLabelName,
