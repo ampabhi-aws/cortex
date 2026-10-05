@@ -5,7 +5,6 @@ import (
 	"flag"
 	"fmt"
 	"io"
-	"math"
 	"net/http"
 	"os"
 	"path/filepath"
@@ -1202,12 +1201,20 @@ func (i *Ingester) Query(ctx context.Context, req *client.QueryRequest) (*client
 	}
 
 	numSamples := 0
+	maxSeriesPerQuery := i.limiter.MaxSeriesPerQuery(userID)
 
 	result := &client.QueryResponse{}
 	for ss.Next() {
 		series := ss.At()
 		if sm.IsSharded() && !sm.MatchesLabels(series.Labels()) {
 			continue
+		}
+
+		// Fail fast before allocating another series' worth of samples when the
+		// per-query series limit would be exceeded. This bounds ingester heap
+		// usage regardless of attacker-chosen matchers.
+		if maxSeriesPerQuery > 0 && len(result.Timeseries) >= maxSeriesPerQuery {
+			return nil, fmt.Errorf("the query hit the max number of series limit (limit: %d series)", maxSeriesPerQuery)
 		}
 
 		ts := cortexpb.TimeSeries{
@@ -1319,6 +1326,13 @@ func (i *Ingester) LabelValues(ctx context.Context, req *client.LabelValuesReque
 		return nil, err
 	}
 
+	// Fail fast if the number of label values exceeds the per-query limit
+	// configured for the tenant. This bounds ingester heap usage regardless
+	// of attacker-chosen label name / matchers.
+	if maxSeriesPerQuery := i.limiter.MaxSeriesPerQuery(userID); maxSeriesPerQuery > 0 && len(vals) > maxSeriesPerQuery {
+		return nil, fmt.Errorf("the query hit the max number of series limit (limit: %d series)", maxSeriesPerQuery)
+	}
+
 	return &client.LabelValuesResponse{
 		LabelValues: vals,
 	}, nil
@@ -1378,6 +1392,12 @@ func (i *Ingester) LabelNames(ctx context.Context, req *client.LabelNamesRequest
 	names, _, err := q.LabelNames()
 	if err != nil {
 		return nil, err
+	}
+
+	// Fail fast if the number of label names exceeds the per-query limit
+	// configured for the tenant. This bounds ingester heap usage.
+	if maxSeriesPerQuery := i.limiter.MaxSeriesPerQuery(userID); maxSeriesPerQuery > 0 && len(names) > maxSeriesPerQuery {
+		return nil, fmt.Errorf("the query hit the max number of series limit (limit: %d series)", maxSeriesPerQuery)
 	}
 
 	return &client.LabelNamesResponse{
@@ -1467,11 +1487,20 @@ func (i *Ingester) MetricsForLabelMatchers(ctx context.Context, req *client.Metr
 		Metric: make([]*cortexpb.Metric, 0),
 	}
 
+	maxSeriesPerQuery := i.limiter.MaxSeriesPerQuery(userID)
+
 	mergedSet := storage.NewMergeSeriesSet(sets, storage.ChainedSeriesMerge)
 	for mergedSet.Next() {
 		// Interrupt if the context has been canceled.
 		if ctx.Err() != nil {
 			return nil, ctx.Err()
+		}
+
+		// Fail fast before allocating more label slices when the per-query
+		// series limit would be exceeded. This bounds ingester heap usage
+		// regardless of attacker-chosen matchers.
+		if maxSeriesPerQuery > 0 && len(result.Metric) >= maxSeriesPerQuery {
+			return nil, fmt.Errorf("the query hit the max number of series limit (limit: %d series)", maxSeriesPerQuery)
 		}
 
 		result.Metric = append(result.Metric, &cortexpb.Metric{
@@ -2562,8 +2591,9 @@ func metadataQueryRange(queryStart, queryEnd int64, db *userTSDB) (mint, maxt in
 	// data for the timerange requested (which will be empty), the dashboards will break. To fix this we should
 	// return the "head block" range until we can query the store-gateway.
 
-	// Now the question would be what to do when the query is partially in the ingester range. I would err on the side
-	// of caution and query the entire db, as I can't think of a good way to query the head + the overlapping range.
+	// Now the question would be what to do when the query is partially in the ingester range. Clamp to the
+	// ingester's actual local range rather than widening to [0, MaxInt64]: an attacker-supplied start=0 would
+	// otherwise force the ingester to query every local block (and index) regardless of query-frontend limits.
 	mint, maxt = queryStart, queryEnd
 
 	lowestTs, err := db.StartTime()
@@ -2571,12 +2601,20 @@ func metadataQueryRange(queryStart, queryEnd int64, db *userTSDB) (mint, maxt in
 		return mint, maxt, err
 	}
 
+	highestTs := db.Head().MaxTime()
+
 	// Completely outside.
 	if queryEnd < lowestTs {
-		mint, maxt = db.Head().MinTime(), db.Head().MaxTime()
+		mint, maxt = db.Head().MinTime(), highestTs
 	} else if queryStart < lowestTs {
-		// Partially inside.
-		mint, maxt = 0, math.MaxInt64
+		// Partially inside: clamp to the ingester's actual local data range
+		// (lowest local block timestamp to head max time). This preserves the
+		// original intent (return head-block data for partially-overlapping
+		// ranges) without silently widening to [0, MaxInt64].
+		mint = lowestTs
+		if queryEnd > highestTs {
+			maxt = highestTs
+		}
 	}
 
 	return

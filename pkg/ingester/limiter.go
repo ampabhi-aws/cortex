@@ -96,8 +96,19 @@ func (l *Limiter) AssertMaxMetricsWithMetadataPerUser(userID string, metrics int
 }
 
 // MaxSeriesPerQuery returns the maximum number of series a query is allowed to hit.
+// A return value <= 0 means no limit is configured.
 func (l *Limiter) MaxSeriesPerQuery(userID string) int {
 	return l.limits.MaxSeriesPerQuery(userID)
+}
+
+// AssertMaxSeriesPerQuery returns an error if the number of series exceeds
+// the per-tenant limit. A non-positive limit disables the check.
+func (l *Limiter) AssertMaxSeriesPerQuery(userID string, series int) error {
+	limit := l.MaxSeriesPerQuery(userID)
+	if limit <= 0 || series < limit {
+		return nil
+	}
+	return fmt.Errorf("the query hit the max number of series limit (limit: %d series)", limit)
 }
 
 // FormatError returns the input error enriched with the actual limits for the given user.
