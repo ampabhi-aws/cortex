@@ -1004,6 +1004,14 @@ func (am *MultitenantAlertmanager) ServeHTTP(w http.ResponseWriter, req *http.Re
 
 // HandleRequest implements gRPC Alertmanager service, which receives request from AlertManager-Distributor.
 func (am *MultitenantAlertmanager) HandleRequest(ctx context.Context, in *httpgrpc.HTTPRequest) (*httpgrpc.HTTPResponse, error) {
+	// The gRPC server is only initialised when ring-based sharding is enabled. When sharding
+	// is disabled, am.grpcServer is nil and dereferencing it would panic (and because the
+	// gRPC chain has no panic-recovery interceptor, that would terminate the whole process).
+	// Return an error instead, matching the behaviour of sibling methods such as
+	// Alertmanager.mergePartialExternalState/getFullState.
+	if am.grpcServer == nil {
+		return nil, errors.New("ring-based sharding not enabled")
+	}
 	return am.grpcServer.Handle(ctx, in)
 }
 
