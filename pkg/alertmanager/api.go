@@ -45,6 +45,7 @@ var (
 	errTLSFileNotAllowed             = errors.New("setting TLS ca_file, cert_file and key_file is not allowed")
 	errSlackAPIURLFileNotAllowed     = errors.New("setting Slack api_url_file and global slack_api_url_file is not allowed")
 	errVictorOpsAPIKeyFileNotAllowed = errors.New("setting VictorOps api_key_file is not allowed")
+	errSNSSigV4CredentialsRequired   = errors.New("setting SNS sigv4.access_key and sigv4.secret_key is required: tenant SNS configurations must not rely on the Alertmanager's ambient AWS credentials (shared credentials file profile, EC2 instance profile via IMDS, or IRSA web-identity token)")
 )
 
 // UserConfig is used to communicate a users alertmanager configs
@@ -350,6 +351,11 @@ func validateAlertmanagerConfig(cfg interface{}) error {
 		if err := validateVictorOpsConfig(v.Interface().(config.VictorOpsConfig)); err != nil {
 			return err
 		}
+
+	case reflect.TypeOf(config.SNSConfig{}):
+		if err := validateSNSConfig(v.Interface().(config.SNSConfig)); err != nil {
+			return err
+		}
 	}
 
 	// If the input config is a struct, recursively iterate on all fields.
@@ -446,6 +452,37 @@ func validateSlackConfig(cfg config.SlackConfig) error {
 func validateVictorOpsConfig(cfg config.VictorOpsConfig) error {
 	if cfg.APIKeyFile != "" {
 		return errVictorOpsAPIKeyFileNotAllowed
+	}
+	return nil
+}
+
+// validateSNSConfig validates the SNS config and returns an error if it would
+// cause the Cortex Alertmanager to sign AWS API calls using its own ambient
+// credentials on behalf of a tenant.
+//
+// The vendored SNS notifier
+// (vendor/github.com/prometheus/alertmanager/notify/sns/sns.go) builds its AWS
+// session and (optionally) STS AssumeRole call using the SigV4 credentials from
+// the tenant-supplied configuration. When sigv4.access_key / sigv4.secret_key
+// are empty, the AWS SDK falls back to the default credential chain
+// (environment variables, shared-credentials file with a tenant-chosen
+// profile, EC2 instance profile via IMDS, or the IRSA web-identity token).
+// That would allow a tenant to perform AWS actions (e.g. sns:Publish,
+// sts:AssumeRole) signed by the Alertmanager's own identity -- a confused
+// deputy privilege escalation across the tenant trust boundary. The receivers
+// firewall does not mitigate this because the AWS SDK credential chain uses
+// its own HTTP client.
+//
+// To close the trust boundary we require tenant SNS configs to carry explicit
+// SigV4 credentials and refuse any configuration that would select the
+// ambient-credential path (empty access_key/secret_key, or a sigv4.profile
+// pointing into the operator's shared-credentials file).
+func validateSNSConfig(cfg config.SNSConfig) error {
+	if cfg.Sigv4.AccessKey == "" || cfg.Sigv4.SecretKey == "" {
+		return errSNSSigV4CredentialsRequired
+	}
+	if cfg.Sigv4.Profile != "" {
+		return errSNSSigV4CredentialsRequired
 	}
 	return nil
 }
