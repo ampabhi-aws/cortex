@@ -1040,16 +1040,41 @@ func (am *MultitenantAlertmanager) serveRequest(w http.ResponseWriter, req *http
 }
 
 func (am *MultitenantAlertmanager) alertmanagerFromFallbackConfig(userID string) (*Alertmanager, error) {
-	// Upload an empty config so that the Alertmanager is no de-activated in the next poll
-	cfgDesc := alertspb.ToProto("", nil, userID)
-	err := am.store.SetAlertConfig(context.Background(), cfgDesc)
-	if err != nil {
+	ctx := context.Background()
+
+	// Read-before-write: never overwrite an existing tenant configuration from a
+	// request path. The in-memory map on this instance is NOT authoritative — a
+	// miss can be caused by sharding (this instance is not an owner), by a
+	// pending config-sync after a ring change or restart, or by the normal poll
+	// window after a config upload. Blindly uploading an empty config in those
+	// cases destroys the tenant's routes, receivers (including embedded
+	// third-party credentials), inhibition rules and templates in object
+	// storage. Only persist the empty placeholder when the alert store
+	// confirms no configuration exists for the tenant yet.
+	cfgDesc, err := am.store.GetAlertConfig(ctx, userID)
+	switch {
+	case err == nil:
+		// A configuration already exists in the store. If it carries real content,
+		// activate it locally without touching the store. If the stored object is
+		// itself an empty placeholder (RawConfig == ""), fall through to the
+		// fallback-activation path below without rewriting the store.
+	case errors.Is(err, alertspb.ErrNotFound):
+		// No configuration persisted for this tenant yet. Upload an empty
+		// placeholder so that the next sync activates the fallback config for
+		// the tenant and this request path does not thrash the store.
+		cfgDesc = alertspb.ToProto("", nil, userID)
+		if err := am.store.SetAlertConfig(ctx, cfgDesc); err != nil {
+			return nil, err
+		}
+	default:
+		// Any other error (transient store failure, auth, etc.) must NOT fall
+		// through to a destructive write.
 		return nil, err
 	}
 
-	// Calling setConfig with an empty configuration will use the fallback config.
-	err = am.setConfig(cfgDesc)
-	if err != nil {
+	// Calling setConfig with an empty configuration will use the fallback config;
+	// calling it with the tenant's real configuration will activate that config.
+	if err := am.setConfig(cfgDesc); err != nil {
 		return nil, err
 	}
 
