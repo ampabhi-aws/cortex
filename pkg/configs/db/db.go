@@ -10,6 +10,7 @@ import (
 	"github.com/cortexproject/cortex/pkg/configs/db/memory"
 	"github.com/cortexproject/cortex/pkg/configs/db/postgres"
 	"github.com/cortexproject/cortex/pkg/configs/userconfig"
+	"github.com/cortexproject/cortex/pkg/util/flagext"
 )
 
 // Config configures the database.
@@ -27,6 +28,22 @@ func (cfg *Config) RegisterFlags(f *flag.FlagSet) {
 	f.StringVar(&cfg.URI, "configs.database.uri", "postgres://postgres@configs-db.weave.local/configs?sslmode=disable", "URI where the database can be found (for dev you can use memory://)")
 	f.StringVar(&cfg.MigrationsDir, "configs.database.migrations-dir", "", "Path where the database migration files can be found")
 	f.StringVar(&cfg.PasswordFile, "configs.database.password-file", "", "File containing password (username goes in URI)")
+}
+
+// MarshalYAML implements yaml.Marshaler. It replaces any password embedded in
+// the database URI's userinfo component with a redaction marker so that the
+// live configuration can be served by the unauthenticated /config endpoint
+// without disclosing the database password.
+//
+// The field-level flagext.Secret helper cannot be used here because the
+// credential is embedded inside a larger DSN string.
+func (cfg Config) MarshalYAML() (interface{}, error) {
+	// Alias has the exact same memory layout as Config but drops the method
+	// set, so marshalling it does not recurse back into MarshalYAML.
+	type plain Config
+	redacted := plain(cfg)
+	redacted.URI = flagext.RedactSecretInURL(cfg.URI)
+	return redacted, nil
 }
 
 // DB is the interface for the database.
