@@ -874,6 +874,19 @@ func (am *MultitenantAlertmanager) setConfig(cfg alertspb.AlertConfigDesc) error
 		}
 	}
 
+	// Re-apply the Alertmanager receiver/global hardening checks here, so that
+	// configurations sourced from the alert store (e.g. the legacy configs
+	// service / configdb backend, which has its own validator that does not
+	// check file-backed credential fields) can never cause Cortex to read
+	// arbitrary operator files via *_file settings on tenant-controlled
+	// receivers. The HTTP API ingress already runs validateUserConfig, but
+	// this is the single choke point every config path funnels through.
+	if userAmConfig != nil {
+		if err := validateAlertmanagerConfig(userAmConfig); err != nil {
+			return fmt.Errorf("invalid Cortex configuration for %v: %v", cfg.User, err)
+		}
+	}
+
 	// We can have an empty configuration here if:
 	// 1) the user had a previous alertmanager
 	// 2) then, submitted a non-working configuration (and we kept running the prev working config)
