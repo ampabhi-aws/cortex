@@ -8,6 +8,7 @@ import (
 	"os"
 	"path/filepath"
 	"reflect"
+	"time"
 
 	"github.com/go-kit/log"
 	"github.com/go-kit/log/level"
@@ -35,6 +36,10 @@ const (
 	errConfigurationTooBig   = "Alertmanager configuration is too big, limit: %d bytes"
 	errTooManyTemplates      = "too many templates in the configuration: %d (limit: %d)"
 	errTemplateTooBig        = "template %s is too big: %d bytes (limit: %d bytes)"
+	errGroupWaitTooSmall     = "route.group_wait %s is below the minimum allowed value of %s"
+	errGroupIntervalTooSmall = "route.group_interval %s is below the minimum allowed value of %s"
+	errRepeatIntervalTooSmall = "route.repeat_interval %s is below the minimum allowed value of %s"
+	errGroupByTooLarge       = "route.group_by cardinality %d exceeds the maximum allowed value of %d"
 
 	fetchConcurrency = 16
 )
@@ -188,6 +193,17 @@ func validateUserConfig(logger log.Logger, cfg alertspb.AlertConfigDesc, limits 
 	// Validate the config recursively scanning it.
 	if err := validateAlertmanagerConfig(amCfg); err != nil {
 		return err
+	}
+
+	// Enforce per-tenant minimums on route interval fields and a cap on group_by cardinality.
+	// These prevent a tenant from configuring pathologically small intervals (e.g.
+	// group_interval: 1ms, repeat_interval: 1ms) that cause the shared Alertmanager process to
+	// emit an unbounded outbound notification stream, and from configuring a high-cardinality
+	// group_by that would spawn unbounded aggregation-group goroutines.
+	if amCfg.Route != nil {
+		if err := validateRouteLimits(amCfg.Route, limits, user); err != nil {
+			return err
+		}
 	}
 
 	// Validate templates referenced in the alertmanager config.
@@ -446,6 +462,49 @@ func validateSlackConfig(cfg config.SlackConfig) error {
 func validateVictorOpsConfig(cfg config.VictorOpsConfig) error {
 	if cfg.APIKeyFile != "" {
 		return errVictorOpsAPIKeyFileNotAllowed
+	}
+	return nil
+}
+
+// validateRouteLimits walks the route tree and enforces per-tenant minimums on the
+// group_wait/group_interval/repeat_interval fields and a maximum cardinality on the group_by
+// list. These are defense-in-depth caps on the shared Alertmanager process: a tenant can
+// otherwise set these intervals to a sub-second value (upstream Alertmanager only rejects
+// exactly zero) and cause an unbounded outbound notification stream and unbounded
+// aggregation-group goroutine growth that degrade delivery for co-tenants sharded onto the
+// same instance.
+func validateRouteLimits(route *config.Route, limits Limits, user string) error {
+	minGroupWait := limits.AlertmanagerMinGroupWait(user)
+	minGroupInterval := limits.AlertmanagerMinGroupInterval(user)
+	minRepeatInterval := limits.AlertmanagerMinRepeatInterval(user)
+	maxGroupBy := limits.AlertmanagerMaxGroupByCardinality(user)
+
+	if minGroupWait <= 0 && minGroupInterval <= 0 && minRepeatInterval <= 0 && maxGroupBy <= 0 {
+		return nil
+	}
+	return walkRouteLimits(route, minGroupWait, minGroupInterval, minRepeatInterval, maxGroupBy)
+}
+
+func walkRouteLimits(route *config.Route, minGroupWait, minGroupInterval, minRepeatInterval time.Duration, maxGroupBy int) error {
+	if route == nil {
+		return nil
+	}
+	if minGroupWait > 0 && route.GroupWait != nil && time.Duration(*route.GroupWait) < minGroupWait {
+		return fmt.Errorf(errGroupWaitTooSmall, time.Duration(*route.GroupWait), minGroupWait)
+	}
+	if minGroupInterval > 0 && route.GroupInterval != nil && time.Duration(*route.GroupInterval) < minGroupInterval {
+		return fmt.Errorf(errGroupIntervalTooSmall, time.Duration(*route.GroupInterval), minGroupInterval)
+	}
+	if minRepeatInterval > 0 && route.RepeatInterval != nil && time.Duration(*route.RepeatInterval) < minRepeatInterval {
+		return fmt.Errorf(errRepeatIntervalTooSmall, time.Duration(*route.RepeatInterval), minRepeatInterval)
+	}
+	if maxGroupBy > 0 && len(route.GroupBy) > maxGroupBy {
+		return fmt.Errorf(errGroupByTooLarge, len(route.GroupBy), maxGroupBy)
+	}
+	for _, child := range route.Routes {
+		if err := walkRouteLimits(child, minGroupWait, minGroupInterval, minRepeatInterval, maxGroupBy); err != nil {
+			return err
+		}
 	}
 	return nil
 }
