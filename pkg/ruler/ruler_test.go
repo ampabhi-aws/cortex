@@ -1108,7 +1108,9 @@ func TestRuler_ListAllRules(t *testing.T) {
 	router := mux.NewRouter()
 	router.Path("/ruler/rule_groups").Methods(http.MethodGet).HandlerFunc(r.ListAllRules)
 
-	req := requestFor(t, http.MethodGet, "https://localhost:8080/ruler/rule_groups", nil, "")
+	// Request as tenant "user1": the response must contain only user1's rule
+	// groups and must not disclose any other tenant's rules.
+	req := requestFor(t, http.MethodGet, "https://localhost:8080/ruler/rule_groups", nil, "user1")
 	w := httptest.NewRecorder()
 	router.ServeHTTP(w, req)
 
@@ -1119,9 +1121,16 @@ func TestRuler_ListAllRules(t *testing.T) {
 	require.Equal(t, http.StatusOK, resp.StatusCode)
 	require.Equal(t, "application/yaml", resp.Header.Get("Content-Type"))
 
-	gs := make(map[string]map[string][]rulefmt.RuleGroup) // user:namespace:[]rulefmt.RuleGroup
-	for userID := range mockRules {
-		gs[userID] = mockRules[userID].Formatted()
+	gs := map[string]map[string][]rulefmt.RuleGroup{
+		"user1": mockRules["user1"].Formatted(),
+	}
+
+	// Response must not include any other tenant's identifier or rules.
+	for otherUser := range mockRules {
+		if otherUser == "user1" {
+			continue
+		}
+		require.NotContains(t, string(body), otherUser)
 	}
 
 	// check for unnecessary fields
@@ -1133,6 +1142,13 @@ func TestRuler_ListAllRules(t *testing.T) {
 	expectedResponse, err := yaml.Marshal(gs)
 	require.NoError(t, err)
 	require.YAMLEq(t, string(expectedResponse), string(body))
+
+	// Without a tenant in the request context, the handler must reject the
+	// request rather than returning any rule groups.
+	reqNoTenant := httptest.NewRequest(http.MethodGet, "https://localhost:8080/ruler/rule_groups", nil)
+	wNoTenant := httptest.NewRecorder()
+	router.ServeHTTP(wNoTenant, reqNoTenant)
+	require.Equal(t, http.StatusUnauthorized, wNoTenant.Result().StatusCode)
 }
 
 type senderFunc func(alerts ...*notifier.Alert)

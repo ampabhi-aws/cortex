@@ -63,9 +63,6 @@ const (
 	// Limit errors
 	errMaxRuleGroupsPerUserLimitExceeded        = "per-user rule groups limit (limit: %d actual: %d) exceeded"
 	errMaxRulesPerRuleGroupPerUserLimitExceeded = "per-user rules per rule group limit (limit: %d actual: %d) exceeded"
-
-	// errors
-	errListAllUser = "unable to list the ruler users"
 )
 
 // Config is the configuration for the recording rules server.
@@ -863,12 +860,22 @@ func (r *Ruler) DeleteTenantConfiguration(w http.ResponseWriter, req *http.Reque
 func (r *Ruler) ListAllRules(w http.ResponseWriter, req *http.Request) {
 	logger := util_log.WithContext(req.Context(), r.logger)
 
-	userIDs, err := r.store.ListAllUsers(req.Context())
+	// Require an authenticated tenant and scope the response to only that
+	// tenant's rule groups. Prior to this check, the handler enumerated every
+	// tenant's rules via store.ListAllUsers and returned them unconditionally,
+	// which allowed any caller able to reach the HTTP port (including other
+	// tenants whose traffic traverses the shared auth proxy) to read every
+	// other tenant's recording/alerting expressions, labels and annotations.
+	userID, err := tenant.TenantID(req.Context())
 	if err != nil {
-		level.Error(logger).Log("msg", errListAllUser, "err", err)
-		http.Error(w, fmt.Sprintf("%s: %s", errListAllUser, err.Error()), http.StatusInternalServerError)
+		// Consistent with other tenant-scoped ruler handlers: the auth
+		// middleware already returns 401 if X-Scope-OrgID is missing, but we
+		// still guard the handler in case it is wired without the middleware.
+		http.Error(w, err.Error(), http.StatusUnauthorized)
 		return
 	}
+
+	userIDs := []string{userID}
 
 	done := make(chan struct{})
 	iter := make(chan interface{})
@@ -897,7 +904,7 @@ func (r *Ruler) ListAllRules(w http.ResponseWriter, req *http.Request) {
 		return nil
 	})
 	if err != nil {
-		level.Error(logger).Log("msg", "failed to list all ruler configs", "err", err)
+		level.Error(logger).Log("msg", "failed to list ruler configs", "err", err, "user", userID)
 	}
 	close(iter)
 	<-done

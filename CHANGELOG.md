@@ -2,6 +2,8 @@
 
 ## master / unreleased
 
+* [CHANGE] Security/Ruler: `GET /ruler/rule_groups` now requires authentication and returns only the calling tenant's rule groups. Previously the endpoint was registered with `auth=false` on the main HTTP router and the handler enumerated every tenant via `store.ListAllUsers`, allowing any caller able to reach the HTTP port (including other tenants whose traffic traverses a shared auth proxy) to read every other tenant's recording/alerting expressions, labels and annotations. The response schema is unchanged (YAML dictionary keyed by tenant ID) but now contains a single key equal to the caller's `X-Scope-OrgID`. Requests without a tenant ID are rejected with HTTP 401.
+
   **This release removes support for chunks storage. See below for more.**
 * [CHANGE] Remove support for chunks storage entirely. If you are using chunks storage on a previous version, you must [migrate your data](https://github.com/cortexproject/cortex/blob/v1.11.1/docs/blocks-storage/migrate-from-chunks-to-blocks.md) on version 1.12 or earlier. Before upgrading to this release, you should also remove any deprecated chunks-related configuration, as this release will no longer accept that. The following flags are gone:
   - `-dynamodb.*`
