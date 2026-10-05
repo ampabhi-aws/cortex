@@ -187,7 +187,14 @@ func (a *API) RegisterAlertmanager(am *alertmanager.MultitenantAlertmanager, tar
 	a.indexPage.AddLink(SectionAdminEndpoints, "/multitenant_alertmanager/ring", "Alertmanager Ring Status")
 	// Ensure this route is registered before the prefixed AM route
 	a.RegisterRoute("/multitenant_alertmanager/status", am.GetStatusHandler(), false, "GET")
-	a.RegisterRoute("/multitenant_alertmanager/configs", http.HandlerFunc(am.ListAllConfigs), false, "GET")
+	// SECURITY: previously this route invoked am.ListAllConfigs with auth=false, which
+	// enumerated every tenant's Alertmanager configuration (including inlined receiver
+	// secrets such as Slack webhook URLs, PagerDuty/OpsGenie keys, SMTP passwords and
+	// bearer tokens) to any caller able to reach the HTTP port. Because Cortex rejects
+	// file-based secret references, those secrets must be inlined in RawConfig and were
+	// therefore disclosed cross-tenant. The route is now tenant-scoped and wrapped by
+	// the auth middleware so it only returns the caller's own configuration.
+	a.RegisterRoute("/multitenant_alertmanager/configs", http.HandlerFunc(am.GetUserConfig), true, "GET")
 	a.RegisterRoute("/multitenant_alertmanager/ring", http.HandlerFunc(am.RingHandler), false, "GET", "POST")
 	a.RegisterRoute("/multitenant_alertmanager/delete_tenant_config", http.HandlerFunc(am.DeleteUserConfig), true, "POST")
 
