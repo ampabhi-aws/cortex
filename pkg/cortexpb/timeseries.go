@@ -17,6 +17,13 @@ var (
 	expectedSamplesPerSeries   = 10
 	expectedExemplarsPerSeries = 1
 
+	// maxPooledSliceCapacityMultiplier bounds the capacity of a slice that may
+	// be returned to the pools. Any slice whose capacity exceeds the
+	// corresponding expected size by more than this multiplier is dropped on
+	// the floor rather than retained in the global sync.Pool, preventing a
+	// single oversized request from permanently inflating process RSS.
+	maxPooledSliceCapacityMultiplier = 16
+
 	/*
 		We cannot pool these as pointer-to-slice because the place we use them is in WriteRequest which is generated from Protobuf
 		and we don't have an option to make it a pointer. There is overhead here 24 bytes of garbage every time a PreallocTimeseries
@@ -28,13 +35,18 @@ var (
 		},
 	}
 
+	// timeSeriesPool returns a zero-valued *TimeSeries. We intentionally do
+	// not eagerly preallocate Labels/Samples/Exemplars slices here: every
+	// repeated `timeseries` wire element (even an empty two-byte one) causes
+	// PreallocTimeseries.Unmarshal to call TimeseriesFromPool(), and eagerly
+	// allocating ~900 bytes of per-element slice headers turned a tiny
+	// decompressed body into tens of GB of pooled heap (a ~470x amplification
+	// factor). Legitimate traffic still benefits from pool reuse because the
+	// slice backing arrays grown by one request are kept by sync.Pool and
+	// handed back (via append) to the next request.
 	timeSeriesPool = sync.Pool{
 		New: func() interface{} {
-			return &TimeSeries{
-				Labels:    make([]LabelAdapter, 0, expectedLabels),
-				Samples:   make([]Sample, 0, expectedSamplesPerSeries),
-				Exemplars: make([]Exemplar, 0, expectedExemplarsPerSeries),
-			}
+			return &TimeSeries{}
 		},
 	}
 )
@@ -279,6 +291,14 @@ func ReuseSlice(ts []PreallocTimeseries) {
 		ReuseTimeseries(ts[i].TimeSeries)
 	}
 
+	// Guard the global pool against permanently retaining an oversized backing
+	// array handed to it by a malicious or pathological request (e.g. tens of
+	// millions of empty timeseries elements). sync.Pool only trims entries
+	// across GC cycles, so without this cap a single large request can
+	// inflate every distributor's RSS until it OOMs.
+	if cap(ts) > expectedTimeseries*maxPooledSliceCapacityMultiplier {
+		return
+	}
 	slicePool.Put(ts[:0]) //nolint:staticcheck //see comment on slicePool for more details
 }
 
@@ -290,6 +310,22 @@ func TimeseriesFromPool() *TimeSeries {
 
 // ReuseTimeseries puts the timeseries back into a sync.Pool for reuse.
 func ReuseTimeseries(ts *TimeSeries) {
+	if ts == nil {
+		return
+	}
+
+	// If any of the backing slice capacities is pathologically large (e.g. an
+	// attacker-controlled wire message that stuffed tens of millions of empty
+	// label/sample/exemplar sub-elements into a single timeseries), drop the
+	// whole struct on the floor rather than returning the oversized arrays to
+	// the process-global sync.Pool where they would keep rotating in
+	// Get/Put cycles and never be GC'd.
+	if cap(ts.Labels) > expectedLabels*maxPooledSliceCapacityMultiplier ||
+		cap(ts.Samples) > expectedSamplesPerSeries*maxPooledSliceCapacityMultiplier ||
+		cap(ts.Exemplars) > expectedExemplarsPerSeries*maxPooledSliceCapacityMultiplier {
+		return
+	}
+
 	// Name and Value may point into a large gRPC buffer, so clear the reference to allow GC
 	for i := 0; i < len(ts.Labels); i++ {
 		ts.Labels[i].Name = ""
