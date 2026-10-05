@@ -23,6 +23,14 @@ import (
 
 const messageSizeLargerErrFmt = "received message larger than max (%d vs %d)"
 
+// maxPreallocSize caps how much memory decompressFromReader will pre-allocate
+// based on the attacker-controlled expectedSize (typically the HTTP
+// Content-Length header). Using the header value verbatim lets a client force
+// a large allocation (up to maxSize, by default 100 MiB) with only a handful
+// of bytes on the wire; capping the hint keeps the buffer growth proportional
+// to data actually received.
+const maxPreallocSize = 1 << 20 // 1 MiB
+
 // IsRequestBodyTooLarge returns true if the error is "http: request body too large".
 func IsRequestBodyTooLarge(err error) bool {
 	return err != nil && strings.Contains(err.Error(), "http: request body too large")
@@ -200,7 +208,14 @@ func decompressFromReader(reader io.Reader, expectedSize, maxSize int, compressi
 		err  error
 	)
 	if expectedSize > 0 {
-		buf.Grow(expectedSize + bytes.MinRead) // extra space guarantees no reallocation
+		// expectedSize is attacker-controlled (HTTP Content-Length); only use it
+		// as a capped hint so a lying client cannot force a huge allocation
+		// before any body byte is read.
+		preallocSize := expectedSize
+		if preallocSize > maxPreallocSize {
+			preallocSize = maxPreallocSize
+		}
+		buf.Grow(preallocSize + bytes.MinRead)
 	}
 	// Read from LimitReader with limit max+1. So if the underlying
 	// reader is over limit, the result will be bigger than max.
