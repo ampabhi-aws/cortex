@@ -18,6 +18,7 @@ import (
 	"github.com/cortexproject/cortex/pkg/alertmanager"
 	"github.com/cortexproject/cortex/pkg/alertmanager/alertmanagerpb"
 	"github.com/cortexproject/cortex/pkg/compactor"
+	configAPI "github.com/cortexproject/cortex/pkg/configs/api"
 	"github.com/cortexproject/cortex/pkg/cortexpb"
 	"github.com/cortexproject/cortex/pkg/distributor"
 	"github.com/cortexproject/cortex/pkg/distributor/distributorpb"
@@ -278,6 +279,24 @@ func (a *API) RegisterIngester(i Ingester, pushConfig distributor.Config) {
 func (a *API) RegisterTenantDeletion(api *purger.TenantDeletionAPI) {
 	a.RegisterRoute("/purger/delete_tenant", http.HandlerFunc(api.DeleteTenant), true, "POST")
 	a.RegisterRoute("/purger/delete_tenant_status", http.HandlerFunc(api.DeleteTenantStatus), true, "GET")
+}
+
+// RegisterConfigAPI registers the legacy Configs service HTTP routes on the
+// Cortex API server. Tenant-scoped routes are wrapped by the standard
+// authentication/tenant-extraction middleware (equivalent to
+// RegisterRoute(..., auth=true, ...)); the deliberately all-tenant internal
+// /private/* routes are registered with auth=false so that
+// fakeauth.SetupAuthMiddleware (and any operator-supplied
+// cfg.HTTPAuthMiddleware) still composes consistently with every other
+// Cortex route and operators keep a single trust boundary to guard. This
+// replaces the previous raw gorilla/mux registration on t.Server.HTTP, which
+// bypassed the middleware pipeline entirely and left configs routes
+// unaffected by -auth.enabled=false (letting any caller pick an arbitrary
+// X-Scope-OrgID header against tenant-scoped routes).
+func (a *API) RegisterConfigAPI(c *configAPI.API) {
+	for _, route := range c.Routes() {
+		a.RegisterRoute(route.Path, route.Handler, route.Auth, route.Method)
+	}
 }
 
 // RegisterRuler registers routes associated with the Ruler service.

@@ -81,29 +81,67 @@ func (a *API) admin(w http.ResponseWriter, r *http.Request) {
 `)
 }
 
-// RegisterRoutes registers the configs API HTTP routes with the provided Router.
-func (a *API) RegisterRoutes(r *mux.Router) {
-	for _, route := range []struct {
-		name, method, path string
-		handler            http.HandlerFunc
-	}{
-		{"root", "GET", "/", a.admin},
+// Route describes a single configs API HTTP route and whether it is
+// tenant-scoped (and therefore requires the tenant/auth middleware to be
+// applied by the server registering it).
+type Route struct {
+	Name    string
+	Method  string
+	Path    string
+	Handler http.HandlerFunc
+	// Auth is true when the handler reads the tenant ID from the request
+	// context (via tenant.ExtractTenantIDFromHTTPRequest) and therefore
+	// requires the server's authentication/tenant-extraction middleware to
+	// be applied in front of it. When false, the route is either tenant
+	// agnostic (e.g. the admin landing page) or deliberately all-tenant
+	// internal (the /private/* endpoints) and must be gated by the operator
+	// at the network layer, consistently with Cortex's documented trust
+	// model.
+	Auth bool
+}
+
+// Routes returns the full set of routes exposed by the configs API together
+// with their expected authentication requirement. Callers wiring this API
+// into Cortex's HTTP server (see pkg/api.API.RegisterConfigAPI) use the Auth
+// flag to apply the standard tenant/auth middleware pipeline, so that
+// `-auth.enabled=false` deployments correctly pin all tenant-scoped configs
+// routes to the single fake tenant (via fakeauth.SetupAuthMiddleware) rather
+// than reading X-Scope-OrgID straight off the wire.
+func (a *API) Routes() []Route {
+	return []Route{
+		{"root", "GET", "/", a.admin, false},
 		// Dedicated APIs for updating rules config. In the future, these *must*
 		// be used.
-		{"get_rules", "GET", "/api/prom/configs/rules", a.getConfig},
-		{"set_rules", "POST", "/api/prom/configs/rules", a.setConfig},
-		{"get_templates", "GET", "/api/prom/configs/templates", a.getConfig},
-		{"set_templates", "POST", "/api/prom/configs/templates", a.setConfig},
-		{"get_alertmanager_config", "GET", "/api/prom/configs/alertmanager", a.getConfig},
-		{"set_alertmanager_config", "POST", "/api/prom/configs/alertmanager", a.setConfig},
-		{"validate_alertmanager_config", "POST", "/api/prom/configs/alertmanager/validate", a.validateAlertmanagerConfig},
-		{"deactivate_config", "DELETE", "/api/prom/configs/deactivate", a.deactivateConfig},
-		{"restore_config", "POST", "/api/prom/configs/restore", a.restoreConfig},
-		// Internal APIs.
-		{"private_get_rules", "GET", "/private/api/prom/configs/rules", a.getConfigs},
-		{"private_get_alertmanager_config", "GET", "/private/api/prom/configs/alertmanager", a.getConfigs},
-	} {
-		r.Handle(route.path, route.handler).Methods(route.method).Name(route.name)
+		{"get_rules", "GET", "/api/prom/configs/rules", a.getConfig, true},
+		{"set_rules", "POST", "/api/prom/configs/rules", a.setConfig, true},
+		{"get_templates", "GET", "/api/prom/configs/templates", a.getConfig, true},
+		{"set_templates", "POST", "/api/prom/configs/templates", a.setConfig, true},
+		{"get_alertmanager_config", "GET", "/api/prom/configs/alertmanager", a.getConfig, true},
+		{"set_alertmanager_config", "POST", "/api/prom/configs/alertmanager", a.setConfig, true},
+		{"validate_alertmanager_config", "POST", "/api/prom/configs/alertmanager/validate", a.validateAlertmanagerConfig, true},
+		{"deactivate_config", "DELETE", "/api/prom/configs/deactivate", a.deactivateConfig, true},
+		{"restore_config", "POST", "/api/prom/configs/restore", a.restoreConfig, true},
+		// Internal APIs. These return every tenant's configuration and must
+		// only ever be reachable from the operator's internal network; see
+		// docs/guides/authentication-and-authorisation.md. They are
+		// deliberately not tenant-scoped (the configs client in
+		// pkg/configs/client/client.go does not send X-Scope-OrgID), but they
+		// are still registered via the Cortex API so they inherit the
+		// standard middleware chain, including fakeauth when
+		// `-auth.enabled=false`.
+		{"private_get_rules", "GET", "/private/api/prom/configs/rules", a.getConfigs, false},
+		{"private_get_alertmanager_config", "GET", "/private/api/prom/configs/alertmanager", a.getConfigs, false},
+	}
+}
+
+// RegisterRoutes registers the configs API HTTP routes with the provided
+// Router. It is retained for the API's own self-contained Handler (used by
+// tests and by callers that embed the configs API directly); production
+// wiring from Cortex goes through pkg/api.API.RegisterConfigAPI so that the
+// routes participate in the standard authentication middleware pipeline.
+func (a *API) RegisterRoutes(r *mux.Router) {
+	for _, route := range a.Routes() {
+		r.Handle(route.Path, route.Handler).Methods(route.Method).Name(route.Name)
 	}
 }
 
