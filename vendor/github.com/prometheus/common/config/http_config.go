@@ -679,10 +679,20 @@ func (rt *oauth2RoundTripper) RoundTrip(req *http.Request) (*http.Response, erro
 			return nil, err
 		}
 
+		// SECURITY: propagate the caller-supplied DialContext (e.g. Cortex's
+		// FirewallDialer) to the token-fetch transport so OAuth2 token requests
+		// honour the same egress firewall as the primary transport. Without
+		// this, a tenant-supplied oauth2.token_url / proxy_url would bypass
+		// WithDialContextFunc and reach loopback/metadata/RFC1918 addresses.
+		var dialContext func(ctx context.Context, network, addr string) (net.Conn, error)
+		if rt.opts != nil && rt.opts.dialContextFunc != nil {
+			dialContext = (func(context.Context, string, string) (net.Conn, error))(rt.opts.dialContextFunc)
+		}
 		tlsTransport := func(tlsConfig *tls.Config) (http.RoundTripper, error) {
 			return &http.Transport{
 				TLSClientConfig:       tlsConfig,
 				Proxy:                 http.ProxyURL(rt.config.ProxyURL.URL),
+				DialContext:           dialContext,
 				DisableKeepAlives:     !rt.opts.keepAlivesEnabled,
 				MaxIdleConns:          20,
 				MaxIdleConnsPerHost:   1, // see https://github.com/golang/go/issues/13801
