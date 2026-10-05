@@ -37,7 +37,32 @@ const (
 	errTemplateTooBig        = "template %s is too big: %d bytes (limit: %d bytes)"
 
 	fetchConcurrency = 16
+
+	// Default safety caps applied to the multitenant Alertmanager config API
+	// (POST /api/v1/alerts) when the operator has not configured a per-tenant
+	// limit (i.e. AlertmanagerMaxConfigSize / AlertmanagerMaxTemplatesCount /
+	// AlertmanagerMaxTemplateSize return 0 = "no limit"). These are defense in
+	// depth: without them an authenticated tenant can force unbounded heap
+	// allocations by streaming a chunked request body and can persist an
+	// unbounded number/size of template files on every replica owning the
+	// tenant, denying service to all co-located tenants. Operators can raise
+	// (or lower) the effective ceiling by configuring the corresponding
+	// -alertmanager.max-* flags / per-tenant overrides.
+	defaultMaxConfigSizeBytes   = 10 * 1024 * 1024 // 10 MiB
+	defaultMaxTemplatesCount    = 20
+	defaultMaxTemplateSizeBytes = 1 * 1024 * 1024 // 1 MiB
 )
+
+// effectiveAlertmanagerLimit returns the operator-configured limit when it is
+// positive, otherwise the hardcoded safety default. A limit of 0 historically
+// meant "no limit" on this path, which is unsafe for an endpoint reachable by
+// any tenant that can set X-Scope-OrgID; this helper enforces a safe default.
+func effectiveAlertmanagerLimit(configured, safeDefault int) int {
+	if configured > 0 {
+		return configured
+	}
+	return safeDefault
+}
 
 var (
 	errPasswordFileNotAllowed        = errors.New("setting password_file, bearer_token_file and credentials_file is not allowed")
@@ -100,15 +125,14 @@ func (am *MultitenantAlertmanager) SetUserConfig(w http.ResponseWriter, r *http.
 		return
 	}
 
-	var input io.Reader
-	maxConfigSize := am.limits.AlertmanagerMaxConfigSize(userID)
-	if maxConfigSize > 0 {
-		// LimitReader will return EOF after reading specified number of bytes. To check if
-		// we have read too many bytes, allow one extra byte.
-		input = io.LimitReader(r.Body, int64(maxConfigSize)+1)
-	} else {
-		input = r.Body
-	}
+	// Always enforce a bound on the request body. If the operator has not
+	// configured -alertmanager.max-config-size-bytes (per-tenant override of
+	// AlertmanagerMaxConfigSize), fall back to a conservative default so a
+	// single tenant cannot drive the shared Alertmanager process to OOM.
+	maxConfigSize := effectiveAlertmanagerLimit(am.limits.AlertmanagerMaxConfigSize(userID), defaultMaxConfigSizeBytes)
+	// LimitReader will return EOF after reading specified number of bytes. To check if
+	// we have read too many bytes, allow one extra byte.
+	input := io.LimitReader(r.Body, int64(maxConfigSize)+1)
 
 	payload, err := io.ReadAll(input)
 	if err != nil {
@@ -117,7 +141,7 @@ func (am *MultitenantAlertmanager) SetUserConfig(w http.ResponseWriter, r *http.
 		return
 	}
 
-	if maxConfigSize > 0 && len(payload) > maxConfigSize {
+	if len(payload) > maxConfigSize {
 		msg := fmt.Sprintf(errConfigurationTooBig, maxConfigSize)
 		level.Warn(logger).Log("msg", msg)
 		http.Error(w, msg, http.StatusBadRequest)
@@ -197,16 +221,21 @@ func validateUserConfig(logger log.Logger, cfg alertspb.AlertConfigDesc, limits 
 		}
 	}
 
-	// Check template limits.
-	if l := limits.AlertmanagerMaxTemplatesCount(user); l > 0 && len(cfg.Templates) > l {
-		return fmt.Errorf(errTooManyTemplates, len(cfg.Templates), l)
+	// Check template limits. Always enforce a bound even when the operator has
+	// not configured a per-tenant limit: templates are persisted to local disk
+	// on every Alertmanager replica owning the tenant, so an unbounded number
+	// or size of templates from a single tenant can fill the shared data
+	// volume and break notification/silence persistence for every co-located
+	// tenant.
+	maxTemplates := effectiveAlertmanagerLimit(limits.AlertmanagerMaxTemplatesCount(user), defaultMaxTemplatesCount)
+	if len(cfg.Templates) > maxTemplates {
+		return fmt.Errorf(errTooManyTemplates, len(cfg.Templates), maxTemplates)
 	}
 
-	if maxSize := limits.AlertmanagerMaxTemplateSize(user); maxSize > 0 {
-		for _, tmpl := range cfg.Templates {
-			if size := len(tmpl.GetBody()); size > maxSize {
-				return fmt.Errorf(errTemplateTooBig, tmpl.GetFilename(), size, maxSize)
-			}
+	maxTemplateSize := effectiveAlertmanagerLimit(limits.AlertmanagerMaxTemplateSize(user), defaultMaxTemplateSizeBytes)
+	for _, tmpl := range cfg.Templates {
+		if size := len(tmpl.GetBody()); size > maxTemplateSize {
+			return fmt.Errorf(errTemplateTooBig, tmpl.GetFilename(), size, maxTemplateSize)
 		}
 	}
 
