@@ -814,6 +814,38 @@ func (am *MultitenantAlertmanager) setConfig(cfg alertspb.AlertConfigDesc) error
 	var userTemplateDir = filepath.Join(am.getTenantDirectory(cfg.User), templatesDir)
 	var pathsToRemove = make(map[string]struct{})
 
+	// Re-validate store-sourced configs before mutating the filesystem. The
+	// POST /api/v1/alerts handler validates everything via validateUserConfig,
+	// but configs coming from the alert store (e.g. the deprecated configs
+	// API or any other writer with access to the backing store) must not be
+	// trusted blindly: the sync path needs to re-enforce the Cortex-specific
+	// restrictions (template filenames, `*_file` deny-list in HTTP/TLS
+	// configs, etc.) before any disk mutation or before applying the config
+	// to the running Alertmanager. We cannot call validateUserConfig here
+	// unconditionally because am.limits may be nil in some embedding setups
+	// and the limit checks are already enforced on the ingest path
+	// (POST /api/v1/alerts); instead we re-run the subset of validation that
+	// is strictly a security control (filename + Cortex-specific config
+	// restrictions) and is cheap enough to run on every sync.
+	if cfg.RawConfig != "" {
+		amCfg, err := amconfig.Load(cfg.RawConfig)
+		if err != nil {
+			return fmt.Errorf("invalid Alertmanager configuration for %v: %v", cfg.User, err)
+		}
+		if err := validateAlertmanagerConfig(amCfg); err != nil {
+			return fmt.Errorf("invalid Alertmanager configuration for %v: %v", cfg.User, err)
+		}
+		// Validate the template filenames referenced from the `templates:`
+		// section of the raw config. The explicit template descriptors in
+		// cfg.Templates are validated below right before they are written
+		// to disk.
+		for _, name := range amCfg.Templates {
+			if err := validateTemplateFilename(name); err != nil {
+				return fmt.Errorf("invalid Alertmanager configuration for %v: %v", cfg.User, err)
+			}
+		}
+	}
+
 	// List existing files to keep track the ones to be removed
 	if oldTemplateFiles, err := os.ReadDir(userTemplateDir); err == nil {
 		for _, file := range oldTemplateFiles {
@@ -822,6 +854,15 @@ func (am *MultitenantAlertmanager) setConfig(cfg alertspb.AlertConfigDesc) error
 	}
 
 	for _, tmpl := range cfg.Templates {
+		// Defense in depth: even though validateUserConfig has already
+		// rejected invalid template filenames, re-apply the filename check
+		// here so that any future caller of setConfig (including code paths
+		// that bypass validateUserConfig) cannot plant files outside the
+		// per-tenant templates directory.
+		if err := validateTemplateFilename(tmpl.Filename); err != nil {
+			return err
+		}
+
 		templateFilePath, err := safeTemplateFilepath(userTemplateDir, tmpl.Filename)
 		if err != nil {
 			return err
@@ -1295,6 +1336,13 @@ func (am *MultitenantAlertmanager) ReadState(ctx context.Context, req *alertmana
 // The validation done in this function is a first fence to avoid having a tenant submitting
 // a config which may escape the per-tenant data directory on disk.
 func validateTemplateFilename(filename string) error {
+	// Reject empty filenames: filepath.Join(dir, "") returns dir itself,
+	// which would make storeTemplateFile clobber the tenant templates
+	// directory with a regular file and permanently break template syncing.
+	if filename == "" {
+		return fmt.Errorf("invalid template name %q: the template name cannot be empty", filename)
+	}
+
 	if filepath.Base(filename) != filename {
 		return fmt.Errorf("invalid template name %q: the template name cannot contain any path", filename)
 	}
@@ -1311,6 +1359,14 @@ func validateTemplateFilename(filename string) error {
 // This function also performs a security check to make sure the provided templateName
 // doesn't contain a relative path escaping the provided dir.
 func safeTemplateFilepath(dir, templateName string) (string, error) {
+	// Reject an empty template name: filepath.Join(dir, "") returns dir
+	// itself and the prefix containment check below would trivially pass,
+	// which would allow a caller to write a regular file over the tenant's
+	// templates directory via storeTemplateFile.
+	if templateName == "" {
+		return "", fmt.Errorf("invalid template name %q: the template name cannot be empty", templateName)
+	}
+
 	// We expect all template files to be stored and referenced within the provided directory.
 	containerDir, err := filepath.Abs(dir)
 	if err != nil {
@@ -1325,8 +1381,12 @@ func safeTemplateFilepath(dir, templateName string) (string, error) {
 
 	// Ensure the actual path of the template is within the expected directory.
 	// This check is a counter-measure to make sure the tenant is not trying to
-	// escape its own directory on disk.
-	if !strings.HasPrefix(actualPath, containerDir) {
+	// escape its own directory on disk. Append the path separator so that a
+	// sibling directory sharing the same prefix (e.g. "<dir>X") is rejected;
+	// without the separator boundary a template name such as
+	// "../templatesX/evil.tmpl" would cleanly resolve to a sibling of the
+	// templates directory and still pass a plain strings.HasPrefix check.
+	if actualPath != containerDir && !strings.HasPrefix(actualPath, containerDir+string(os.PathSeparator)) {
 		return "", fmt.Errorf("invalid template name %q: the template filepath is escaping the per-tenant local directory", templateName)
 	}
 
