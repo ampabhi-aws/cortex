@@ -321,6 +321,13 @@ func (s resultsCache) isAtModifierCachable(ctx context.Context, r tripperware.Re
 	if !strings.Contains(query, "@") {
 		return true
 	}
+	if err := ValidateQueryExpressionSize(query); err != nil {
+		// Oversized expressions must not be fed to the recursive promql parser.
+		// Treat them as not cachable (pessimistic) rather than risk a quadratic
+		// parse or an unrecoverable stack overflow.
+		level.Warn(util_log.WithContext(ctx, s.logger)).Log("msg", "query expression too large; considering @ modifier as not cachable", "err", err)
+		return false
+	}
 	expr, err := parser.ParseExpr(query)
 	if err != nil {
 		// We are being pessimistic in such cases.

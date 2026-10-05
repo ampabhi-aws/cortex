@@ -135,6 +135,9 @@ func (c instantQueryCodec) DecodeRequest(_ context.Context, r *http.Request, for
 	}
 
 	result.Query = r.FormValue("query")
+	if err := queryrange.ValidateQueryExpressionSize(result.Query); err != nil {
+		return nil, err
+	}
 	result.Stats = r.FormValue("stats")
 	result.Path = r.URL.Path
 

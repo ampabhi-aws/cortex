@@ -30,6 +30,26 @@ import (
 // StatusSuccess Prometheus success result.
 const StatusSuccess = "success"
 
+// MaxQueryExpressionSizeBytesDefault is the default maximum accepted size (in
+// bytes) of the raw PromQL expression accepted by the query-frontend codecs.
+//
+// Capping the raw expression bytes is required to prevent an unauthenticated or
+// low-privilege tenant from submitting a pathologically large / deeply nested
+// PromQL expression that would cause the recursive promql parser, AST walker
+// and printer to consume quadratic CPU/memory (fmt.Sprintf-based printer in
+// prometheus/promql/parser is Theta(N^2) in nesting depth) and, at larger
+// depths, overflow the goroutine stack via an unrecoverable runtime fatal
+// error (`goroutine stack exceeds 1000000000-byte limit`) which `recover()`
+// cannot intercept and which terminates the whole shared multi-tenant
+// query-frontend/querier process.
+//
+// 10KB is comfortably larger than any realistic hand-written or dashboard
+// generated PromQL expression (Grafana/Prometheus community guidance treats
+// anything above ~1KB as very large) and is small enough that both the
+// quadratic serialisation and the unbounded recursion in the vendored
+// prometheus parser cannot escalate into a denial-of-service.
+const MaxQueryExpressionSizeBytesDefault = 10 * 1024
+
 var (
 	matrix = model.ValMatrix.String()
 	json   = jsoniter.Config{
@@ -41,6 +61,15 @@ var (
 	errNegativeStep   = httpgrpc.Errorf(http.StatusBadRequest, "zero or negative query resolution step widths are not accepted. Try a positive integer")
 	errStepTooSmall   = httpgrpc.Errorf(http.StatusBadRequest, "exceeded maximum resolution of 11,000 points per timeseries. Try decreasing the query resolution (?step=XX)")
 
+	// MaxQueryExpressionSizeBytes is the maximum accepted size (in bytes) of
+	// the raw PromQL expression. A value <= 0 disables the limit (not
+	// recommended). It is exposed as a package-level variable so that advanced
+	// operators who have proven that upstream controls bound the expression
+	// (e.g. a strict ingress WAF) can tune or disable it, but the shipped
+	// default is deliberately conservative to protect multi-tenant deployments
+	// out of the box.
+	MaxQueryExpressionSizeBytes = MaxQueryExpressionSizeBytesDefault
+
 	// PrometheusCodec is a codec to encode and decode Prometheus query range requests and responses.
 	PrometheusCodec tripperware.Codec = &prometheusCodec{sharded: false}
 	// ShardedPrometheusCodec is same as PrometheusCodec but to be used on the sharded queries (it sum up the stats)
@@ -49,6 +78,21 @@ var (
 	// Name of the cache control header.
 	cacheControlHeader = "Cache-Control"
 )
+
+// ValidateQueryExpressionSize returns an HTTP 400 error if the given raw
+// PromQL expression exceeds MaxQueryExpressionSizeBytes. It is intentionally a
+// cheap byte-length check that executes before any recursive parse of the
+// expression, so that an attacker-controlled 10 MiB form body cannot drive the
+// recursive promql parser/printer into quadratic allocation or an
+// unrecoverable stack overflow.
+func ValidateQueryExpressionSize(query string) error {
+	if limit := MaxQueryExpressionSizeBytes; limit > 0 && len(query) > limit {
+		return httpgrpc.Errorf(http.StatusBadRequest,
+			"query expression exceeds the limit (size: %d bytes, limit: %d bytes)",
+			len(query), limit)
+	}
+	return nil
+}
 
 type prometheusCodec struct {
 	sharded bool
@@ -197,6 +241,9 @@ func (prometheusCodec) DecodeRequest(_ context.Context, r *http.Request, forward
 	}
 
 	result.Query = r.FormValue("query")
+	if err := ValidateQueryExpressionSize(result.Query); err != nil {
+		return nil, err
+	}
 	result.Stats = r.FormValue("stats")
 	result.Path = r.URL.Path
 
