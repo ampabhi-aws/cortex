@@ -37,6 +37,18 @@ const (
 	errTemplateTooBig        = "template %s is too big: %d bytes (limit: %d bytes)"
 
 	fetchConcurrency = 16
+
+	// defaultMaxConfigSizeBytes is a safety cap applied to the request body of
+	// POST /api/v1/alerts when the operator has not set a per-tenant limit via
+	// -alertmanager.max-config-size-bytes (default 0 = "no limit"). Without
+	// this bound a single authenticated tenant could POST an arbitrarily large
+	// configuration, buffer it fully in memory (plus yaml.Unmarshal copies),
+	// and OOM-kill the shared multitenant Alertmanager process, impacting
+	// alert delivery for every co-tenant on the replica. 100 MiB is well
+	// above any realistic alertmanager configuration while still preventing
+	// unbounded allocation. Operators who need a different bound should set
+	// -alertmanager.max-config-size-bytes explicitly.
+	defaultMaxConfigSizeBytes = 100 * 1024 * 1024
 )
 
 var (
@@ -100,15 +112,20 @@ func (am *MultitenantAlertmanager) SetUserConfig(w http.ResponseWriter, r *http.
 		return
 	}
 
-	var input io.Reader
+	// Always bound the amount of tenant-supplied data we are willing to buffer
+	// in memory. If the operator has configured a per-tenant limit via
+	// -alertmanager.max-config-size-bytes we honour it; otherwise we fall back
+	// to a conservative safety cap so that a single tenant cannot OOM-kill the
+	// shared multitenant Alertmanager process (which would stop alert delivery
+	// for every co-tenant on the replica).
 	maxConfigSize := am.limits.AlertmanagerMaxConfigSize(userID)
-	if maxConfigSize > 0 {
-		// LimitReader will return EOF after reading specified number of bytes. To check if
-		// we have read too many bytes, allow one extra byte.
-		input = io.LimitReader(r.Body, int64(maxConfigSize)+1)
-	} else {
-		input = r.Body
+	effectiveMax := maxConfigSize
+	if effectiveMax <= 0 {
+		effectiveMax = defaultMaxConfigSizeBytes
 	}
+	// LimitReader will return EOF after reading the specified number of bytes.
+	// Allow one extra byte so we can detect oversize payloads.
+	input := io.LimitReader(r.Body, int64(effectiveMax)+1)
 
 	payload, err := io.ReadAll(input)
 	if err != nil {
@@ -117,8 +134,8 @@ func (am *MultitenantAlertmanager) SetUserConfig(w http.ResponseWriter, r *http.
 		return
 	}
 
-	if maxConfigSize > 0 && len(payload) > maxConfigSize {
-		msg := fmt.Sprintf(errConfigurationTooBig, maxConfigSize)
+	if len(payload) > effectiveMax {
+		msg := fmt.Sprintf(errConfigurationTooBig, effectiveMax)
 		level.Warn(logger).Log("msg", msg)
 		http.Error(w, msg, http.StatusBadRequest)
 		return
