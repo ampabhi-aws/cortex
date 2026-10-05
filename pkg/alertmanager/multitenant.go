@@ -814,6 +814,26 @@ func (am *MultitenantAlertmanager) setConfig(cfg alertspb.AlertConfigDesc) error
 	var userTemplateDir = filepath.Join(am.getTenantDirectory(cfg.User), templatesDir)
 	var pathsToRemove = make(map[string]struct{})
 
+	// Enforce an aggregate per-tenant on-disk byte budget before touching the
+	// shared data volume. storeTemplateFile writes tenant-controlled bytes to
+	// a directory that is shared across all tenants hosted by this instance,
+	// so an unbounded or ever-growing set of templates for one tenant can
+	// fill the volume and break silence/notification-log persistence and
+	// config reloads for co-tenants. We cap the aggregate template byte
+	// footprint by the tenant's max-config-size limit (which already bounds
+	// the uploaded body) when available, with the per-template cap applied
+	// as a lower bound to tolerate configurations with the full allowed
+	// template count. 0 (= operator opt-out) disables the aggregate check.
+	if budget := am.aggregateTemplateBudgetBytes(cfg.User); budget > 0 {
+		var total int64
+		for _, tmpl := range cfg.Templates {
+			total += int64(len(tmpl.GetBody()))
+			if total > budget {
+				return fmt.Errorf("aggregate size of templates for user %s exceeds the per-tenant on-disk budget of %d bytes", cfg.User, budget)
+			}
+		}
+	}
+
 	// List existing files to keep track the ones to be removed
 	if oldTemplateFiles, err := os.ReadDir(userTemplateDir); err == nil {
 		for _, file := range oldTemplateFiles {
@@ -921,6 +941,28 @@ func (am *MultitenantAlertmanager) setConfig(cfg alertspb.AlertConfigDesc) error
 
 func (am *MultitenantAlertmanager) getTenantDirectory(userID string) string {
 	return filepath.Join(am.cfg.DataDir, userID)
+}
+
+// aggregateTemplateBudgetBytes returns the per-tenant on-disk byte budget for
+// template files, or 0 to disable the aggregate check. The budget is derived
+// from the per-tenant Alertmanager limits: we take the max config size as the
+// upper bound on how much data a single accepted upload can commit to disk,
+// falling back to max-templates-count * max-template-size when the config
+// size limit is disabled (0 = operator opt-out). Returning 0 means no
+// aggregate accounting is enforced.
+func (am *MultitenantAlertmanager) aggregateTemplateBudgetBytes(userID string) int64 {
+	if am == nil || am.limits == nil {
+		return 0
+	}
+	if v := am.limits.AlertmanagerMaxConfigSize(userID); v > 0 {
+		return int64(v)
+	}
+	count := am.limits.AlertmanagerMaxTemplatesCount(userID)
+	size := am.limits.AlertmanagerMaxTemplateSize(userID)
+	if count > 0 && size > 0 {
+		return int64(count) * int64(size)
+	}
+	return 0
 }
 
 func (am *MultitenantAlertmanager) newAlertmanager(userID string, amConfig *amconfig.Config, rawCfg string) (*Alertmanager, error) {
