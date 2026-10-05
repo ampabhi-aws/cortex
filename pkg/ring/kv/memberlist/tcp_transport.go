@@ -90,6 +90,15 @@ type TCPTransport struct {
 	tcpListeners []net.Listener
 	tlsConfig    *tls.Config
 
+	// serverTLSConfig is used by the inbound TLS listener; unlike tlsConfig
+	// (which is used for outbound dials), it requires inbound peers to
+	// present a client certificate that chains to the configured CA. This
+	// closes a cluster-takeover vulnerability where any TCP peer could
+	// pushPull / merge arbitrary ring state via the gossip KV because the
+	// listener was built from the client-side TLS config and therefore left
+	// ClientAuth at NoClientCert.
+	serverTLSConfig *tls.Config
+
 	shutdown atomic.Int32
 
 	advertiseMu   sync.RWMutex
@@ -131,6 +140,19 @@ func NewTCPTransport(config TCPTransportConfig, logger log.Logger) (*TCPTranspor
 		if err != nil {
 			return nil, errors.Wrap(err, "unable to create TLS config")
 		}
+		// Build a *separate* server-side TLS config for the inbound
+		// listener. ClientConfig.GetTLSConfig() returns a client-side
+		// config whose ClientAuth defaults to NoClientCert, which left
+		// the memberlist listener accepting any peer and allowed any
+		// network-adjacent attacker to inject or exfiltrate ring state.
+		// GetServerTLSConfig requires both a server certificate
+		// (tls_cert_path / tls_key_path) and a client CA (tls_ca_path)
+		// and sets ClientAuth = RequireAndVerifyClientCert so inbound
+		// peers are authenticated.
+		t.serverTLSConfig, err = config.TLS.GetServerTLSConfig()
+		if err != nil {
+			return nil, errors.Wrap(err, "unable to create server TLS config for memberlist listener")
+		}
 	}
 
 	t.registerMetrics(config.MetricsRegisterer)
@@ -151,7 +173,7 @@ func NewTCPTransport(config TCPTransportConfig, logger log.Logger) (*TCPTranspor
 
 		var tcpLn net.Listener
 		if config.TLSEnabled {
-			tcpLn, err = tls.Listen("tcp", tcpAddr.String(), t.tlsConfig)
+			tcpLn, err = tls.Listen("tcp", tcpAddr.String(), t.serverTLSConfig)
 			if err != nil {
 				return nil, errors.Wrapf(err, "failed to start TLS TCP listener on %q port %d", addr, port)
 			}

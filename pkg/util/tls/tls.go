@@ -22,8 +22,10 @@ type ClientConfig struct {
 }
 
 var (
-	errKeyMissing  = errors.New("certificate given but no key configured")
-	errCertMissing = errors.New("key given but no certificate configured")
+	errKeyMissing            = errors.New("certificate given but no key configured")
+	errCertMissing           = errors.New("key given but no certificate configured")
+	errServerCertMissing     = errors.New("server TLS requires both a certificate and a key (tls_cert_path and tls_key_path)")
+	errServerClientCAMissing = errors.New("server TLS requires a client CA (tls_ca_path) in order to authenticate inbound peers; without it any peer can connect")
 )
 
 // RegisterFlagsWithPrefix registers flags with prefix.
@@ -71,6 +73,53 @@ func (cfg *ClientConfig) GetTLSConfig() (*tls.Config, error) {
 	}
 
 	return config, nil
+}
+
+// GetServerTLSConfig initialises a *tls.Config suitable for use by a TLS
+// *server* (e.g. a tls.Listen call), reusing the certificate/key and CA
+// configured on this ClientConfig.
+//
+// Unlike GetTLSConfig (which returns a client-side configuration whose only
+// authentication is of the *server*), the returned config requires inbound
+// peers to present a certificate that chains to the configured CA
+// (ClientAuth = RequireAndVerifyClientCert, ClientCAs = CAPath). This is
+// used to authenticate peers on protocols where the ClientConfig is reused
+// to provision both client and server endpoints — in particular the
+// memberlist gossip transport, which previously built its listener via
+// GetTLSConfig() and therefore left ClientAuth at the Go default of
+// NoClientCert, accepting any inbound peer.
+//
+// Both a server certificate (CertPath/KeyPath) and a client CA (CAPath)
+// are mandatory; without them it is impossible to authenticate incoming
+// connections.
+func (cfg *ClientConfig) GetServerTLSConfig() (*tls.Config, error) {
+	if cfg.CertPath == "" || cfg.KeyPath == "" {
+		return nil, errServerCertMissing
+	}
+	if cfg.CAPath == "" {
+		return nil, errServerClientCAMissing
+	}
+
+	serverCert, err := tls.LoadX509KeyPair(cfg.CertPath, cfg.KeyPath)
+	if err != nil {
+		return nil, errors.Wrapf(err, "failed to load server TLS certificate %s,%s", cfg.CertPath, cfg.KeyPath)
+	}
+
+	caCert, err := os.ReadFile(cfg.CAPath)
+	if err != nil {
+		return nil, errors.Wrapf(err, "error loading client CA cert: %s", cfg.CAPath)
+	}
+	clientCAs := x509.NewCertPool()
+	if !clientCAs.AppendCertsFromPEM(caCert) {
+		return nil, errors.Errorf("failed to parse any client CA certificate from %s", cfg.CAPath)
+	}
+
+	return &tls.Config{
+		Certificates: []tls.Certificate{serverCert},
+		ClientCAs:    clientCAs,
+		ClientAuth:   tls.RequireAndVerifyClientCert,
+		MinVersion:   tls.VersionTLS12,
+	}, nil
 }
 
 // GetGRPCDialOptions creates GRPC DialOptions for TLS
