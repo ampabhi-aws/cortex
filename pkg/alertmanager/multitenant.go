@@ -4,6 +4,7 @@ import (
 	"context"
 	"flag"
 	"fmt"
+	"net"
 	"net/http"
 	"net/url"
 	"os"
@@ -25,6 +26,9 @@ import (
 	"github.com/weaveworks/common/httpgrpc/server"
 	"github.com/weaveworks/common/user"
 	"golang.org/x/time/rate"
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/peer"
+	"google.golang.org/grpc/status"
 
 	"github.com/cortexproject/cortex/pkg/alertmanager/alertmanagerpb"
 	"github.com/cortexproject/cortex/pkg/alertmanager/alertspb"
@@ -1152,8 +1156,74 @@ func (am *MultitenantAlertmanager) ReadFullStateForUser(ctx context.Context, use
 	return results, nil
 }
 
+// verifyReplicationPeer authorises the caller of the state-replication RPCs
+// (UpdateState / ReadState) as a legitimate Alertmanager peer. Those RPCs are
+// internal replication primitives whose only authorization is otherwise the
+// caller-supplied X-Scope-OrgID gRPC metadata, which lets anyone with network
+// access to the shared Cortex gRPC port forge or exfiltrate silence /
+// notification-log state for an arbitrary tenant. We verify that:
+//
+//  1. Sharding is enabled (otherwise there is no replication, so these RPCs
+//     must not be used);
+//  2. The gRPC transport exposes a peer network address; and
+//  3. The peer's IP matches a healthy member of the Alertmanager ring (so
+//     the caller is a legitimate replica).
+//
+// This complements, and does not replace, operator-provided transport
+// authentication (-server.grpc-tls-client-auth=RequireAndVerifyClientCert).
+func (am *MultitenantAlertmanager) verifyReplicationPeer(ctx context.Context) error {
+	if !am.cfg.ShardingEnabled || am.ring == nil {
+		return status.Error(codes.FailedPrecondition, "alertmanager state replication is only available when sharding is enabled")
+	}
+
+	p, ok := peer.FromContext(ctx)
+	if !ok || p == nil || p.Addr == nil {
+		return status.Error(codes.Unauthenticated, "state replication RPC rejected: no peer address available")
+	}
+
+	peerIP, err := extractHost(p.Addr.String())
+	if err != nil {
+		return status.Errorf(codes.Unauthenticated, "state replication RPC rejected: cannot parse peer address %q: %s", p.Addr.String(), err)
+	}
+
+	replicas, err := am.ring.GetAllHealthy(SyncRingOp)
+	if err != nil {
+		level.Warn(am.logger).Log("msg", "failed to read alertmanager ring while authorizing replication peer", "err", err)
+		return status.Error(codes.Unavailable, "state replication RPC rejected: unable to read alertmanager ring")
+	}
+
+	for _, inst := range replicas.Instances {
+		instIP, err := extractHost(inst.Addr)
+		if err != nil {
+			continue
+		}
+		if instIP == peerIP {
+			return nil
+		}
+	}
+
+	level.Warn(am.logger).Log("msg", "rejected alertmanager state replication RPC from non-peer", "peer", p.Addr.String())
+	return status.Errorf(codes.PermissionDenied, "state replication RPC rejected: peer %s is not a member of the alertmanager ring", peerIP)
+}
+
+// extractHost returns the host (IP or hostname) part of an address string.
+// It accepts both "host:port" forms and bare host addresses.
+func extractHost(addr string) (string, error) {
+	if addr == "" {
+		return "", fmt.Errorf("empty address")
+	}
+	if host, _, err := net.SplitHostPort(addr); err == nil {
+		return host, nil
+	}
+	return addr, nil
+}
+
 // UpdateState implements the Alertmanager service.
 func (am *MultitenantAlertmanager) UpdateState(ctx context.Context, part *clusterpb.Part) (*alertmanagerpb.UpdateStateResponse, error) {
+	if err := am.verifyReplicationPeer(ctx); err != nil {
+		return nil, err
+	}
+
 	userID, err := tenant.TenantID(ctx)
 	if err != nil {
 		return nil, err
@@ -1258,8 +1328,12 @@ func (am *MultitenantAlertmanager) getPerUserDirectories() map[string]string {
 	return result
 }
 
-// UpdateState implements the Alertmanager service.
+// ReadState implements the Alertmanager service.
 func (am *MultitenantAlertmanager) ReadState(ctx context.Context, req *alertmanagerpb.ReadStateRequest) (*alertmanagerpb.ReadStateResponse, error) {
+	if err := am.verifyReplicationPeer(ctx); err != nil {
+		return nil, err
+	}
+
 	userID, err := tenant.TenantID(ctx)
 	if err != nil {
 		return nil, err

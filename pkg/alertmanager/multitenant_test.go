@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"io"
 	"math/rand"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"net/http/pprof"
@@ -36,6 +37,7 @@ import (
 	"go.uber.org/atomic"
 	"golang.org/x/time/rate"
 	"google.golang.org/grpc"
+	"google.golang.org/grpc/peer"
 
 	"github.com/cortexproject/cortex/pkg/alertmanager/alertmanagerpb"
 	"github.com/cortexproject/cortex/pkg/alertmanager/alertspb"
@@ -2052,15 +2054,35 @@ receivers:
 }
 
 type passthroughAlertmanagerClient struct {
-	server alertmanagerpb.AlertmanagerServer
+	server     alertmanagerpb.AlertmanagerServer
+	fromAddr   string
+	remoteAddr string
 }
 
+func (am *passthroughAlertmanagerClient) injectPeer(ctx context.Context) context.Context {
+	if am.fromAddr == "" {
+		return ctx
+	}
+	host, _, err := net.SplitHostPort(am.fromAddr)
+	if err != nil {
+		host = am.fromAddr
+	}
+	return peer.NewContext(ctx, &peer.Peer{Addr: &testPeerAddr{host: host}})
+}
+
+type testPeerAddr struct {
+	host string
+}
+
+func (a *testPeerAddr) Network() string { return "tcp" }
+func (a *testPeerAddr) String() string  { return a.host + ":12345" }
+
 func (am *passthroughAlertmanagerClient) UpdateState(ctx context.Context, in *clusterpb.Part, opts ...grpc.CallOption) (*alertmanagerpb.UpdateStateResponse, error) {
-	return am.server.UpdateState(ctx, in)
+	return am.server.UpdateState(am.injectPeer(ctx), in)
 }
 
 func (am *passthroughAlertmanagerClient) ReadState(ctx context.Context, in *alertmanagerpb.ReadStateRequest, opts ...grpc.CallOption) (*alertmanagerpb.ReadStateResponse, error) {
-	return am.server.ReadState(ctx, in)
+	return am.server.ReadState(am.injectPeer(ctx), in)
 }
 
 func (am *passthroughAlertmanagerClient) HandleRequest(context.Context, *httpgrpc.HTTPRequest, ...grpc.CallOption) (*httpgrpc.HTTPResponse, error) {
@@ -2068,7 +2090,7 @@ func (am *passthroughAlertmanagerClient) HandleRequest(context.Context, *httpgrp
 }
 
 func (am *passthroughAlertmanagerClient) RemoteAddress() string {
-	return ""
+	return am.remoteAddr
 }
 
 // passthroughAlertmanagerClientPool allows testing the logic of gRPC calls between alertmanager instances
@@ -2097,7 +2119,17 @@ func (f *passthroughAlertmanagerClientPool) GetClientFor(addr string) (Client, e
 	if !ok {
 		return nil, fmt.Errorf("client not found for address: %v", addr)
 	}
-	return Client(&passthroughAlertmanagerClient{s}), nil
+	// Pick any other server address from the pool to act as the caller's peer
+	// address, so the server-side ring-membership check in UpdateState /
+	// ReadState is satisfied in unit tests.
+	fromAddr := addr
+	for otherAddr := range f.servers {
+		if otherAddr != addr {
+			fromAddr = otherAddr
+			break
+		}
+	}
+	return Client(&passthroughAlertmanagerClient{server: s, fromAddr: fromAddr, remoteAddr: addr}), nil
 }
 
 type mockAlertManagerLimits struct {
