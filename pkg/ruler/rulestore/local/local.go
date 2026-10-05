@@ -5,6 +5,7 @@ import (
 	"flag"
 	"os"
 	"path/filepath"
+	"strings"
 
 	"github.com/pkg/errors"
 	promRules "github.com/prometheus/prometheus/rules"
@@ -31,6 +32,17 @@ func (cfg *Config) RegisterFlagsWithPrefix(prefix string, f *flag.FlagSet) {
 type Client struct {
 	cfg    Config
 	loader promRules.GroupLoader
+}
+
+// containsUnsafePathSegments reports whether the given value is a directory
+// reference ("." or "..") or contains a path separator ("/" or "\\"). It is
+// used to reject tenant and namespace values that could be used to escape the
+// configured rule store directory via filepath.Join.
+func containsUnsafePathSegments(v string) bool {
+	if v == "." || v == ".." {
+		return true
+	}
+	return strings.ContainsAny(v, "\\/")
 }
 
 func NewLocalRulesClient(cfg Config, loader promRules.GroupLoader) (*Client, error) {
@@ -168,6 +180,16 @@ func (l *Client) loadAllRulesGroupsForUser(ctx context.Context, userID string) (
 }
 
 func (l *Client) loadAllRulesGroupsForUserAndNamespace(_ context.Context, userID string, namespace string) (rulespb.RuleGroupList, error) {
+	// Defense-in-depth containment check: reject tenant or namespace values
+	// that contain path separators or relative-path references which could
+	// escape the configured rule store directory via filepath.Join (which
+	// cleans `..` segments rather than rejecting them). The API layer
+	// already sanitizes these inputs; this guard ensures the local store
+	// cannot be misused by any future caller.
+	if containsUnsafePathSegments(userID) || containsUnsafePathSegments(namespace) {
+		return nil, errors.Errorf("invalid userID or namespace")
+	}
+
 	filename := filepath.Join(l.cfg.Directory, userID, namespace)
 
 	rulegroups, allErrors := l.loader.Load(filename)
