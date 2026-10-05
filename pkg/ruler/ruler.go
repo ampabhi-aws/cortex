@@ -125,6 +125,22 @@ type Config struct {
 	DisableRuleGroupLabel bool `yaml:"disable_rule_group_label"`
 }
 
+// MarshalYAML implements yaml.Marshaler. It replaces the password embedded in
+// the Alertmanager URL (which the ruler consumes as HTTP basic-auth) with a
+// redaction marker so that the live configuration can be served by the
+// unauthenticated /config endpoint without disclosing credentials.
+//
+// The field-level flagext.Secret helper cannot be used here because the
+// credential is embedded inside a larger URL/DSN string.
+func (cfg Config) MarshalYAML() (interface{}, error) {
+	// Alias has the exact same memory layout as Config but drops the method
+	// set, so marshalling it does not recurse back into MarshalYAML.
+	type plain Config
+	redacted := plain(cfg)
+	redacted.AlertmanagerURL = flagext.RedactSecretInURLList(cfg.AlertmanagerURL, ",")
+	return redacted, nil
+}
+
 // Validate config and returns error on failure
 func (cfg *Config) Validate(limits validation.Limits, log log.Logger) error {
 	if !util.StringsContain(supportedShardingStrategies, cfg.ShardingStrategy) {
