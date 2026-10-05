@@ -37,6 +37,14 @@ const (
 	errTemplateTooBig        = "template %s is too big: %d bytes (limit: %d bytes)"
 
 	fetchConcurrency = 16
+
+	// defaultMaxConfigSize is the hard, defence-in-depth ceiling applied to the
+	// body of config-accepting Alertmanager API routes when the operator has
+	// not configured a smaller per-tenant limit. It bounds the amount of memory
+	// a single POST can force the Alertmanager process to allocate even when
+	// the per-tenant override is left at the "0 = no limit" opt-out, preventing
+	// a tenant from driving the shared process into the OOM killer.
+	defaultMaxConfigSize = 1 << 20 // 1 MiB
 )
 
 var (
@@ -100,15 +108,20 @@ func (am *MultitenantAlertmanager) SetUserConfig(w http.ResponseWriter, r *http.
 		return
 	}
 
-	var input io.Reader
+	// Always bound the body with a hard ceiling: operators may leave the
+	// per-tenant override at the "0 = no limit" opt-out, so we must not fall
+	// back to an unbounded io.ReadAll. If the per-tenant limit is set to a
+	// smaller value we honour that, otherwise we clamp to defaultMaxConfigSize.
+	// http.MaxBytesReader provides a belt-and-braces server-side cap that will
+	// also terminate oversized streaming uploads at the HTTP layer.
 	maxConfigSize := am.limits.AlertmanagerMaxConfigSize(userID)
-	if maxConfigSize > 0 {
-		// LimitReader will return EOF after reading specified number of bytes. To check if
-		// we have read too many bytes, allow one extra byte.
-		input = io.LimitReader(r.Body, int64(maxConfigSize)+1)
-	} else {
-		input = r.Body
+	if maxConfigSize <= 0 || maxConfigSize > defaultMaxConfigSize {
+		maxConfigSize = defaultMaxConfigSize
 	}
+	// LimitReader will return EOF after reading specified number of bytes. To
+	// check if we have read too many bytes, allow one extra byte.
+	r.Body = http.MaxBytesReader(w, r.Body, int64(maxConfigSize)+1)
+	input := io.LimitReader(r.Body, int64(maxConfigSize)+1)
 
 	payload, err := io.ReadAll(input)
 	if err != nil {
@@ -117,7 +130,7 @@ func (am *MultitenantAlertmanager) SetUserConfig(w http.ResponseWriter, r *http.
 		return
 	}
 
-	if maxConfigSize > 0 && len(payload) > maxConfigSize {
+	if len(payload) > maxConfigSize {
 		msg := fmt.Sprintf(errConfigurationTooBig, maxConfigSize)
 		level.Warn(logger).Log("msg", msg)
 		http.Error(w, msg, http.StatusBadRequest)
