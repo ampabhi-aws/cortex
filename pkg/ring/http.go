@@ -7,6 +7,7 @@ import (
 	"html/template"
 	"math"
 	"net/http"
+	"net/url"
 	"sort"
 	"strings"
 	"time"
@@ -25,7 +26,6 @@ const pageContent = `
 		<h1>Ring Status</h1>
 		<p>Current time: {{ .Now }}</p>
 		<form action="" method="POST">
-			<input type="hidden" name="csrf_token" value="$__CSRF_TOKEN_PLACEHOLDER__">
 			<table width="100%" border="1">
 				<thead>
 					<tr>
@@ -123,12 +123,36 @@ type httpResponse struct {
 
 func (r *Ring) ServeHTTP(w http.ResponseWriter, req *http.Request) {
 	if req.Method == http.MethodPost {
-		ingesterID := req.FormValue("forget")
+		// Reject cross-site / simple-form CSRF submissions before touching the KV store.
+		// `forget` is a destructive, cluster-wide mutation: enforce (1) same-origin via
+		// Origin/Referer matching the Host header, and (2) a non "simple" Content-Type
+		// so an attacker page cannot submit this with a plain HTML <form>. The handler
+		// is still intentionally unauthenticated — operators are expected to put auth
+		// in front of Cortex — but the controls below close the CSRF path a browser
+		// is willing to walk without the operator's intent.
+		if err := checkSameOrigin(req); err != nil {
+			level.Warn(r.logger).Log("msg", "rejected ring POST: cross-origin", "err", err, "remote", req.RemoteAddr)
+			http.Error(w, "cross-origin request rejected", http.StatusForbidden)
+			return
+		}
+		if ct := req.Header.Get("Content-Type"); !isAllowedForgetContentType(ct) {
+			level.Warn(r.logger).Log("msg", "rejected ring POST: bad content-type", "content_type", ct, "remote", req.RemoteAddr)
+			http.Error(w, "unsupported content-type for ring mutation", http.StatusUnsupportedMediaType)
+			return
+		}
+
+		// Read `forget` from the request body only (PostFormValue), not from the URL
+		// query string: a bodyless cross-site POST must not be able to carry the id.
+		ingesterID := req.PostFormValue("forget")
+		if ingesterID == "" {
+			http.Error(w, "missing forget parameter", http.StatusBadRequest)
+			return
+		}
 		if err := r.forget(req.Context(), ingesterID); err != nil {
 			level.Error(r.logger).Log("msg", "error forgetting instance", "err", err)
 		}
 
-		// Implement PRG pattern to prevent double-POST and work with CSRF middleware.
+		// Implement PRG pattern to prevent double-POST.
 		// https://en.wikipedia.org/wiki/Post/Redirect/Get
 
 		// http.Redirect() would convert our relative URL to absolute, which is not what we want.
@@ -186,6 +210,76 @@ func (r *Ring) ServeHTTP(w http.ResponseWriter, req *http.Request) {
 		Now:        now,
 		ShowTokens: tokensParam == "true",
 	}, pageTemplate, req)
+}
+
+// isAllowedForgetContentType returns true if the request Content-Type is one
+// a legitimate same-origin form submission from the ring status page would
+// use. We accept application/x-www-form-urlencoded (what the embedded form
+// posts) and multipart/form-data. We deliberately reject text/plain and the
+// empty Content-Type, which are the two values a cross-site <form> or <a
+// ping> is permitted to send without triggering a CORS preflight.
+func isAllowedForgetContentType(ct string) bool {
+	if ct == "" {
+		return false
+	}
+	// Strip parameters (e.g. "; charset=UTF-8", "; boundary=...").
+	if i := strings.IndexByte(ct, ';'); i >= 0 {
+		ct = ct[:i]
+	}
+	switch strings.ToLower(strings.TrimSpace(ct)) {
+	case "application/x-www-form-urlencoded", "multipart/form-data":
+		return true
+	}
+	return false
+}
+
+// checkSameOrigin verifies the request's Origin (or, as a fallback, Referer)
+// header host matches the request Host. Browsers always send Origin on POST
+// requests to cross-origin targets, so a missing Origin with a matching
+// Referer is treated as same-origin; a missing Origin AND missing Referer is
+// rejected. Non-browser clients (curl, operational scripts) can set either
+// header explicitly.
+func checkSameOrigin(req *http.Request) error {
+	host := req.Host
+	if host == "" {
+		return fmt.Errorf("missing Host header")
+	}
+	if origin := req.Header.Get("Origin"); origin != "" && origin != "null" {
+		u, err := url.Parse(origin)
+		if err != nil {
+			return fmt.Errorf("invalid Origin header: %w", err)
+		}
+		if !sameHost(u.Host, host) {
+			return fmt.Errorf("Origin %q does not match Host %q", u.Host, host)
+		}
+		return nil
+	}
+	if referer := req.Header.Get("Referer"); referer != "" {
+		u, err := url.Parse(referer)
+		if err != nil {
+			return fmt.Errorf("invalid Referer header: %w", err)
+		}
+		if !sameHost(u.Host, host) {
+			return fmt.Errorf("Referer %q does not match Host %q", u.Host, host)
+		}
+		return nil
+	}
+	return fmt.Errorf("missing Origin and Referer headers")
+}
+
+// sameHost compares two host[:port] values for equality, tolerating a missing
+// port on either side (e.g. "cortex.example" vs "cortex.example:80").
+func sameHost(a, b string) bool {
+	if a == b {
+		return true
+	}
+	stripPort := func(h string) string {
+		if i := strings.LastIndexByte(h, ':'); i >= 0 && !strings.Contains(h[i:], "]") {
+			return h[:i]
+		}
+		return h
+	}
+	return stripPort(a) == stripPort(b)
 }
 
 // RenderHTTPResponse either responds with json or a rendered html page using the passed in template
