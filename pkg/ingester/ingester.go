@@ -516,6 +516,12 @@ type TSDBState struct {
 	forceCompactTrigger chan requestWithUsersAndCallback
 	shipTrigger         chan requestWithUsersAndCallback
 
+	// asyncFlushInProgress limits the flush handler to at most one in-flight
+	// asynchronous (fire-and-forget) run at a time, so unauthenticated callers
+	// cannot amplify a single HTTP request into unbounded goroutines/queued
+	// forced compactions.
+	asyncFlushInProgress atomic.Bool
+
 	// Timeout chosen for idle compactions.
 	compactionIdleTimeout time.Duration
 
@@ -2491,6 +2497,33 @@ func (i *Ingester) flushHandler(w http.ResponseWriter, r *http.Request) {
 
 	tenants := r.Form[tenantParam]
 
+	// Defense-in-depth: if the caller provided an X-Scope-OrgID, require any
+	// requested tenant list to be a subset of the caller's own tenants, and
+	// default an empty list to the caller's tenants (instead of "all tenants").
+	// This prevents a request carrying a benign tenant header from being used
+	// to force-compact arbitrary other tenants' TSDBs. When no OrgID header is
+	// set, we preserve the historical operator-endpoint behaviour (as
+	// documented under the API "Dangerous" section) and expect the deployment
+	// to protect this route via network isolation / reverse proxy.
+	if callerTenants, err := tenant.TenantIDs(r.Context()); err == nil && len(callerTenants) > 0 {
+		allowed := make(map[string]struct{}, len(callerTenants))
+		for _, t := range callerTenants {
+			allowed[t] = struct{}{}
+		}
+		if len(tenants) == 0 {
+			// Default to the caller's own tenants rather than "all tenants".
+			tenants = append([]string(nil), callerTenants...)
+		} else {
+			for _, t := range tenants {
+				if _, ok := allowed[t]; !ok {
+					level.Warn(logutil.WithContext(r.Context(), i.logger)).Log("msg", "flush handler rejected: tenant not owned by caller", "tenant", t)
+					http.Error(w, "requested tenant is not owned by the caller", http.StatusForbidden)
+					return
+				}
+			}
+		}
+	}
+
 	allowedUsers := util.NewAllowedTenants(tenants, nil)
 	run := func() {
 		ingCtx := i.BasicService.ServiceContext()
@@ -2549,7 +2582,19 @@ func (i *Ingester) flushHandler(w http.ResponseWriter, r *http.Request) {
 		// Run synchronously. This simplifies and speeds up tests.
 		run()
 	} else {
-		go run()
+		// Rate-limit asynchronous flushes to a single in-flight run so that a
+		// burst of unauthenticated requests cannot spawn an unbounded number of
+		// goroutines, each blocked on the unbuffered forceCompactTrigger
+		// channel, and cannot queue an unbounded number of forced compactions.
+		if !i.TSDBState.asyncFlushInProgress.CompareAndSwap(false, true) {
+			level.Info(logutil.WithContext(r.Context(), i.logger)).Log("msg", "flush handler rejected: another asynchronous flush is already in progress; retry later or use wait=true")
+			http.Error(w, "another asynchronous flush is already in progress; retry later or use wait=true", http.StatusTooManyRequests)
+			return
+		}
+		go func() {
+			defer i.TSDBState.asyncFlushInProgress.Store(false)
+			run()
+		}()
 	}
 
 	w.WriteHeader(http.StatusNoContent)
