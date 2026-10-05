@@ -5,6 +5,7 @@ import (
 	"flag"
 	"net/http"
 	"path"
+	"strconv"
 	"strings"
 
 	"github.com/NYTimes/gziphandler"
@@ -219,7 +220,36 @@ func (a *API) RegisterAPI(httpPathPrefix string, actualCfg interface{}, defaultC
 
 	a.RegisterRoute("/config", a.cfg.configHandler(actualCfg, defaultCfg), false, "GET")
 	a.RegisterRoute("/", indexHandler(httpPathPrefix, a.indexPage), false, "GET")
-	a.RegisterRoute("/debug/fgprof", fgprof.Handler(), false, "GET")
+	a.RegisterRoute("/debug/fgprof", boundedFgprofHandler(fgprof.Handler()), false, "GET")
+}
+
+// maxFgprofSeconds is the upper bound (in seconds) enforced on the
+// `seconds` query parameter accepted by the /debug/fgprof endpoint. The
+// vendored fgprof handler only validates that `seconds > 0`, so without a
+// cap a single request could pin a 99 Hz stop-the-world goroutine
+// profiler for an attacker-controlled duration (potentially years),
+// degrading or stalling a shared Cortex process until it is restarted.
+// 120s matches the practical ceiling used by other Go profile endpoints
+// and is more than long enough for any legitimate profile.
+const maxFgprofSeconds = 120
+
+// boundedFgprofHandler wraps the vendored fgprof handler to clamp the
+// attacker-controlled `seconds` query parameter to maxFgprofSeconds. This
+// prevents a tiny request from forcing the server to run a stop-the-world
+// goroutine profiler for an unbounded amount of time (CWE-770).
+func boundedFgprofHandler(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if s := r.URL.Query().Get("seconds"); s != "" {
+			if seconds, err := strconv.Atoi(s); err == nil && seconds > maxFgprofSeconds {
+				q := r.URL.Query()
+				q.Set("seconds", strconv.Itoa(maxFgprofSeconds))
+				r2 := r.Clone(r.Context())
+				r2.URL.RawQuery = q.Encode()
+				r = r2
+			}
+		}
+		next.ServeHTTP(w, r)
+	})
 }
 
 // RegisterRuntimeConfig registers the endpoints associates with the runtime configuration
