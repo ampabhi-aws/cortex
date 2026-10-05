@@ -372,7 +372,58 @@ alertmanager_config: |
 			err: errors.Wrap(errOAuth2SecretFileNotAllowed, "error validating Alertmanager config"),
 		},
 		{
-			name: "Should return error if global slack_api_url_file is set",
+			name: "Should return error if receiver's OAuth2 token_url is set (bypasses receivers firewall)",
+			cfg: `
+alertmanager_config: |
+  receivers:
+    - name: default-receiver
+      webhook_configs:
+        - url: http://localhost
+          http_config:
+            oauth2:
+              client_id: test
+              client_secret: supersecret
+              token_url: http://127.0.0.1/oauth/token
+
+  route:
+    receiver: 'default-receiver'
+`,
+			err: errors.Wrap(errOAuth2NotAllowed, "error validating Alertmanager config"),
+		},
+		{
+			name: "Should return error if global OAuth2 token_url is set (bypasses receivers firewall)",
+			cfg: `
+alertmanager_config: |
+  global:
+    http_config:
+      oauth2:
+        client_id: test
+        client_secret: supersecret
+        token_url: http://127.0.0.1/oauth/token
+
+  route:
+    receiver: 'default-receiver'
+  receivers:
+    - name: default-receiver
+`,
+			err: errors.Wrap(errOAuth2NotAllowed, "error validating Alertmanager config"),
+		},
+		{
+			name: "Should return error if receiver's http_config proxy_url is set (bypasses receivers firewall)",
+			cfg: `
+alertmanager_config: |
+  receivers:
+    - name: default-receiver
+      webhook_configs:
+        - url: http://localhost
+          http_config:
+            proxy_url: http://127.0.0.1:8080
+
+  route:
+    receiver: 'default-receiver'
+`,
+			err: errors.Wrap(errProxyURLNotAllowed, "error validating Alertmanager config"),
+		},
 			cfg: `
 alertmanager_config: |
   global:
