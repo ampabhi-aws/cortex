@@ -3,6 +3,7 @@ package ruler
 import (
 	"encoding/json"
 	io "io"
+	"math"
 	"net/http"
 	"net/url"
 	"sort"
@@ -24,6 +25,7 @@ import (
 	"github.com/cortexproject/cortex/pkg/ruler/rulespb"
 	"github.com/cortexproject/cortex/pkg/ruler/rulestore"
 	"github.com/cortexproject/cortex/pkg/tenant"
+	"github.com/cortexproject/cortex/pkg/util"
 	util_log "github.com/cortexproject/cortex/pkg/util/log"
 )
 
@@ -134,6 +136,17 @@ func NewAPI(r *Ruler, s rulestore.RuleStore, logger log.Logger) *API {
 		store:  s,
 		logger: logger,
 	}
+}
+
+// maxRuleGroupPayloadSize returns the limit (in bytes) to pass to
+// http.MaxBytesReader for the rule-group create/update endpoint. A configured
+// value of 0 (or less) disables the cap, which we represent as math.MaxInt64
+// because http.MaxBytesReader treats zero/negative as "zero bytes".
+func maxRuleGroupPayloadSize(configured int64) int64 {
+	if configured <= 0 {
+		return math.MaxInt64
+	}
+	return configured
 }
 
 func (a *API) PrometheusRules(w http.ResponseWriter, req *http.Request) {
@@ -447,8 +460,13 @@ func (a *API) CreateRuleGroup(w http.ResponseWriter, req *http.Request) {
 		return
 	}
 
-	payload, err := io.ReadAll(req.Body)
+	payload, err := io.ReadAll(http.MaxBytesReader(w, req.Body, maxRuleGroupPayloadSize(a.ruler.cfg.APIMaxRuleGroupSizeBytes)))
 	if err != nil {
+		if util.IsRequestBodyTooLarge(err) {
+			level.Warn(logger).Log("msg", "rule group payload too large", "user", userID, "limit", a.ruler.cfg.APIMaxRuleGroupSizeBytes)
+			http.Error(w, "rule group payload too large", http.StatusRequestEntityTooLarge)
+			return
+		}
 		level.Error(logger).Log("msg", "unable to read rule group payload", "err", err.Error())
 		http.Error(w, err.Error(), http.StatusBadRequest)
 		return

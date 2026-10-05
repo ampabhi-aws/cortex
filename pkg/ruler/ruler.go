@@ -116,6 +116,10 @@ type Config struct {
 
 	EnableAPI bool `yaml:"enable_api"`
 
+	// APIMaxRuleGroupSizeBytes bounds the size of a rule group payload accepted
+	// by the ruler API (POST /api/v1/rules/{namespace}). 0 disables the limit.
+	APIMaxRuleGroupSizeBytes int64 `yaml:"api_max_rule_group_size_bytes"`
+
 	EnabledTenants  flagext.StringSliceCSV `yaml:"enabled_tenants"`
 	DisabledTenants flagext.StringSliceCSV `yaml:"disabled_tenants"`
 
@@ -174,6 +178,7 @@ func (cfg *Config) RegisterFlags(f *flag.FlagSet) {
 	f.DurationVar(&cfg.FlushCheckPeriod, "ruler.flush-period", 1*time.Minute, "Period with which to attempt to flush rule groups.")
 	f.StringVar(&cfg.RulePath, "ruler.rule-path", "/rules", "file path to store temporary rule files for the prometheus rule managers")
 	f.BoolVar(&cfg.EnableAPI, "experimental.ruler.enable-api", false, "Enable the ruler api")
+	f.Int64Var(&cfg.APIMaxRuleGroupSizeBytes, "ruler.api-max-rule-group-size-bytes", 1024*1024, "Maximum size (in bytes) of a rule group payload accepted by the ruler API's rule-group create/update endpoint. 0 to disable.")
 	f.DurationVar(&cfg.OutageTolerance, "ruler.for-outage-tolerance", time.Hour, `Max time to tolerate outage for restoring "for" state of alert.`)
 	f.DurationVar(&cfg.ForGracePeriod, "ruler.for-grace-period", 10*time.Minute, `Minimum duration between alert and restored "for" state. This is maintained only for alerts with configured "for" time greater than grace period.`)
 	f.DurationVar(&cfg.ResendDelay, "ruler.resend-delay", time.Minute, `Minimum amount of time to wait before resending an alert to Alertmanager.`)
