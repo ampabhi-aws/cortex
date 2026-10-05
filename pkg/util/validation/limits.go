@@ -113,6 +113,11 @@ type Limits struct {
 	AlertmanagerMaxDispatcherAggregationGroups int `yaml:"alertmanager_max_dispatcher_aggregation_groups" json:"alertmanager_max_dispatcher_aggregation_groups"`
 	AlertmanagerMaxAlertsCount                 int `yaml:"alertmanager_max_alerts_count" json:"alertmanager_max_alerts_count"`
 	AlertmanagerMaxAlertsSizeBytes             int `yaml:"alertmanager_max_alerts_size_bytes" json:"alertmanager_max_alerts_size_bytes"`
+
+	// AlertmanagerAdmin marks a tenant as an Alertmanager administrator, which is allowed
+	// to invoke cross-tenant operator endpoints such as GET /multitenant_alertmanager/configs.
+	// Defaults to false; must be enabled via per-tenant overrides.
+	AlertmanagerAdmin bool `yaml:"alertmanager_admin" json:"alertmanager_admin"`
 }
 
 // RegisterFlags adds the flags required to config this to the given FlagSet
@@ -623,6 +628,12 @@ func (o *Overrides) AlertmanagerMaxAlertsCount(userID string) int {
 
 func (o *Overrides) AlertmanagerMaxAlertsSizeBytes(userID string) int {
 	return o.getOverridesForUser(userID).AlertmanagerMaxAlertsSizeBytes
+}
+
+// AlertmanagerAdmin returns whether the given tenant is permitted to invoke
+// cross-tenant Alertmanager operator endpoints.
+func (o *Overrides) AlertmanagerAdmin(userID string) bool {
+	return o.getOverridesForUser(userID).AlertmanagerAdmin
 }
 
 func (o *Overrides) getOverridesForUser(userID string) *Limits {

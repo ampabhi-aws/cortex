@@ -219,6 +219,10 @@ type Limits interface {
 	// AlertmanagerMaxAlertsSizeBytes returns total max size of alerts that tenant can have active at the same time. 0 = no limit.
 	// Size of the alert is computed from alert labels, annotations and generator URL.
 	AlertmanagerMaxAlertsSizeBytes(tenant string) int
+
+	// AlertmanagerAdmin returns true if the given tenant may invoke cross-tenant
+	// Alertmanager operator endpoints (e.g. GET /multitenant_alertmanager/configs).
+	AlertmanagerAdmin(tenant string) bool
 }
 
 // A MultitenantAlertmanager manages Alertmanager instances for multiple
