@@ -482,6 +482,12 @@ func (a *API) CreateRuleGroup(w http.ResponseWriter, req *http.Request) {
 		return
 	}
 
+	if err := a.ruler.AssertMinRuleEvaluationInterval(userID, rg.Name, time.Duration(rg.Interval)); err != nil {
+		level.Error(logger).Log("msg", "limit validation failure", "err", err.Error(), "user", userID)
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
+
 	rgs, err := a.store.ListRuleGroupsForUserAndNamespace(req.Context(), userID, "")
 	if err != nil {
 		level.Error(logger).Log("msg", "unable to fetch current rule groups for validation", "err", err.Error(), "user", userID)
