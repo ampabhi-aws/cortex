@@ -1197,6 +1197,34 @@ func TestConstSplitter_generateCacheKey(t *testing.T) {
 	}
 }
 
+// TestConstSplitter_generateCacheKey_NoCrossTenantCollision regression-tests the
+// cross-tenant results-cache key collision: without escaping, tenant
+// "team:prod" querying "cpu_usage" and tenant "team" querying "prod:cpu_usage"
+// produce byte-identical cache keys because ':' is used as the field separator
+// but is legal in both tenant IDs and PromQL metric names.
+func TestConstSplitter_generateCacheKey_NoCrossTenantCollision(t *testing.T) {
+	t.Parallel()
+
+	interval := 30 * time.Minute
+	r1 := &PrometheusRequest{Start: 0, Step: 10, Query: "cpu_usage"}
+	r2 := &PrometheusRequest{Start: 0, Step: 10, Query: "prod:cpu_usage"}
+
+	k1 := constSplitter(interval).GenerateCacheKey("team:prod", r1)
+	k2 := constSplitter(interval).GenerateCacheKey("team", r2)
+	if k1 == k2 {
+		t.Fatalf("cross-tenant cache key collision: team:prod/%q and team/%q both produced %q", r1.Query, r2.Query, k1)
+	}
+
+	// Also verify that the escape of ':' and '\\' is injective: a tenant
+	// literally called "team\\" asking for query ":prod..." must not collide
+	// with "team" + "\\:prod...".
+	k3 := constSplitter(interval).GenerateCacheKey("team\\", &PrometheusRequest{Start: 0, Step: 10, Query: ":prod"})
+	k4 := constSplitter(interval).GenerateCacheKey("team", &PrometheusRequest{Start: 0, Step: 10, Query: "\\:prod"})
+	if k3 == k4 {
+		t.Fatalf("escape is not injective: %q == %q", k3, k4)
+	}
+}
+
 func TestResultsCacheShouldCacheFunc(t *testing.T) {
 	testcases := []struct {
 		name         string
