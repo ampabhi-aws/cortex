@@ -1059,35 +1059,82 @@ func (am *MultitenantAlertmanager) alertmanagerFromFallbackConfig(userID string)
 }
 
 // ReplicateStateForUser attempts to replicate a partial state sent by an alertmanager to its other replicas through the ring.
+//
+// Note: this does NOT use ring.DoBatch, because the Alertmanager ring is configured with
+// ring.NewIgnoreUnhealthyInstancesReplicationStrategy() which sets MaxErrors = len(instances)-1,
+// so DoBatch computes minSuccess = 1. The local instance is always a member of its own
+// tenants' replication set while ACTIVE, and the self-branch returns success instantly without
+// doing any work, which would satisfy minSuccess=1 and cause DoBatch to return nil before any
+// peer RPC completes. That silently swallows every peer failure (transport error, MERGE_ERROR,
+// USER_NOT_FOUND) and makes alertmanager_state_replication_failed_total and the companion
+// error log effectively unreachable. Instead, we fetch the replication set once, drop the local
+// instance, and dispatch to peers concurrently, aggregating their errors so the caller can
+// observe peer replication failures.
 func (am *MultitenantAlertmanager) ReplicateStateForUser(ctx context.Context, userID string, part *clusterpb.Part) error {
 	level.Debug(am.logger).Log("msg", "message received for replication", "user", userID, "key", part.Key)
 
-	selfAddress := am.ringLifecycler.GetInstanceAddr()
-	err := ring.DoBatch(ctx, RingOp, am.ring, []uint32{shardByUser(userID)}, func(desc ring.InstanceDesc, _ []int) error {
-		if desc.GetAddr() == selfAddress {
-			return nil
-		}
+	replicationSet, err := am.ring.Get(shardByUser(userID), RingOp, nil, nil, nil)
+	if err != nil {
+		return err
+	}
 
-		c, err := am.alertmanagerClientsPool.GetClientFor(desc.GetAddr())
+	// Only replicate to peers (exclude the local instance - our own state is already up to date).
+	addrs := replicationSet.GetAddressesWithout(am.ringLifecycler.GetInstanceAddr())
+	if len(addrs) == 0 {
+		return nil
+	}
+
+	var (
+		errsMtx sync.Mutex
+		errs    []error
+	)
+
+	jobs := concurrency.CreateJobsFromStrings(addrs)
+	err = concurrency.ForEach(ctx, jobs, len(jobs), func(ctx context.Context, job interface{}) error {
+		addr := job.(string)
+
+		c, err := am.alertmanagerClientsPool.GetClientFor(addr)
 		if err != nil {
-			return err
+			errsMtx.Lock()
+			errs = append(errs, errors.Wrapf(err, "failed to get rpc client for %s", addr))
+			errsMtx.Unlock()
+			return nil
 		}
 
 		resp, err := c.UpdateState(user.InjectOrgID(ctx, userID), part)
 		if err != nil {
-			return err
+			errsMtx.Lock()
+			errs = append(errs, errors.Wrapf(err, "UpdateState rpc to %s failed", addr))
+			errsMtx.Unlock()
+			return nil
 		}
 
 		switch resp.Status {
 		case alertmanagerpb.MERGE_ERROR:
-			level.Error(am.logger).Log("msg", "state replication failed", "user", userID, "key", part.Key, "err", resp.Error)
+			level.Error(am.logger).Log("msg", "state replication failed", "user", userID, "key", part.Key, "addr", addr, "err", resp.Error)
+			errsMtx.Lock()
+			errs = append(errs, fmt.Errorf("merge error from %s: %s", addr, resp.Error))
+			errsMtx.Unlock()
 		case alertmanagerpb.USER_NOT_FOUND:
-			level.Debug(am.logger).Log("msg", "user not found while trying to replicate state", "user", userID, "key", part.Key)
+			level.Debug(am.logger).Log("msg", "user not found while trying to replicate state", "user", userID, "key", part.Key, "addr", addr)
+			errsMtx.Lock()
+			errs = append(errs, fmt.Errorf("user not found on %s", addr))
+			errsMtx.Unlock()
 		}
 		return nil
-	}, func() {})
+	})
+	if err != nil {
+		return err
+	}
 
-	return err
+	// Preserve availability-biased semantics: as long as at least one peer accepted the state,
+	// we consider replication successful (surviving peers can gossip it further). But if every
+	// peer failed, surface that so the caller can report it via the state replication failure
+	// metric and operator-facing error log.
+	if len(errs) == len(addrs) {
+		return fmt.Errorf("failed to replicate state to any peer (%d peers): %v", len(addrs), errs)
+	}
+	return nil
 }
 
 // ReadFullStateForUser attempts to read the full state from each replica for user. Note that it will try to obtain and return
