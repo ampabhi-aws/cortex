@@ -5,6 +5,7 @@ import (
 	io "io"
 	"net/http"
 	"net/url"
+	"path/filepath"
 	"sort"
 	"strconv"
 	"strings"
@@ -288,7 +289,45 @@ var (
 	ErrNoRuleGroups = errors.New("no rule groups found")
 	// ErrBadRuleGroup is returned when the provided rule group can not be unmarshalled
 	ErrBadRuleGroup = errors.New("unable to decoded rule group")
+	// ErrInvalidNamespace signals that the namespace contains path traversal
+	// characters or dot segments that could escape the per-tenant rule store.
+	ErrInvalidNamespace = errors.New("invalid namespace: must not be '.', '..' or contain path traversal segments")
+	// ErrInvalidGroupName signals that the group name contains path traversal
+	// characters or dot segments that could escape the per-namespace rule store.
+	ErrInvalidGroupName = errors.New("invalid group name: must not be '.', '..' or contain path traversal segments")
 )
+
+// containsTraversalSegments reports whether s is a path reference that could
+// escape its containing directory when passed to filepath.Join or similar
+// path-constructing APIs. It rejects "." and ".." references, absolute paths,
+// Windows volume references and any path containing ".." as a cleaned segment.
+//
+// The ruler rules API passes the URL-decoded {namespace} / {groupName} path
+// variables directly to the configured rule store, and the "local" rule-store
+// backend concatenates them into a filesystem path. Without this check a
+// percent-encoded "../" (which survives gorilla/mux UseEncodedPath) would be
+// collapsed by filepath.Clean inside filepath.Join and escape the per-tenant
+// directory, allowing cross-tenant disclosure and arbitrary file read on the
+// ruler host.
+func containsTraversalSegments(s string) bool {
+	if s == "." || s == ".." {
+		return true
+	}
+	// Reject absolute paths and Windows volume references outright: a rule
+	// namespace / group is always a key relative to the per-tenant store.
+	if filepath.IsAbs(s) || strings.HasPrefix(s, "/") || strings.HasPrefix(s, "\\") {
+		return true
+	}
+	// Normalise separators so the check is OS-independent (the local backend
+	// uses filepath.Join which honours both separators on Windows).
+	normalised := strings.ReplaceAll(s, "\\", "/")
+	for _, seg := range strings.Split(normalised, "/") {
+		if seg == ".." {
+			return true
+		}
+	}
+	return false
+}
 
 func marshalAndSend(output interface{}, w http.ResponseWriter, logger log.Logger) {
 	d, err := yaml.Marshal(&output)
@@ -336,6 +375,13 @@ func parseNamespace(params map[string]string) (string, error) {
 		return "", err
 	}
 
+	// Reject path traversal in the decoded namespace. The HTTP router uses
+	// mux.UseEncodedPath(), so a percent-encoded "../" is matched as a single
+	// path segment and would otherwise be passed verbatim to the rule store.
+	if containsTraversalSegments(namespace) {
+		return "", ErrInvalidNamespace
+	}
+
 	return namespace, nil
 }
 
@@ -350,6 +396,12 @@ func parseGroupName(params map[string]string) (string, error) {
 	groupName, err := url.PathUnescape(groupName)
 	if err != nil {
 		return "", err
+	}
+
+	// Reject path traversal in the decoded group name. See parseNamespace for
+	// the equivalent rationale.
+	if containsTraversalSegments(groupName) {
+		return "", ErrInvalidGroupName
 	}
 
 	return groupName, nil

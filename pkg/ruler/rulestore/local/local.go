@@ -5,6 +5,7 @@ import (
 	"flag"
 	"os"
 	"path/filepath"
+	"strings"
 
 	"github.com/pkg/errors"
 	promRules "github.com/prometheus/prometheus/rules"
@@ -168,7 +169,18 @@ func (l *Client) loadAllRulesGroupsForUser(ctx context.Context, userID string) (
 }
 
 func (l *Client) loadAllRulesGroupsForUserAndNamespace(_ context.Context, userID string, namespace string) (rulespb.RuleGroupList, error) {
-	filename := filepath.Join(l.cfg.Directory, userID, namespace)
+	// Defence in depth: ensure the resolved rule file stays inside the
+	// per-tenant directory. The HTTP API layer already rejects traversal in
+	// the {namespace} / {groupName} path variables (see
+	// pkg/ruler/api.go:containsTraversalSegments), but the local rule store
+	// is also reachable from ListAllRuleGroups / background pollers and must
+	// enforce containment itself to avoid cross-tenant disclosure or
+	// arbitrary file read if a caller slips a traversal through.
+	tenantRoot := filepath.Clean(filepath.Join(l.cfg.Directory, userID))
+	filename := filepath.Clean(filepath.Join(tenantRoot, namespace))
+	if filename != tenantRoot && !strings.HasPrefix(filename, tenantRoot+string(filepath.Separator)) {
+		return nil, errors.Errorf("invalid namespace %q: resolved path escapes tenant directory", namespace)
+	}
 
 	rulegroups, allErrors := l.loader.Load(filename)
 	if len(allErrors) > 0 {
