@@ -417,3 +417,57 @@ func requestFor(t *testing.T, method string, url string, body io.Reader, userID 
 
 	return req.WithContext(ctx)
 }
+
+func TestParseNamespace_RejectsPathTraversal(t *testing.T) {
+	cases := []struct {
+		name    string
+		raw     string
+		wantErr bool
+	}{
+		{name: "plain", raw: "namespace1"},
+		{name: "percent encoded safe", raw: "my%20namespace"},
+		{name: "slash in name is allowed for non-local backends", raw: "ns/with/slash"},
+		{name: "dot", raw: ".", wantErr: true},
+		{name: "dotdot", raw: "..", wantErr: true},
+		{name: "encoded dotdot slash", raw: "..%2Fvictim", wantErr: true},
+		{name: "double encoded dotdot slash", raw: "%2e%2e%2fvictim", wantErr: true},
+		{name: "trailing dotdot segment", raw: "foo/..", wantErr: true},
+		{name: "nested dotdot segment", raw: "foo/../bar", wantErr: true},
+		{name: "backslash dotdot segment", raw: "foo%5C..%5Cbar", wantErr: true},
+		{name: "absolute path", raw: "%2Fetc%2Fshadow", wantErr: true},
+		{name: "windows absolute path", raw: "%5C%5Cserver%5Cshare", wantErr: true},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			got, err := parseNamespace(map[string]string{"namespace": tc.raw})
+			if tc.wantErr {
+				require.Error(t, err, "expected rejection for %q, got %q", tc.raw, got)
+				return
+			}
+			require.NoError(t, err)
+		})
+	}
+}
+
+func TestParseGroupName_RejectsPathTraversal(t *testing.T) {
+	cases := []struct {
+		name    string
+		raw     string
+		wantErr bool
+	}{
+		{name: "plain", raw: "group1"},
+		{name: "dotdot", raw: "..", wantErr: true},
+		{name: "encoded dotdot slash", raw: "..%2Fvictim.yaml", wantErr: true},
+		{name: "nested dotdot", raw: "foo/../bar", wantErr: true},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			_, err := parseGroupName(map[string]string{"groupName": tc.raw})
+			if tc.wantErr {
+				require.Error(t, err)
+				return
+			}
+			require.NoError(t, err)
+		})
+	}
+}
