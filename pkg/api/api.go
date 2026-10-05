@@ -3,9 +3,12 @@ package api
 import (
 	"context"
 	"flag"
+	"fmt"
 	"net/http"
 	"path"
+	"strconv"
 	"strings"
+	"sync/atomic"
 
 	"github.com/NYTimes/gziphandler"
 	"github.com/felixge/fgprof"
@@ -219,7 +222,52 @@ func (a *API) RegisterAPI(httpPathPrefix string, actualCfg interface{}, defaultC
 
 	a.RegisterRoute("/config", a.cfg.configHandler(actualCfg, defaultCfg), false, "GET")
 	a.RegisterRoute("/", indexHandler(httpPathPrefix, a.indexPage), false, "GET")
-	a.RegisterRoute("/debug/fgprof", fgprof.Handler(), false, "GET")
+	a.RegisterRoute("/debug/fgprof", fgprofHandler(fgprof.Handler()), false, "GET")
+}
+
+// fgprofMaxSeconds caps the attacker-controlled "seconds" query parameter on
+// /debug/fgprof. The vendored fgprof.Handler only validates that seconds > 0,
+// which lets a single unauthenticated request pin the process into an
+// arbitrarily long 99 Hz goroutine profile. Capping to 30s matches the
+// handler's own default duration and the typical operator profiling window.
+const fgprofMaxSeconds = 30
+
+// fgprofInflight limits /debug/fgprof to a single concurrent profile. Each
+// request spawns an independent 99 Hz sampler plus an unbounded in-memory
+// stackCounter map, so without this guard N concurrent requests multiply the
+// per-tick cost and memory growth of profiling.
+var fgprofInflight int32
+
+// fgprofHandler wraps the vendored fgprof.Handler with input validation and a
+// concurrency guard. It bounds the attacker-controlled "seconds" parameter and
+// rejects overlapping profile requests, mitigating
+// CWE-770 (Allocation of Resources Without Limits or Throttling) on this
+// unauthenticated debug endpoint.
+func fgprofHandler(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if s := r.URL.Query().Get("seconds"); s != "" {
+			seconds, err := strconv.Atoi(s)
+			if err != nil || seconds <= 0 {
+				w.WriteHeader(http.StatusBadRequest)
+				fmt.Fprintf(w, "bad seconds: %q\n", s)
+				return
+			}
+			if seconds > fgprofMaxSeconds {
+				w.WriteHeader(http.StatusBadRequest)
+				fmt.Fprintf(w, "seconds must be <= %d\n", fgprofMaxSeconds)
+				return
+			}
+		}
+
+		if !atomic.CompareAndSwapInt32(&fgprofInflight, 0, 1) {
+			w.Header().Set("Retry-After", strconv.Itoa(fgprofMaxSeconds))
+			http.Error(w, "another fgprof profile is already in progress", http.StatusTooManyRequests)
+			return
+		}
+		defer atomic.StoreInt32(&fgprofInflight, 0)
+
+		next.ServeHTTP(w, r)
+	})
 }
 
 // RegisterRuntimeConfig registers the endpoints associates with the runtime configuration
