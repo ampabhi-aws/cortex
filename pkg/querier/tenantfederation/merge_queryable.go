@@ -31,20 +31,34 @@ const (
 // and results for request with a single querier will not contain the
 // "__tenant_id__" label. This allows a smoother transition, when enabling
 // tenant federation in a cluster.
+// maxTenants, when > 0, limits the number of tenant IDs allowed in a single
+// federated query. Requests exceeding the limit are rejected before any
+// per-tenant querier is allocated.
 // The result contains a label "__tenant_id__" to identify the tenant ID that
 // it originally resulted from.
 // If the label "__tenant_id__" is already existing, its value is overwritten
 // by the tenant ID and the previous value is exposed through a new label
 // prefixed with "original_". This behaviour is not implemented recursively.
-func NewQueryable(upstream storage.Queryable, byPassWithSingleQuerier bool) storage.Queryable {
-	return NewMergeQueryable(defaultTenantLabel, tenantQuerierCallback(upstream), byPassWithSingleQuerier)
+func NewQueryable(upstream storage.Queryable, byPassWithSingleQuerier bool, maxTenants int) storage.Queryable {
+	return NewMergeQueryable(defaultTenantLabel, tenantQuerierCallback(upstream, maxTenants), byPassWithSingleQuerier)
 }
 
-func tenantQuerierCallback(queryable storage.Queryable) MergeQuerierCallback {
+func tenantQuerierCallback(queryable storage.Queryable, maxTenants int) MergeQuerierCallback {
 	return func(ctx context.Context, mint int64, maxt int64) ([]string, []storage.Querier, error) {
 		tenantIDs, err := tenant.TenantIDs(ctx)
 		if err != nil {
 			return nil, nil, err
+		}
+
+		// Enforce the configured upper bound on the number of tenants in a
+		// single federated query. This protects shared read-path components
+		// from unbounded fan-out caused by attacker-controlled X-Scope-OrgID
+		// headers of the form "t1|t2|...|tN": without this cap, each of the N
+		// per-tenant sub-queries dispatches gRPCs to every ingester and
+		// store-gateway, and the maxConcurrency bound in mergeQuerier.Select
+		// is defeated by lazyquery.LazyQuerier, so all N execute in parallel.
+		if maxTenants > 0 && len(tenantIDs) > maxTenants {
+			return nil, nil, fmt.Errorf("too many tenant IDs in request: %d (max %d); reduce the number of tenants in the X-Scope-OrgID header", len(tenantIDs), maxTenants)
 		}
 
 		var queriers = make([]storage.Querier, len(tenantIDs))

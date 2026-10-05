@@ -257,7 +257,7 @@ type mergeQueryableScenario struct {
 
 func (s *mergeQueryableScenario) init() (storage.Querier, error) {
 	// initialize with default tenant label
-	q := NewQueryable(&s.queryable, !s.doNotByPassSingleQuerier)
+	q := NewQueryable(&s.queryable, !s.doNotByPassSingleQuerier, 0)
 
 	// inject tenants into context
 	ctx := context.Background()
@@ -336,12 +336,40 @@ type labelValuesScenario struct {
 func TestMergeQueryable_Querier(t *testing.T) {
 	t.Run("querying without a tenant specified should error", func(t *testing.T) {
 		queryable := &mockTenantQueryableWithFilter{}
-		q := NewQueryable(queryable, false /* byPassWithSingleQuerier */)
+		q := NewQueryable(queryable, false /* byPassWithSingleQuerier */, 0)
 		// Create a context with no tenant specified.
 		ctx := context.Background()
 
 		_, err := q.Querier(ctx, mint, maxt)
 		require.EqualError(t, err, user.ErrNoOrgID.Error())
+	})
+
+	t.Run("too many tenants should be rejected before allocating queriers", func(t *testing.T) {
+		// Enable the multi-tenant resolver so TenantIDs can split the
+		// pipe-separated header into multiple IDs.
+		tenant.WithDefaultResolver(tenant.NewMultiResolver())
+		defer tenant.WithDefaultResolver(tenant.NewSingleResolver())
+
+		queryable := &mockTenantQueryableWithFilter{}
+		const maxTenants = 2
+		q := NewQueryable(queryable, false /* byPassWithSingleQuerier */, maxTenants)
+
+		ctx := user.InjectOrgID(context.Background(), "team-a|team-b|team-c")
+		_, err := q.Querier(ctx, mint, maxt)
+		require.Error(t, err)
+		require.Contains(t, err.Error(), "too many tenant IDs")
+	})
+
+	t.Run("maxTenants=0 disables the limit", func(t *testing.T) {
+		tenant.WithDefaultResolver(tenant.NewMultiResolver())
+		defer tenant.WithDefaultResolver(tenant.NewSingleResolver())
+
+		queryable := &mockTenantQueryableWithFilter{}
+		q := NewQueryable(queryable, false /* byPassWithSingleQuerier */, 0)
+
+		ctx := user.InjectOrgID(context.Background(), "team-a|team-b|team-c|team-d")
+		_, err := q.Querier(ctx, mint, maxt)
+		require.NoError(t, err)
 	})
 }
 
@@ -917,7 +945,7 @@ func TestTracingMergeQueryable(t *testing.T) {
 	// set a multi tenant resolver
 	tenant.WithDefaultResolver(tenant.NewMultiResolver())
 	filter := mockTenantQueryableWithFilter{}
-	q := NewQueryable(&filter, false)
+	q := NewQueryable(&filter, false, 0)
 	// retrieve querier if set
 	querier, err := q.Querier(ctx, mint, maxt)
 	require.NoError(t, err)
