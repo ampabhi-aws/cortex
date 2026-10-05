@@ -1556,21 +1556,33 @@ func (i *Ingester) UserStats(ctx context.Context, req *client.UserStatsRequest) 
 	return createUserStats(db), nil
 }
 
-// AllUserStats returns ingestion statistics for all users known to this ingester.
-func (i *Ingester) AllUserStats(_ context.Context, _ *client.UserStatsRequest) (*client.UsersStatsResponse, error) {
+// AllUserStats returns ingestion statistics for the calling tenant only.
+//
+// Historically this RPC returned statistics for every tenant hosted on the
+// ingester. That behaviour leaked other tenants' identifiers, in-memory series
+// counts and ingestion rates to any caller that could reach the ingester gRPC
+// surface, because Cortex delegates authentication to an upstream proxy and
+// the gRPC server itself only propagates the (fully-trusted) X-Scope-OrgID
+// header. The response is now scoped to the caller's tenant, matching the
+// behaviour of every other tenant-aware RPC on this interface (see
+// UserStats, Query, QueryStream, LabelNames, LabelValues, ...). Operators who
+// need a cluster-wide aggregate must obtain it over a separately
+// authenticated admin surface.
+func (i *Ingester) AllUserStats(ctx context.Context, _ *client.UserStatsRequest) (*client.UsersStatsResponse, error) {
 	if err := i.checkRunning(); err != nil {
+		return nil, err
+	}
+
+	userID, err := tenant.TenantID(ctx)
+	if err != nil {
 		return nil, err
 	}
 
 	i.stoppedMtx.RLock()
 	defer i.stoppedMtx.RUnlock()
 
-	users := i.TSDBState.dbs
-
-	response := &client.UsersStatsResponse{
-		Stats: make([]*client.UserIDStatsResponse, 0, len(users)),
-	}
-	for userID, db := range users {
+	response := &client.UsersStatsResponse{}
+	if db := i.TSDBState.dbs[userID]; db != nil {
 		response.Stats = append(response.Stats, &client.UserIDStatsResponse{
 			UserId: userID,
 			Data:   createUserStats(db),
