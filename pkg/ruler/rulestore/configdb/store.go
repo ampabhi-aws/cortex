@@ -3,6 +3,7 @@ package configdb
 import (
 	"context"
 	"errors"
+	"sync"
 
 	"github.com/cortexproject/cortex/pkg/configs/client"
 	"github.com/cortexproject/cortex/pkg/configs/userconfig"
@@ -15,7 +16,17 @@ const (
 
 // ConfigRuleStore is a concrete implementation of RuleStore that sources rules from the config service
 type ConfigRuleStore struct {
-	configClient  client.Client
+	configClient client.Client
+
+	// mtx protects the mutable since cursor and ruleGroupList cache below.
+	// ListAllRuleGroups mutates both fields on every call and is invoked
+	// concurrently from multiple ruler code paths (the unauthenticated
+	// /ruler/rule_groups handler fans out up to fetchRulesConcurrency
+	// goroutines, tenant APIs run on independent request goroutines, and
+	// the background sync loop ticks in parallel). Without this lock Go's
+	// runtime would raise a fatal "concurrent map writes" throw that
+	// bypasses recover() and crashes the process.
+	mtx           sync.Mutex
 	since         userconfig.ID
 	ruleGroupList map[string]rulespb.RuleGroupList
 }
@@ -47,6 +58,9 @@ func (c *ConfigRuleStore) ListAllUsers(ctx context.Context) ([]string, error) {
 
 // ListAllRuleGroups implements RuleStore
 func (c *ConfigRuleStore) ListAllRuleGroups(ctx context.Context) (map[string]rulespb.RuleGroupList, error) {
+	c.mtx.Lock()
+	defer c.mtx.Unlock()
+
 	configs, err := c.configClient.GetRules(ctx, c.since)
 
 	if err != nil {
@@ -73,7 +87,15 @@ func (c *ConfigRuleStore) ListAllRuleGroups(ctx context.Context) (map[string]rul
 
 	c.since = getLatestConfigID(configs, c.since)
 
-	return c.ruleGroupList, nil
+	// Return a shallow copy of the cache so callers can safely iterate it
+	// (and in some cases delete entries from the returned map) without
+	// racing against concurrent ListAllRuleGroups invocations that mutate
+	// the internal cache.
+	out := make(map[string]rulespb.RuleGroupList, len(c.ruleGroupList))
+	for user, rules := range c.ruleGroupList {
+		out[user] = rules
+	}
+	return out, nil
 }
 
 // getLatestConfigID gets the latest configs ID.
