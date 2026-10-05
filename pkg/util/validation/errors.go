@@ -128,8 +128,11 @@ func newTooManyLabelsError(series []cortexpb.LabelAdapter, limit int) Validation
 }
 
 func (e *tooManyLabelsError) Error() string {
+	// NOTE: the rendered series is attacker-controlled and the per-label length
+	// checks run after this one, so we must bound the formatted length to avoid
+	// amplifying a validation failure into a multi-MB error body / log line.
 	return fmt.Sprintf(
-		"series has too many labels (actual: %d, limit: %d) series: '%s'",
+		"series has too many labels (actual: %d, limit: %d) series: '%.200s'",
 		len(e.series), e.limit, cortexpb.FromLabelAdaptersToMetric(e.series).String())
 }
 
@@ -193,7 +196,23 @@ type exemplarValidationError struct {
 }
 
 func (e *exemplarValidationError) Error() string {
-	return fmt.Sprintf(e.message, e.timestamp, cortexpb.FromLabelAdaptersToLabels(e.seriesLabels).String(), cortexpb.FromLabelAdaptersToLabels(e.exemplarLabels).String())
+	// NOTE: both the series labels and exemplar labels are attacker-controlled
+	// and only the overall request size bounds them, so each is truncated to
+	// 200 bytes to avoid amplifying rejected input into a multi-MB error body /
+	// log line (see tooManyLabelsError for details).
+	return fmt.Sprintf(e.message, e.timestamp, truncateForError(cortexpb.FromLabelAdaptersToLabels(e.seriesLabels).String()), truncateForError(cortexpb.FromLabelAdaptersToLabels(e.exemplarLabels).String()))
+}
+
+// truncateForError bounds attacker-controlled label text embedded in
+// validation error messages. It matches the %.200q truncation applied by
+// sibling formatters but preserves the un-quoted rendering historically used
+// by exemplar errors.
+func truncateForError(s string) string {
+	const maxLen = 200
+	if len(s) <= maxLen {
+		return s
+	}
+	return s[:maxLen]
 }
 
 func newExemplarEmtpyLabelsError(seriesLabels []cortexpb.LabelAdapter, exemplarLabels []cortexpb.LabelAdapter, timestamp int64) ValidationError {
