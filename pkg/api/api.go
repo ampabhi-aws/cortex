@@ -187,7 +187,14 @@ func (a *API) RegisterAlertmanager(am *alertmanager.MultitenantAlertmanager, tar
 	a.indexPage.AddLink(SectionAdminEndpoints, "/multitenant_alertmanager/ring", "Alertmanager Ring Status")
 	// Ensure this route is registered before the prefixed AM route
 	a.RegisterRoute("/multitenant_alertmanager/status", am.GetStatusHandler(), false, "GET")
-	a.RegisterRoute("/multitenant_alertmanager/configs", http.HandlerFunc(am.ListAllConfigs), false, "GET")
+	// Admin endpoint that enumerates all tenants' Alertmanager configs (including
+	// receiver secrets). Require the auth middleware so that the X-Scope-OrgID
+	// header must be present (mirroring other admin routes like
+	// /multitenant_alertmanager/delete_tenant_config and matching the documented
+	// 'should not be exposed to end users' guidance); this closes the trivially
+	// unauthenticated cross-tenant disclosure vector against operators relying
+	// on the documented reverse-proxy authentication model.
+	a.RegisterRoute("/multitenant_alertmanager/configs", http.HandlerFunc(am.ListAllConfigs), true, "GET")
 	a.RegisterRoute("/multitenant_alertmanager/ring", http.HandlerFunc(am.RingHandler), false, "GET", "POST")
 	a.RegisterRoute("/multitenant_alertmanager/delete_tenant_config", http.HandlerFunc(am.DeleteUserConfig), true, "POST")
 
@@ -291,8 +298,12 @@ func (a *API) RegisterRuler(r *ruler.Ruler) {
 	// Legacy Ring Route
 	a.RegisterRoute("/ruler_ring", r, false, "GET", "POST")
 
-	// List all user rule groups
-	a.RegisterRoute("/ruler/rule_groups", http.HandlerFunc(r.ListAllRules), false, "GET")
+	// List all user rule groups. Admin endpoint that enumerates every tenant's
+	// recording/alerting rules; require the auth middleware so that the
+	// X-Scope-OrgID header must be present (mirroring /ruler/delete_tenant_config
+	// and the documented 'should not be exposed to end users' guidance), closing
+	// the trivially unauthenticated cross-tenant disclosure vector.
+	a.RegisterRoute("/ruler/rule_groups", http.HandlerFunc(r.ListAllRules), true, "GET")
 
 	ruler.RegisterRulerServer(a.server.GRPC, r)
 }
