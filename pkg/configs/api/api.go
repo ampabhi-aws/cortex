@@ -1,6 +1,7 @@
 package api
 
 import (
+	"crypto/subtle"
 	"database/sql"
 	"encoding/json"
 	"errors"
@@ -34,7 +35,8 @@ var (
 
 // Config configures Configs API
 type Config struct {
-	Notifications NotificationsConfig `yaml:"notifications"`
+	Notifications       NotificationsConfig `yaml:"notifications"`
+	PrivateAPIBearerToken string            `yaml:"private_api_bearer_token"`
 }
 
 // NotificationsConfig configures Alertmanager notifications method.
@@ -47,6 +49,7 @@ type NotificationsConfig struct {
 func (cfg *Config) RegisterFlags(f *flag.FlagSet) {
 	f.BoolVar(&cfg.Notifications.DisableEmail, "configs.notifications.disable-email", false, "Disable Email notifications for Alertmanager.")
 	f.BoolVar(&cfg.Notifications.DisableWebHook, "configs.notifications.disable-webhook", false, "Disable WebHook notifications for Alertmanager.")
+	f.StringVar(&cfg.PrivateAPIBearerToken, "configs.api.private-api-bearer-token", "", "Shared secret bearer token that internal callers (ruler, alertmanager) must present via the Authorization header to access the /private/api/prom/configs/* endpoints. If empty, those endpoints are disabled and return 401.")
 }
 
 // API implements the configs api.
@@ -263,7 +266,44 @@ type ConfigsView struct {
 	Configs map[string]userconfig.View `json:"configs"`
 }
 
+// authorizePrivateAPI enforces a shared-secret bearer token on the internal
+// /private/api/prom/configs/* endpoints. These endpoints disclose every
+// tenant's rules, templates and raw alertmanager_config (which legitimately
+// embeds third-party credentials such as Slack/webhook URLs, PagerDuty keys
+// and SMTP passwords) and so must never be reachable anonymously on the
+// tenant-facing HTTP listener. The endpoint is default-closed: if no token
+// is configured, every request is rejected with 401.
+func (a *API) authorizePrivateAPI(w http.ResponseWriter, r *http.Request) bool {
+	logger := util_log.WithContext(r.Context(), util_log.Logger)
+	expected := a.cfg.PrivateAPIBearerToken
+	if expected == "" {
+		level.Warn(logger).Log("msg", "rejecting request to private configs API: -configs.api.private-api-bearer-token is not configured; the endpoint is disabled")
+		http.Error(w, "private configs API is disabled: -configs.api.private-api-bearer-token must be configured", http.StatusUnauthorized)
+		return false
+	}
+	auth := r.Header.Get("Authorization")
+	const prefix = "Bearer "
+	if !strings.HasPrefix(auth, prefix) {
+		http.Error(w, "missing bearer token", http.StatusUnauthorized)
+		return false
+	}
+	provided := strings.TrimPrefix(auth, prefix)
+	// Constant-time comparison to avoid leaking the secret via timing.
+	// subtle.ConstantTimeCompare already requires equal-length inputs and
+	// returns 0 for mismatched lengths; prefix the length check so we always
+	// pass equal-length byte slices.
+	if len(provided) != len(expected) ||
+		subtle.ConstantTimeCompare([]byte(provided), []byte(expected)) != 1 {
+		http.Error(w, "invalid bearer token", http.StatusUnauthorized)
+		return false
+	}
+	return true
+}
+
 func (a *API) getConfigs(w http.ResponseWriter, r *http.Request) {
+	if !a.authorizePrivateAPI(w, r) {
+		return
+	}
 	var cfgs map[string]userconfig.View
 	var cfgErr error
 	logger := util_log.WithContext(r.Context(), util_log.Logger)

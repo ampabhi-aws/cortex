@@ -9,6 +9,7 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/cortexproject/cortex/pkg/configs/db/dbtest"
 	"github.com/cortexproject/cortex/pkg/configs/userconfig"
 
 	"github.com/stretchr/testify/assert"
@@ -64,6 +65,42 @@ func Test_GetConfig_Anonymous(t *testing.T) {
 
 	for _, c := range allClients {
 		w := request(t, "GET", c.Endpoint, nil)
+		assert.Equal(t, http.StatusUnauthorized, w.Code)
+	}
+}
+
+// The private all-tenant dump endpoints must reject requests that do not
+// carry the shared-secret bearer token.
+func Test_GetConfigs_PrivateEndpoints_RequireBearerToken(t *testing.T) {
+	setup(t)
+	defer cleanup(t)
+
+	for _, c := range allClients {
+		// No Authorization header at all.
+		w := request(t, "GET", c.PrivateEndpoint, nil)
+		assert.Equal(t, http.StatusUnauthorized, w.Code, "anonymous request to %s must be rejected", c.PrivateEndpoint)
+
+		// Wrong token.
+		w = requestWithAuth(t, "GET", c.PrivateEndpoint, "Bearer wrong-token", nil)
+		assert.Equal(t, http.StatusUnauthorized, w.Code, "request with wrong bearer token to %s must be rejected", c.PrivateEndpoint)
+
+		// Non-Bearer auth scheme.
+		w = requestWithAuth(t, "GET", c.PrivateEndpoint, "Basic dXNlcjpwYXNz", nil)
+		assert.Equal(t, http.StatusUnauthorized, w.Code, "request with non-bearer auth to %s must be rejected", c.PrivateEndpoint)
+	}
+}
+
+// When no shared-secret bearer token is configured the endpoint must stay
+// closed even if the caller sends an Authorization header.
+func Test_GetConfigs_PrivateEndpoints_DisabledWhenTokenUnset(t *testing.T) {
+	database = dbtest.Setup(t)
+	app = New(database, Config{Notifications: NotificationsConfig{DisableEmail: true}})
+	defer cleanup(t)
+
+	for _, c := range allClients {
+		w := request(t, "GET", c.PrivateEndpoint, nil)
+		assert.Equal(t, http.StatusUnauthorized, w.Code)
+		w = requestWithAuth(t, "GET", c.PrivateEndpoint, "Bearer anything", nil)
 		assert.Equal(t, http.StatusUnauthorized, w.Code)
 	}
 }
@@ -149,7 +186,7 @@ func Test_GetAllConfigs_Empty(t *testing.T) {
 	defer cleanup(t)
 
 	for _, c := range allClients {
-		w := request(t, "GET", c.PrivateEndpoint, nil)
+		w := requestPrivate(t, "GET", c.PrivateEndpoint, nil)
 		assert.Equal(t, http.StatusOK, w.Code)
 		var found ConfigsView
 		err := json.Unmarshal(w.Body.Bytes(), &found)
@@ -168,7 +205,7 @@ func Test_GetAllConfigs(t *testing.T) {
 
 	for _, c := range allClients {
 		view := c.post(t, userID, config)
-		w := request(t, "GET", c.PrivateEndpoint, nil)
+		w := requestPrivate(t, "GET", c.PrivateEndpoint, nil)
 		assert.Equal(t, http.StatusOK, w.Code)
 		var found ConfigsView
 		err := json.Unmarshal(w.Body.Bytes(), &found)
@@ -191,7 +228,7 @@ func Test_GetAllConfigs_Newest(t *testing.T) {
 		c.post(t, userID, makeConfig())
 		lastCreated := c.post(t, userID, makeConfig())
 
-		w := request(t, "GET", c.PrivateEndpoint, nil)
+		w := requestPrivate(t, "GET", c.PrivateEndpoint, nil)
 		assert.Equal(t, http.StatusOK, w.Code)
 		var found ConfigsView
 		err := json.Unmarshal(w.Body.Bytes(), &found)
@@ -212,7 +249,7 @@ func Test_GetConfigs_IncludesNewerConfigsAndExcludesOlder(t *testing.T) {
 		userID3 := makeUserID()
 		config3 := c.post(t, userID3, makeConfig())
 
-		w := request(t, "GET", fmt.Sprintf("%s?since=%d", c.PrivateEndpoint, config2.ID), nil)
+		w := requestPrivate(t, "GET", fmt.Sprintf("%s?since=%d", c.PrivateEndpoint, config2.ID), nil)
 		assert.Equal(t, http.StatusOK, w.Code)
 		var found ConfigsView
 		err := json.Unmarshal(w.Body.Bytes(), &found)

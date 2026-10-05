@@ -24,6 +24,8 @@ var (
 	counter  int
 )
 
+const testPrivateAPIBearerToken = "test-private-bearer-token"
+
 // setup sets up the environment for the tests.
 func setup(t *testing.T) {
 	database = dbtest.Setup(t)
@@ -31,6 +33,7 @@ func setup(t *testing.T) {
 		Notifications: NotificationsConfig{
 			DisableEmail: true,
 		},
+		PrivateAPIBearerToken: testPrivateAPIBearerToken,
 	})
 	counter = 0
 }
@@ -42,6 +45,7 @@ func setupWithEmailEnabled(t *testing.T) {
 		Notifications: NotificationsConfig{
 			DisableEmail: false,
 		},
+		PrivateAPIBearerToken: testPrivateAPIBearerToken,
 	})
 	counter = 0
 }
@@ -56,6 +60,24 @@ func request(t *testing.T, method, urlStr string, body io.Reader) *httptest.Resp
 	w := httptest.NewRecorder()
 	r, err := http.NewRequest(method, urlStr, body)
 	require.NoError(t, err)
+	app.ServeHTTP(w, r)
+	return w
+}
+
+// requestPrivate makes a request to the private configs API, authenticated
+// with the shared-secret bearer token configured in setup().
+func requestPrivate(t *testing.T, method, urlStr string, body io.Reader) *httptest.ResponseRecorder {
+	return requestWithAuth(t, method, urlStr, "Bearer "+testPrivateAPIBearerToken, body)
+}
+
+// requestWithAuth makes a request with an explicit Authorization header value.
+func requestWithAuth(t *testing.T, method, urlStr, authHeader string, body io.Reader) *httptest.ResponseRecorder {
+	w := httptest.NewRecorder()
+	r, err := http.NewRequest(method, urlStr, body)
+	require.NoError(t, err)
+	if authHeader != "" {
+		r.Header.Set("Authorization", authHeader)
+	}
 	app.ServeHTTP(w, r)
 	return w
 }

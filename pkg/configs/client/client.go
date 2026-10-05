@@ -31,6 +31,7 @@ var (
 type Config struct {
 	ConfigsAPIURL flagext.URLValue     `yaml:"configs_api_url"`
 	ClientTimeout time.Duration        `yaml:"client_timeout"` // HTTP timeout duration for requests made to the Weave Cloud configs service.
+	BearerToken   string               `yaml:"bearer_token"`
 	TLS           tls_cfg.ClientConfig `yaml:",inline"`
 }
 
@@ -38,6 +39,7 @@ type Config struct {
 func (cfg *Config) RegisterFlagsWithPrefix(prefix string, f *flag.FlagSet) {
 	f.Var(&cfg.ConfigsAPIURL, prefix+"configs.url", "URL of configs API server.")
 	f.DurationVar(&cfg.ClientTimeout, prefix+"configs.client-timeout", 5*time.Second, "Timeout for requests to Weave Cloud configs service.")
+	f.StringVar(&cfg.BearerToken, prefix+"configs.bearer-token", "", "Bearer token sent to the configs service via the Authorization header when calling /private/api/prom/configs/*. Must match -configs.api.private-api-bearer-token on the configs service.")
 	cfg.TLS.RegisterFlagsWithPrefix(prefix+"configs", f)
 }
 
@@ -66,8 +68,9 @@ func New(cfg Config) (*ConfigDBClient, error) {
 	}
 
 	client := &ConfigDBClient{
-		URL:     cfg.ConfigsAPIURL.URL,
-		Timeout: cfg.ClientTimeout,
+		URL:         cfg.ConfigsAPIURL.URL,
+		Timeout:     cfg.ClientTimeout,
+		BearerToken: cfg.BearerToken,
 	}
 
 	tlsConfig, err := cfg.TLS.GetTLSConfig()
@@ -83,9 +86,10 @@ func New(cfg Config) (*ConfigDBClient, error) {
 
 // ConfigDBClient allows retrieving recording and alerting rules from the configs server.
 type ConfigDBClient struct {
-	URL       *url.URL
-	Timeout   time.Duration
-	TLSConfig *tls.Config
+	URL         *url.URL
+	Timeout     time.Duration
+	BearerToken string
+	TLSConfig   *tls.Config
 }
 
 // GetRules implements Client
@@ -98,7 +102,7 @@ func (c ConfigDBClient) GetRules(ctx context.Context, since userconfig.ID) (map[
 	var response *ConfigsResponse
 	err := instrument.CollectedRequest(ctx, "GetRules", configsRequestDuration, instrument.ErrorCode, func(ctx context.Context) error {
 		var err error
-		response, err = doRequest(endpoint, c.Timeout, c.TLSConfig, since)
+		response, err = doRequest(endpoint, c.Timeout, c.TLSConfig, c.BearerToken, since)
 		return err
 	})
 	if err != nil {
@@ -124,13 +128,13 @@ func (c ConfigDBClient) GetAlerts(ctx context.Context, since userconfig.ID) (*Co
 	var response *ConfigsResponse
 	err := instrument.CollectedRequest(ctx, "GetAlerts", configsRequestDuration, instrument.ErrorCode, func(ctx context.Context) error {
 		var err error
-		response, err = doRequest(endpoint, c.Timeout, c.TLSConfig, since)
+		response, err = doRequest(endpoint, c.Timeout, c.TLSConfig, c.BearerToken, since)
 		return err
 	})
 	return response, err
 }
 
-func doRequest(endpoint string, timeout time.Duration, tlsConfig *tls.Config, since userconfig.ID) (*ConfigsResponse, error) {
+func doRequest(endpoint string, timeout time.Duration, tlsConfig *tls.Config, bearerToken string, since userconfig.ID) (*ConfigsResponse, error) {
 	req, err := http.NewRequest("GET", endpoint, nil)
 	if err != nil {
 		return nil, err
@@ -142,6 +146,9 @@ func doRequest(endpoint string, timeout time.Duration, tlsConfig *tls.Config, si
 	}
 
 	req.Header.Set("User-Agent", fmt.Sprintf("Cortex/%s", version.Version))
+	if bearerToken != "" {
+		req.Header.Set("Authorization", "Bearer "+bearerToken)
+	}
 
 	resp, err := client.Do(req)
 	if err != nil {
