@@ -446,6 +446,8 @@ GET /ruler/rule_groups
 
 List all tenant rules. This endpoint is not part of ruler-API and is always available regardless of whether ruler-API is enabled or not. It should not be exposed to end users. This endpoint returns a YAML dictionary with all the rule groups for each tenant and `200` status code on success.
 
+Requests must include the `X-Scope-OrgID` header (the caller is treated as an operator / administrative tenant); unauthenticated requests are rejected with `401 Unauthorized`. As with every Cortex HTTP endpoint, the `X-Scope-OrgID` value is trusted as-is: operators must still restrict this administrative route to privileged callers at the proxy / network-ACL layer (see [Authentication and Authorisation](../guides/authentication-and-authorisation.md)).
+
 ### List rules
 
 ```

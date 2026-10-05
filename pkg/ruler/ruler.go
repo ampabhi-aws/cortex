@@ -863,6 +863,25 @@ func (r *Ruler) DeleteTenantConfiguration(w http.ResponseWriter, req *http.Reque
 func (r *Ruler) ListAllRules(w http.ResponseWriter, req *http.Request) {
 	logger := util_log.WithContext(req.Context(), r.logger)
 
+	// ListAllRules exposes rule groups for every tenant, so it is strictly an
+	// administrative/operator endpoint. Require a caller identity via the
+	// standard X-Scope-OrgID header for parity with the other ruler admin
+	// handlers (e.g. DeleteTenantConfiguration): this prevents fully
+	// unauthenticated callers from enumerating all tenants' recording and
+	// alerting rules when the operator-provided auth proxy forwards the
+	// request without a tenant header. Operators must still restrict this
+	// path to trusted callers at the proxy/network layer; see
+	// docs/api/_index.md and docs/guides/authentication-and-authorisation.md.
+	if userID, err := tenant.TenantID(req.Context()); err != nil || userID == "" {
+		// When Cortex is running, it uses Auth Middleware for checking X-Scope-OrgID and injecting tenant into context.
+		// Auth Middleware sends http.StatusUnauthorized if X-Scope-OrgID is missing, so we do too here, for consistency.
+		if err == nil {
+			err = user.ErrNoOrgID
+		}
+		http.Error(w, err.Error(), http.StatusUnauthorized)
+		return
+	}
+
 	userIDs, err := r.store.ListAllUsers(req.Context())
 	if err != nil {
 		level.Error(logger).Log("msg", errListAllUser, "err", err)

@@ -2,6 +2,8 @@
 
 ## master / unreleased
 
+* [SECURITY] Require `X-Scope-OrgID` on `GET /ruler/rule_groups`. This administrative endpoint lists every tenant's rule groups; it previously accepted requests with no tenant/operator identity. The route is now registered with `auth=true` and the handler returns `401 Unauthorized` when the header is missing or empty. Operators must still restrict this path to privileged callers at the proxy layer (unchanged documented control). #continuum-01a10c979ba379fcb8045ded507f7881
+
   **This release removes support for chunks storage. See below for more.**
 * [CHANGE] Remove support for chunks storage entirely. If you are using chunks storage on a previous version, you must [migrate your data](https://github.com/cortexproject/cortex/blob/v1.11.1/docs/blocks-storage/migrate-from-chunks-to-blocks.md) on version 1.12 or earlier. Before upgrading to this release, you should also remove any deprecated chunks-related configuration, as this release will no longer accept that. The following flags are gone:
   - `-dynamodb.*`
