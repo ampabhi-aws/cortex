@@ -288,7 +288,26 @@ var (
 	ErrNoRuleGroups = errors.New("no rule groups found")
 	// ErrBadRuleGroup is returned when the provided rule group can not be unmarshalled
 	ErrBadRuleGroup = errors.New("unable to decoded rule group")
+	// ErrInvalidNamespace signals that the namespace in the request contains
+	// path separators or relative-path references which could be used to
+	// traverse the rule store directory layout.
+	ErrInvalidNamespace = errors.New("invalid namespace")
+	// ErrInvalidGroupName signals that the group name in the request contains
+	// path separators or relative-path references which could be used to
+	// traverse the rule store directory layout.
+	ErrInvalidGroupName = errors.New("invalid group name")
 )
+
+// containsPathSeparatorsOrRelativeRefs reports whether the given value is a
+// directory reference ("." or "..") or contains a path separator ("/" or
+// "\\"). It is used to reject namespace and group-name URL parameters that
+// could be used to escape the rule store directory layout via filepath.Join.
+func containsPathSeparatorsOrRelativeRefs(v string) bool {
+	if v == "." || v == ".." {
+		return true
+	}
+	return strings.ContainsAny(v, "\\/")
+}
 
 func marshalAndSend(output interface{}, w http.ResponseWriter, logger log.Logger) {
 	d, err := yaml.Marshal(&output)
@@ -336,6 +355,16 @@ func parseNamespace(params map[string]string) (string, error) {
 		return "", err
 	}
 
+	// Reject path separators and relative-path references after
+	// percent-decoding. Without this check, an attacker can smuggle `%2F`
+	// and `..%2F` sequences through the single `{namespace}` URL path
+	// segment (gorilla/mux is configured with UseEncodedPath()), and the
+	// local rule store would resolve the resulting `..` via filepath.Join
+	// and read files outside the caller's tenant directory.
+	if containsPathSeparatorsOrRelativeRefs(namespace) {
+		return "", ErrInvalidNamespace
+	}
+
 	return namespace, nil
 }
 
@@ -350,6 +379,13 @@ func parseGroupName(params map[string]string) (string, error) {
 	groupName, err := url.PathUnescape(groupName)
 	if err != nil {
 		return "", err
+	}
+
+	// Reject path separators and relative-path references after
+	// percent-decoding for the same reason as parseNamespace: the local
+	// rule store concatenates these values into filesystem paths.
+	if containsPathSeparatorsOrRelativeRefs(groupName) {
+		return "", ErrInvalidGroupName
 	}
 
 	return groupName, nil
