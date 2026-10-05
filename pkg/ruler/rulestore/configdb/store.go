@@ -94,20 +94,31 @@ func (c *ConfigRuleStore) ListRuleGroupsForUserAndNamespace(ctx context.Context,
 		return nil, err
 	}
 
+	cached := r[userID]
 	if namespace == "" {
-		return r[userID], nil
+		// Return a copy so callers cannot mutate the cached slice backing array.
+		if cached == nil {
+			return nil, nil
+		}
+		out := make(rulespb.RuleGroupList, len(cached))
+		copy(out, cached)
+		return out, nil
 	}
 
-	list := r[userID]
-	for ix := 0; ix < len(list); {
-		if list[ix].GetNamespace() != namespace {
-			list = append(list[:ix], list[ix+1:]...)
-		} else {
-			ix++
+	// Build a new slice containing only the matching namespace. Filtering with
+	// the in-place `append(list[:ix], list[ix+1:]...)` idiom would mutate the
+	// cached backing array that `ListAllRuleGroups` returns by reference,
+	// permanently corrupting the tenant's cached rule groups (losing entries
+	// from other namespaces and creating duplicates). See issue in
+	// pkg/ruler/rulestore/configdb/store.go for details.
+	out := make(rulespb.RuleGroupList, 0, len(cached))
+	for _, rg := range cached {
+		if rg.GetNamespace() == namespace {
+			out = append(out, rg)
 		}
 	}
 
-	return list, nil
+	return out, nil
 }
 
 func (c *ConfigRuleStore) LoadRuleGroups(ctx context.Context, groupsToLoad map[string]rulespb.RuleGroupList) error {
