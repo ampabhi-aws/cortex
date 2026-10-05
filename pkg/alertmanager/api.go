@@ -261,6 +261,22 @@ func validateUserConfig(logger log.Logger, cfg alertspb.AlertConfigDesc, limits 
 
 func (am *MultitenantAlertmanager) ListAllConfigs(w http.ResponseWriter, r *http.Request) {
 	logger := util_log.WithContext(r.Context(), am.logger)
+
+	// This endpoint discloses every tenant's raw Alertmanager YAML — including
+	// any embedded third-party credentials (Slack webhook URLs, PagerDuty
+	// routing keys, OpsGenie/VictorOps API keys, SMTP/HTTP basic-auth
+	// passwords, bearer tokens) — plus all notification template files. It is
+	// an operator-only administrative endpoint and must never be reachable by
+	// tenants or by unauthenticated callers. To prevent accidental
+	// cross-tenant disclosure (CWE-306 / CWE-200), it is disabled by default
+	// and must be explicitly opted into via
+	// -alertmanager.enable-all-tenant-api on an operator-only listener.
+	if am.cfg == nil || !am.cfg.EnableAllTenantAPI {
+		level.Warn(logger).Log("msg", "refusing cross-tenant alertmanager configs request: endpoint disabled", "remote", r.RemoteAddr)
+		http.Error(w, "multi-tenant alertmanager configs listing is disabled; enable via -alertmanager.enable-all-tenant-api on an operator-only listener", http.StatusForbidden)
+		return
+	}
+
 	userIDs, err := am.store.ListAllUsers(r.Context())
 	if err != nil {
 		level.Error(logger).Log("msg", "failed to list users of alertmanager", "err", err)
