@@ -39,6 +39,11 @@ import (
 )
 
 // DistributorPushWrapper wraps around a push. It is similar to middleware.Interface.
+//
+// Lifetime note: implementations MUST treat the *cortexpb.WriteRequest passed
+// to the wrapped push.Func as owned by the distributor the moment next is
+// called. See the Config.DistributorPushWrapper doc comment for the full
+// ownership contract.
 type DistributorPushWrapper func(next push.Func) push.Func
 type ConfigHandler func(actualCfg interface{}, defaultCfg interface{}) http.HandlerFunc
 
@@ -54,7 +59,20 @@ type Config struct {
 	HTTPAuthMiddleware middleware.Interface `yaml:"-"`
 
 	// This allows downstream projects to wrap the distributor push function
-	// and access the deserialized write requests before/after they are pushed.
+	// and inspect the deserialized write request *before* it is pushed.
+	//
+	// Ownership / lifetime contract: the wrapper MUST NOT retain or read any
+	// part of the *cortexpb.WriteRequest (including its Timeseries, Labels,
+	// Samples, Exemplars or Metadata) after invoking next(ctx, req). The
+	// distributor transfers ownership of the request to a process-global,
+	// cross-tenant sync.Pool via cortexpb.ReuseSlice as soon as next returns;
+	// the recycle may happen asynchronously (see ring.DoBatch) so the request
+	// backing storage can be concurrently reused by another tenant's Push.
+	// Because label names/values are zero-copy aliases of the gRPC/HTTP input
+	// buffer, post-push access can observe another tenant's data or race on
+	// 16-byte string headers. If a wrapper needs to retain data past next,
+	// it MUST copy what it needs (e.g. strings.Clone on label names/values
+	// and copies of Samples/Exemplars) before calling next.
 	DistributorPushWrapper DistributorPushWrapper `yaml:"-"`
 
 	// The CustomConfigHandler allows for providing a different handler for the
