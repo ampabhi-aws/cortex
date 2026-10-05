@@ -80,6 +80,14 @@ type MultitenantAlertmanagerConfig struct {
 
 	EnableAPI bool `yaml:"enable_api"`
 
+	// EnableAllTenantAPI, when true, enables the admin endpoint
+	// `GET /multitenant_alertmanager/configs` which lists every tenant's
+	// Alertmanager configuration (including embedded secrets). This endpoint
+	// is intended for operator/debugging use only and must never be exposed to
+	// end users. It is disabled by default to prevent accidental cross-tenant
+	// disclosure (CWE-306 / CWE-200).
+	EnableAllTenantAPI bool `yaml:"enable_all_tenant_api"`
+
 	// For distributor.
 	AlertmanagerClient ClientConfig `yaml:"alertmanager_client"`
 
@@ -114,6 +122,7 @@ func (cfg *MultitenantAlertmanagerConfig) RegisterFlags(f *flag.FlagSet) {
 	f.DurationVar(&cfg.PollInterval, "alertmanager.configs.poll-interval", 15*time.Second, "How frequently to poll Cortex configs")
 
 	f.BoolVar(&cfg.EnableAPI, "experimental.alertmanager.enable-api", false, "Enable the experimental alertmanager config api.")
+	f.BoolVar(&cfg.EnableAllTenantAPI, "alertmanager.enable-all-tenant-api", false, "Enable the admin endpoint GET /multitenant_alertmanager/configs which exposes every tenant's Alertmanager configuration (including embedded secrets). Disabled by default; only enable on operator-only listeners that are not reachable by end users.")
 
 	f.BoolVar(&cfg.ShardingEnabled, "alertmanager.sharding-enabled", false, "Shard tenants across multiple alertmanager instances.")
 

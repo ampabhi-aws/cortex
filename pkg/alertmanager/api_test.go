@@ -670,6 +670,7 @@ receivers:
 	// Create the Multitenant Alertmanager.
 	reg := prometheus.NewPedanticRegistry()
 	cfg := mockAlertmanagerConfig(t)
+	cfg.EnableAllTenantAPI = true
 	am, err := createMultitenantAlertmanager(cfg, nil, nil, alertStore, nil, nil, log.NewNopLogger(), reg)
 	require.NoError(t, err)
 	require.NoError(t, services.StartAndAwaitRunning(context.Background(), am))
@@ -681,6 +682,18 @@ receivers:
 
 	router := mux.NewRouter()
 	router.Path("/multitenant_alertmanager/configs").Methods(http.MethodGet).HandlerFunc(am.ListAllConfigs)
+
+	// With EnableAllTenantAPI disabled (the secure default), the endpoint must refuse the request.
+	{
+		am.cfg.EnableAllTenantAPI = false
+		req := httptest.NewRequest("GET", "https://localhost:8080/multitenant_alertmanager/configs", nil)
+		w := httptest.NewRecorder()
+		router.ServeHTTP(w, req)
+		resp := w.Result()
+		require.Equal(t, http.StatusForbidden, resp.StatusCode)
+		am.cfg.EnableAllTenantAPI = true
+	}
+
 	req := httptest.NewRequest("GET", "https://localhost:8080/multitenant_alertmanager/configs", nil)
 	w := httptest.NewRecorder()
 	router.ServeHTTP(w, req)
