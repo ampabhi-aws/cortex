@@ -29,13 +29,18 @@ var response = `{
 `
 
 func TestDoRequest(t *testing.T) {
+	const wantToken = "shared-secret"
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if got := r.Header.Get("Authorization"); got != "Bearer "+wantToken {
+			http.Error(w, "missing or invalid bearer token", http.StatusUnauthorized)
+			return
+		}
 		_, err := w.Write([]byte(response))
 		require.NoError(t, err)
 	}))
 	defer server.Close()
 
-	resp, err := doRequest(server.URL, 1*time.Second, nil, 0)
+	resp, err := doRequest(server.URL, 1*time.Second, nil, wantToken, 0)
 	assert.Nil(t, err)
 
 	expected := ConfigsResponse{Configs: map[string]userconfig.View{

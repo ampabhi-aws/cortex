@@ -2,6 +2,8 @@
 
 ## master / unreleased
 
+* [SECURITY/CHANGE] configs: the internal `GET /private/api/prom/configs/{rules,alertmanager}` endpoints are now authenticated with a shared-secret bearer token. Operators must set `-configs.api.private-api-bearer-token` on the configs service and `-<prefix>configs.bearer-token` on every internal caller (ruler, alertmanager). If no token is configured on the server the endpoints return `401` for every request. Previously these endpoints were reachable anonymously and returned every tenant's rules, templates and raw Alertmanager configuration (including embedded third-party credentials). #CVE-cortex-configs-private-dump
+
   **This release removes support for chunks storage. See below for more.**
 * [CHANGE] Remove support for chunks storage entirely. If you are using chunks storage on a previous version, you must [migrate your data](https://github.com/cortexproject/cortex/blob/v1.11.1/docs/blocks-storage/migrate-from-chunks-to-blocks.md) on version 1.12 or earlier. Before upgrading to this release, you should also remove any deprecated chunks-related configuration, as this release will no longer accept that. The following flags are gone:
   - `-dynamodb.*`
