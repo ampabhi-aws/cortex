@@ -312,6 +312,19 @@ func clusterWait(position func() int, timeout time.Duration) func() time.Duratio
 func (am *Alertmanager) ApplyConfig(userID string, conf *config.Config, rawCfg string) error {
 	templateFiles := make([]string, len(conf.Templates))
 	for i, t := range conf.Templates {
+		// Enforce the per-tenant template filename restrictions before
+		// resolving the on-disk path: an untrusted config loaded from the
+		// alert store (e.g. the deprecated configs API or any writer with
+		// write access to the backing store) could otherwise reference a
+		// template name containing a relative path or an empty string. The
+		// safeTemplateFilepath call below defends against directory
+		// escapes, but validateTemplateFilename additionally rejects any
+		// name containing a path separator, which keeps the on-disk layout
+		// strictly flat for each tenant.
+		if err := validateTemplateFilename(t); err != nil {
+			return err
+		}
+
 		templateFilepath, err := safeTemplateFilepath(filepath.Join(am.cfg.TenantDataDir, templatesDir), t)
 		if err != nil {
 			return err
