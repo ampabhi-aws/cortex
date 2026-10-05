@@ -45,6 +45,7 @@ var (
 	errTLSFileNotAllowed             = errors.New("setting TLS ca_file, cert_file and key_file is not allowed")
 	errSlackAPIURLFileNotAllowed     = errors.New("setting Slack api_url_file and global slack_api_url_file is not allowed")
 	errVictorOpsAPIKeyFileNotAllowed = errors.New("setting VictorOps api_key_file is not allowed")
+	errOpsGenieAPIKeyFileNotAllowed  = errors.New("setting OpsGenie api_key_file and global opsgenie_api_key_file is not allowed")
 )
 
 // UserConfig is used to communicate a users alertmanager configs
@@ -350,6 +351,11 @@ func validateAlertmanagerConfig(cfg interface{}) error {
 		if err := validateVictorOpsConfig(v.Interface().(config.VictorOpsConfig)); err != nil {
 			return err
 		}
+
+	case reflect.TypeOf(config.OpsGenieConfig{}):
+		if err := validateOpsGenieConfig(v.Interface().(config.OpsGenieConfig)); err != nil {
+			return err
+		}
 	}
 
 	// If the input config is a struct, recursively iterate on all fields.
@@ -428,6 +434,18 @@ func validateReceiverTLSConfig(cfg commoncfg.TLSConfig) error {
 func validateGlobalConfig(cfg config.GlobalConfig) error {
 	if cfg.SlackAPIURLFile != "" {
 		return errSlackAPIURLFileNotAllowed
+	}
+	if cfg.OpsGenieAPIKeyFile != "" {
+		return errOpsGenieAPIKeyFileNotAllowed
+	}
+	return nil
+}
+
+// validateOpsGenieConfig validates the OpsGenie config and returns an error if it contains
+// settings not allowed by Cortex.
+func validateOpsGenieConfig(cfg config.OpsGenieConfig) error {
+	if cfg.APIKeyFile != "" {
+		return errOpsGenieAPIKeyFileNotAllowed
 	}
 	return nil
 }
