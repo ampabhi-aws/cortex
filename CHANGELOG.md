@@ -3,6 +3,7 @@
 ## master / unreleased
 
   **This release removes support for chunks storage. See below for more.**
+* [CHANGE] Alertmanager: `-alertmanager.receivers-firewall-block-private-addresses` now defaults to `true`. This closes a blind SSRF vector where a tenant-uploaded Alertmanager configuration could use webhook / Slack / PagerDuty / OpsGenie / VictorOps / Pushover / WeChat / SNS receivers (and `http_config.proxy_url`) to make the Alertmanager process send HTTP requests to loopback, link-local or RFC1918 destinations — including Cortex's own unauthenticated admin endpoints such as `/ingester/flush`, `/ingester/shutdown` and `/<component>/ring?forget=`. Deployments that legitimately need to deliver notifications to private or loopback destinations must set `-alertmanager.receivers-firewall-block-private-addresses=false` (or the equivalent per-tenant limit) explicitly.
 * [CHANGE] Remove support for chunks storage entirely. If you are using chunks storage on a previous version, you must [migrate your data](https://github.com/cortexproject/cortex/blob/v1.11.1/docs/blocks-storage/migrate-from-chunks-to-blocks.md) on version 1.12 or earlier. Before upgrading to this release, you should also remove any deprecated chunks-related configuration, as this release will no longer accept that. The following flags are gone:
   - `-dynamodb.*`
   - `-metrics.*`
