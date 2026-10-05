@@ -42,6 +42,8 @@ const (
 var (
 	errPasswordFileNotAllowed        = errors.New("setting password_file, bearer_token_file and credentials_file is not allowed")
 	errOAuth2SecretFileNotAllowed    = errors.New("setting OAuth2 client_secret_file is not allowed")
+	errOAuth2NotAllowed              = errors.New("setting OAuth2 http_config options (token_url, endpoint_params, proxy_url) is not allowed because the per-tenant receivers firewall cannot enforce the configured destination restrictions on the OAuth2 token request")
+	errProxyURLNotAllowed            = errors.New("setting http_config proxy_url is not allowed because it can bypass the per-tenant receivers firewall")
 	errTLSFileNotAllowed             = errors.New("setting TLS ca_file, cert_file and key_file is not allowed")
 	errSlackAPIURLFileNotAllowed     = errors.New("setting Slack api_url_file and global slack_api_url_file is not allowed")
 	errVictorOpsAPIKeyFileNotAllowed = errors.New("setting VictorOps api_key_file is not allowed")
@@ -408,8 +410,27 @@ func validateReceiverHTTPConfig(cfg commoncfg.HTTPClientConfig) error {
 	if cfg.BearerTokenFile != "" {
 		return errPasswordFileNotAllowed
 	}
-	if cfg.OAuth2 != nil && cfg.OAuth2.ClientSecretFile != "" {
-		return errOAuth2SecretFileNotAllowed
+	if cfg.OAuth2 != nil {
+		if cfg.OAuth2.ClientSecretFile != "" {
+			return errOAuth2SecretFileNotAllowed
+		}
+		// The per-tenant receivers firewall (FirewallDialer) is enforced only as a
+		// DialContext hook on the main notification transport. The OAuth2 round
+		// tripper in prometheus/common builds a separate http.Transport for the
+		// token request that does not honour the injected DialContext, so a
+		// tenant-supplied oauth2.token_url (plus endpoint_params / proxy_url) can
+		// reach private cluster addresses from inside the Alertmanager pod and
+		// bypass the firewall. Reject tenant-supplied OAuth2 http_config entirely
+		// to close this SSRF vector until the token transport also honours the
+		// firewall.
+		return errOAuth2NotAllowed
+	}
+	if cfg.ProxyURL.URL != nil {
+		// A tenant-controlled HTTP proxy can be used to tunnel receiver traffic
+		// to arbitrary destinations (including internal cluster addresses) via
+		// CONNECT, which also bypasses the per-tenant receivers firewall that
+		// is enforced only at dial time against the resolved target host.
+		return errProxyURLNotAllowed
 	}
 	return validateReceiverTLSConfig(cfg.TLSConfig)
 }

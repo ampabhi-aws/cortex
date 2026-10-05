@@ -2,6 +2,8 @@
 
 ## master / unreleased
 
+* [BUGFIX] Alertmanager: reject tenant-supplied `http_config.oauth2` and `http_config.proxy_url` options in receiver / global configurations. The per-tenant receivers firewall (`-alertmanager.receivers-firewall-block-private-addresses` / `-alertmanager.receivers-firewall-block-cidr-networks`) is enforced as a `DialContext` hook on the main notification transport only. The OAuth2 round tripper in the vendored `prometheus/common` and HTTP proxies both bypass that hook, allowing a tenant to point `oauth2.token_url` or `proxy_url` at loopback / link-local / in-cluster addresses from the Alertmanager pod (SSRF). The validator now rejects these at config-set time.
+
   **This release removes support for chunks storage. See below for more.**
 * [CHANGE] Remove support for chunks storage entirely. If you are using chunks storage on a previous version, you must [migrate your data](https://github.com/cortexproject/cortex/blob/v1.11.1/docs/blocks-storage/migrate-from-chunks-to-blocks.md) on version 1.12 or earlier. Before upgrading to this release, you should also remove any deprecated chunks-related configuration, as this release will no longer accept that. The following flags are gone:
   - `-dynamodb.*`
