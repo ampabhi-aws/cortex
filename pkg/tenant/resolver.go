@@ -83,6 +83,17 @@ func (t *SingleResolver) TenantID(ctx context.Context) (string, error) {
 		return "", err
 	}
 
+	// Reject the empty tenant ID. filepath.Join(dir, "") collapses to dir,
+	// so an empty tenant would alias the shared parent directory /
+	// object-store prefix used by every tenant, breaking isolation and
+	// (via per-tenant cleanup paths) enabling cross-tenant data
+	// destruction. The HTTP auth middleware rejects an empty X-Scope-OrgID
+	// header, but the gRPC middleware and the tenant-federation `|` split
+	// can still yield an empty injected org ID that we must reject here.
+	if id == "" {
+		return "", errEmptyTenantID
+	}
+
 	if containsUnsafePathSegments(id) {
 		return "", errInvalidTenantID
 	}
@@ -139,7 +150,20 @@ func (t *MultiResolver) TenantIDs(ctx context.Context) ([]string, error) {
 		}
 	}
 
-	return NormalizeTenantIDs(orgIDs), nil
+	normalized := NormalizeTenantIDs(orgIDs)
+
+	// Defense-in-depth: NormalizeTenantIDs sorts and de-duplicates but does
+	// not reject empty elements. ValidTenantID above already rejects "",
+	// but keep this guard so future callers that bypass ValidTenantID still
+	// cannot smuggle through an empty tenant ID (which would collapse
+	// per-tenant paths onto the shared parent directory / bucket prefix).
+	for _, orgID := range normalized {
+		if orgID == "" {
+			return nil, errEmptyTenantID
+		}
+	}
+
+	return normalized, nil
 }
 
 // ExtractTenantIDFromHTTPRequest extracts a single TenantID through a given
