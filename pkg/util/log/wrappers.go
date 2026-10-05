@@ -59,6 +59,13 @@ func WithSourceIPs(sourceIPs string, l log.Logger) log.Logger {
 func headersFromContext(ctx context.Context, l log.Logger) log.Logger {
 	headerContentsMap := HeaderMapFromContext(ctx)
 	for header, contents := range headerContentsMap {
+		// Defense in depth: never materialize credential-bearing headers as
+		// log fields, even if they slipped into the context by some other
+		// path (e.g. a direct ContextWithHeaderMap call, or legacy data
+		// still in flight).
+		if IsSensitiveRequestHeader(header) {
+			continue
+		}
 		l = kitlog.With(l, header, contents)
 	}
 	return l
