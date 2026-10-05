@@ -113,6 +113,17 @@ type Limits struct {
 	AlertmanagerMaxDispatcherAggregationGroups int `yaml:"alertmanager_max_dispatcher_aggregation_groups" json:"alertmanager_max_dispatcher_aggregation_groups"`
 	AlertmanagerMaxAlertsCount                 int `yaml:"alertmanager_max_alerts_count" json:"alertmanager_max_alerts_count"`
 	AlertmanagerMaxAlertsSizeBytes             int `yaml:"alertmanager_max_alerts_size_bytes" json:"alertmanager_max_alerts_size_bytes"`
+
+	// Minimum values enforced on tenant-uploaded Alertmanager route configuration. These exist to
+	// prevent a tenant from configuring pathologically small intervals (e.g. group_interval: 1ms,
+	// repeat_interval: 1ms) which cause the shared Alertmanager process to emit an unbounded
+	// outbound notification flood and to spawn unbounded aggregation-group goroutines, degrading
+	// notification delivery for co-tenants. A value of 0 disables the minimum (preserves the
+	// previous permissive behavior for operators who need it).
+	AlertmanagerMinGroupWait          model.Duration `yaml:"alertmanager_min_group_wait" json:"alertmanager_min_group_wait"`
+	AlertmanagerMinGroupInterval      model.Duration `yaml:"alertmanager_min_group_interval" json:"alertmanager_min_group_interval"`
+	AlertmanagerMinRepeatInterval     model.Duration `yaml:"alertmanager_min_repeat_interval" json:"alertmanager_min_repeat_interval"`
+	AlertmanagerMaxGroupByCardinality int            `yaml:"alertmanager_max_group_by_cardinality" json:"alertmanager_max_group_by_cardinality"`
 }
 
 // RegisterFlags adds the flags required to config this to the given FlagSet
@@ -188,6 +199,26 @@ func (l *Limits) RegisterFlags(f *flag.FlagSet) {
 	f.IntVar(&l.AlertmanagerMaxDispatcherAggregationGroups, "alertmanager.max-dispatcher-aggregation-groups", 0, "Maximum number of aggregation groups in Alertmanager's dispatcher that a tenant can have. Each active aggregation group uses single goroutine. When the limit is reached, dispatcher will not dispatch alerts that belong to additional aggregation groups, but existing groups will keep working properly. 0 = no limit.")
 	f.IntVar(&l.AlertmanagerMaxAlertsCount, "alertmanager.max-alerts-count", 0, "Maximum number of alerts that a single user can have. Inserting more alerts will fail with a log message and metric increment. 0 = no limit.")
 	f.IntVar(&l.AlertmanagerMaxAlertsSizeBytes, "alertmanager.max-alerts-size-bytes", 0, "Maximum total size of alerts that a single user can have, alert size is the sum of the bytes of its labels, annotations and generatorURL. Inserting more alerts will fail with a log message and metric increment. 0 = no limit.")
+
+	// Safer-by-default minimums applied to tenant-uploaded Alertmanager route configuration. These
+	// defaults are intentionally far below any sensible production value (upstream Prometheus
+	// Alertmanager defaults are group_wait=30s, group_interval=5m, repeat_interval=4h) but prevent
+	// a tenant from configuring sub-second intervals that would turn the shared Alertmanager into
+	// a tenant-controlled notification/outbound-request firehose. Operators can override per
+	// tenant via runtime config; setting a value to 0 disables the minimum.
+	if l.AlertmanagerMinGroupWait == 0 {
+		l.AlertmanagerMinGroupWait = model.Duration(time.Second)
+	}
+	if l.AlertmanagerMinGroupInterval == 0 {
+		l.AlertmanagerMinGroupInterval = model.Duration(time.Second)
+	}
+	if l.AlertmanagerMinRepeatInterval == 0 {
+		l.AlertmanagerMinRepeatInterval = model.Duration(time.Second)
+	}
+	f.Var(&l.AlertmanagerMinGroupWait, "alertmanager.min-group-wait", "Minimum value accepted for route.group_wait in tenant-uploaded Alertmanager configuration. 0 = no minimum. Protects the shared Alertmanager process from tenant-configured sub-second intervals.")
+	f.Var(&l.AlertmanagerMinGroupInterval, "alertmanager.min-group-interval", "Minimum value accepted for route.group_interval in tenant-uploaded Alertmanager configuration. 0 = no minimum. Protects the shared Alertmanager process from tenant-configured sub-second intervals that would produce an unbounded outbound notification stream.")
+	f.Var(&l.AlertmanagerMinRepeatInterval, "alertmanager.min-repeat-interval", "Minimum value accepted for route.repeat_interval in tenant-uploaded Alertmanager configuration. 0 = no minimum. Protects the shared Alertmanager process from tenant-configured sub-second intervals that would produce an unbounded outbound notification stream.")
+	f.IntVar(&l.AlertmanagerMaxGroupByCardinality, "alertmanager.max-group-by-cardinality", 0, "Maximum number of labels that a tenant can specify in a single route.group_by. 0 = no limit. Protects the shared Alertmanager process from configurations that would create an unbounded number of aggregation-group goroutines.")
 }
 
 // Validate the limits config and returns an error if the validation
@@ -623,6 +654,30 @@ func (o *Overrides) AlertmanagerMaxAlertsCount(userID string) int {
 
 func (o *Overrides) AlertmanagerMaxAlertsSizeBytes(userID string) int {
 	return o.getOverridesForUser(userID).AlertmanagerMaxAlertsSizeBytes
+}
+
+// AlertmanagerMinGroupWait returns the minimum allowed route.group_wait for a tenant-uploaded
+// Alertmanager configuration. 0 means no minimum.
+func (o *Overrides) AlertmanagerMinGroupWait(userID string) time.Duration {
+	return time.Duration(o.getOverridesForUser(userID).AlertmanagerMinGroupWait)
+}
+
+// AlertmanagerMinGroupInterval returns the minimum allowed route.group_interval for a
+// tenant-uploaded Alertmanager configuration. 0 means no minimum.
+func (o *Overrides) AlertmanagerMinGroupInterval(userID string) time.Duration {
+	return time.Duration(o.getOverridesForUser(userID).AlertmanagerMinGroupInterval)
+}
+
+// AlertmanagerMinRepeatInterval returns the minimum allowed route.repeat_interval for a
+// tenant-uploaded Alertmanager configuration. 0 means no minimum.
+func (o *Overrides) AlertmanagerMinRepeatInterval(userID string) time.Duration {
+	return time.Duration(o.getOverridesForUser(userID).AlertmanagerMinRepeatInterval)
+}
+
+// AlertmanagerMaxGroupByCardinality returns the maximum number of labels that a tenant can
+// specify in a single route.group_by. 0 means no limit.
+func (o *Overrides) AlertmanagerMaxGroupByCardinality(userID string) int {
+	return o.getOverridesForUser(userID).AlertmanagerMaxGroupByCardinality
 }
 
 func (o *Overrides) getOverridesForUser(userID string) *Limits {

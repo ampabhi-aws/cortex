@@ -219,6 +219,22 @@ type Limits interface {
 	// AlertmanagerMaxAlertsSizeBytes returns total max size of alerts that tenant can have active at the same time. 0 = no limit.
 	// Size of the alert is computed from alert labels, annotations and generator URL.
 	AlertmanagerMaxAlertsSizeBytes(tenant string) int
+
+	// AlertmanagerMinGroupWait returns the minimum accepted value for route.group_wait in a
+	// tenant-uploaded Alertmanager configuration. 0 = no minimum.
+	AlertmanagerMinGroupWait(tenant string) time.Duration
+
+	// AlertmanagerMinGroupInterval returns the minimum accepted value for route.group_interval in
+	// a tenant-uploaded Alertmanager configuration. 0 = no minimum.
+	AlertmanagerMinGroupInterval(tenant string) time.Duration
+
+	// AlertmanagerMinRepeatInterval returns the minimum accepted value for route.repeat_interval
+	// in a tenant-uploaded Alertmanager configuration. 0 = no minimum.
+	AlertmanagerMinRepeatInterval(tenant string) time.Duration
+
+	// AlertmanagerMaxGroupByCardinality returns the maximum number of labels that a tenant can
+	// specify in a single route.group_by. 0 = no limit.
+	AlertmanagerMaxGroupByCardinality(tenant string) int
 }
 
 // A MultitenantAlertmanager manages Alertmanager instances for multiple

@@ -2109,6 +2109,10 @@ type mockAlertManagerLimits struct {
 	maxDispatcherAggregationGroups int
 	maxAlertsCount                 int
 	maxAlertsSizeBytes             int
+	minGroupWait                   time.Duration
+	minGroupInterval               time.Duration
+	minRepeatInterval              time.Duration
+	maxGroupByCardinality          int
 }
 
 func (m *mockAlertManagerLimits) AlertmanagerMaxConfigSize(tenant string) int {
@@ -2149,4 +2153,20 @@ func (m *mockAlertManagerLimits) AlertmanagerMaxAlertsCount(_ string) int {
 
 func (m *mockAlertManagerLimits) AlertmanagerMaxAlertsSizeBytes(_ string) int {
 	return m.maxAlertsSizeBytes
+}
+
+func (m *mockAlertManagerLimits) AlertmanagerMinGroupWait(_ string) time.Duration {
+	return m.minGroupWait
+}
+
+func (m *mockAlertManagerLimits) AlertmanagerMinGroupInterval(_ string) time.Duration {
+	return m.minGroupInterval
+}
+
+func (m *mockAlertManagerLimits) AlertmanagerMinRepeatInterval(_ string) time.Duration {
+	return m.minRepeatInterval
+}
+
+func (m *mockAlertManagerLimits) AlertmanagerMaxGroupByCardinality(_ string) int {
+	return m.maxGroupByCardinality
 }
