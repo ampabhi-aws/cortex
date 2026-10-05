@@ -24,9 +24,26 @@ type Config struct {
 
 // RegisterFlags adds the flags required to configure this to the given FlagSet.
 func (cfg *Config) RegisterFlags(f *flag.FlagSet) {
-	f.StringVar(&cfg.URI, "configs.database.uri", "postgres://postgres@configs-db.weave.local/configs?sslmode=disable", "URI where the database can be found (for dev you can use memory://)")
+	f.StringVar(&cfg.URI, "configs.database.uri", "postgres://postgres@configs-db.weave.local/configs?sslmode=disable", "URI where the database can be found (for dev you can use memory://). Prefer -configs.database.password-file over embedding the password in the URI.")
 	f.StringVar(&cfg.MigrationsDir, "configs.database.migrations-dir", "", "Path where the database migration files can be found")
 	f.StringVar(&cfg.PasswordFile, "configs.database.password-file", "", "File containing password (username goes in URI)")
+}
+
+// MarshalYAML implements yaml.Marshaler. It returns a copy of the Config with
+// any password embedded in URI user-info stripped, so that serializing the
+// running configuration (e.g. via the unauthenticated GET /config endpoint)
+// does not disclose the database password in cleartext.
+func (cfg Config) MarshalYAML() (interface{}, error) {
+	redacted := cfg
+	if u, err := url.Parse(cfg.URI); err == nil && u.User != nil {
+		if _, hasPassword := u.User.Password(); hasPassword {
+			u.User = url.User(u.User.Username())
+			redacted.URI = u.String()
+		}
+	}
+	// Avoid infinite recursion: convert to a type without MarshalYAML.
+	type plain Config
+	return plain(redacted), nil
 }
 
 // DB is the interface for the database.
