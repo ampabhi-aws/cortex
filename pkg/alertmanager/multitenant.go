@@ -200,13 +200,16 @@ type Limits interface {
 	// when limit == rate.Inf.
 	NotificationBurstSize(tenant string, integration string) int
 
-	// AlertmanagerMaxConfigSize returns max size of configuration file that user is allowed to upload. If 0, there is no limit.
+	// AlertmanagerMaxConfigSize returns max size of configuration file that user is allowed to upload. If 0, a safe
+	// in-code default is applied by the config API handler (see pkg/alertmanager/api.go).
 	AlertmanagerMaxConfigSize(tenant string) int
 
-	// AlertmanagerMaxTemplatesCount returns max number of templates that tenant can use in the configuration. 0 = no limit.
+	// AlertmanagerMaxTemplatesCount returns max number of templates that tenant can use in the configuration. If 0,
+	// a safe in-code default is applied by the config API handler (see pkg/alertmanager/api.go).
 	AlertmanagerMaxTemplatesCount(tenant string) int
 
-	// AlertmanagerMaxTemplateSize returns max size of individual template. 0 = no limit.
+	// AlertmanagerMaxTemplateSize returns max size of individual template. If 0, a safe in-code default is applied
+	// by the config API handler (see pkg/alertmanager/api.go).
 	AlertmanagerMaxTemplateSize(tenant string) int
 
 	// AlertmanagerMaxDispatcherAggregationGroups returns maximum number of aggregation groups in Alertmanager's dispatcher that a tenant can have.
