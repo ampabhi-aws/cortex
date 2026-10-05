@@ -974,15 +974,33 @@ func (am *MultitenantAlertmanager) GetPositionForUser(userID string) int {
 		return 0
 	}
 
-	var position int
 	for i, instance := range set.Instances {
 		if instance.Addr == am.ringLifecycler.GetInstanceAddr() {
-			position = i
-			break
+			return i
 		}
 	}
 
-	return position
+	// This instance isn't part of the tenant's replication set under RingOp (ACTIVE only).
+	// This can legitimately happen when the instance owns the tenant via SyncRingOp
+	// (ACTIVE+JOINING) but isn't ACTIVE yet, during resharding/heartbeat lag, or when a
+	// non-owner serves the tenant via the fallback-config path. In all these cases we
+	// must NOT return 0 - position 0 is the single-sender/single-writer slot used by
+	// clusterWait (zero notification delay) and by statePersister.persist() (the only
+	// replica allowed to overwrite the shared fullstate object). Returning 0 here would
+	// let a non-primary replica dispatch duplicate notifications and overwrite the
+	// tenant's persisted silence/notification-log state (last-writer-wins corruption).
+	//
+	// Return a sentinel >= replication factor: it is guaranteed not to collide with any
+	// real position (which are in [0, RF)), it fails closed in persist() (position != 0
+	// returns early), and it makes clusterWait produce a large enough delay that any
+	// genuine primary's notification-log entry will have replicated first, suppressing
+	// the duplicate send on the next pipeline tick.
+	level.Warn(am.logger).Log(
+		"msg", "this alertmanager instance is not in the tenant's replication set; returning non-primary position to avoid duplicate notifications and state overwrites",
+		"user", userID,
+		"instance_addr", am.ringLifecycler.GetInstanceAddr(),
+	)
+	return am.ring.ReplicationFactor()
 }
 
 // ServeHTTP serves the Alertmanager's web UI and API.
