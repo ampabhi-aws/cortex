@@ -32,9 +32,19 @@ var (
 	ErrWebhookNotificationsAreDisabled = errors.New("webhook notifications are disabled")
 )
 
+// DefaultMaxConfigSize is the default maximum size, in bytes, of a configuration
+// payload accepted by the configs service write/validate HTTP handlers. It bounds
+// the per-request allocation performed by json/yaml decoders and io.ReadAll so
+// that a single oversized POST cannot exhaust the heap of the shared configs
+// service (and, transitively, every ruler/alertmanager that polls it).
+const DefaultMaxConfigSize = 10 * 1024 * 1024 // 10 MiB
+
 // Config configures Configs API
 type Config struct {
 	Notifications NotificationsConfig `yaml:"notifications"`
+	// MaxConfigSize is the maximum size, in bytes, of a configuration payload
+	// accepted by the write/validate HTTP handlers. 0 disables the limit.
+	MaxConfigSize int64 `yaml:"max_config_size"`
 }
 
 // NotificationsConfig configures Alertmanager notifications method.
@@ -47,6 +57,7 @@ type NotificationsConfig struct {
 func (cfg *Config) RegisterFlags(f *flag.FlagSet) {
 	f.BoolVar(&cfg.Notifications.DisableEmail, "configs.notifications.disable-email", false, "Disable Email notifications for Alertmanager.")
 	f.BoolVar(&cfg.Notifications.DisableWebHook, "configs.notifications.disable-webhook", false, "Disable WebHook notifications for Alertmanager.")
+	f.Int64Var(&cfg.MaxConfigSize, "configs.max-config-size-bytes", DefaultMaxConfigSize, "Maximum size, in bytes, of a configuration payload accepted by the configs service write/validate HTTP handlers. 0 = no limit.")
 }
 
 // API implements the configs api.
@@ -154,20 +165,34 @@ func (a *API) setConfig(w http.ResponseWriter, r *http.Request) {
 	}
 	logger := util_log.WithContext(r.Context(), util_log.Logger)
 
+	// Bound the request body so a single oversized POST cannot exhaust the
+	// heap of the shared configs service.
+	if a.cfg.MaxConfigSize > 0 {
+		r.Body = http.MaxBytesReader(w, r.Body, a.cfg.MaxConfigSize)
+	}
+
 	var cfg userconfig.Config
 	switch parseConfigFormat(r.Header.Get("Content-Type"), FormatJSON) {
 	case FormatJSON:
 		if err := json.NewDecoder(r.Body).Decode(&cfg); err != nil {
 			// XXX: Untested
 			level.Error(logger).Log("msg", "error decoding json body", "err", err)
-			http.Error(w, err.Error(), http.StatusBadRequest)
+			status := http.StatusBadRequest
+			if isMaxBytesError(err) {
+				status = http.StatusRequestEntityTooLarge
+			}
+			http.Error(w, err.Error(), status)
 			return
 		}
 	case FormatYAML:
 		if err := yaml.NewDecoder(r.Body).Decode(&cfg); err != nil {
 			// XXX: Untested
 			level.Error(logger).Log("msg", "error decoding yaml body", "err", err)
-			http.Error(w, err.Error(), http.StatusBadRequest)
+			status := http.StatusBadRequest
+			if isMaxBytesError(err) {
+				status = http.StatusRequestEntityTooLarge
+			}
+			http.Error(w, err.Error(), status)
 			return
 		}
 	default:
@@ -201,12 +226,42 @@ func (a *API) setConfig(w http.ResponseWriter, r *http.Request) {
 	w.WriteHeader(http.StatusNoContent)
 }
 
+// isMaxBytesError reports whether err was produced by http.MaxBytesReader
+// exceeding its limit. The concrete type is unexported in older Go versions,
+// so we fall back to a string check.
+func isMaxBytesError(err error) bool {
+	if err == nil {
+		return false
+	}
+	return strings.Contains(err.Error(), "http: request body too large")
+}
+
 func (a *API) validateAlertmanagerConfig(w http.ResponseWriter, r *http.Request) {
 	logger := util_log.WithContext(r.Context(), util_log.Logger)
-	cfg, err := io.ReadAll(r.Body)
+
+	// Bound the request body. This handler does not require a tenant ID, so it
+	// is especially important to cap the per-request allocation.
+	var reader io.Reader = r.Body
+	maxSize := a.cfg.MaxConfigSize
+	if maxSize > 0 {
+		// Read one extra byte so we can detect oversize payloads deterministically.
+		reader = io.LimitReader(r.Body, maxSize+1)
+	}
+
+	cfg, err := io.ReadAll(reader)
 	if err != nil {
 		level.Error(logger).Log("msg", "error reading request body", "err", err)
 		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	if maxSize > 0 && int64(len(cfg)) > maxSize {
+		msg := fmt.Sprintf("Alertmanager configuration is too big, limit: %d bytes", maxSize)
+		level.Warn(logger).Log("msg", msg)
+		w.WriteHeader(http.StatusRequestEntityTooLarge)
+		util.WriteJSONResponse(w, map[string]string{
+			"status": "error",
+			"error":  msg,
+		})
 		return
 	}
 
