@@ -1023,8 +1023,33 @@ func (am *MultitenantAlertmanager) serveRequest(w http.ResponseWriter, req *http
 		return
 	}
 
+	// When sharding is enabled, non-owning replicas must not initialize a
+	// per-tenant Alertmanager from the fallback config: doing so would
+	// unconditionally overwrite the tenant's stored configuration with an
+	// empty one (see alertmanagerFromFallbackConfig). Only the replicas that
+	// own the tenant in the hash ring load its config via
+	// loadAlertmanagerConfigs/isUserOwned, so if we reach this point with
+	// sharding enabled and the tenant is not loaded, this instance does not
+	// own the tenant. Refuse the request so the caller (typically the
+	// Distributor on an owning replica, or a sharding-aware load balancer)
+	// retries against an owning replica.
+	if am.cfg.ShardingEnabled && !am.isUserOwned(userID) {
+		level.Debug(am.logger).Log("msg", "request for tenant not owned by this alertmanager instance", "user", userID, "path", req.URL.Path)
+		http.Error(w, "the Alertmanager instance does not own this tenant", http.StatusNotFound)
+		return
+	}
+
 	if am.fallbackConfig != "" {
-		userAM, err = am.alertmanagerFromFallbackConfig(userID)
+		userAM, err = am.alertmanagerFromFallbackConfig(req.Context(), userID)
+		if err == errAlertmanagerConfigAlreadyExists {
+			// A config already exists in object storage but has not yet been
+			// loaded into this instance (e.g. the periodic poll has not run
+			// since it was uploaded). Refuse to serve from the fallback
+			// rather than destroying the stored config.
+			level.Debug(am.logger).Log("msg", "declined to serve from fallback: tenant config already exists in storage", "user", userID)
+			http.Error(w, "the Alertmanager is still loading the tenant configuration", http.StatusServiceUnavailable)
+			return
+		}
 		if err != nil {
 			level.Error(am.logger).Log("msg", "unable to initialize the Alertmanager with a fallback configuration", "user", userID, "err", err)
 			http.Error(w, "Failed to initialize the Alertmanager", http.StatusInternalServerError)
@@ -1039,17 +1064,37 @@ func (am *MultitenantAlertmanager) serveRequest(w http.ResponseWriter, req *http
 	http.Error(w, "the Alertmanager is not configured", http.StatusNotFound)
 }
 
-func (am *MultitenantAlertmanager) alertmanagerFromFallbackConfig(userID string) (*Alertmanager, error) {
+// errAlertmanagerConfigAlreadyExists is returned by alertmanagerFromFallbackConfig
+// when the tenant already has a configuration in the alert store, so bootstrapping
+// from the fallback config would destroy it. Callers should treat this as a signal
+// to refuse the request rather than performing a destructive write.
+var errAlertmanagerConfigAlreadyExists = errors.New("tenant alertmanager configuration already exists in the alert store")
+
+func (am *MultitenantAlertmanager) alertmanagerFromFallbackConfig(ctx context.Context, userID string) (*Alertmanager, error) {
+	// Guard against clobbering the tenant's stored configuration. The fallback
+	// bootstrap path performs an unconditional Upload of an empty config to
+	// alerts/<userID>; if a config already exists for this tenant (because
+	// another replica owns it in the ring, or because the owning replica has
+	// not yet picked up a just-uploaded config), writing an empty config here
+	// would destroy routes, receivers, templates and embedded third-party
+	// credentials. Perform a read-before-write check and refuse to overwrite
+	// a non-empty existing config.
+	existing, err := am.store.GetAlertConfig(ctx, userID)
+	if err != nil && !errors.Is(err, alertspb.ErrNotFound) {
+		return nil, err
+	}
+	if err == nil && existing.RawConfig != "" {
+		return nil, errAlertmanagerConfigAlreadyExists
+	}
+
 	// Upload an empty config so that the Alertmanager is no de-activated in the next poll
 	cfgDesc := alertspb.ToProto("", nil, userID)
-	err := am.store.SetAlertConfig(context.Background(), cfgDesc)
-	if err != nil {
+	if err := am.store.SetAlertConfig(context.Background(), cfgDesc); err != nil {
 		return nil, err
 	}
 
 	// Calling setConfig with an empty configuration will use the fallback config.
-	err = am.setConfig(cfgDesc)
-	if err != nil {
+	if err := am.setConfig(cfgDesc); err != nil {
 		return nil, err
 	}
 
