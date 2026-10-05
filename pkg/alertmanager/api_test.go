@@ -670,7 +670,8 @@ receivers:
 	// Create the Multitenant Alertmanager.
 	reg := prometheus.NewPedanticRegistry()
 	cfg := mockAlertmanagerConfig(t)
-	am, err := createMultitenantAlertmanager(cfg, nil, nil, alertStore, nil, nil, log.NewNopLogger(), reg)
+	limits := &mockAlertManagerLimits{adminTenants: map[string]bool{"admin": true}}
+	am, err := createMultitenantAlertmanager(cfg, nil, nil, alertStore, nil, limits, log.NewNopLogger(), reg)
 	require.NoError(t, err)
 	require.NoError(t, services.StartAndAwaitRunning(context.Background(), am))
 	defer services.StopAndAwaitTerminated(context.Background(), am) //nolint:errcheck
@@ -681,7 +682,28 @@ receivers:
 
 	router := mux.NewRouter()
 	router.Path("/multitenant_alertmanager/configs").Methods(http.MethodGet).HandlerFunc(am.ListAllConfigs)
+
+	// Unauthenticated callers must be rejected (no X-Scope-OrgID).
+	{
+		req := httptest.NewRequest("GET", "https://localhost:8080/multitenant_alertmanager/configs", nil)
+		w := httptest.NewRecorder()
+		router.ServeHTTP(w, req)
+		require.Equal(t, http.StatusUnauthorized, w.Result().StatusCode)
+	}
+
+	// Non-admin tenants must be rejected (prevents cross-tenant disclosure).
+	{
+		req := httptest.NewRequest("GET", "https://localhost:8080/multitenant_alertmanager/configs", nil)
+		req = req.WithContext(user.InjectOrgID(req.Context(), "user1"))
+		w := httptest.NewRecorder()
+		router.ServeHTTP(w, req)
+		require.Equal(t, http.StatusForbidden, w.Result().StatusCode)
+	}
+
+	// Admin tenants may list all configs, but secrets must be redacted and
+	// template files must be omitted from the response.
 	req := httptest.NewRequest("GET", "https://localhost:8080/multitenant_alertmanager/configs", nil)
+	req = req.WithContext(user.InjectOrgID(req.Context(), "admin"))
 	w := httptest.NewRecorder()
 	router.ServeHTTP(w, req)
 
@@ -690,9 +712,20 @@ receivers:
 	require.Equal(t, "application/yaml", resp.Header.Get("Content-Type"))
 	body, err := io.ReadAll(resp.Body)
 	require.NoError(t, err)
-	old, err := yaml.Marshal(testCases)
-	require.NoError(t, err)
-	require.YAMLEq(t, string(old), string(body))
+
+	// Response must enumerate both tenants but must not expose template files
+	// and must round-trip through *config.Config (which redacts Secret fields).
+	var got map[string]*UserConfig
+	require.NoError(t, yaml.Unmarshal(body, &got))
+	require.Contains(t, got, "user1")
+	require.Contains(t, got, "user2")
+	for u, cfg := range got {
+		require.Empty(t, cfg.TemplateFiles, "template files must be omitted from ListAllConfigs for %s", u)
+		require.NotEmpty(t, cfg.AlertmanagerConfig, "redacted alertmanager config missing for %s", u)
+		// Sanity-check that the body round-tripped through the parser.
+		_, perr := config.Load(cfg.AlertmanagerConfig)
+		require.NoError(t, perr, "redacted config for %s is not valid Alertmanager YAML", u)
+	}
 }
 
 func TestValidateAlertmanagerConfig(t *testing.T) {

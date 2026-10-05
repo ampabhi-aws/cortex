@@ -261,6 +261,22 @@ func validateUserConfig(logger log.Logger, cfg alertspb.AlertConfigDesc, limits 
 
 func (am *MultitenantAlertmanager) ListAllConfigs(w http.ResponseWriter, r *http.Request) {
 	logger := util_log.WithContext(r.Context(), am.logger)
+
+	// Require an authenticated tenant and gate on admin identity. Without this,
+	// any caller with network reach would receive every tenant's Alertmanager
+	// config, including embedded third-party credentials.
+	userID, err := tenant.TenantID(r.Context())
+	if err != nil {
+		level.Warn(logger).Log("msg", errNoOrgID, "err", err.Error())
+		http.Error(w, fmt.Sprintf("%s: %s", errNoOrgID, err.Error()), http.StatusUnauthorized)
+		return
+	}
+	if !am.limits.AlertmanagerAdmin(userID) {
+		level.Warn(logger).Log("msg", "non-admin tenant denied access to ListAllConfigs", "user", userID)
+		http.Error(w, "forbidden", http.StatusForbidden)
+		return
+	}
+
 	userIDs, err := am.store.ListAllUsers(r.Context())
 	if err != nil {
 		level.Error(logger).Log("msg", "failed to list users of alertmanager", "err", err)
@@ -283,10 +299,30 @@ func (am *MultitenantAlertmanager) ListAllConfigs(w http.ResponseWriter, r *http
 		} else if err != nil {
 			return errors.Wrapf(err, "failed to fetch alertmanager config for user %s", userID)
 		}
+
+		// Redact embedded secrets (Slack webhooks, PagerDuty routing keys, bearer
+		// tokens, SMTP/OAuth2/basic-auth credentials, etc.) by round-tripping the
+		// raw YAML through *config.Config, whose Secret/SecretURL fields marshal
+		// as "<secret>". If parsing fails, omit the config body rather than
+		// echoing it verbatim. Template files are omitted as well because they
+		// commonly embed internal URLs and runbook details.
+		redacted := ""
+		if cfg.RawConfig != "" {
+			parsed, perr := config.Load(cfg.RawConfig)
+			if perr != nil {
+				level.Warn(logger).Log("msg", "failed to parse alertmanager config for redaction; omitting body", "user", userID, "err", perr)
+			} else if parsed != nil {
+				if out, merr := yaml.Marshal(parsed); merr != nil {
+					level.Warn(logger).Log("msg", "failed to marshal redacted alertmanager config; omitting body", "user", userID, "err", merr)
+				} else {
+					redacted = string(out)
+				}
+			}
+		}
+
 		data := map[string]*UserConfig{
 			userID: {
-				TemplateFiles:      alertspb.ParseTemplates(cfg),
-				AlertmanagerConfig: cfg.RawConfig,
+				AlertmanagerConfig: redacted,
 			},
 		}
 
