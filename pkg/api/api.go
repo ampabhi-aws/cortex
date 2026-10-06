@@ -2,6 +2,7 @@ package api
 
 import (
 	"context"
+	"crypto/subtle"
 	"flag"
 	"net/http"
 	"path"
@@ -48,6 +49,15 @@ type Config struct {
 	AlertmanagerHTTPPrefix string `yaml:"alertmanager_http_prefix"`
 	PrometheusHTTPPrefix   string `yaml:"prometheus_http_prefix"`
 
+	// AdminAPIAuthToken is a shared secret bearer token required to access
+	// admin-only endpoints that return cross-tenant data (e.g.
+	// /multitenant_alertmanager/configs). When empty, admin-only endpoints
+	// are disabled and will return 403 Forbidden. This is a defense-in-depth
+	// control that does not replace an authenticating proxy in front of
+	// Cortex, but prevents a tenant-reachable listener from silently serving
+	// cross-tenant data when no proxy is present or when a proxy fails open.
+	AdminAPIAuthToken string `yaml:"admin_api_auth_token"`
+
 	// The following configs are injected by the upstream caller.
 	ServerPrefix       string               `yaml:"-"`
 	LegacyHTTPPrefix   string               `yaml:"-"`
@@ -71,6 +81,7 @@ type Config struct {
 func (cfg *Config) RegisterFlags(f *flag.FlagSet) {
 	f.BoolVar(&cfg.ResponseCompression, "api.response-compression-enabled", false, "Use GZIP compression for API responses. Some endpoints serve large YAML or JSON blobs which can benefit from compression.")
 	f.Var(&cfg.HTTPRequestHeadersToLog, "api.http-request-headers-to-log", "Which HTTP Request headers to add to logs")
+	f.StringVar(&cfg.AdminAPIAuthToken, "api.admin-api-auth-token", "", "Shared secret bearer token required to access cross-tenant admin endpoints such as /multitenant_alertmanager/configs. When empty, those endpoints return 403 Forbidden. Does not replace an authenticating proxy in front of Cortex.")
 	cfg.RegisterFlagsWithPrefix("", f)
 }
 
@@ -133,6 +144,55 @@ func New(cfg Config, serverCfg server.Config, s *server.Server, logger log.Logge
 	return api, nil
 }
 
+// AdminOnly wraps an HTTP handler and only allows the request through when it
+// carries operator credentials, independent of the tenant-facing
+// AuthMiddleware. This is used for routes that return cross-tenant data (for
+// example /multitenant_alertmanager/configs), so that any caller that can
+// reach the tenant HTTP port cannot pivot a well-formed X-Scope-OrgID header
+// into a cross-tenant disclosure.
+//
+// The current implementation checks for a shared bearer token configured via
+// -api.admin-api-auth-token. When the token is unset the handler returns 403
+// Forbidden, which fails closed: admin endpoints are not world-readable even
+// in default configurations.
+func (a *API) AdminOnly(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if !a.isOperator(r) {
+			http.Error(w, "forbidden", http.StatusForbidden)
+			return
+		}
+		next.ServeHTTP(w, r)
+	})
+}
+
+// isOperator reports whether the request is authenticated as a Cortex operator.
+// It performs a constant-time comparison of the configured admin bearer token
+// against the Authorization header (Bearer token) or the X-Cortex-Admin-Token
+// header. When no admin token is configured, no request is treated as an
+// operator — admin-only endpoints fail closed.
+func (a *API) isOperator(r *http.Request) bool {
+	expected := a.cfg.AdminAPIAuthToken
+	if expected == "" {
+		return false
+	}
+
+	var presented string
+	if auth := r.Header.Get("Authorization"); auth != "" {
+		const prefix = "Bearer "
+		if len(auth) > len(prefix) && strings.EqualFold(auth[:len(prefix)], prefix) {
+			presented = auth[len(prefix):]
+		}
+	}
+	if presented == "" {
+		presented = r.Header.Get("X-Cortex-Admin-Token")
+	}
+	if presented == "" {
+		return false
+	}
+
+	return subtle.ConstantTimeCompare([]byte(presented), []byte(expected)) == 1
+}
+
 // RegisterRoute registers a single route enforcing HTTP methods. A single
 // route is expected to be specific about which HTTP methods are supported.
 func (a *API) RegisterRoute(path string, handler http.Handler, auth bool, method string, methods ...string) {
@@ -187,7 +247,11 @@ func (a *API) RegisterAlertmanager(am *alertmanager.MultitenantAlertmanager, tar
 	a.indexPage.AddLink(SectionAdminEndpoints, "/multitenant_alertmanager/ring", "Alertmanager Ring Status")
 	// Ensure this route is registered before the prefixed AM route
 	a.RegisterRoute("/multitenant_alertmanager/status", am.GetStatusHandler(), false, "GET")
-	a.RegisterRoute("/multitenant_alertmanager/configs", http.HandlerFunc(am.ListAllConfigs), false, "GET")
+	// /multitenant_alertmanager/configs returns every tenant's Alertmanager config
+	// (including notification secrets). Require operator-level credentials even on
+	// the tenant-facing listener, so a tenant able to reach the HTTP port cannot
+	// read other tenants' configurations.
+	a.RegisterRoute("/multitenant_alertmanager/configs", a.AdminOnly(http.HandlerFunc(am.ListAllConfigs)), false, "GET")
 	a.RegisterRoute("/multitenant_alertmanager/ring", http.HandlerFunc(am.RingHandler), false, "GET", "POST")
 	a.RegisterRoute("/multitenant_alertmanager/delete_tenant_config", http.HandlerFunc(am.DeleteUserConfig), true, "POST")
 
