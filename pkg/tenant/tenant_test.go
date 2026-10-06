@@ -16,6 +16,10 @@ func TestValidTenantIDs(t *testing.T) {
 			name: "tenant-a",
 		},
 		{
+			name: "",
+			err:  strptr("empty tenant ID"),
+		},
+		{
 			name: "ABCDEFGHIJKLMNOPQRSTUVWXYZ-abcdefghijklmnopqrstuvwxyz_0987654321!.*'()",
 		},
 		{

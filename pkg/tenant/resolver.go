@@ -83,6 +83,15 @@ func (t *SingleResolver) TenantID(ctx context.Context) (string, error) {
 		return "", err
 	}
 
+	// Enforce the documented tenant-ID allow-list on every path (not only when
+	// tenant federation is enabled). This rejects characters such as ':' and
+	// '|' that otherwise make the results-cache key non-injective and allow
+	// cross-tenant cache poisoning / disclosure. See
+	// https://cortexmetrics.io/docs/guides/limitations/#tenant-id-naming
+	if err := ValidTenantID(id); err != nil {
+		return "", err
+	}
+
 	if containsUnsafePathSegments(id) {
 		return "", errInvalidTenantID
 	}
