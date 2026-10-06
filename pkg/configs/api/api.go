@@ -20,6 +20,7 @@ import (
 	amconfig "github.com/prometheus/alertmanager/config"
 	amtemplate "github.com/prometheus/alertmanager/template"
 
+	"github.com/cortexproject/cortex/pkg/alertmanager"
 	"github.com/cortexproject/cortex/pkg/configs/db"
 	"github.com/cortexproject/cortex/pkg/configs/userconfig"
 	"github.com/cortexproject/cortex/pkg/tenant"
@@ -227,6 +228,14 @@ func (a *API) validateAlertmanagerConfig(w http.ResponseWriter, r *http.Request)
 func validateAlertmanagerConfig(cfg string, noCfg NotificationsConfig) error {
 	amCfg, err := amconfig.Load(cfg)
 	if err != nil {
+		return err
+	}
+
+	// Enforce the shared hardening policy (e.g. the *_file denylist that mitigates
+	// CVE-2021-31232) so the legacy configs write path cannot drift from the
+	// /api/v1/alerts handler and silently store a non-compliant Alertmanager
+	// configuration that the Alertmanager would then apply.
+	if err := alertmanager.ValidateAlertmanagerConfig(amCfg); err != nil {
 		return err
 	}
 

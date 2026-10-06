@@ -2150,3 +2150,131 @@ func (m *mockAlertManagerLimits) AlertmanagerMaxAlertsCount(_ string) int {
 func (m *mockAlertManagerLimits) AlertmanagerMaxAlertsSizeBytes(_ string) int {
 	return m.maxAlertsSizeBytes
 }
+
+// TestMultitenantAlertmanager_setConfigRejectsDenylistedFileFields verifies that
+// configs stored directly in the alert store (e.g. via the deprecated configs/configdb
+// write path) are rejected by setConfig when they contain a denylisted `*_file` field.
+// This is the point-of-use enforcement that mitigates the CVE-2021-31232 primitive
+// against every config producer, not just the /api/v1/alerts handler.
+func TestMultitenantAlertmanager_setConfigRejectsDenylistedFileFields(t *testing.T) {
+	ctx := context.Background()
+
+	cases := map[string]string{
+		"password_file": `route:
+  receiver: w
+receivers:
+  - name: w
+    webhook_configs:
+      - url: http://127.0.0.1/
+        http_config:
+          basic_auth:
+            username: u
+            password_file: /etc/passwd`,
+		"bearer_token_file": `route:
+  receiver: w
+receivers:
+  - name: w
+    webhook_configs:
+      - url: http://127.0.0.1/
+        http_config:
+          bearer_token_file: /etc/passwd`,
+		"credentials_file": `route:
+  receiver: w
+receivers:
+  - name: w
+    webhook_configs:
+      - url: http://127.0.0.1/
+        http_config:
+          authorization:
+            credentials_file: /etc/passwd`,
+		"oauth2_client_secret_file": `route:
+  receiver: w
+receivers:
+  - name: w
+    webhook_configs:
+      - url: http://127.0.0.1/
+        http_config:
+          oauth2:
+            client_id: id
+            client_secret_file: /etc/passwd
+            token_url: http://127.0.0.1/token`,
+		"tls_key_file": `route:
+  receiver: w
+receivers:
+  - name: w
+    webhook_configs:
+      - url: http://127.0.0.1/
+        http_config:
+          tls_config:
+            key_file: /etc/passwd`,
+		"tls_ca_file": `route:
+  receiver: w
+receivers:
+  - name: w
+    webhook_configs:
+      - url: http://127.0.0.1/
+        http_config:
+          tls_config:
+            ca_file: /etc/passwd`,
+		"tls_cert_file": `route:
+  receiver: w
+receivers:
+  - name: w
+    webhook_configs:
+      - url: http://127.0.0.1/
+        http_config:
+          tls_config:
+            cert_file: /etc/passwd`,
+		"slack_api_url_file_global": `global:
+  slack_api_url_file: /etc/passwd
+route:
+  receiver: s
+receivers:
+  - name: s
+    slack_configs:
+      - channel: '#x'`,
+		"slack_api_url_file_receiver": `route:
+  receiver: s
+receivers:
+  - name: s
+    slack_configs:
+      - channel: '#x'
+        api_url_file: /etc/passwd`,
+		"victorops_api_key_file": `route:
+  receiver: v
+receivers:
+  - name: v
+    victorops_configs:
+      - api_key_file: /etc/passwd
+        routing_key: rk`,
+	}
+
+	for name, cfg := range cases {
+		t.Run(name, func(t *testing.T) {
+			store := prepareInMemoryAlertStore()
+			require.NoError(t, store.SetAlertConfig(ctx, alertspb.AlertConfigDesc{
+				User:      "user1",
+				RawConfig: cfg,
+				Templates: []*alertspb.TemplateDesc{},
+			}))
+
+			reg := prometheus.NewPedanticRegistry()
+			amCfg := mockAlertmanagerConfig(t)
+			am, err := createMultitenantAlertmanager(amCfg, nil, nil, store, nil, nil, log.NewNopLogger(), reg)
+			require.NoError(t, err)
+
+			// loadAndSyncConfigs itself does not propagate the per-user error, but setConfig must,
+			// and the Alertmanager for that tenant must NOT be started.
+			require.NoError(t, am.loadAndSyncConfigs(ctx, reasonInitial))
+			require.NotContains(t, am.alertmanagers, "user1", "Alertmanager was started from a non-compliant stored config")
+
+			// setConfig called directly surfaces the validation error.
+			err = am.setConfig(alertspb.AlertConfigDesc{
+				User:      "user1",
+				RawConfig: cfg,
+				Templates: []*alertspb.TemplateDesc{},
+			})
+			require.Error(t, err, "setConfig must reject a stored config containing a denylisted *_file field")
+		})
+	}
+}

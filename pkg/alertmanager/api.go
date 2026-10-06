@@ -186,7 +186,7 @@ func validateUserConfig(logger log.Logger, cfg alertspb.AlertConfigDesc, limits 
 	}
 
 	// Validate the config recursively scanning it.
-	if err := validateAlertmanagerConfig(amCfg); err != nil {
+	if err := ValidateAlertmanagerConfig(amCfg); err != nil {
 		return err
 	}
 
@@ -304,10 +304,15 @@ func (am *MultitenantAlertmanager) ListAllConfigs(w http.ResponseWriter, r *http
 	<-done
 }
 
-// validateAlertmanagerConfig recursively scans the input config looking for data types for which
+// ValidateAlertmanagerConfig recursively scans the input config looking for data types for which
 // we have a specific validation and, whenever encountered, it runs their validation. Returns the
 // first error or nil if validation succeeds.
-func validateAlertmanagerConfig(cfg interface{}) error {
+//
+// This is exported so that every code path that stores or applies an Alertmanager
+// configuration (not just the /api/v1/alerts handler) can enforce the same hardening
+// policy at the trust boundary where the dangerous data is consumed, in particular
+// the *_file denylist that mitigates CVE-2021-31232.
+func ValidateAlertmanagerConfig(cfg interface{}) error {
 	v := reflect.ValueOf(cfg)
 	t := v.Type()
 
@@ -360,7 +365,7 @@ func validateAlertmanagerConfig(cfg interface{}) error {
 
 			// Skip any field value which can't be converted to interface (eg. primitive types).
 			if fieldValue.CanInterface() {
-				if err := validateAlertmanagerConfig(fieldValue.Interface()); err != nil {
+				if err := ValidateAlertmanagerConfig(fieldValue.Interface()); err != nil {
 					return err
 				}
 			}
@@ -373,7 +378,7 @@ func validateAlertmanagerConfig(cfg interface{}) error {
 
 			// Skip any field value which can't be converted to interface (eg. primitive types).
 			if fieldValue.CanInterface() {
-				if err := validateAlertmanagerConfig(fieldValue.Interface()); err != nil {
+				if err := ValidateAlertmanagerConfig(fieldValue.Interface()); err != nil {
 					return err
 				}
 			}
@@ -386,7 +391,7 @@ func validateAlertmanagerConfig(cfg interface{}) error {
 
 			// Skip any field value which can't be converted to interface (eg. primitive types).
 			if fieldValue.CanInterface() {
-				if err := validateAlertmanagerConfig(fieldValue.Interface()); err != nil {
+				if err := ValidateAlertmanagerConfig(fieldValue.Interface()); err != nil {
 					return err
 				}
 			}
