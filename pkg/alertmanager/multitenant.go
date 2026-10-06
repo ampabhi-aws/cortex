@@ -4,6 +4,7 @@ import (
 	"context"
 	"flag"
 	"fmt"
+	"io/fs"
 	"net/http"
 	"net/url"
 	"os"
@@ -158,6 +159,7 @@ func (cfg *MultitenantAlertmanagerConfig) Validate(storageCfg alertstore.Config)
 type multitenantAlertmanagerMetrics struct {
 	lastReloadSuccessful          *prometheus.GaugeVec
 	lastReloadSuccessfulTimestamp *prometheus.GaugeVec
+	configReloadTotal             *prometheus.CounterVec
 }
 
 func newMultitenantAlertmanagerMetrics(reg prometheus.Registerer) *multitenantAlertmanagerMetrics {
@@ -173,6 +175,12 @@ func newMultitenantAlertmanagerMetrics(reg prometheus.Registerer) *multitenantAl
 		Namespace: "cortex",
 		Name:      "alertmanager_config_last_reload_successful_seconds",
 		Help:      "Timestamp of the last successful configuration reload.",
+	}, []string{"user"})
+
+	m.configReloadTotal = promauto.With(reg).NewCounterVec(prometheus.CounterOpts{
+		Namespace: "cortex",
+		Name:      "alertmanager_config_reload_total",
+		Help:      "Total number of times the per-tenant Alertmanager configuration has been (re)applied. A continuously increasing value indicates a config-reload loop.",
 	}, []string{"user"})
 
 	return m
@@ -814,10 +822,41 @@ func (am *MultitenantAlertmanager) setConfig(cfg alertspb.AlertConfigDesc) error
 	var userTemplateDir = filepath.Join(am.getTenantDirectory(cfg.User), templatesDir)
 	var pathsToRemove = make(map[string]struct{})
 
-	// List existing files to keep track the ones to be removed
-	if oldTemplateFiles, err := os.ReadDir(userTemplateDir); err == nil {
-		for _, file := range oldTemplateFiles {
-			pathsToRemove[filepath.Join(userTemplateDir, file.Name())] = struct{}{}
+	// Validate the template filenames coming from the store. The Alertmanager HTTP API already
+	// enforces this (pkg/alertmanager/api.go), but filenames coming from alternative stores
+	// (e.g. the legacy configdb backend) are copied verbatim from the tenant-supplied map keys
+	// and must be rejected here to avoid creating nested directories under the per-tenant
+	// templates directory. A nested path would otherwise leave an undeletable sub-directory
+	// behind that would be classified as stale forever and drive a permanent config-reload loop.
+	for _, tmpl := range cfg.Templates {
+		if err := validateTemplateFilename(tmpl.Filename); err != nil {
+			return err
+		}
+	}
+
+	// List existing files (recursively) to keep track of the ones to be removed.
+	// We only track regular files so that the "existing" and "desired" sets are computed at the
+	// same granularity as the paths written by storeTemplateFile.
+	if _, statErr := os.Stat(userTemplateDir); statErr == nil {
+		walkErr := filepath.WalkDir(userTemplateDir, func(path string, d fs.DirEntry, err error) error {
+			if err != nil {
+				return err
+			}
+			if path == userTemplateDir {
+				return nil
+			}
+			if d.IsDir() {
+				// Directories are not written by setConfig for validated (bare) filenames.
+				// Any directory present here is unexpected state and will be cleaned up via
+				// os.RemoveAll below if it is not re-created by this sync.
+				pathsToRemove[path] = struct{}{}
+				return nil
+			}
+			pathsToRemove[path] = struct{}{}
+			return nil
+		})
+		if walkErr != nil {
+			level.Warn(am.logger).Log("msg", "failed to walk template directory", "dir", userTemplateDir, "err", walkErr)
 		}
 	}
 
@@ -840,9 +879,33 @@ func (am *MultitenantAlertmanager) setConfig(cfg alertspb.AlertConfigDesc) error
 	}
 
 	for pathToRemove := range pathsToRemove {
-		err := os.Remove(pathToRemove)
-		if err != nil {
-			level.Warn(am.logger).Log("msg", "failed to remove file", "file", pathToRemove, "err", err)
+		info, statErr := os.Lstat(pathToRemove)
+		if statErr != nil {
+			if os.IsNotExist(statErr) {
+				continue
+			}
+			level.Warn(am.logger).Log("msg", "failed to stat file to remove", "file", pathToRemove, "err", statErr)
+			continue
+		}
+
+		var removeErr error
+		if info.IsDir() {
+			// Unexpected directory (e.g. left over from a pre-validation release that
+			// accepted nested template filenames). Remove it recursively so we do not get
+			// stuck in a permanent reload loop re-detecting the same stale directory.
+			removeErr = os.RemoveAll(pathToRemove)
+		} else {
+			removeErr = os.Remove(pathToRemove)
+		}
+		if removeErr != nil {
+			if os.IsNotExist(removeErr) {
+				continue
+			}
+			level.Warn(am.logger).Log("msg", "failed to remove file", "file", pathToRemove, "err", removeErr)
+			// Do NOT report a template change we did not make: setting hasTemplateChanges
+			// here would cause ApplyConfig to be re-invoked on every poll tick, tearing down
+			// and rebuilding the dispatcher/inhibitor and losing aggregation groups.
+			continue
 		}
 		hasTemplateChanges = true
 	}
@@ -906,6 +969,7 @@ func (am *MultitenantAlertmanager) setConfig(cfg alertspb.AlertConfigDesc) error
 			return err
 		}
 		am.alertmanagers[cfg.User] = newAM
+		am.multitenantMetrics.configReloadTotal.WithLabelValues(cfg.User).Inc()
 	} else if am.cfgs[cfg.User].RawConfig != cfg.RawConfig || hasTemplateChanges {
 		level.Info(am.logger).Log("msg", "updating new per-tenant alertmanager", "user", cfg.User)
 		// If the config changed, apply the new one.
@@ -913,6 +977,7 @@ func (am *MultitenantAlertmanager) setConfig(cfg alertspb.AlertConfigDesc) error
 		if err != nil {
 			return fmt.Errorf("unable to apply Alertmanager config for user %v: %v", cfg.User, err)
 		}
+		am.multitenantMetrics.configReloadTotal.WithLabelValues(cfg.User).Inc()
 	}
 
 	am.cfgs[cfg.User] = cfg
