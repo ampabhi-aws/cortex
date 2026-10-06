@@ -9,6 +9,7 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"sort"
 	"strings"
 	"sync"
 	"time"
@@ -878,6 +879,30 @@ type extendedAppender interface {
 	storage.GetRef
 }
 
+// labelAdaptersByName implements sort.Interface over a slice of label
+// adapters, ordered by label name. It is used to assert the sorted-label
+// TSDB invariant inside Ingester.Push before any append reaches the head,
+// without allocating a labels.Labels copy.
+type labelAdaptersByName []cortexpb.LabelAdapter
+
+func (ls labelAdaptersByName) Len() int           { return len(ls) }
+func (ls labelAdaptersByName) Swap(i, j int)      { ls[i], ls[j] = ls[j], ls[i] }
+func (ls labelAdaptersByName) Less(i, j int) bool { return ls[i].Name < ls[j].Name }
+
+// firstInvalidSample returns the first validation error for the provided
+// samples under the given series labels, or nil if every sample is valid.
+// Fully validating before appending prevents partially-accepted series
+// where a future-timestamp sample would advance the head's maxTime and
+// block subsequent legitimate ingestion for the same tenant.
+func firstInvalidSample(cfg validation.SampleValidationConfig, userID string, ls []cortexpb.LabelAdapter, samples []cortexpb.Sample) validation.ValidationError {
+	for _, s := range samples {
+		if err := validation.ValidateSample(cfg, userID, ls, s); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
 // Push adds metrics to a block
 func (i *Ingester) Push(ctx context.Context, req *cortexpb.WriteRequest) (*cortexpb.WriteResponse, error) {
 	if err := i.checkRunning(); err != nil {
@@ -959,8 +984,40 @@ func (i *Ingester) Push(ctx context.Context, req *cortexpb.WriteRequest) (*corte
 	// Walk the samples, appending them to the users database
 	app := db.Appender(ctx).(extendedAppender)
 	for _, ts := range req.Timeseries {
-		// The labels must be sorted (in our case, it's guaranteed a write request
-		// has sorted labels once hit the ingester).
+		// Treat the ingester as an independent trust boundary: do not rely on
+		// the distributor having validated the request, since the ingester
+		// push RPC can be called directly (e.g. via /ingester/push or the
+		// gRPC Ingester/Push service in misconfigured deployments). The
+		// checks mirror validation.validateSeries in the distributor.
+		if err := validation.ValidateLabels(i.limits, userID, ts.Labels, false); err != nil {
+			failedSamplesCount += len(ts.Samples)
+			updateFirstPartial(func() error { return err })
+			continue
+		}
+
+		// Defence-in-depth: assert the sorted-label invariant explicitly
+		// rather than assuming the caller provided sorted labels. This is
+		// also covered by ValidateLabels above, but keeping the explicit
+		// assertion makes the invariant unmistakable at the TSDB boundary
+		// and still fires if validation is relaxed in the future.
+		if !sort.IsSorted(labelAdaptersByName(ts.Labels)) {
+			failedSamplesCount += len(ts.Samples)
+			updateFirstPartial(func() error {
+				return httpgrpc.Errorf(http.StatusBadRequest, "labels not sorted: %v", cortexpb.FromLabelAdaptersToLabels(ts.Labels).String())
+			})
+			continue
+		}
+
+		// Validate every sample. We fail the whole series on the first
+		// invalid sample so that the TSDB append below never observes a
+		// sample with a far-future timestamp, which would otherwise poison
+		// the head's appendable time window for the whole tenant.
+		if invalid := firstInvalidSample(i.limits, userID, ts.Labels, ts.Samples); invalid != nil {
+			failedSamplesCount += len(ts.Samples)
+			err := invalid
+			updateFirstPartial(func() error { return err })
+			continue
+		}
 
 		// Look up a reference for this series.
 		ref, copiedLabels := app.GetRef(cortexpb.FromLabelAdaptersToLabels(ts.Labels))
@@ -1051,6 +1108,12 @@ func (i *Ingester) Push(ctx context.Context, req *cortexpb.WriteRequest) (*corte
 				failedExemplarsCount += len(ts.Exemplars)
 			} else { // Note that else is explicit, rather than a continue in the above if, in case of additional logic post exemplar processing.
 				for _, ex := range ts.Exemplars {
+					if err := validation.ValidateExemplar(userID, ts.Labels, ex); err != nil {
+						exErr := err
+						updateFirstPartial(func() error { return exErr })
+						failedExemplarsCount++
+						continue
+					}
 					e := exemplar.Exemplar{
 						Value:  ex.Value,
 						Ts:     ex.TimestampMs,

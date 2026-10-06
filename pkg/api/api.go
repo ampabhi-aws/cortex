@@ -48,6 +48,13 @@ type Config struct {
 	AlertmanagerHTTPPrefix string `yaml:"alertmanager_http_prefix"`
 	PrometheusHTTPPrefix   string `yaml:"prometheus_http_prefix"`
 
+	// EnableIngesterDebugPush exposes the tenant-authenticated /ingester/push
+	// HTTP debug route. The ingester push RPC is an internal component
+	// interface and must not be exposed to untrusted callers. When disabled
+	// (the default), the route is not registered and the legacy /push alias
+	// is never exposed.
+	EnableIngesterDebugPush bool `yaml:"enable_ingester_debug_push"`
+
 	// The following configs are injected by the upstream caller.
 	ServerPrefix       string               `yaml:"-"`
 	LegacyHTTPPrefix   string               `yaml:"-"`
@@ -71,6 +78,7 @@ type Config struct {
 func (cfg *Config) RegisterFlags(f *flag.FlagSet) {
 	f.BoolVar(&cfg.ResponseCompression, "api.response-compression-enabled", false, "Use GZIP compression for API responses. Some endpoints serve large YAML or JSON blobs which can benefit from compression.")
 	f.Var(&cfg.HTTPRequestHeadersToLog, "api.http-request-headers-to-log", "Which HTTP Request headers to add to logs")
+	f.BoolVar(&cfg.EnableIngesterDebugPush, "api.enable-ingester-debug-push", false, "Expose the tenant-authenticated /ingester/push HTTP debug route. Disabled by default: the ingester push RPC is an internal component interface and must not be reachable by untrusted callers. The legacy /push alias is never exposed.")
 	cfg.RegisterFlagsWithPrefix("", f)
 }
 
@@ -267,12 +275,22 @@ func (a *API) RegisterIngester(i Ingester, pushConfig distributor.Config) {
 	a.indexPage.AddLink(SectionDangerous, "/ingester/shutdown", "Trigger Ingester Shutdown (Dangerous)")
 	a.RegisterRoute("/ingester/flush", http.HandlerFunc(i.FlushHandler), false, "GET", "POST")
 	a.RegisterRoute("/ingester/shutdown", http.HandlerFunc(i.ShutdownHandler), false, "GET", "POST")
-	a.RegisterRoute("/ingester/push", push.Handler(pushConfig.MaxRecvMsgSize, a.sourceIPs, i.Push), true, "POST") // For testing and debugging.
+	if a.cfg.EnableIngesterDebugPush {
+		// For testing and debugging only. The ingester push path bypasses the
+		// distributor's per-tenant validation and rate limiting; it must only
+		// be reachable by trusted operators and is therefore opt-in. The
+		// ingester now also validates inside Push as defence-in-depth, but
+		// this route still exposes a privileged entry point.
+		a.RegisterRoute("/ingester/push", push.Handler(pushConfig.MaxRecvMsgSize, a.sourceIPs, i.Push), true, "POST")
+	}
 
 	// Legacy Routes
 	a.RegisterRoute("/flush", http.HandlerFunc(i.FlushHandler), false, "GET", "POST")
 	a.RegisterRoute("/shutdown", http.HandlerFunc(i.ShutdownHandler), false, "GET", "POST")
-	a.RegisterRoute("/push", push.Handler(pushConfig.MaxRecvMsgSize, a.sourceIPs, i.Push), true, "POST") // For testing and debugging.
+	// The legacy /push alias to the ingester push is intentionally no longer
+	// registered: it duplicated /ingester/push and could not be gated
+	// independently. Use the distributor's /api/v1/push endpoint for client
+	// writes.
 }
 
 func (a *API) RegisterTenantDeletion(api *purger.TenantDeletionAPI) {
