@@ -81,13 +81,24 @@ func (a *API) admin(w http.ResponseWriter, r *http.Request) {
 `)
 }
 
-// RegisterRoutes registers the configs API HTTP routes with the provided Router.
-func (a *API) RegisterRoutes(r *mux.Router) {
-	for _, route := range []struct {
-		name, method, path string
-		handler            http.HandlerFunc
-	}{
-		{"root", "GET", "/", a.admin},
+// Route describes a single configs API HTTP route.
+type Route struct {
+	Name    string
+	Method  string
+	Path    string
+	Handler http.HandlerFunc
+}
+
+// TenantRoutes returns the tenant-scoped configs API routes (served under
+// /api/prom/configs/*). Each handler resolves the tenant from the request
+// (via tenant.ExtractTenantIDFromHTTPRequest) and only returns that tenant's
+// data, so these are safe to expose on the normal tenant-facing listener.
+//
+// The configs module's HTML landing page at "/" is intentionally omitted:
+// when the configs API is wired through pkg/api, "/" is already owned by
+// the main index page registered in RegisterAPI.
+func (a *API) TenantRoutes() []Route {
+	return []Route{
 		// Dedicated APIs for updating rules config. In the future, these *must*
 		// be used.
 		{"get_rules", "GET", "/api/prom/configs/rules", a.getConfig},
@@ -99,11 +110,34 @@ func (a *API) RegisterRoutes(r *mux.Router) {
 		{"validate_alertmanager_config", "POST", "/api/prom/configs/alertmanager/validate", a.validateAlertmanagerConfig},
 		{"deactivate_config", "DELETE", "/api/prom/configs/deactivate", a.deactivateConfig},
 		{"restore_config", "POST", "/api/prom/configs/restore", a.restoreConfig},
-		// Internal APIs.
+	}
+}
+
+// AdminRoutes returns the all-tenant "internal" configs API routes (served
+// under /private/api/prom/configs/*). These handlers DO NOT resolve a tenant
+// and expose every tenant's rules / Alertmanager configuration, including
+// receiver credentials — they MUST be gated by an operator credential (see
+// pkg/api.API.AdminOnly) rather than relying on the /private/ path prefix.
+func (a *API) AdminRoutes() []Route {
+	return []Route{
 		{"private_get_rules", "GET", "/private/api/prom/configs/rules", a.getConfigs},
 		{"private_get_alertmanager_config", "GET", "/private/api/prom/configs/alertmanager", a.getConfigs},
-	} {
-		r.Handle(route.path, route.handler).Methods(route.method).Name(route.name)
+	}
+}
+
+// RegisterRoutes registers the configs API HTTP routes with the provided Router.
+//
+// Deprecated: prefer wiring the configs module through pkg/api so the
+// per-route auth middleware applies and the all-tenant admin routes are
+// gated by an operator credential. This method remains for internal use by
+// New (which exposes the API as an http.Handler for tests) and registers
+// every route — tenant AND admin — directly, without authentication, so it
+// must never be used to attach the configs API to a public listener.
+func (a *API) RegisterRoutes(r *mux.Router) {
+	r.Handle("/", http.HandlerFunc(a.admin)).Methods("GET").Name("root")
+	routes := append(a.TenantRoutes(), a.AdminRoutes()...)
+	for _, route := range routes {
+		r.Handle(route.Path, route.Handler).Methods(route.Method).Name(route.Name)
 	}
 }
 
