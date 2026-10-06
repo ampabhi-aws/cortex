@@ -3,6 +3,8 @@ package swift
 import (
 	"flag"
 	"time"
+
+	"github.com/cortexproject/cortex/pkg/util/flagext"
 )
 
 // Config holds the config options for Swift backend
@@ -12,8 +14,8 @@ type Config struct {
 	Username          string        `yaml:"username"`
 	UserDomainName    string        `yaml:"user_domain_name"`
 	UserDomainID      string        `yaml:"user_domain_id"`
-	UserID            string        `yaml:"user_id"`
-	Password          string        `yaml:"password"`
+	UserID            string         `yaml:"user_id"`
+	Password          flagext.Secret `yaml:"password"`
 	DomainID          string        `yaml:"domain_id"`
 	DomainName        string        `yaml:"domain_name"`
 	ProjectID         string        `yaml:"project_id"`
@@ -40,7 +42,7 @@ func (cfg *Config) RegisterFlagsWithPrefix(prefix string, f *flag.FlagSet) {
 	f.StringVar(&cfg.UserDomainName, prefix+"swift.user-domain-name", "", "OpenStack Swift user's domain name.")
 	f.StringVar(&cfg.UserDomainID, prefix+"swift.user-domain-id", "", "OpenStack Swift user's domain ID.")
 	f.StringVar(&cfg.UserID, prefix+"swift.user-id", "", "OpenStack Swift user ID.")
-	f.StringVar(&cfg.Password, prefix+"swift.password", "", "OpenStack Swift API key.")
+	f.Var(&cfg.Password, prefix+"swift.password", "OpenStack Swift API key.")
 	f.StringVar(&cfg.DomainID, prefix+"swift.domain-id", "", "OpenStack Swift user's domain ID.")
 	f.StringVar(&cfg.DomainName, prefix+"swift.domain-name", "", "OpenStack Swift user's domain name.")
 	f.StringVar(&cfg.ProjectID, prefix+"swift.project-id", "", "OpenStack Swift project ID (v2,v3 auth only).")
