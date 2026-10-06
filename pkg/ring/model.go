@@ -301,16 +301,20 @@ func normalizeIngestersMap(inputRing *Desc) {
 			sort.Sort(Tokens(ing.Tokens))
 		}
 
-		// tokens are sorted now, we can easily remove duplicates.
-		prev := ing.Tokens[0]
-		for ix := 1; ix < len(ing.Tokens); {
-			if ing.Tokens[ix] == prev {
-				ing.Tokens = append(ing.Tokens[:ix], ing.Tokens[ix+1:]...)
-			} else {
-				prev = ing.Tokens[ix]
-				ix++
+		// tokens are sorted now, we can remove duplicates in a single O(N)
+		// in-place compaction. The previous implementation used
+		// append(ing.Tokens[:ix], ing.Tokens[ix+1:]...) inside the loop,
+		// which is an O(N) memmove per duplicate and therefore O(N^2) overall.
+		// For attacker-supplied gossip Descs with many duplicate tokens that
+		// quadratic cost (combined with the global KV storeMu being held during
+		// Desc.Merge) is a cheap unauthenticated DoS vector.
+		out := ing.Tokens[:1]
+		for _, t := range ing.Tokens[1:] {
+			if t != out[len(out)-1] {
+				out = append(out, t)
 			}
 		}
+		ing.Tokens = out
 
 		// write updated value back to map
 		inputRing.Ingesters[n] = ing
