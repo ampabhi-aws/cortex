@@ -2,6 +2,7 @@ package queryrange
 
 import (
 	"context"
+	"crypto/sha256"
 	"flag"
 	"fmt"
 	"net/http"
@@ -141,9 +142,17 @@ type CacheSplitter interface {
 type constSplitter time.Duration
 
 // GenerateCacheKey generates a cache key based on the userID, Request and interval.
+//
+// The variable-length userID is length-prefixed and the (variable-length) query
+// string is hashed with SHA-256 before being embedded, so that the mapping
+// (tenant, request) -> key is injective. This prevents a tenant whose ID
+// contains the ':' separator from colliding with another tenant's cache entry
+// (e.g. tenant "team:prod" querying "up" would otherwise collide with tenant
+// "team" querying "prod:up").
 func (t constSplitter) GenerateCacheKey(userID string, r tripperware.Request) string {
 	currentInterval := r.GetStart() / int64(time.Duration(t)/time.Millisecond)
-	return fmt.Sprintf("%s:%s:%d:%d", userID, r.GetQuery(), r.GetStep(), currentInterval)
+	qh := sha256.Sum256([]byte(r.GetQuery()))
+	return fmt.Sprintf("%d:%s:%x:%d:%d", len(userID), userID, qh, r.GetStep(), currentInterval)
 }
 
 // ShouldCacheFn checks whether the current request should go to cache
