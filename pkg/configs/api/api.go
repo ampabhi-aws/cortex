@@ -32,9 +32,20 @@ var (
 	ErrWebhookNotificationsAreDisabled = errors.New("webhook notifications are disabled")
 )
 
+// defaultMaxConfigBytes is the default maximum size in bytes we accept for a
+// single configs API request body. It bounds the amount of memory a single
+// unauthenticated / authenticated caller can consume while uploading a config,
+// preventing storage/memory abuse via arbitrarily large bodies.
+const defaultMaxConfigBytes = int64(10 * 1024 * 1024) // 10 MiB
+
 // Config configures Configs API
 type Config struct {
 	Notifications NotificationsConfig `yaml:"notifications"`
+	// MaxConfigBytes is the maximum size, in bytes, of a configs API request
+	// body. Bodies larger than this value are rejected before being decoded,
+	// providing a hard upper bound on per-tenant storage growth from a single
+	// request. A non-positive value falls back to defaultMaxConfigBytes.
+	MaxConfigBytes int64 `yaml:"max_config_bytes"`
 }
 
 // NotificationsConfig configures Alertmanager notifications method.
@@ -47,6 +58,15 @@ type NotificationsConfig struct {
 func (cfg *Config) RegisterFlags(f *flag.FlagSet) {
 	f.BoolVar(&cfg.Notifications.DisableEmail, "configs.notifications.disable-email", false, "Disable Email notifications for Alertmanager.")
 	f.BoolVar(&cfg.Notifications.DisableWebHook, "configs.notifications.disable-webhook", false, "Disable WebHook notifications for Alertmanager.")
+	f.Int64Var(&cfg.MaxConfigBytes, "configs.api.max-config-bytes", defaultMaxConfigBytes, "Maximum size, in bytes, of a configs API request body. Bodies larger than this value are rejected with 413.")
+}
+
+// maxConfigBytes returns the effective per-request body limit.
+func (a *API) maxConfigBytes() int64 {
+	if a.cfg.MaxConfigBytes > 0 {
+		return a.cfg.MaxConfigBytes
+	}
+	return defaultMaxConfigBytes
 }
 
 // API implements the configs api.
@@ -81,7 +101,16 @@ func (a *API) admin(w http.ResponseWriter, r *http.Request) {
 `)
 }
 
-// RegisterRoutes registers the configs API HTTP routes with the provided Router.
+// RegisterRoutes registers the configs API HTTP routes with the provided
+// Router.
+//
+// NOTE: this helper is retained for backward compatibility with the in-memory
+// router used by `New` and by the package tests. Production callers must use
+// `pkg/cortex` wiring, which registers these routes through
+// `pkg/api.API.RegisterRoute` so each tenant-scoped route is wrapped by the
+// configured HTTP auth middleware. Registering directly on a raw
+// `*mux.Router` bypasses that middleware and must not be done on a
+// tenant-facing listener (see issue 01a110da9ac475dda1eec6c395d5efe3).
 func (a *API) RegisterRoutes(r *mux.Router) {
 	for _, route := range []struct {
 		name, method, path string
@@ -90,26 +119,32 @@ func (a *API) RegisterRoutes(r *mux.Router) {
 		{"root", "GET", "/", a.admin},
 		// Dedicated APIs for updating rules config. In the future, these *must*
 		// be used.
-		{"get_rules", "GET", "/api/prom/configs/rules", a.getConfig},
-		{"set_rules", "POST", "/api/prom/configs/rules", a.setConfig},
-		{"get_templates", "GET", "/api/prom/configs/templates", a.getConfig},
-		{"set_templates", "POST", "/api/prom/configs/templates", a.setConfig},
-		{"get_alertmanager_config", "GET", "/api/prom/configs/alertmanager", a.getConfig},
-		{"set_alertmanager_config", "POST", "/api/prom/configs/alertmanager", a.setConfig},
-		{"validate_alertmanager_config", "POST", "/api/prom/configs/alertmanager/validate", a.validateAlertmanagerConfig},
-		{"deactivate_config", "DELETE", "/api/prom/configs/deactivate", a.deactivateConfig},
-		{"restore_config", "POST", "/api/prom/configs/restore", a.restoreConfig},
+		{"get_rules", "GET", "/api/prom/configs/rules", a.GetConfig},
+		{"set_rules", "POST", "/api/prom/configs/rules", a.SetConfig},
+		{"get_templates", "GET", "/api/prom/configs/templates", a.GetConfig},
+		{"set_templates", "POST", "/api/prom/configs/templates", a.SetConfig},
+		{"get_alertmanager_config", "GET", "/api/prom/configs/alertmanager", a.GetConfig},
+		{"set_alertmanager_config", "POST", "/api/prom/configs/alertmanager", a.SetConfig},
+		{"validate_alertmanager_config", "POST", "/api/prom/configs/alertmanager/validate", a.ValidateAlertmanagerConfig},
+		{"deactivate_config", "DELETE", "/api/prom/configs/deactivate", a.DeactivateConfig},
+		{"restore_config", "POST", "/api/prom/configs/restore", a.RestoreConfig},
 		// Internal APIs.
-		{"private_get_rules", "GET", "/private/api/prom/configs/rules", a.getConfigs},
-		{"private_get_alertmanager_config", "GET", "/private/api/prom/configs/alertmanager", a.getConfigs},
+		{"private_get_rules", "GET", "/private/api/prom/configs/rules", a.GetConfigs},
+		{"private_get_alertmanager_config", "GET", "/private/api/prom/configs/alertmanager", a.GetConfigs},
 	} {
 		r.Handle(route.path, route.handler).Methods(route.method).Name(route.name)
 	}
 }
 
-// getConfig returns the request configuration.
-func (a *API) getConfig(w http.ResponseWriter, r *http.Request) {
-	userID, _, err := tenant.ExtractTenantIDFromHTTPRequest(r)
+// GetConfig returns the request configuration.
+//
+// The tenant is resolved from the request context (populated by the HTTP auth
+// middleware); callers that do not go through the auth middleware must inject
+// the tenant into the context themselves. We intentionally no longer read the
+// `X-Scope-OrgID` header directly here so that this handler cannot be used to
+// escape the per-route auth wrapper.
+func (a *API) GetConfig(w http.ResponseWriter, r *http.Request) {
+	userID, err := tenant.TenantID(r.Context())
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusUnauthorized)
 		return
@@ -146,13 +181,23 @@ func (a *API) getConfig(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
-func (a *API) setConfig(w http.ResponseWriter, r *http.Request) {
-	userID, _, err := tenant.ExtractTenantIDFromHTTPRequest(r)
+// SetConfig stores the posted configuration for the tenant resolved from the
+// request context. The request body is bounded by MaxConfigBytes to prevent an
+// authenticated-but-malicious or buggy caller from exhausting server memory /
+// backing-store space with an unbounded upload.
+func (a *API) SetConfig(w http.ResponseWriter, r *http.Request) {
+	userID, err := tenant.TenantID(r.Context())
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusUnauthorized)
 		return
 	}
 	logger := util_log.WithContext(r.Context(), util_log.Logger)
+
+	// Bound the request body so a single POST cannot consume unlimited memory
+	// or create an arbitrarily large configs row. The reader returns an error
+	// on the first read past the limit which the decoders surface as a decode
+	// error below.
+	r.Body = http.MaxBytesReader(w, r.Body, a.maxConfigBytes())
 
 	var cfg userconfig.Config
 	switch parseConfigFormat(r.Header.Get("Content-Type"), FormatJSON) {
@@ -201,8 +246,12 @@ func (a *API) setConfig(w http.ResponseWriter, r *http.Request) {
 	w.WriteHeader(http.StatusNoContent)
 }
 
-func (a *API) validateAlertmanagerConfig(w http.ResponseWriter, r *http.Request) {
+// ValidateAlertmanagerConfig validates a candidate Alertmanager configuration
+// without persisting it. The request body is bounded to prevent large-body
+// resource exhaustion.
+func (a *API) ValidateAlertmanagerConfig(w http.ResponseWriter, r *http.Request) {
 	logger := util_log.WithContext(r.Context(), util_log.Logger)
+	r.Body = http.MaxBytesReader(w, r.Body, a.maxConfigBytes())
 	cfg, err := io.ReadAll(r.Body)
 	if err != nil {
 		level.Error(logger).Log("msg", "error reading request body", "err", err)
@@ -263,7 +312,14 @@ type ConfigsView struct {
 	Configs map[string]userconfig.View `json:"configs"`
 }
 
-func (a *API) getConfigs(w http.ResponseWriter, r *http.Request) {
+// GetConfigs returns configs for every tenant, optionally only those newer
+// than the `since` parameter.
+//
+// WARNING: this handler returns all tenants' configurations. It MUST only be
+// exposed on an internal listener or wrapped by an administrator-only
+// authentication middleware. The `pkg/cortex` wiring deliberately does not
+// expose this handler on the tenant-facing HTTP listener.
+func (a *API) GetConfigs(w http.ResponseWriter, r *http.Request) {
 	var cfgs map[string]userconfig.View
 	var cfgErr error
 	logger := util_log.WithContext(r.Context(), util_log.Logger)
@@ -296,8 +352,10 @@ func (a *API) getConfigs(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
-func (a *API) deactivateConfig(w http.ResponseWriter, r *http.Request) {
-	userID, _, err := tenant.ExtractTenantIDFromHTTPRequest(r)
+// DeactivateConfig soft-deletes the configuration for the tenant resolved
+// from the request context.
+func (a *API) DeactivateConfig(w http.ResponseWriter, r *http.Request) {
+	userID, err := tenant.TenantID(r.Context())
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusUnauthorized)
 		return
@@ -318,8 +376,10 @@ func (a *API) deactivateConfig(w http.ResponseWriter, r *http.Request) {
 	w.WriteHeader(http.StatusOK)
 }
 
-func (a *API) restoreConfig(w http.ResponseWriter, r *http.Request) {
-	userID, _, err := tenant.ExtractTenantIDFromHTTPRequest(r)
+// RestoreConfig restores a previously-deactivated configuration for the
+// tenant resolved from the request context.
+func (a *API) RestoreConfig(w http.ResponseWriter, r *http.Request) {
+	userID, err := tenant.TenantID(r.Context())
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusUnauthorized)
 		return
