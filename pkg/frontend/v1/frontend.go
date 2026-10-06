@@ -41,6 +41,14 @@ func (cfg *Config) RegisterFlags(f *flag.FlagSet) {
 	f.DurationVar(&cfg.QuerierForgetDelay, "query-frontend.querier-forget-delay", 0, "If a querier disconnects without sending notification about graceful shutdown, the query-frontend will keep the querier in the tenant's shard until the forget delay has passed. This feature is useful to reduce the blast radius when shuffle-sharding is enabled.")
 }
 
+// Validate validates the Config.
+func (cfg *Config) Validate() error {
+	if cfg.MaxOutstandingPerTenant < 1 {
+		return errors.New("querier.max-outstanding-requests-per-tenant must be at least 1")
+	}
+	return nil
+}
+
 type Limits interface {
 	// Returns max queriers to use per tenant, or 0 if shuffle sharding is disabled.
 	MaxQueriersPerUser(user string) int

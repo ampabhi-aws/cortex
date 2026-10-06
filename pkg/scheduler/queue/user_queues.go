@@ -60,6 +60,15 @@ type userQueue struct {
 }
 
 func newUserQueues(maxUserQueueSize int, forgetDelay time.Duration) *queues {
+	// Guard against a non-positive buffer size: make(chan Request, 0) is unbuffered
+	// (every send would hit the default branch of EnqueueRequest and leave an
+	// empty registered queue), and make(chan Request, negative) panics. Both would
+	// break the "registered queues are non-empty" invariant that
+	// GetNextRequestForQuerier relies on. Config validation should also reject
+	// values < 1 up-front, but we clamp here as defence in depth.
+	if maxUserQueueSize < 1 {
+		maxUserQueueSize = 1
+	}
 	return &queues{
 		userQueues:       map[string]*userQueue{},
 		users:            nil,

@@ -91,6 +91,14 @@ func (cfg *Config) RegisterFlags(f *flag.FlagSet) {
 	cfg.GRPCClientConfig.RegisterFlagsWithPrefix("query-scheduler.grpc-client-config", f)
 }
 
+// Validate validates the Config.
+func (cfg *Config) Validate() error {
+	if cfg.MaxOutstandingPerTenant < 1 {
+		return errors.New("query-scheduler.max-outstanding-requests-per-tenant must be at least 1")
+	}
+	return nil
+}
+
 // NewScheduler creates a new Scheduler.
 func NewScheduler(cfg Config, limits Limits, log log.Logger, registerer prometheus.Registerer) (*Scheduler, error) {
 	s := &Scheduler{
