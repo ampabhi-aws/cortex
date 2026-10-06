@@ -307,6 +307,7 @@ type BucketIndexConfig struct {
 	UpdateOnErrorInterval time.Duration `yaml:"update_on_error_interval"`
 	IdleTimeout           time.Duration `yaml:"idle_timeout"`
 	MaxStalePeriod        time.Duration `yaml:"max_stale_period"`
+	MaxCachedIndexes      int           `yaml:"max_cached_indexes"`
 }
 
 func (cfg *BucketIndexConfig) RegisterFlagsWithPrefix(f *flag.FlagSet, prefix string) {
@@ -314,4 +315,5 @@ func (cfg *BucketIndexConfig) RegisterFlagsWithPrefix(f *flag.FlagSet, prefix st
 	f.DurationVar(&cfg.UpdateOnErrorInterval, prefix+"update-on-error-interval", time.Minute, "How frequently a bucket index, which previously failed to load, should be tried to load again. This option is used only by querier.")
 	f.DurationVar(&cfg.IdleTimeout, prefix+"idle-timeout", time.Hour, "How long a unused bucket index should be cached. Once this timeout expires, the unused bucket index is removed from the in-memory cache. This option is used only by querier.")
 	f.DurationVar(&cfg.MaxStalePeriod, prefix+"max-stale-period", time.Hour, "The maximum allowed age of a bucket index (last updated) before queries start failing because the bucket index is too old. The bucket index is periodically updated by the compactor, while this check is enforced in the querier (at query time).")
+	f.IntVar(&cfg.MaxCachedIndexes, prefix+"max-cached-indexes", 10000, "Maximum number of per-tenant bucket indexes kept in-memory by the querier. When the cache is full and a new tenant is requested, the least-recently-requested entry is evicted. This caps memory and background-refresh work when callers can supply arbitrary tenant identifiers. Set to 0 to disable the limit (not recommended).")
 }

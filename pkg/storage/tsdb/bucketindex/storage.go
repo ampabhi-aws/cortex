@@ -5,6 +5,7 @@ import (
 	"compress/gzip"
 	"context"
 	"encoding/json"
+	"io"
 
 	"github.com/go-kit/log"
 	"github.com/pkg/errors"
@@ -14,9 +15,17 @@ import (
 	"github.com/cortexproject/cortex/pkg/util/runutil"
 )
 
+// MaxIndexSizeBytes caps the number of decompressed bytes ReadIndex will consume
+// from a bucket-index object. It is defence in depth against an untrusted or
+// corrupted compressed index being used to exhaust memory via the gzip decoder
+// (e.g. a "zip bomb"). 128 MiB comfortably exceeds the size of bucket indexes
+// observed on very large tenants.
+const MaxIndexSizeBytes = 128 * 1024 * 1024
+
 var (
 	ErrIndexNotFound  = errors.New("bucket index not found")
 	ErrIndexCorrupted = errors.New("bucket index corrupted")
+	ErrIndexTooLarge  = errors.New("bucket index too large")
 )
 
 // ReadIndex reads, parses and returns a bucket index from the bucket.
@@ -40,11 +49,22 @@ func ReadIndex(ctx context.Context, bkt objstore.Bucket, userID string, cfgProvi
 	}
 	defer runutil.CloseWithLogOnErr(logger, gzipReader, "close bucket index gzip reader")
 
-	// Deserialize it.
+	// Deserialize it. We wrap the gzip stream in an io.LimitReader (plus one extra
+	// byte) so that we can detect and reject bucket indexes that would decompress
+	// to more than MaxIndexSizeBytes without having to buffer the whole payload.
+	limited := &io.LimitedReader{R: gzipReader, N: MaxIndexSizeBytes + 1}
 	index := &Index{}
-	d := json.NewDecoder(gzipReader)
+	d := json.NewDecoder(limited)
 	if err := d.Decode(index); err != nil {
+		if limited.N <= 0 {
+			return nil, ErrIndexTooLarge
+		}
 		return nil, ErrIndexCorrupted
+	}
+	if limited.N <= 0 {
+		// The JSON decoder stopped at a syntactically valid value but there are more
+		// bytes available; treat this as oversized rather than silently truncating.
+		return nil, ErrIndexTooLarge
 	}
 
 	return index, nil
