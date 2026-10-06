@@ -29,6 +29,13 @@ type LoaderConfig struct {
 	UpdateOnStaleInterval time.Duration
 	UpdateOnErrorInterval time.Duration
 	IdleTimeout           time.Duration
+
+	// MaxCachedIndexes bounds the number of bucket indexes kept in-memory in order to
+	// mitigate unbounded memory growth and background-refresh starvation when callers
+	// can supply arbitrary tenant identifiers (eg. via the X-Scope-OrgID header). When
+	// a new entry would exceed this limit, the least-recently-requested entry is
+	// evicted. A value <= 0 disables the limit (legacy behaviour).
+	MaxCachedIndexes int
 }
 
 // Loader is responsible to lazy load bucket indexes and, once loaded for the first time,
@@ -109,6 +116,18 @@ func (l *Loader) GetIndex(ctx context.Context, userID string) (*Index, error) {
 	l.loadAttempts.Inc()
 	idx, err := ReadIndex(ctx, l.bkt, userID, l.cfgProvider, l.logger)
 	if err != nil {
+		// Never poison the shared cache with request-scoped failures: a query that
+		// gets cancelled/times out while loading the index would otherwise cause
+		// every other user of the same tenant to fail until the background refresh
+		// runs. These errors are not representative of the index state in storage.
+		if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+			if !errors.Is(err, ErrIndexNotFound) {
+				l.loadFailures.Inc()
+				level.Warn(l.logger).Log("msg", "bucket index load aborted", "user", userID, "err", err)
+			}
+			return nil, err
+		}
+
 		// Cache the error, to avoid hammering the object store in case of persistent issues
 		// (eg. corrupted bucket index or not existing).
 		l.cacheIndex(userID, nil, err)
@@ -138,9 +157,39 @@ func (l *Loader) cacheIndex(userID string, idx *Index, err error) {
 	l.indexesMx.Lock()
 	defer l.indexesMx.Unlock()
 
+	// Enforce the max-cached-indexes bound. When a new (not already cached) entry
+	// would make the cache exceed the configured limit, evict the least-recently
+	// requested entry so that attacker-controlled identities cannot grow the cache
+	// without bound. A value <= 0 disables the limit for backward compatibility.
+	if _, exists := l.indexes[userID]; !exists && l.cfg.MaxCachedIndexes > 0 && len(l.indexes) >= l.cfg.MaxCachedIndexes {
+		l.evictLeastRecentlyRequestedLocked()
+	}
+
 	// Not an issue if, due to concurrency, another index was already cached
 	// and we overwrite it: last will win.
 	l.indexes[userID] = newCachedIndex(idx, err)
+}
+
+// evictLeastRecentlyRequestedLocked removes the single cached entry whose last
+// request timestamp is the oldest. Caller must hold indexesMx for writing.
+func (l *Loader) evictLeastRecentlyRequestedLocked() {
+	var (
+		victim    string
+		victimAt  int64
+		haveFound bool
+	)
+	for userID, entry := range l.indexes {
+		at := entry.requestedAt.Load()
+		if !haveFound || at < victimAt {
+			victim = userID
+			victimAt = at
+			haveFound = true
+		}
+	}
+	if haveFound {
+		delete(l.indexes, victim)
+		level.Info(l.logger).Log("msg", "unloaded bucket index", "user", victim, "reason", "max-cached-indexes")
+	}
 }
 
 // checkCachedIndexes checks all cached indexes and, for each of them, does two things:
@@ -208,9 +257,11 @@ func (l *Loader) updateCachedIndex(ctx context.Context, userID string) {
 	// is when a tenant has rules configured but hasn't started remote writing yet. Rules will be evaluated and
 	// bucket index loaded by the ruler.
 	l.indexesMx.Lock()
-	l.indexes[userID].index = idx
-	l.indexes[userID].err = err
-	l.indexes[userID].setUpdatedAt(startTime)
+	if entry := l.indexes[userID]; entry != nil {
+		entry.index = idx
+		entry.err = err
+		entry.setUpdatedAt(startTime)
+	}
 	l.indexesMx.Unlock()
 }
 

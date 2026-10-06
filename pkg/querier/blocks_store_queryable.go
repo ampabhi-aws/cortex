@@ -195,6 +195,7 @@ func NewBlocksStoreQueryableFromConfig(querierCfg Config, gatewayCfg storegatewa
 				UpdateOnStaleInterval: storageCfg.BucketStore.SyncInterval,
 				UpdateOnErrorInterval: storageCfg.BucketStore.BucketIndex.UpdateOnErrorInterval,
 				IdleTimeout:           storageCfg.BucketStore.BucketIndex.IdleTimeout,
+				MaxCachedIndexes:      storageCfg.BucketStore.BucketIndex.MaxCachedIndexes,
 			},
 			MaxStalePeriod:           storageCfg.BucketStore.BucketIndex.MaxStalePeriod,
 			IgnoreDeletionMarksDelay: storageCfg.BucketStore.IgnoreDeletionMarksDelay,

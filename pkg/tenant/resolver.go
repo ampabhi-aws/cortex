@@ -87,6 +87,16 @@ func (t *SingleResolver) TenantID(ctx context.Context) (string, error) {
 		return "", errInvalidTenantID
 	}
 
+	// Enforce the tenant-ID charset/length rules so that attacker-controlled
+	// identities cannot be used as unbounded cache keys, object keys, log
+	// fields or metric labels in the rest of the codebase. The empty string
+	// is already rejected upstream by user.ExtractOrgID.
+	if id != "" {
+		if err := ValidTenantID(id); err != nil {
+			return "", err
+		}
+	}
+
 	return id, nil
 }
 
