@@ -83,6 +83,15 @@ func (t *SingleResolver) TenantID(ctx context.Context) (string, error) {
 		return "", err
 	}
 
+	// Apply the documented tenant-ID charset and 150-character limit on every
+	// resolution path, not just tenant federation. Without this check an
+	// unvalidated X-Scope-OrgID would reach downstream components (e.g. the
+	// ingester) and could be used to allocate per-tenant state keyed by an
+	// essentially arbitrary string.
+	if err := ValidTenantID(id); err != nil {
+		return "", err
+	}
+
 	if containsUnsafePathSegments(id) {
 		return "", errInvalidTenantID
 	}
