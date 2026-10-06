@@ -2,6 +2,7 @@ package api
 
 import (
 	"context"
+	"crypto/subtle"
 	"flag"
 	"net/http"
 	"path"
@@ -42,11 +43,43 @@ import (
 type DistributorPushWrapper func(next push.Func) push.Func
 type ConfigHandler func(actualCfg interface{}, defaultCfg interface{}) http.HandlerFunc
 
+// AuthLevel describes the authentication/authorization required for a route.
+// It replaces the historical `auth bool` flag with three explicit states so
+// operator (admin) endpoints cannot be silently registered as unauthenticated.
+type AuthLevel int
+
+const (
+	// AuthNone means the handler is reachable without any Cortex auth wrapping.
+	// This must only be used for routes that are safe to expose without any
+	// credential (e.g. /ready, /metrics, static UI pages). It MUST NOT be used
+	// for any handler that iterates all tenants via store.ListAllUsers().
+	AuthNone AuthLevel = iota
+	// AuthTenant wraps the handler with the tenant-propagation auth middleware
+	// (X-Scope-OrgID extraction). This is the default for per-tenant APIs.
+	AuthTenant
+	// AuthAdmin wraps the handler with the operator (admin) middleware. Admin
+	// endpoints are closed by default: callers must present a configured
+	// shared secret via the admin-token header, otherwise the request is
+	// rejected with 403 Forbidden. This is the only safe level for routes
+	// that disclose data for multiple tenants.
+	AuthAdmin
+)
+
+// AdminTokenHeader is the HTTP header used to carry the operator credential
+// for routes registered at AuthAdmin.
+const AdminTokenHeader = "X-Cortex-Admin-Token"
+
 type Config struct {
 	ResponseCompression bool `yaml:"response_compression_enabled"`
 
 	AlertmanagerHTTPPrefix string `yaml:"alertmanager_http_prefix"`
 	PrometheusHTTPPrefix   string `yaml:"prometheus_http_prefix"`
+
+	// AdminToken is a shared secret required (via the AdminTokenHeader) to
+	// reach any route registered at AuthAdmin. When empty, admin routes are
+	// closed and return 403 Forbidden. This keeps operator surface area off
+	// the tenant-facing listener unless explicitly enabled.
+	AdminToken string `yaml:"admin_token"`
 
 	// The following configs are injected by the upstream caller.
 	ServerPrefix       string               `yaml:"-"`
@@ -71,6 +104,7 @@ type Config struct {
 func (cfg *Config) RegisterFlags(f *flag.FlagSet) {
 	f.BoolVar(&cfg.ResponseCompression, "api.response-compression-enabled", false, "Use GZIP compression for API responses. Some endpoints serve large YAML or JSON blobs which can benefit from compression.")
 	f.Var(&cfg.HTTPRequestHeadersToLog, "api.http-request-headers-to-log", "Which HTTP Request headers to add to logs")
+	f.StringVar(&cfg.AdminToken, "api.admin-token", "", "Shared secret required in the "+AdminTokenHeader+" HTTP header to reach operator (admin) endpoints such as /ruler/rule_groups. When empty, admin endpoints are closed and return 403 Forbidden. Operators should set this to a long random value and only distribute it to internal tooling; the admin listener is expected to be reached only from a trusted network path.")
 	cfg.RegisterFlagsWithPrefix("", f)
 }
 
@@ -133,15 +167,67 @@ func New(cfg Config, serverCfg server.Config, s *server.Server, logger log.Logge
 	return api, nil
 }
 
+// AdminOnly wraps a handler so that it only serves requests which present a
+// matching shared secret in AdminTokenHeader. When no admin token is
+// configured, every request is rejected with 403 Forbidden — admin
+// endpoints are closed by default. Comparison is constant-time to avoid
+// leaking the configured token via timing.
+//
+// AdminOnly is required for any handler that discloses data across tenants
+// (handlers that iterate store.ListAllUsers()). It is intentionally the
+// *innermost* wrapper so the admin check runs regardless of what tenant
+// context (if any) the upstream auth middleware produced.
+func (a *API) AdminOnly(handler http.Handler) http.Handler {
+	token := a.cfg.AdminToken
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if token == "" {
+			http.Error(w, "operator endpoint disabled: set -api.admin-token to enable", http.StatusForbidden)
+			return
+		}
+		provided := r.Header.Get(AdminTokenHeader)
+		if provided == "" || subtle.ConstantTimeCompare([]byte(provided), []byte(token)) != 1 {
+			http.Error(w, "forbidden: operator credential required", http.StatusForbidden)
+			return
+		}
+		handler.ServeHTTP(w, r)
+	})
+}
+
 // RegisterRoute registers a single route enforcing HTTP methods. A single
 // route is expected to be specific about which HTTP methods are supported.
+//
+// The legacy `auth bool` parameter is preserved for backward compatibility:
+// `true` is equivalent to AuthTenant and `false` is equivalent to AuthNone.
+// For admin endpoints prefer RegisterRouteWithAuth(path, handler, AuthAdmin, ...)
+// or wrap the handler with a.AdminOnly(...) and pass auth=true.
 func (a *API) RegisterRoute(path string, handler http.Handler, auth bool, method string, methods ...string) {
+	lvl := AuthNone
+	if auth {
+		lvl = AuthTenant
+	}
+	a.RegisterRouteWithAuth(path, handler, lvl, method, methods...)
+}
+
+// RegisterRouteWithAuth is the explicit three-state replacement for
+// RegisterRoute. It should be used for any new route to avoid the ambiguity
+// of the legacy `auth bool` flag between tenant-scoped and admin-scoped
+// access.
+func (a *API) RegisterRouteWithAuth(path string, handler http.Handler, lvl AuthLevel, method string, methods ...string) {
 	methods = append([]string{method}, methods...)
 
-	level.Debug(a.logger).Log("msg", "api: registering route", "methods", strings.Join(methods, ","), "path", path, "auth", auth)
+	level.Debug(a.logger).Log("msg", "api: registering route", "methods", strings.Join(methods, ","), "path", path, "auth_level", lvl)
 
-	if auth {
+	switch lvl {
+	case AuthAdmin:
+		// Admin routes authenticate the caller via the admin token, not via
+		// X-Scope-OrgID. Do NOT wrap with the tenant AuthMiddleware — doing so
+		// would reject admin requests that correctly present the admin token
+		// but no tenant header.
+		handler = a.AdminOnly(handler)
+	case AuthTenant:
 		handler = a.AuthMiddleware.Wrap(handler)
+	case AuthNone:
+		// no auth wrapping
 	}
 
 	if a.cfg.ResponseCompression {
@@ -159,9 +245,27 @@ func (a *API) RegisterRoute(path string, handler http.Handler, auth bool, method
 }
 
 func (a *API) RegisterRoutesWithPrefix(prefix string, handler http.Handler, auth bool, methods ...string) {
-	level.Debug(a.logger).Log("msg", "api: registering route", "methods", strings.Join(methods, ","), "prefix", prefix, "auth", auth)
+	lvl := AuthNone
 	if auth {
+		lvl = AuthTenant
+	}
+	a.RegisterRoutesWithPrefixAndAuth(prefix, handler, lvl, methods...)
+}
+
+// RegisterRoutesWithPrefixAndAuth is the explicit three-state replacement for
+// RegisterRoutesWithPrefix.
+func (a *API) RegisterRoutesWithPrefixAndAuth(prefix string, handler http.Handler, lvl AuthLevel, methods ...string) {
+	level.Debug(a.logger).Log("msg", "api: registering route", "methods", strings.Join(methods, ","), "prefix", prefix, "auth_level", lvl)
+
+	switch lvl {
+	case AuthAdmin:
+		// Admin routes authenticate the caller via the admin token, not via
+		// X-Scope-OrgID.
+		handler = a.AdminOnly(handler)
+	case AuthTenant:
 		handler = a.AuthMiddleware.Wrap(handler)
+	case AuthNone:
+		// no auth wrapping
 	}
 
 	if a.cfg.ResponseCompression {
@@ -291,8 +395,10 @@ func (a *API) RegisterRuler(r *ruler.Ruler) {
 	// Legacy Ring Route
 	a.RegisterRoute("/ruler_ring", r, false, "GET", "POST")
 
-	// List all user rule groups
-	a.RegisterRoute("/ruler/rule_groups", http.HandlerFunc(r.ListAllRules), false, "GET")
+	// List all user rule groups. This is an operator (all-tenants) endpoint;
+	// it must be gated by the admin credential and must NOT be reachable on
+	// the tenant data-plane with no authentication (CWE-1220).
+	a.RegisterRouteWithAuth("/ruler/rule_groups", http.HandlerFunc(r.ListAllRules), AuthAdmin, "GET")
 
 	ruler.RegisterRulerServer(a.server.GRPC, r)
 }
