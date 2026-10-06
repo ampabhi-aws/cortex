@@ -8,6 +8,7 @@ import (
 	"os"
 	"path/filepath"
 	"reflect"
+	"strings"
 
 	"github.com/go-kit/log"
 	"github.com/go-kit/log/level"
@@ -35,8 +36,15 @@ const (
 	errConfigurationTooBig   = "Alertmanager configuration is too big, limit: %d bytes"
 	errTooManyTemplates      = "too many templates in the configuration: %d (limit: %d)"
 	errTemplateTooBig        = "template %s is too big: %d bytes (limit: %d bytes)"
+	errTemplatesTooBig       = "total templates size %d bytes is too big (limit: %d bytes)"
 
 	fetchConcurrency = 16
+
+	// maxHardConfigSize is an absolute upper bound applied to every tenant's
+	// Alertmanager config upload, used as a safety net when the per-tenant
+	// limit is unset or configured above this value. 16 MiB matches the
+	// default -alertmanager.max-recv-msg-size.
+	maxHardConfigSize = 16 << 20
 )
 
 var (
@@ -100,25 +108,38 @@ func (am *MultitenantAlertmanager) SetUserConfig(w http.ResponseWriter, r *http.
 		return
 	}
 
-	var input io.Reader
+	// Always bound the request body before buffering it in memory. If the
+	// per-tenant limit is unset (0) or exceeds the hard ceiling, fall back
+	// to the hard ceiling so a tenant cannot OOM the shared process.
 	maxConfigSize := am.limits.AlertmanagerMaxConfigSize(userID)
-	if maxConfigSize > 0 {
-		// LimitReader will return EOF after reading specified number of bytes. To check if
-		// we have read too many bytes, allow one extra byte.
-		input = io.LimitReader(r.Body, int64(maxConfigSize)+1)
-	} else {
-		input = r.Body
+	limit := maxConfigSize
+	if limit <= 0 || limit > maxHardConfigSize {
+		limit = maxHardConfigSize
 	}
+	// Allow one extra byte so we can distinguish "exactly at limit" from
+	// "over the limit" after reading.
+	r.Body = http.MaxBytesReader(w, r.Body, int64(limit)+1)
 
-	payload, err := io.ReadAll(input)
+	payload, err := io.ReadAll(r.Body)
 	if err != nil {
+		// http.MaxBytesReader returns an error (and in Go 1.19+ a
+		// *http.MaxBytesError) once the body exceeds the limit; surface a
+		// consistent "too big" message in that case. Since we requested
+		// limit+1 bytes, reading limit+1 or more bytes implies the body was
+		// over the limit regardless of the underlying Go version.
+		if int64(len(payload)) > int64(limit) || strings.Contains(err.Error(), "request body too large") {
+			msg := fmt.Sprintf(errConfigurationTooBig, limit)
+			level.Warn(logger).Log("msg", msg)
+			http.Error(w, msg, http.StatusBadRequest)
+			return
+		}
 		level.Error(logger).Log("msg", errReadingConfiguration, "err", err.Error())
 		http.Error(w, fmt.Sprintf("%s: %s", errReadingConfiguration, err.Error()), http.StatusBadRequest)
 		return
 	}
 
-	if maxConfigSize > 0 && len(payload) > maxConfigSize {
-		msg := fmt.Sprintf(errConfigurationTooBig, maxConfigSize)
+	if len(payload) > limit {
+		msg := fmt.Sprintf(errConfigurationTooBig, limit)
 		level.Warn(logger).Log("msg", msg)
 		http.Error(w, msg, http.StatusBadRequest)
 		return
@@ -206,6 +227,22 @@ func validateUserConfig(logger log.Logger, cfg alertspb.AlertConfigDesc, limits 
 		for _, tmpl := range cfg.Templates {
 			if size := len(tmpl.GetBody()); size > maxSize {
 				return fmt.Errorf(errTemplateTooBig, tmpl.GetFilename(), size, maxSize)
+			}
+		}
+	}
+
+	// Enforce an aggregate per-tenant limit on the total size of all
+	// templates before materialising any of them on disk. This prevents a
+	// tenant from filling the shared data volume (used by other tenants'
+	// silence/notification-log state) by submitting many individually
+	// small-enough templates.
+	if maxCount, maxSize := limits.AlertmanagerMaxTemplatesCount(user), limits.AlertmanagerMaxTemplateSize(user); maxCount > 0 && maxSize > 0 {
+		aggregateLimit := maxCount * maxSize
+		total := 0
+		for _, tmpl := range cfg.Templates {
+			total += len(tmpl.GetBody())
+			if total > aggregateLimit {
+				return fmt.Errorf(errTemplatesTooBig, total, aggregateLimit)
 			}
 		}
 	}

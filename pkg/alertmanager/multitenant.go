@@ -814,6 +814,32 @@ func (am *MultitenantAlertmanager) setConfig(cfg alertspb.AlertConfigDesc) error
 	var userTemplateDir = filepath.Join(am.getTenantDirectory(cfg.User), templatesDir)
 	var pathsToRemove = make(map[string]struct{})
 
+	// Enforce per-tenant template quotas before writing any file to the
+	// (shared) local data directory. This is a defence-in-depth against
+	// configs that bypassed validateUserConfig (for example, uploaded
+	// before the limits were in place) being re-materialised on every
+	// poll on every replica owning the tenant.
+	if maxCount := am.limits.AlertmanagerMaxTemplatesCount(cfg.User); maxCount > 0 && len(cfg.Templates) > maxCount {
+		return fmt.Errorf("too many templates for user %s: %d (limit: %d)", cfg.User, len(cfg.Templates), maxCount)
+	}
+	if maxSize := am.limits.AlertmanagerMaxTemplateSize(cfg.User); maxSize > 0 {
+		for _, tmpl := range cfg.Templates {
+			if size := len(tmpl.GetBody()); size > maxSize {
+				return fmt.Errorf("template %s for user %s is too big: %d bytes (limit: %d bytes)", tmpl.GetFilename(), cfg.User, size, maxSize)
+			}
+		}
+	}
+	if maxCount, maxSize := am.limits.AlertmanagerMaxTemplatesCount(cfg.User), am.limits.AlertmanagerMaxTemplateSize(cfg.User); maxCount > 0 && maxSize > 0 {
+		aggregateLimit := maxCount * maxSize
+		total := 0
+		for _, tmpl := range cfg.Templates {
+			total += len(tmpl.GetBody())
+		}
+		if total > aggregateLimit {
+			return fmt.Errorf("total templates size %d bytes for user %s is too big (limit: %d bytes)", total, cfg.User, aggregateLimit)
+		}
+	}
+
 	// List existing files to keep track the ones to be removed
 	if oldTemplateFiles, err := os.ReadDir(userTemplateDir); err == nil {
 		for _, file := range oldTemplateFiles {
