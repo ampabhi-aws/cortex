@@ -5,6 +5,7 @@ import (
 	"context"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"testing"
@@ -789,8 +790,104 @@ func TestValidateAlertmanagerConfig(t *testing.T) {
 
 	for testName, testData := range tests {
 		t.Run(testName, func(t *testing.T) {
-			err := validateAlertmanagerConfig(testData.input)
+			err := validateAlertmanagerConfig(testData.input, nil)
 			assert.ErrorIs(t, err, testData.expected)
+		})
+	}
+}
+
+func TestValidateAlertmanagerConfig_EmailSmarthostFirewall(t *testing.T) {
+	// Avoid touching real DNS: resolve literal IPs only, treat hostnames as unresolvable.
+	orig := resolveHost
+	defer func() { resolveHost = orig }()
+	resolveHost = func(host string) ([]net.IP, error) {
+		if ip := net.ParseIP(host); ip != nil {
+			return []net.IP{ip}, nil
+		}
+		return nil, fmt.Errorf("test: no DNS lookup for %q", host)
+	}
+
+	newLimits := func(block bool) Limits {
+		l := &mockAlertManagerLimits{}
+		l.privateAddresses = block
+		return l
+	}
+
+	tests := map[string]struct {
+		cfg       interface{}
+		limits    Limits
+		wantErrIs error
+	}{
+		"loopback smarthost is blocked when firewall is enabled": {
+			cfg: &config.Config{Receivers: []*config.Receiver{{
+				Name: "email",
+				EmailConfigs: []*config.EmailConfig{{
+					Smarthost: config.HostPort{Host: "127.0.0.1", Port: "2525"},
+				}},
+			}}},
+			limits:    newLimits(true),
+			wantErrIs: errEmailSmarthostBlocked,
+		},
+		"link-local metadata smarthost is blocked when firewall is enabled": {
+			cfg: &config.Config{Receivers: []*config.Receiver{{
+				Name: "email",
+				EmailConfigs: []*config.EmailConfig{{
+					Smarthost: config.HostPort{Host: "169.254.169.254", Port: "80"},
+				}},
+			}}},
+			limits:    newLimits(true),
+			wantErrIs: errEmailSmarthostBlocked,
+		},
+		"RFC1918 smarthost is blocked when firewall is enabled": {
+			cfg: &config.Config{Receivers: []*config.Receiver{{
+				Name: "email",
+				EmailConfigs: []*config.EmailConfig{{
+					Smarthost: config.HostPort{Host: "10.0.0.5", Port: "25"},
+				}},
+			}}},
+			limits:    newLimits(true),
+			wantErrIs: errEmailSmarthostBlocked,
+		},
+		"public smarthost is allowed when firewall is enabled": {
+			cfg: &config.Config{Receivers: []*config.Receiver{{
+				Name: "email",
+				EmailConfigs: []*config.EmailConfig{{
+					Smarthost: config.HostPort{Host: "1.1.1.1", Port: "25"},
+				}},
+			}}},
+			limits:    newLimits(true),
+			wantErrIs: nil,
+		},
+		"loopback smarthost is allowed when firewall is disabled": {
+			cfg: &config.Config{Receivers: []*config.Receiver{{
+				Name: "email",
+				EmailConfigs: []*config.EmailConfig{{
+					Smarthost: config.HostPort{Host: "127.0.0.1", Port: "25"},
+				}},
+			}}},
+			limits:    newLimits(false),
+			wantErrIs: nil,
+		},
+		"global SMTPSmarthost loopback is blocked when firewall is enabled": {
+			cfg: &config.Config{
+				Global: &config.GlobalConfig{
+					SMTPSmarthost: config.HostPort{Host: "127.0.0.1", Port: "25"},
+				},
+			},
+			limits:    newLimits(true),
+			wantErrIs: errEmailSmarthostBlocked,
+		},
+	}
+
+	for name, tc := range tests {
+		t.Run(name, func(t *testing.T) {
+			validator := newEmailSmarthostValidator(tc.limits, "tenant-a")
+			err := validateAlertmanagerConfig(tc.cfg, validator)
+			if tc.wantErrIs == nil {
+				assert.NoError(t, err)
+			} else {
+				assert.ErrorIs(t, err, tc.wantErrIs)
+			}
 		})
 	}
 }

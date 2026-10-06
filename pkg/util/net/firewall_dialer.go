@@ -34,6 +34,15 @@ func (d *FirewallDialer) DialContext(ctx context.Context, network, address strin
 	return d.parent.DialContext(ctx, network, address)
 }
 
+// Dialer returns the underlying *net.Dialer, with the firewall Control hook
+// installed. This is useful for integrations that do not use the
+// prometheus/common HTTP client (and therefore cannot be wired through
+// commoncfg.WithDialContextFunc), but still need firewall enforcement at
+// connect time (eg. the SMTP email notifier).
+func (d *FirewallDialer) Dialer() *net.Dialer {
+	return d.parent
+}
+
 func (d *FirewallDialer) control(_, address string, _ syscall.RawConn) error {
 	blockPrivateAddresses := d.cfgProvider.BlockPrivateAddresses()
 	blockCIDRNetworks := d.cfgProvider.BlockCIDRNetworks()
