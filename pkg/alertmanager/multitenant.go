@@ -294,9 +294,14 @@ func NewMultitenantAlertmanager(cfg *MultitenantAlertmanagerConfig, store alerts
 		if err != nil {
 			return nil, fmt.Errorf("unable to read fallback config %q: %s", cfg.FallbackConfigFile, err)
 		}
-		_, err = amconfig.LoadFile(cfg.FallbackConfigFile)
+		fallbackAmConfig, err := amconfig.LoadFile(cfg.FallbackConfigFile)
 		if err != nil {
 			return nil, fmt.Errorf("unable to load fallback config %q: %s", cfg.FallbackConfigFile, err)
+		}
+		// Enforce the same hardening on the operator-provided fallback config so a
+		// non-compliant fallback cannot be used to bypass the policy at startup.
+		if err := ValidateAlertmanagerConfig(fallbackAmConfig); err != nil {
+			return nil, fmt.Errorf("invalid fallback Alertmanager config %q: %s", cfg.FallbackConfigFile, err)
 		}
 	}
 
@@ -871,6 +876,23 @@ func (am *MultitenantAlertmanager) setConfig(cfg alertspb.AlertConfigDesc) error
 			// they submit a broken one, the Manager will keep running the last known
 			// working configuration.
 			return fmt.Errorf("invalid Cortex configuration for %v: %v", cfg.User, err)
+		}
+	}
+
+	// Enforce the Alertmanager configuration hardening (e.g. *_file denylist that
+	// mitigates CVE-2021-31232) at the point of use so every config producer is
+	// covered -- not just the /api/v1/alerts handler. Any config fetched from the
+	// alert store (including the deprecated configdb legacy write path) must satisfy
+	// the same policy before it is handed to Alertmanager.
+	if userAmConfig != nil {
+		if err := ValidateAlertmanagerConfig(userAmConfig); err != nil {
+			level.Warn(am.logger).Log("msg", "rejecting stored Alertmanager config", "user", cfg.User, "err", err)
+			if hasExisting {
+				// Keep the previously-applied, compliant configuration running.
+				return fmt.Errorf("invalid Alertmanager configuration for %v: %v", cfg.User, err)
+			}
+			// Do not start an Alertmanager from a non-compliant stored config.
+			return fmt.Errorf("invalid Alertmanager configuration for %v: %v", cfg.User, err)
 		}
 	}
 
