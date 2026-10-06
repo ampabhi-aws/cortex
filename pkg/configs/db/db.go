@@ -12,9 +12,58 @@ import (
 	"github.com/cortexproject/cortex/pkg/configs/userconfig"
 )
 
+// URI is a database URI string whose MarshalYAML implementation strips any
+// embedded userinfo (user:password@host) so that credentials inlined into the
+// URI are not emitted when the live configuration is serialised (for example
+// by the unauthenticated /config endpoint). The in-process value is preserved
+// in Value so that database connection setup still has access to the full URI.
+type URI struct {
+	Value string
+}
+
+// String implements flag.Value.
+func (u URI) String() string {
+	return u.Value
+}
+
+// Set implements flag.Value.
+func (u *URI) Set(s string) error {
+	u.Value = s
+	return nil
+}
+
+// UnmarshalYAML implements yaml.Unmarshaler.
+func (u *URI) UnmarshalYAML(unmarshal func(interface{}) error) error {
+	var s string
+	if err := unmarshal(&s); err != nil {
+		return err
+	}
+	return u.Set(s)
+}
+
+// MarshalYAML implements yaml.Marshaler, stripping userinfo so inline
+// credentials are never emitted.
+func (u URI) MarshalYAML() (interface{}, error) {
+	if u.Value == "" {
+		return "", nil
+	}
+	parsed, err := url.Parse(u.Value)
+	if err != nil {
+		// If the URI is not parseable, redact it entirely to avoid leaking
+		// potentially-sensitive content.
+		return "********", nil
+	}
+	if parsed.User != nil {
+		// Replace userinfo with a redacted sentinel preserving the fact that
+		// a username was configured.
+		parsed.User = url.UserPassword("xxx", "xxx")
+	}
+	return parsed.String(), nil
+}
+
 // Config configures the database.
 type Config struct {
-	URI           string `yaml:"uri"`
+	URI           URI    `yaml:"uri"`
 	MigrationsDir string `yaml:"migrations_dir"`
 	PasswordFile  string `yaml:"password_file"`
 
@@ -24,7 +73,8 @@ type Config struct {
 
 // RegisterFlags adds the flags required to configure this to the given FlagSet.
 func (cfg *Config) RegisterFlags(f *flag.FlagSet) {
-	f.StringVar(&cfg.URI, "configs.database.uri", "postgres://postgres@configs-db.weave.local/configs?sslmode=disable", "URI where the database can be found (for dev you can use memory://)")
+	cfg.URI.Value = "postgres://postgres@configs-db.weave.local/configs?sslmode=disable"
+	f.Var(&cfg.URI, "configs.database.uri", "URI where the database can be found (for dev you can use memory://)")
 	f.StringVar(&cfg.MigrationsDir, "configs.database.migrations-dir", "", "Path where the database migration files can be found")
 	f.StringVar(&cfg.PasswordFile, "configs.database.password-file", "", "File containing password (username goes in URI)")
 }
@@ -64,7 +114,7 @@ func New(cfg Config) (DB, error) {
 		return cfg.Mock, nil
 	}
 
-	u, err := url.Parse(cfg.URI)
+	u, err := url.Parse(cfg.URI.Value)
 	if err != nil {
 		return nil, err
 	}

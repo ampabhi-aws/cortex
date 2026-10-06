@@ -16,7 +16,7 @@ import (
 func Setup(t *testing.T) db.DB {
 	require.NoError(t, logging.Setup("debug"))
 	database, err := db.New(db.Config{
-		URI: "memory://",
+		URI: db.URI{Value: "memory://"},
 	})
 	require.NoError(t, err)
 	return database
