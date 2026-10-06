@@ -33,6 +33,33 @@ const (
 	ServiceTimingHeaderName   = "Server-Timing"
 )
 
+// defaultAllowedResponseHeaders is the canonical-cased allow-list of response
+// headers that are copied from an upstream (querier) response back to the
+// tenant HTTP client. The query path forwards whatever headers an upstream
+// querier returns; a compromised, buggy, or impersonating querier can
+// otherwise inject arbitrary headers (Set-Cookie, Location, CORS, CSP, etc.)
+// into the victim tenant's response. We intentionally restrict the set to
+// headers that are legitimately needed by Prometheus / Cortex clients.
+var defaultAllowedResponseHeaders = map[string]struct{}{
+	// Content negotiation / encoding.
+	http.CanonicalHeaderKey("Content-Type"):     {},
+	http.CanonicalHeaderKey("Content-Encoding"): {},
+	http.CanonicalHeaderKey("Content-Length"):   {},
+	http.CanonicalHeaderKey("Vary"):             {},
+	// Caching metadata (safe, well-defined semantics).
+	http.CanonicalHeaderKey("Cache-Control"): {},
+	http.CanonicalHeaderKey("Date"):          {},
+	http.CanonicalHeaderKey("Last-Modified"): {},
+	http.CanonicalHeaderKey("Expires"):       {},
+	http.CanonicalHeaderKey("ETag"):          {},
+	// Server-Timing (we emit it ourselves and queriers may append entries).
+	http.CanonicalHeaderKey(ServiceTimingHeaderName): {},
+	// Cortex / Prometheus specific headers.
+	http.CanonicalHeaderKey("Results-Cache-Gen-Number"): {},
+	http.CanonicalHeaderKey("X-Prometheus-Remote-Read-Version"):  {},
+	http.CanonicalHeaderKey("X-Prometheus-Remote-Write-Version"): {},
+}
+
 var (
 	errCanceled              = httpgrpc.Errorf(StatusClientClosedRequest, context.Canceled.Error())
 	errDeadlineExceeded      = httpgrpc.Errorf(http.StatusGatewayTimeout, context.DeadlineExceeded.Error())
@@ -41,15 +68,17 @@ var (
 
 // Config for a Handler.
 type HandlerConfig struct {
-	LogQueriesLongerThan time.Duration `yaml:"log_queries_longer_than"`
-	MaxBodySize          int64         `yaml:"max_body_size"`
-	QueryStatsEnabled    bool          `yaml:"query_stats_enabled"`
+	LogQueriesLongerThan    time.Duration `yaml:"log_queries_longer_than"`
+	MaxBodySize             int64         `yaml:"max_body_size"`
+	QueryStatsEnabled       bool          `yaml:"query_stats_enabled"`
+	ExtraAllowedRespHeaders string        `yaml:"extra_allowed_response_headers"`
 }
 
 func (cfg *HandlerConfig) RegisterFlags(f *flag.FlagSet) {
 	f.DurationVar(&cfg.LogQueriesLongerThan, "frontend.log-queries-longer-than", 0, "Log queries that are slower than the specified duration. Set to 0 to disable. Set to < 0 to enable on all queries.")
 	f.Int64Var(&cfg.MaxBodySize, "frontend.max-body-size", 10*1024*1024, "Max body size for downstream prometheus.")
 	f.BoolVar(&cfg.QueryStatsEnabled, "frontend.query-stats-enabled", false, "True to enable query statistics tracking. When enabled, a message with some statistics is logged for every query.")
+	f.StringVar(&cfg.ExtraAllowedRespHeaders, "frontend.extra-allowed-response-headers", "", "Comma-separated list of additional response headers (beyond the built-in allow-list of safe Prometheus/Cortex headers) that the query-frontend will copy from an upstream querier response back to the HTTP client. All other querier-returned headers are dropped as a defense against response-header injection by a compromised or impersonating querier.")
 }
 
 // Handler accepts queries and forwards them to RoundTripper. It can log slow queries,
@@ -58,6 +87,10 @@ type Handler struct {
 	cfg          HandlerConfig
 	log          log.Logger
 	roundTripper http.RoundTripper
+
+	// Pre-computed allow-list of response headers (canonical-cased) permitted
+	// to be copied from an upstream querier response back to the client.
+	allowedRespHeaders map[string]struct{}
 
 	// Metrics.
 	querySeconds   *prometheus.CounterVec
@@ -70,9 +103,10 @@ type Handler struct {
 // NewHandler creates a new frontend handler.
 func NewHandler(cfg HandlerConfig, roundTripper http.RoundTripper, log log.Logger, reg prometheus.Registerer) http.Handler {
 	h := &Handler{
-		cfg:          cfg,
-		log:          log,
-		roundTripper: roundTripper,
+		cfg:                cfg,
+		log:                log,
+		roundTripper:       roundTripper,
+		allowedRespHeaders: buildAllowedResponseHeaders(cfg.ExtraAllowedRespHeaders),
 	}
 
 	if cfg.QueryStatsEnabled {
@@ -143,6 +177,14 @@ func (f *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 
 	hs := w.Header()
 	for h, vs := range resp.Header {
+		// Only propagate headers that are on the allow-list. The upstream
+		// response is produced by a querier reachable over the internal
+		// gRPC loop and we must not let it inject arbitrary headers
+		// (e.g. Set-Cookie, Location, CORS/CSP overrides) into the tenant's
+		// response.
+		if _, ok := f.allowedRespHeaders[http.CanonicalHeaderKey(h)]; !ok {
+			continue
+		}
 		hs[h] = vs
 	}
 
@@ -251,6 +293,25 @@ func writeError(w http.ResponseWriter, err error) {
 		}
 	}
 	server.WriteError(w, err)
+}
+
+// buildAllowedResponseHeaders returns the canonical-cased allow-list of
+// response headers that will be copied from an upstream (querier) response
+// back to the HTTP client. The caller may extend the built-in list via a
+// comma-separated string of header names.
+func buildAllowedResponseHeaders(extra string) map[string]struct{} {
+	allowed := make(map[string]struct{}, len(defaultAllowedResponseHeaders))
+	for k := range defaultAllowedResponseHeaders {
+		allowed[k] = struct{}{}
+	}
+	for _, h := range strings.Split(extra, ",") {
+		h = strings.TrimSpace(h)
+		if h == "" {
+			continue
+		}
+		allowed[http.CanonicalHeaderKey(h)] = struct{}{}
+	}
+	return allowed
 }
 
 func writeServiceTimingHeader(queryResponseTime time.Duration, headers http.Header, stats *querier_stats.Stats) {

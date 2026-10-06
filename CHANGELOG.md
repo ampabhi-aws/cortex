@@ -2,6 +2,8 @@
 
 ## master / unreleased
 
+* [FEATURE] Query-frontend: `-frontend.extra-allowed-response-headers`: Only a built-in allow-list of safe response headers (e.g. `Content-Type`, `Content-Encoding`, `Cache-Control`, `Server-Timing`, `Results-Cache-Gen-Number`, `X-Prometheus-Remote-Read-Version`, `X-Prometheus-Remote-Write-Version`, …) is now copied from an upstream querier response back to the HTTP client. Other headers returned by the querier are dropped, as a defense-in-depth measure against response-header injection by a compromised, buggy, or impersonating querier. Operators that intentionally return additional response headers from their queriers can add them to the allow-list via the new flag/config.
+
   **This release removes support for chunks storage. See below for more.**
 * [CHANGE] Remove support for chunks storage entirely. If you are using chunks storage on a previous version, you must [migrate your data](https://github.com/cortexproject/cortex/blob/v1.11.1/docs/blocks-storage/migrate-from-chunks-to-blocks.md) on version 1.12 or earlier. Before upgrading to this release, you should also remove any deprecated chunks-related configuration, as this release will no longer accept that. The following flags are gone:
   - `-dynamodb.*`
