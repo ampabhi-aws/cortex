@@ -5,9 +5,11 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"net/url"
 	"os"
 	"path/filepath"
 	"reflect"
+	"strings"
 
 	"github.com/go-kit/log"
 	"github.com/go-kit/log/level"
@@ -45,6 +47,15 @@ var (
 	errTLSFileNotAllowed             = errors.New("setting TLS ca_file, cert_file and key_file is not allowed")
 	errSlackAPIURLFileNotAllowed     = errors.New("setting Slack api_url_file and global slack_api_url_file is not allowed")
 	errVictorOpsAPIKeyFileNotAllowed = errors.New("setting VictorOps api_key_file is not allowed")
+
+	// errSNSAmbientCredentialsNotAllowed rejects tenant SNS receiver configurations that would
+	// cause the Cortex Alertmanager to sign SNS Publish requests with the server's ambient AWS
+	// credentials (default credential chain, env vars, mounted ~/.aws, IRSA/web identity, or
+	// EC2/ECS IMDS) or with a tenant-chosen STS AssumeRole. Tenants must provide explicit
+	// static sigv4 access_key and secret_key.
+	errSNSAmbientCredentialsNotAllowed = errors.New("sns_configs require explicit sigv4 access_key and secret_key; profile/role_arn and the ambient credentials chain are not allowed")
+	errSNSAPIURLTemplateNotAllowed     = errors.New("sns_configs api_url must not contain Go template expressions")
+	errSNSAPIURLInvalid                = errors.New("sns_configs api_url must be an https AWS SNS regional endpoint (e.g. https://sns.<region>.amazonaws.com)")
 )
 
 // UserConfig is used to communicate a users alertmanager configs
@@ -350,6 +361,11 @@ func validateAlertmanagerConfig(cfg interface{}) error {
 		if err := validateVictorOpsConfig(v.Interface().(config.VictorOpsConfig)); err != nil {
 			return err
 		}
+
+	case reflect.TypeOf(config.SNSConfig{}):
+		if err := validateSNSConfig(v.Interface().(config.SNSConfig)); err != nil {
+			return err
+		}
 	}
 
 	// If the input config is a struct, recursively iterate on all fields.
@@ -448,4 +464,82 @@ func validateVictorOpsConfig(cfg config.VictorOpsConfig) error {
 		return errVictorOpsAPIKeyFileNotAllowed
 	}
 	return nil
+}
+
+// validateSNSConfig validates the SNS receiver config and returns an error if it would cause
+// the Cortex Alertmanager to sign SNS requests with ambient AWS credentials (default credential
+// chain, EC2/ECS IMDS, IRSA web identity, mounted shared-config profiles, or STS AssumeRole
+// performed with the server identity). Tenants MUST supply explicit static sigv4 credentials;
+// profile and role_arn are rejected, and api_url is restricted to a static AWS SNS endpoint so
+// the signed request cannot be redirected to an attacker-controlled host or computed from alert
+// labels at notify time.
+func validateSNSConfig(cfg config.SNSConfig) error {
+	if cfg.Sigv4.Profile != "" || cfg.Sigv4.RoleARN != "" {
+		return errSNSAmbientCredentialsNotAllowed
+	}
+	if cfg.Sigv4.AccessKey == "" || string(cfg.Sigv4.SecretKey) == "" {
+		return errSNSAmbientCredentialsNotAllowed
+	}
+	if cfg.APIUrl != "" {
+		// Reject Go-template expressions so the endpoint cannot be computed from alert
+		// labels at notify time.
+		if strings.Contains(cfg.APIUrl, "{{") || strings.Contains(cfg.APIUrl, "}}") {
+			return errSNSAPIURLTemplateNotAllowed
+		}
+		if !isAllowedSNSEndpoint(cfg.APIUrl) {
+			return errSNSAPIURLInvalid
+		}
+	}
+	return nil
+}
+
+// isAllowedSNSEndpoint only allows https URLs pointing at an AWS SNS regional endpoint, i.e.
+// a host of the form sns.<region>.amazonaws.com (optionally sns-fips.<region>.amazonaws.com or
+// the China/GovCloud partitions). No path, query or user info is permitted.
+func isAllowedSNSEndpoint(raw string) bool {
+	u, err := url.Parse(raw)
+	if err != nil {
+		return false
+	}
+	if u.Scheme != "https" {
+		return false
+	}
+	if u.User != nil {
+		return false
+	}
+	if u.RawQuery != "" || u.Fragment != "" {
+		return false
+	}
+	if p := strings.TrimSuffix(u.Path, "/"); p != "" {
+		return false
+	}
+	host := u.Hostname()
+	if host == "" {
+		return false
+	}
+	// Accept sns.<region>.amazonaws.com, sns-fips.<region>.amazonaws.com,
+	// sns.<region>.amazonaws.com.cn and sns.<region>.sc2s.sgov.gov / c2s.ic.gov variants.
+	parts := strings.Split(host, ".")
+	if len(parts) < 4 {
+		return false
+	}
+	service := parts[0]
+	if service != "sns" && service != "sns-fips" {
+		return false
+	}
+	region := parts[1]
+	if region == "" {
+		return false
+	}
+	for _, r := range region {
+		if !(r == '-' || (r >= 'a' && r <= 'z') || (r >= '0' && r <= '9')) {
+			return false
+		}
+	}
+	suffix := strings.Join(parts[2:], ".")
+	switch suffix {
+	case "amazonaws.com", "amazonaws.com.cn", "sc2s.sgov.gov", "c2s.ic.gov":
+		return true
+	}
+	return false
 }

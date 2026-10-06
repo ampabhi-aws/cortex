@@ -419,6 +419,108 @@ alertmanager_config: |
 			err: errors.Wrap(errVictorOpsAPIKeyFileNotAllowed, "error validating Alertmanager config"),
 		},
 		{
+			name: "Should return error if SNS receiver has no explicit sigv4 credentials",
+			cfg: `
+alertmanager_config: |
+  receivers:
+    - name: default-receiver
+      sns_configs:
+        - sigv4:
+            region: us-east-1
+          topic_arn: arn:aws:sns:us-east-1:xxxxxxxxxxxx:topic
+          subject: x
+          message: x
+
+  route:
+    receiver: 'default-receiver'
+`,
+			err: errors.Wrap(errSNSAmbientCredentialsNotAllowed, "error validating Alertmanager config"),
+		},
+		{
+			name: "Should return error if SNS receiver uses sigv4 profile",
+			cfg: `
+alertmanager_config: |
+  receivers:
+    - name: default-receiver
+      sns_configs:
+        - sigv4:
+            region: us-east-1
+            profile: tenant-profile
+            access_key: test-ak
+            secret_key: test-sk
+          topic_arn: arn:aws:sns:us-east-1:xxxxxxxxxxxx:topic
+          subject: x
+          message: x
+
+  route:
+    receiver: 'default-receiver'
+`,
+			err: errors.Wrap(errSNSAmbientCredentialsNotAllowed, "error validating Alertmanager config"),
+		},
+		{
+			name: "Should return error if SNS receiver uses sigv4 role_arn",
+			cfg: `
+alertmanager_config: |
+  receivers:
+    - name: default-receiver
+      sns_configs:
+        - sigv4:
+            region: us-east-1
+            role_arn: arn:aws:iam::xxxxxxxxxxxx:role/other
+            access_key: test-ak
+            secret_key: test-sk
+          topic_arn: arn:aws:sns:us-east-1:xxxxxxxxxxxx:topic
+          subject: x
+          message: x
+
+  route:
+    receiver: 'default-receiver'
+`,
+			err: errors.Wrap(errSNSAmbientCredentialsNotAllowed, "error validating Alertmanager config"),
+		},
+		{
+			name: "Should return error if SNS api_url is not an AWS SNS endpoint",
+			cfg: `
+alertmanager_config: |
+  receivers:
+    - name: default-receiver
+      sns_configs:
+        - api_url: http://not-sns.example.com/
+          sigv4:
+            region: us-east-1
+            access_key: test-ak
+            secret_key: test-sk
+          topic_arn: arn:aws:sns:us-east-1:xxxxxxxxxxxx:topic
+          subject: x
+          message: x
+
+  route:
+    receiver: 'default-receiver'
+`,
+			err: errors.Wrap(errSNSAPIURLInvalid, "error validating Alertmanager config"),
+		},
+		{
+			name: "Should return error if SNS api_url contains Go template expressions",
+			cfg: `
+alertmanager_config: |
+  receivers:
+    - name: default-receiver
+      sns_configs:
+        - api_url: 'https://sns.{{ .Labels.region }}.amazonaws.com'
+          sigv4:
+            region: us-east-1
+            access_key: test-ak
+            secret_key: test-sk
+          topic_arn: arn:aws:sns:us-east-1:xxxxxxxxxxxx:topic
+          subject: x
+          message: x
+
+  route:
+    receiver: 'default-receiver'
+`,
+			err: errors.Wrap(errSNSAPIURLTemplateNotAllowed, "error validating Alertmanager config"),
+		},
+		{
 			name: "should return error if template is wrong",
 			cfg: `
 alertmanager_config: |
