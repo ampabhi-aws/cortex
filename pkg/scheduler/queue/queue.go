@@ -104,6 +104,13 @@ func (q *RequestQueue) EnqueueRequest(userID string, req Request, maxQueriers in
 		}
 		return nil
 	default:
+		// If the enqueue failed and the queue is empty, delete it to preserve the
+		// invariant that every registered per-tenant queue has at least one pending
+		// request. Otherwise a later querier call could block forever on an empty
+		// channel while holding q.mtx.
+		if len(queue) == 0 {
+			q.queues.deleteQueue(userID)
+		}
 		q.discardedRequests.WithLabelValues(userID).Inc()
 		return ErrTooManyRequests
 	}
@@ -140,9 +147,14 @@ FindQueue:
 			break
 		}
 
-		// Pick next request from the queue.
-		for {
-			request := <-queue
+		// Pick next request from the queue without blocking: the receive must never
+		// block while q.mtx is held, otherwise every other operation (enqueue,
+		// querier (de)registration, metrics, shutdown) deadlocks. If the queue is
+		// registered but empty (which can happen if a previous EnqueueRequest hit
+		// the full-queue default branch, or on a transient race), drop the stale
+		// registration and keep iterating over the other tenants.
+		select {
+		case request := <-queue:
 			if len(queue) == 0 {
 				q.queues.deleteQueue(userID)
 			}
@@ -153,6 +165,11 @@ FindQueue:
 			q.cond.Broadcast()
 
 			return request, last, nil
+		default:
+			// Registered but empty: clean up and keep iterating instead of
+			// deadlocking on the empty channel.
+			q.queues.deleteQueue(userID)
+			continue
 		}
 	}
 

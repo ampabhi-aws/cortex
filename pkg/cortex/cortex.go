@@ -227,6 +227,13 @@ func (c *Config) Validate(log log.Logger) error {
 		return errors.Wrap(err, "invalid tracing config")
 	}
 
+	if err := c.QueryScheduler.Validate(); err != nil {
+		return errors.Wrap(err, "invalid query_scheduler config")
+	}
+	if err := c.Frontend.FrontendV1.Validate(); err != nil {
+		return errors.Wrap(err, "invalid frontend config")
+	}
+
 	return nil
 }
 
