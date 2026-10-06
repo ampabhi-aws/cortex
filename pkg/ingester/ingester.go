@@ -2334,6 +2334,14 @@ func (i *Ingester) closeAndDeleteUserTSDBIfIdle(userID string) tsdbCloseCheckRes
 	validation.DeletePerUserValidationMetrics(userID, i.logger)
 
 	// And delete local data.
+	// Defense-in-depth: refuse to remove the shared TSDB root directory. If
+	// tenant validation ever allowed an empty tenant ID through, BlocksDir("")
+	// would equal the configured root path and this RemoveAll would wipe
+	// every tenant's TSDB data.
+	if userID == "" || filepath.Clean(dir) == filepath.Clean(i.cfg.BlocksStorageConfig.TSDB.Dir) {
+		level.Error(i.logger).Log("msg", "refusing to delete shared TSDB root directory for empty tenant ID", "user", userID, "dir", dir)
+		return tsdbDataRemovalFailed
+	}
 	if err := os.RemoveAll(dir); err != nil {
 		level.Error(i.logger).Log("msg", "failed to delete local TSDB", "user", userID, "err", err)
 		return tsdbDataRemovalFailed

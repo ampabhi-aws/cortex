@@ -215,6 +215,13 @@ func (cfg *TSDBConfig) Validate() error {
 // BlocksDir returns the directory path where TSDB blocks and wal should be
 // stored by the ingester
 func (cfg *TSDBConfig) BlocksDir(userID string) string {
+	// Defense-in-depth: an empty userID would make filepath.Join(cfg.Dir, "")
+	// collapse to the shared TSDB root directory, which holds every tenant's
+	// data. Refuse to compute such a path – tenant validation must reject empty
+	// tenant IDs before reaching this point.
+	if userID == "" {
+		panic("BlocksDir called with empty tenant ID: refusing to collapse per-tenant path onto shared TSDB root")
+	}
 	return filepath.Join(cfg.Dir, userID)
 }
 
