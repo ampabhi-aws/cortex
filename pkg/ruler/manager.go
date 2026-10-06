@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"net/http"
 	"sync"
+	"time"
 
 	"github.com/go-kit/log"
 	"github.com/go-kit/log/level"
@@ -12,6 +13,7 @@ import (
 	"github.com/pkg/errors"
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/promauto"
+	"github.com/prometheus/common/model"
 	"github.com/prometheus/prometheus/config"
 	"github.com/prometheus/prometheus/model/rulefmt"
 	"github.com/prometheus/prometheus/notifier"
@@ -26,6 +28,7 @@ type DefaultMultiTenantManager struct {
 	cfg            Config
 	notifierCfg    *config.Config
 	managerFactory ManagerFactory
+	limits         RulesLimits
 
 	mapper *mapper
 
@@ -47,7 +50,7 @@ type DefaultMultiTenantManager struct {
 	logger                        log.Logger
 }
 
-func NewDefaultMultiTenantManager(cfg Config, managerFactory ManagerFactory, reg prometheus.Registerer, logger log.Logger) (*DefaultMultiTenantManager, error) {
+func NewDefaultMultiTenantManager(cfg Config, limits RulesLimits, managerFactory ManagerFactory, reg prometheus.Registerer, logger log.Logger) (*DefaultMultiTenantManager, error) {
 	ncfg, err := buildNotifierConfig(&cfg)
 	if err != nil {
 		return nil, err
@@ -62,6 +65,7 @@ func NewDefaultMultiTenantManager(cfg Config, managerFactory ManagerFactory, reg
 		cfg:                cfg,
 		notifierCfg:        ncfg,
 		managerFactory:     managerFactory,
+		limits:             limits,
 		notifiers:          map[string]*rulerNotifier{},
 		mapper:             newMapper(cfg.RulePath, logger),
 		userManagers:       map[string]RulesManager{},
@@ -123,9 +127,34 @@ func (r *DefaultMultiTenantManager) SyncRuleGroups(ctx context.Context, ruleGrou
 // syncRulesToManager maps the rule files to disk, detects any changes and will create/update the
 // the users Prometheus Rules Manager.
 func (r *DefaultMultiTenantManager) syncRulesToManager(ctx context.Context, user string, groups rulespb.RuleGroupList) {
+	formatted := groups.Formatted()
+
+	// Clamp any tenant-supplied evaluation interval below the operator-configured
+	// minimum, so pre-existing or externally stored rule groups cannot bypass the
+	// write-time floor in ValidateRuleGroup and starve co-tenants' rule evaluations.
+	if r.limits != nil {
+		if min := r.limits.RulerMinRuleEvaluationInterval(user); min > 0 {
+			for ns, gs := range formatted {
+				for i := range gs {
+					if gs[i].Interval != 0 && time.Duration(gs[i].Interval) < min {
+						level.Warn(r.logger).Log(
+							"msg", "clamping tenant rule group evaluation interval to the configured minimum",
+							"user", user,
+							"namespace", ns,
+							"group", gs[i].Name,
+							"configured", time.Duration(gs[i].Interval),
+							"minimum", min,
+						)
+						gs[i].Interval = model.Duration(min)
+					}
+				}
+			}
+		}
+	}
+
 	// Map the files to disk and return the file names to be passed to the users manager if they
 	// have been updated
-	update, files, err := r.mapper.MapRules(user, groups.Formatted())
+	update, files, err := r.mapper.MapRules(user, formatted)
 	if err != nil {
 		r.lastReloadSuccessful.WithLabelValues(user).Set(0)
 		level.Error(r.logger).Log("msg", "unable to map rule files", "user", user, "err", err)
@@ -267,7 +296,7 @@ func (r *DefaultMultiTenantManager) Stop() {
 	r.mapper.cleanup()
 }
 
-func (*DefaultMultiTenantManager) ValidateRuleGroup(g rulefmt.RuleGroup) []error {
+func (r *DefaultMultiTenantManager) ValidateRuleGroup(userID string, g rulefmt.RuleGroup) []error {
 	var errs []error
 
 	if g.Name == "" {
@@ -278,6 +307,19 @@ func (*DefaultMultiTenantManager) ValidateRuleGroup(g rulefmt.RuleGroup) []error
 	if len(g.Rules) == 0 {
 		errs = append(errs, fmt.Errorf("invalid rules config: rule group '%s' has no rules", g.Name))
 		return errs
+	}
+
+	// Enforce a per-tenant minimum evaluation interval. The vendored
+	// Prometheus manager uses the group's interval verbatim when it is
+	// non-zero (overriding -ruler.evaluation-interval), so without this
+	// floor a tenant can configure interval: 1s and have each group hold
+	// a shared PromQL engine slot every second, starving co-tenants.
+	if r.limits != nil {
+		if min := r.limits.RulerMinRuleEvaluationInterval(userID); min > 0 &&
+			g.Interval != 0 && time.Duration(g.Interval) < min {
+			errs = append(errs, fmt.Errorf("invalid rules config: rule group '%s' interval %s is below the minimum allowed %s", g.Name, time.Duration(g.Interval), min))
+			return errs
+		}
 	}
 
 	for i, r := range g.Rules {

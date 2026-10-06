@@ -82,10 +82,12 @@ type Limits struct {
 	QueryVerticalShardSize       int            `yaml:"query_vertical_shard_size" json:"query_vertical_shard_size" doc:"hidden"`
 
 	// Ruler defaults and limits.
-	RulerEvaluationDelay        model.Duration `yaml:"ruler_evaluation_delay_duration" json:"ruler_evaluation_delay_duration"`
-	RulerTenantShardSize        int            `yaml:"ruler_tenant_shard_size" json:"ruler_tenant_shard_size"`
-	RulerMaxRulesPerRuleGroup   int            `yaml:"ruler_max_rules_per_rule_group" json:"ruler_max_rules_per_rule_group"`
-	RulerMaxRuleGroupsPerTenant int            `yaml:"ruler_max_rule_groups_per_tenant" json:"ruler_max_rule_groups_per_tenant"`
+	RulerEvaluationDelay                     model.Duration `yaml:"ruler_evaluation_delay_duration" json:"ruler_evaluation_delay_duration"`
+	RulerTenantShardSize                     int            `yaml:"ruler_tenant_shard_size" json:"ruler_tenant_shard_size"`
+	RulerMaxRulesPerRuleGroup                int            `yaml:"ruler_max_rules_per_rule_group" json:"ruler_max_rules_per_rule_group"`
+	RulerMaxRuleGroupsPerTenant              int            `yaml:"ruler_max_rule_groups_per_tenant" json:"ruler_max_rule_groups_per_tenant"`
+	RulerMinRuleEvaluationInterval           model.Duration `yaml:"ruler_min_rule_evaluation_interval" json:"ruler_min_rule_evaluation_interval"`
+	RulerMaxConcurrentRuleEvaluationsPerUser int            `yaml:"ruler_max_concurrent_rule_evaluations_per_user" json:"ruler_max_concurrent_rule_evaluations_per_user"`
 
 	// Store-gateway.
 	StoreGatewayTenantShardSize int `yaml:"store_gateway_tenant_shard_size" json:"store_gateway_tenant_shard_size"`
@@ -163,8 +165,11 @@ func (l *Limits) RegisterFlags(f *flag.FlagSet) {
 
 	f.Var(&l.RulerEvaluationDelay, "ruler.evaluation-delay-duration", "Duration to delay the evaluation of rules to ensure the underlying metrics have been pushed to Cortex.")
 	f.IntVar(&l.RulerTenantShardSize, "ruler.tenant-shard-size", 0, "The default tenant's shard size when the shuffle-sharding strategy is used by ruler. When this setting is specified in the per-tenant overrides, a value of 0 disables shuffle sharding for the tenant.")
-	f.IntVar(&l.RulerMaxRulesPerRuleGroup, "ruler.max-rules-per-rule-group", 0, "Maximum number of rules per rule group per-tenant. 0 to disable.")
-	f.IntVar(&l.RulerMaxRuleGroupsPerTenant, "ruler.max-rule-groups-per-tenant", 0, "Maximum number of rule groups per-tenant. 0 to disable.")
+	f.IntVar(&l.RulerMaxRulesPerRuleGroup, "ruler.max-rules-per-rule-group", 20, "Maximum number of rules per rule group per-tenant. 0 to disable.")
+	f.IntVar(&l.RulerMaxRuleGroupsPerTenant, "ruler.max-rule-groups-per-tenant", 70, "Maximum number of rule groups per-tenant. 0 to disable.")
+	_ = l.RulerMinRuleEvaluationInterval.Set("10s")
+	f.Var(&l.RulerMinRuleEvaluationInterval, "ruler.min-rule-evaluation-interval", "Minimum allowed evaluation interval for a tenant-supplied rule group. Groups whose configured interval is below this value are rejected on write and clamped to this value when loaded. 0 disables the floor.")
+	f.IntVar(&l.RulerMaxConcurrentRuleEvaluationsPerUser, "ruler.max-concurrent-rule-evaluations-per-tenant", 2, "Maximum number of concurrent rule evaluations allowed per tenant on this ruler. Prevents a single tenant from monopolising the shared PromQL engine concurrency slots. 0 disables the per-tenant bound.")
 
 	f.Var(&l.CompactorBlocksRetentionPeriod, "compactor.blocks-retention-period", "Delete blocks containing samples older than the specified retention period. 0 to disable.")
 	f.IntVar(&l.CompactorTenantShardSize, "compactor.tenant-shard-size", 0, "The default tenant's shard size when the shuffle-sharding strategy is used by the compactor. When this setting is specified in the per-tenant overrides, a value of 0 disables shuffle sharding for the tenant.")
@@ -514,6 +519,19 @@ func (o *Overrides) RulerMaxRulesPerRuleGroup(userID string) int {
 // RulerMaxRuleGroupsPerTenant returns the maximum number of rule groups for a given user.
 func (o *Overrides) RulerMaxRuleGroupsPerTenant(userID string) int {
 	return o.getOverridesForUser(userID).RulerMaxRuleGroupsPerTenant
+}
+
+// RulerMinRuleEvaluationInterval returns the minimum allowed evaluation interval
+// for a tenant-supplied rule group. A value of 0 disables the floor.
+func (o *Overrides) RulerMinRuleEvaluationInterval(userID string) time.Duration {
+	return time.Duration(o.getOverridesForUser(userID).RulerMinRuleEvaluationInterval)
+}
+
+// RulerMaxConcurrentRuleEvaluationsPerUser returns the per-tenant cap on
+// concurrent rule evaluations against the shared PromQL engine. A value <= 0
+// disables the per-tenant bound (not recommended in multi-tenant deployments).
+func (o *Overrides) RulerMaxConcurrentRuleEvaluationsPerUser(userID string) int {
+	return o.getOverridesForUser(userID).RulerMaxConcurrentRuleEvaluationsPerUser
 }
 
 // StoreGatewayTenantShardSize returns the store-gateway shard size for a given user.
