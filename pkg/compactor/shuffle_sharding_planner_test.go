@@ -354,6 +354,10 @@ func TestShuffleShardingPlanner_Plan(t *testing.T) {
 				}
 				visitMarkerFileContent, _ := json.Marshal(blockVisitMarker)
 				bkt.MockGet(visitMarkerFile, string(visitMarkerFileContent), nil)
+				// The heartbeat goroutine started by Plan checks whether each
+				// block's meta.json still exists before (re-)uploading its
+				// visit marker, so make sure that check has an expectation.
+				bkt.MockExists(path.Join(visitedBlock.id.String(), metadata.MetaFilename), true, nil)
 			}
 			bkt.MockUpload(mock.Anything, nil)
 

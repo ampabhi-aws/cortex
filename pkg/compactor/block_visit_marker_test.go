@@ -1,7 +1,9 @@
 package compactor
 
 import (
+	"bytes"
 	"context"
+	"path"
 	"testing"
 	"time"
 
@@ -83,6 +85,13 @@ func TestMarkBlocksVisited(t *testing.T) {
 			dummyCounter := prometheus.NewCounter(prometheus.CounterOpts{})
 			bkt, _ := cortex_testutil.PrepareFilesystemBucket(t)
 			logger := log.NewNopLogger()
+			// markBlocksVisited only writes the visit marker if the block still
+			// exists (meta.json present) to avoid resurrecting hard-deleted blocks
+			// as orphan partial blocks. Seed a placeholder meta.json for each
+			// block the test expects to be marked.
+			for _, meta := range tcase.blocks {
+				require.NoError(t, bkt.Upload(ctx, path.Join(meta.ULID.String(), metadata.MetaFilename), bytes.NewReader([]byte("{}"))))
+			}
 			markBlocksVisited(ctx, bkt, logger, tcase.blocks, tcase.visitMarker, dummyCounter)
 			for _, meta := range tcase.blocks {
 				res, err := ReadBlockVisitMarker(ctx, objstore.WithNoopInstr(bkt), logger, meta.ULID.String(), dummyCounter)
