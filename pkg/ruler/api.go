@@ -4,7 +4,6 @@ import (
 	"encoding/json"
 	io "io"
 	"net/http"
-	"net/url"
 	"sort"
 	"strconv"
 	"strings"
@@ -288,7 +287,29 @@ var (
 	ErrNoRuleGroups = errors.New("no rule groups found")
 	// ErrBadRuleGroup is returned when the provided rule group can not be unmarshalled
 	ErrBadRuleGroup = errors.New("unable to decoded rule group")
+	// ErrUnsafeNamespace is returned when a namespace path parameter resolves to an
+	// unsafe value (empty, ".", "..", or containing path separators or NUL bytes).
+	ErrUnsafeNamespace = errors.New("invalid namespace: must not be empty, '.', '..' or contain path separators")
+	// ErrUnsafeGroupName is returned when a group name path parameter resolves to an
+	// unsafe value (empty, ".", "..", or containing path separators or NUL bytes).
+	ErrUnsafeGroupName = errors.New("invalid group name: must not be empty, '.', '..' or contain path separators")
 )
+
+// validatePathComponent rejects path segments that could be used to escape the
+// per-tenant rule-group directory via path traversal: empty, ".", "..", path
+// separators or embedded NUL bytes. Mirrors the CVE-2021-36157 hardening
+// applied to tenant IDs in pkg/tenant/resolver.go, extended to namespaces and
+// group names which are also used as filesystem path components by the local
+// rule store.
+func validatePathComponent(s string) bool {
+	if s == "" || s == "." || s == ".." {
+		return false
+	}
+	if strings.ContainsAny(s, "/\\") || strings.ContainsRune(s, 0) {
+		return false
+	}
+	return true
+}
 
 func marshalAndSend(output interface{}, w http.ResponseWriter, logger log.Logger) {
 	d, err := yaml.Marshal(&output)
@@ -324,32 +345,42 @@ func respondAccepted(w http.ResponseWriter, logger log.Logger) {
 }
 
 // parseNamespace parses the namespace from the provided set of params, in this
-// api these params are derived from the url path
+// api these params are derived from the url path. The returned namespace is
+// validated to be a safe single filesystem path component so it can be used by
+// the local rule store without allowing path traversal.
+//
+// NOTE: the previous implementation also performed a url.PathUnescape() here.
+// That second decode (gorilla/mux already provides the decoded path segment
+// when UseEncodedPath is not used, and the encoded form when it is) made it
+// possible to smuggle a path separator through routing and have it decoded
+// into "/" only after mux's path.Clean normalisation (CWE-22). The second
+// decode has been removed; namespaces must now be provided as a single opaque
+// path segment that does not resolve to a path separator or dot segment.
 func parseNamespace(params map[string]string) (string, error) {
 	namespace, exists := params["namespace"]
 	if !exists {
 		return "", ErrNoNamespace
 	}
 
-	namespace, err := url.PathUnescape(namespace)
-	if err != nil {
-		return "", err
+	if !validatePathComponent(namespace) {
+		return "", ErrUnsafeNamespace
 	}
 
 	return namespace, nil
 }
 
 // parseGroupName parses the group name from the provided set of params, in this
-// api these params are derived from the url path
+// api these params are derived from the url path. The returned group name is
+// validated to be a safe single filesystem path component. See parseNamespace
+// for why the second url.PathUnescape() was removed.
 func parseGroupName(params map[string]string) (string, error) {
 	groupName, exists := params["groupName"]
 	if !exists {
 		return "", ErrNoGroupName
 	}
 
-	groupName, err := url.PathUnescape(groupName)
-	if err != nil {
-		return "", err
+	if !validatePathComponent(groupName) {
+		return "", ErrUnsafeGroupName
 	}
 
 	return groupName, nil
@@ -395,7 +426,11 @@ func (a *API) ListRules(w http.ResponseWriter, req *http.Request) {
 	level.Debug(logger).Log("msg", "retrieving rule groups with namespace", "userID", userID, "namespace", namespace)
 	rgs, err := a.store.ListRuleGroupsForUserAndNamespace(req.Context(), userID, namespace)
 	if err != nil {
-		http.Error(w, err.Error(), http.StatusBadRequest)
+		// Do not echo the underlying rule-store error back to the caller: it may
+		// contain resolved filesystem paths and YAML parse details that can be
+		// used as a filesystem oracle. Log the detail and return a generic error.
+		level.Error(logger).Log("msg", "unable to list rule groups", "userID", userID, "namespace", namespace, "err", err)
+		http.Error(w, "unable to list rule groups", http.StatusBadRequest)
 		return
 	}
 

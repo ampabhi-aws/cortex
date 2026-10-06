@@ -168,7 +168,20 @@ func (l *Client) loadAllRulesGroupsForUser(ctx context.Context, userID string) (
 }
 
 func (l *Client) loadAllRulesGroupsForUserAndNamespace(_ context.Context, userID string, namespace string) (rulespb.RuleGroupList, error) {
-	filename := filepath.Join(l.cfg.Directory, userID, namespace)
+	// Defence in depth: ensure the resolved <Directory>/<userID>/<namespace>
+	// filename stays strictly inside the per-tenant directory, even if the
+	// caller (or an upstream bug) lets a path-traversal sequence through.
+	userDir, err := filepath.Abs(filepath.Join(l.cfg.Directory, userID))
+	if err != nil {
+		return nil, errors.Wrapf(err, "unable to resolve rules directory for user %s", userID)
+	}
+	filename, err := filepath.Abs(filepath.Join(userDir, namespace))
+	if err != nil {
+		return nil, errors.Wrapf(err, "unable to resolve rules file for user %s and namespace %s", userID, namespace)
+	}
+	if filepath.Dir(filename) != userDir {
+		return nil, errors.New("invalid namespace")
+	}
 
 	rulegroups, allErrors := l.loader.Load(filename)
 	if len(allErrors) > 0 {
