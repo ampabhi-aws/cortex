@@ -591,7 +591,26 @@ func (t *Cortex) initConfig() (serv services.Service, err error) {
 	}
 
 	t.ConfigAPI = configAPI.New(t.ConfigDB, t.Cfg.Configs.API)
-	t.ConfigAPI.RegisterRoutes(t.Server.HTTP)
+	// Register the configs routes through pkg/api so each tenant-scoped route
+	// is wrapped by t.API.AuthMiddleware. This mirrors how every other
+	// tenant-facing Cortex module exposes its endpoints and ensures that
+	// `-auth.enabled=false` deployments correctly pin the tenant to "fake"
+	// (via fakeauth) and that `-auth.enabled=true` deployments inject the
+	// tenant into the request context exactly once, before the handler runs.
+	//
+	// The all-tenant `/private/api/prom/configs/*` endpoints are intentionally
+	// NOT exposed on the tenant-facing HTTP listener: they return every
+	// tenant's configuration and must be reached only via an internal
+	// listener protected by mTLS / a shared secret (deployment concern).
+	t.API.RegisterRoute("/api/prom/configs/rules", http.HandlerFunc(t.ConfigAPI.GetConfig), true, "GET")
+	t.API.RegisterRoute("/api/prom/configs/rules", http.HandlerFunc(t.ConfigAPI.SetConfig), true, "POST")
+	t.API.RegisterRoute("/api/prom/configs/templates", http.HandlerFunc(t.ConfigAPI.GetConfig), true, "GET")
+	t.API.RegisterRoute("/api/prom/configs/templates", http.HandlerFunc(t.ConfigAPI.SetConfig), true, "POST")
+	t.API.RegisterRoute("/api/prom/configs/alertmanager", http.HandlerFunc(t.ConfigAPI.GetConfig), true, "GET")
+	t.API.RegisterRoute("/api/prom/configs/alertmanager", http.HandlerFunc(t.ConfigAPI.SetConfig), true, "POST")
+	t.API.RegisterRoute("/api/prom/configs/alertmanager/validate", http.HandlerFunc(t.ConfigAPI.ValidateAlertmanagerConfig), true, "POST")
+	t.API.RegisterRoute("/api/prom/configs/deactivate", http.HandlerFunc(t.ConfigAPI.DeactivateConfig), true, "DELETE")
+	t.API.RegisterRoute("/api/prom/configs/restore", http.HandlerFunc(t.ConfigAPI.RestoreConfig), true, "POST")
 	return services.NewIdleService(nil, func(_ error) error {
 		t.ConfigDB.Close()
 		return nil
