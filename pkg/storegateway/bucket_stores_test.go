@@ -30,6 +30,7 @@ import (
 	"github.com/thanos-io/thanos/pkg/store/labelpb"
 	"github.com/thanos-io/thanos/pkg/store/storepb"
 	"github.com/weaveworks/common/logging"
+	"github.com/weaveworks/common/user"
 	"go.uber.org/atomic"
 	"google.golang.org/grpc/metadata"
 
@@ -436,8 +437,13 @@ func mockLoggingLevel() logging.Level {
 }
 
 func setUserIDToGRPCContext(ctx context.Context, userID string) context.Context {
-	// We have to store it in the incoming metadata because we have to emulate the
-	// case it's coming from a gRPC request, while here we're running everything in-memory.
+	// We have to inject the org ID into the incoming gRPC context so that
+	// tenant.TenantID(ctx) resolves to it, as if the request had been
+	// authenticated by middleware.ServerUserHeaderInterceptor from an
+	// X-Scope-OrgID header. The legacy __org_id__ metadata key is kept for
+	// compatibility; resolveUserID will verify that it matches the
+	// authenticated tenant.
+	ctx = user.InjectOrgID(ctx, userID)
 	return metadata.NewIncomingContext(ctx, metadata.Pairs(cortex_tsdb.TenantIDExternalLabel, userID))
 }
 
