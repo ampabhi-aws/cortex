@@ -91,3 +91,78 @@ func TestHandler_ServeHTTP(t *testing.T) {
 		})
 	}
 }
+
+func TestHandler_FiltersResponseHeadersAllowList(t *testing.T) {
+	// A rogue/compromised upstream (querier) is simulated by returning a
+	// response that contains both legitimate headers and attacker-controlled
+	// headers. Only the allow-listed headers must reach the client.
+	roundTripper := roundTripperFunc(func(req *http.Request) (*http.Response, error) {
+		h := http.Header{}
+		h.Set("Content-Type", "application/json")
+		h.Set("Cache-Control", "no-cache")
+		h.Set("Results-Cache-Gen-Number", "42")
+		h.Set("Set-Cookie", "session=attacker")
+		h.Set("Location", "http://evil.example/")
+		h.Set("Access-Control-Allow-Origin", "*")
+		h.Set("X-Totally-Made-Up", "nope")
+		return &http.Response{
+			StatusCode: http.StatusOK,
+			Header:     h,
+			Body:       io.NopCloser(strings.NewReader("{}")),
+		}, nil
+	})
+
+	reg := prometheus.NewPedanticRegistry()
+	handler := NewHandler(HandlerConfig{}, roundTripper, log.NewNopLogger(), reg)
+
+	ctx := user.InjectOrgID(context.Background(), "12345")
+	req := httptest.NewRequest("GET", "/", nil)
+	req = req.WithContext(ctx)
+	resp := httptest.NewRecorder()
+
+	handler.ServeHTTP(resp, req)
+	_, _ = io.ReadAll(resp.Body)
+	require.Equal(t, http.StatusOK, resp.Code)
+
+	// Allowed headers must be present.
+	assert.Equal(t, "application/json", resp.Header().Get("Content-Type"))
+	assert.Equal(t, "no-cache", resp.Header().Get("Cache-Control"))
+	assert.Equal(t, "42", resp.Header().Get("Results-Cache-Gen-Number"))
+
+	// Attacker-controlled / unexpected headers must be stripped.
+	assert.Empty(t, resp.Header().Get("Set-Cookie"))
+	assert.Empty(t, resp.Header().Get("Location"))
+	assert.Empty(t, resp.Header().Get("Access-Control-Allow-Origin"))
+	assert.Empty(t, resp.Header().Get("X-Totally-Made-Up"))
+}
+
+func TestHandler_ExtraAllowedResponseHeaders(t *testing.T) {
+	roundTripper := roundTripperFunc(func(req *http.Request) (*http.Response, error) {
+		h := http.Header{}
+		h.Set("Content-Type", "application/json")
+		h.Set("X-Custom-One", "a")
+		h.Set("X-Custom-Two", "b")
+		h.Set("X-Not-Allowed", "c")
+		return &http.Response{
+			StatusCode: http.StatusOK,
+			Header:     h,
+			Body:       io.NopCloser(strings.NewReader("{}")),
+		}, nil
+	})
+
+	reg := prometheus.NewPedanticRegistry()
+	handler := NewHandler(HandlerConfig{ExtraAllowedRespHeaders: "X-Custom-One, x-custom-two"}, roundTripper, log.NewNopLogger(), reg)
+
+	ctx := user.InjectOrgID(context.Background(), "12345")
+	req := httptest.NewRequest("GET", "/", nil)
+	req = req.WithContext(ctx)
+	resp := httptest.NewRecorder()
+
+	handler.ServeHTTP(resp, req)
+	_, _ = io.ReadAll(resp.Body)
+	require.Equal(t, http.StatusOK, resp.Code)
+
+	assert.Equal(t, "a", resp.Header().Get("X-Custom-One"))
+	assert.Equal(t, "b", resp.Header().Get("X-Custom-Two"))
+	assert.Empty(t, resp.Header().Get("X-Not-Allowed"))
+}
