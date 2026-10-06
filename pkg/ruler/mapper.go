@@ -2,6 +2,7 @@ package ruler
 
 import (
 	"crypto/md5"
+	"errors"
 	"net/url"
 	"path/filepath"
 	"sort"
@@ -12,6 +13,10 @@ import (
 	"github.com/spf13/afero"
 	"gopkg.in/yaml.v3"
 )
+
+// errMapperEmptyUser is returned when the mapper is asked to operate on a path
+// that collapses onto the shared rules root (e.g. an empty tenant ID).
+var errMapperEmptyUser = errors.New("refusing to map rules for empty tenant ID")
 
 // mapper is designed to enusre the provided rule sets are identical
 // to the on-disk rules tracked by the prometheus manager
@@ -35,6 +40,15 @@ func newMapper(path string, logger log.Logger) *mapper {
 
 func (m *mapper) cleanupUser(userID string) {
 	dirPath := filepath.Join(m.Path, userID)
+	// Defense-in-depth: refuse to remove the shared rules root directory. An
+	// empty (or path-collapsing) userID would make filepath.Join(m.Path, userID)
+	// equal to the configured root path, which holds every tenant's rule
+	// files. Tenant validation must reject empty tenant IDs before reaching
+	// here; this guards against regressions.
+	if filepath.Clean(dirPath) == filepath.Clean(m.Path) {
+		level.Error(m.logger).Log("msg", "refusing to remove shared rules root directory for empty tenant ID", "path", m.Path, "userID", userID)
+		return
+	}
 	err := m.FS.RemoveAll(dirPath)
 	if err != nil {
 		level.Warn(m.logger).Log("msg", "unable to remove user directory", "path", dirPath, "err", err)
@@ -75,6 +89,14 @@ func (m *mapper) MapRules(user string, ruleConfigs map[string][]rulefmt.RuleGrou
 
 	// user rule files will be stored as `/<path>/<userid>/<encoded filename>`
 	path := filepath.Join(m.Path, user)
+	// Defense-in-depth: refuse to operate on the shared rules root. An empty
+	// (or path-collapsing) user would make filepath.Join(m.Path, user) equal
+	// to the configured root path, letting one tenant's rule files leak into
+	// (and be deleted from) the shared directory holding every tenant's rules.
+	if filepath.Clean(path) == filepath.Clean(m.Path) {
+		level.Error(m.logger).Log("msg", "refusing to map rules onto shared rules root directory for empty tenant ID", "path", m.Path, "user", user)
+		return false, nil, errMapperEmptyUser
+	}
 	err := m.FS.MkdirAll(path, 0777)
 	if err != nil {
 		return false, nil, err

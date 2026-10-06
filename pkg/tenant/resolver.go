@@ -83,7 +83,7 @@ func (t *SingleResolver) TenantID(ctx context.Context) (string, error) {
 		return "", err
 	}
 
-	if containsUnsafePathSegments(id) {
+	if id == "" || containsUnsafePathSegments(id) {
 		return "", errInvalidTenantID
 	}
 
