@@ -76,6 +76,14 @@ type MultitenantAlertmanagerConfig struct {
 	FallbackConfigFile string `yaml:"fallback_config_file"`
 	AutoWebhookRoot    string `yaml:"auto_webhook_root"`
 
+	// MaxTenants is an optional upper bound on the number of per-tenant
+	// Alertmanagers this instance will create. 0 (the default) disables the
+	// limit. When exceeded, requests that would create a new per-tenant
+	// Alertmanager (either from the fallback-config auto-provisioning path or
+	// from a config written to the alert store) are rejected and the
+	// cortex_alertmanager_tenants_limit_exceeded_total counter is incremented.
+	MaxTenants int `yaml:"max_tenants"`
+
 	Cluster ClusterConfig `yaml:"cluster"`
 
 	EnableAPI bool `yaml:"enable_api"`
@@ -112,6 +120,7 @@ func (cfg *MultitenantAlertmanagerConfig) RegisterFlags(f *flag.FlagSet) {
 	f.StringVar(&cfg.FallbackConfigFile, "alertmanager.configs.fallback", "", "Filename of fallback config to use if none specified for instance.")
 	f.StringVar(&cfg.AutoWebhookRoot, "alertmanager.configs.auto-webhook-root", "", "Root of URL to generate if config is "+autoWebhookURL)
 	f.DurationVar(&cfg.PollInterval, "alertmanager.configs.poll-interval", 15*time.Second, "How frequently to poll Cortex configs")
+	f.IntVar(&cfg.MaxTenants, "alertmanager.max-tenants", 0, "Maximum number of per-tenant Alertmanagers this instance will create. Requests that would exceed this limit are rejected. 0 (default) disables the limit. This bounds the resources (goroutines, file descriptors, disk, object storage keys and metric cardinality) consumed per instance and in particular bounds the fallback-config auto-provisioning path which creates per-tenant state for any tenant ID asserted via X-Scope-OrgID.")
 
 	f.BoolVar(&cfg.EnableAPI, "experimental.alertmanager.enable-api", false, "Enable the experimental alertmanager config api.")
 
@@ -273,13 +282,14 @@ type MultitenantAlertmanager struct {
 	ringCheckErrors   prometheus.Counter
 	tenantsOwned      prometheus.Gauge
 	tenantsDiscovered prometheus.Gauge
+	tenantsLimitExceeded prometheus.Counter
 	syncTotal         *prometheus.CounterVec
 	syncFailures      *prometheus.CounterVec
 }
 
 // NewMultitenantAlertmanager creates a new MultitenantAlertmanager.
 func NewMultitenantAlertmanager(cfg *MultitenantAlertmanagerConfig, store alertstore.AlertStore, limits Limits, logger log.Logger, registerer prometheus.Registerer) (*MultitenantAlertmanager, error) {
-	err := os.MkdirAll(cfg.DataDir, 0777)
+	err := os.MkdirAll(cfg.DataDir, 0700)
 	if err != nil {
 		return nil, fmt.Errorf("unable to create Alertmanager data directory %q: %s", cfg.DataDir, err)
 	}
@@ -378,6 +388,10 @@ func createMultitenantAlertmanager(cfg *MultitenantAlertmanagerConfig, fallbackC
 		tenantsOwned: promauto.With(registerer).NewGauge(prometheus.GaugeOpts{
 			Name: "cortex_alertmanager_tenants_owned",
 			Help: "Current number of tenants owned by the Alertmanager instance.",
+		}),
+		tenantsLimitExceeded: promauto.With(registerer).NewCounter(prometheus.CounterOpts{
+			Name: "cortex_alertmanager_tenants_limit_exceeded_total",
+			Help: "Number of times a per-tenant Alertmanager was not created because the max-tenants limit was reached.",
 		}),
 	}
 
@@ -525,7 +539,7 @@ func (am *MultitenantAlertmanager) migrateStateFilesToPerTenantDirectories() err
 
 	for userID, files := range st {
 		tenantDir := am.getTenantDirectory(userID)
-		err := os.MkdirAll(tenantDir, 0777)
+		err := os.MkdirAll(tenantDir, 0700)
 		if err != nil {
 			return errors.Wrapf(err, "failed to create per-tenant directory %v", tenantDir)
 		}
@@ -900,6 +914,16 @@ func (am *MultitenantAlertmanager) setConfig(cfg alertspb.AlertConfigDesc) error
 
 	// If no Alertmanager instance exists for this user yet, start one.
 	if !hasExisting {
+		// Enforce the configured per-instance max-tenants limit before
+		// instantiating a new per-tenant Alertmanager. This bounds the
+		// amount of state (goroutines, file descriptors, disk, metric
+		// cardinality) consumed by this instance regardless of how the
+		// request reached setConfig (fallback path, API-driven config,
+		// store poll).
+		if am.cfg.MaxTenants > 0 && len(am.alertmanagers) >= am.cfg.MaxTenants {
+			am.tenantsLimitExceeded.Inc()
+			return fmt.Errorf("too many alertmanager tenants on this instance (max %d)", am.cfg.MaxTenants)
+		}
 		level.Debug(am.logger).Log("msg", "initializing new per-tenant alertmanager", "user", cfg.User)
 		newAM, err := am.newAlertmanager(cfg.User, userAmConfig, rawCfg)
 		if err != nil {
@@ -927,7 +951,11 @@ func (am *MultitenantAlertmanager) newAlertmanager(userID string, amConfig *amco
 	reg := prometheus.NewRegistry()
 
 	tenantDir := am.getTenantDirectory(userID)
-	err := os.MkdirAll(tenantDir, 0777)
+	// Create the per-tenant state directory with a restrictive mode so
+	// that a co-located process or sidecar sharing the volume cannot read
+	// or tamper with another tenant's notification log, silences snapshot
+	// or templates.
+	err := os.MkdirAll(tenantDir, 0700)
 	if err != nil {
 		return nil, errors.Wrapf(err, "failed to create per-tenant directory %v", tenantDir)
 	}
@@ -1040,16 +1068,39 @@ func (am *MultitenantAlertmanager) serveRequest(w http.ResponseWriter, req *http
 }
 
 func (am *MultitenantAlertmanager) alertmanagerFromFallbackConfig(userID string) (*Alertmanager, error) {
-	// Upload an empty config so that the Alertmanager is no de-activated in the next poll
-	cfgDesc := alertspb.ToProto("", nil, userID)
-	err := am.store.SetAlertConfig(context.Background(), cfgDesc)
-	if err != nil {
+	// Validate the tenant ID with the strict charset/length rules so an
+	// attacker cannot squat an unbounded set of invented tenant IDs via the
+	// fallback path (the ID is used as an on-disk directory name, object
+	// storage key and Prometheus label value).
+	if err := tenant.ValidTenantID(userID); err != nil {
 		return nil, err
 	}
 
-	// Calling setConfig with an empty configuration will use the fallback config.
-	err = am.setConfig(cfgDesc)
-	if err != nil {
+	// Enforce the configured per-instance max-tenants limit on the
+	// fallback-config auto-provisioning path. Without this limit a single
+	// cheap GET per invented tenant ID permanently consumes memory,
+	// goroutines, file descriptors, disk, object storage and metric
+	// cardinality on the replica.
+	if am.cfg.MaxTenants > 0 {
+		am.alertmanagersMtx.Lock()
+		count := len(am.alertmanagers)
+		am.alertmanagersMtx.Unlock()
+		if count >= am.cfg.MaxTenants {
+			am.tenantsLimitExceeded.Inc()
+			return nil, fmt.Errorf("too many alertmanager tenants on this instance (max %d)", am.cfg.MaxTenants)
+		}
+	}
+
+	// Build the per-tenant Alertmanager from the fallback configuration
+	// without persisting an empty config to the alert store. The previous
+	// behaviour of uploading an empty config object meant that every tenant
+	// ID asserted via X-Scope-OrgID was permanently registered in the alert
+	// store and would be re-created on every poll and restart - an
+	// amplification DoS whose damage survives restarts. The Alertmanager
+	// built here is ephemeral; if the user actually wants a persistent
+	// Alertmanager they must POST a config via /api/v1/alerts.
+	cfgDesc := alertspb.ToProto("", nil, userID)
+	if err := am.setConfig(cfgDesc); err != nil {
 		return nil, err
 	}
 
@@ -1339,7 +1390,7 @@ func safeTemplateFilepath(dir, templateName string) (string, error) {
 func storeTemplateFile(templateFilepath, content string) (bool, error) {
 	// Make sure the directory exists.
 	dir := filepath.Dir(templateFilepath)
-	err := os.MkdirAll(dir, 0755)
+	err := os.MkdirAll(dir, 0700)
 	if err != nil {
 		return false, fmt.Errorf("unable to create Alertmanager templates directory %q: %s", dir, err)
 	}
