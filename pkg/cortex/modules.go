@@ -590,7 +590,7 @@ func (t *Cortex) initConfig() (serv services.Service, err error) {
 		return
 	}
 
-	t.ConfigAPI = configAPI.New(t.ConfigDB, t.Cfg.Configs.API)
+	t.ConfigAPI = configAPI.NewWithAuth(t.ConfigDB, t.Cfg.Configs.API, t.API.AuthMiddleware)
 	t.ConfigAPI.RegisterRoutes(t.Server.HTTP)
 	return services.NewIdleService(nil, func(_ error) error {
 		t.ConfigDB.Close()

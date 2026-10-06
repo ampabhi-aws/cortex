@@ -10,6 +10,7 @@ import (
 	"io"
 	"mime"
 	"net/http"
+	"path/filepath"
 	"strconv"
 	"strings"
 
@@ -19,6 +20,7 @@ import (
 	"github.com/gorilla/mux"
 	amconfig "github.com/prometheus/alertmanager/config"
 	amtemplate "github.com/prometheus/alertmanager/template"
+	"github.com/weaveworks/common/middleware"
 
 	"github.com/cortexproject/cortex/pkg/configs/db"
 	"github.com/cortexproject/cortex/pkg/configs/userconfig"
@@ -54,13 +56,26 @@ type API struct {
 	http.Handler
 	db  db.DB
 	cfg Config
+
+	// authMiddleware wraps the tenant-scoped routes to enforce authentication
+	// (e.g. presence of the X-Scope-OrgID header). It is applied to every route
+	// that reads or writes a tenant configuration, so an unauthenticated caller
+	// cannot plant a configuration for an arbitrary tenant.
+	authMiddleware middleware.Interface
 }
 
 // New creates a new API
 func New(database db.DB, cfg Config) *API {
+	return NewWithAuth(database, cfg, nil)
+}
+
+// NewWithAuth creates a new API that applies the given middleware to every
+// tenant-scoped route. Pass nil to disable authentication (test-only).
+func NewWithAuth(database db.DB, cfg Config, auth middleware.Interface) *API {
 	a := &API{
-		db:  database,
-		cfg: cfg,
+		db:             database,
+		cfg:            cfg,
+		authMiddleware: auth,
 	}
 	r := mux.NewRouter()
 	a.RegisterRoutes(r)
@@ -86,24 +101,29 @@ func (a *API) RegisterRoutes(r *mux.Router) {
 	for _, route := range []struct {
 		name, method, path string
 		handler            http.HandlerFunc
+		auth               bool
 	}{
-		{"root", "GET", "/", a.admin},
+		{"root", "GET", "/", a.admin, false},
 		// Dedicated APIs for updating rules config. In the future, these *must*
 		// be used.
-		{"get_rules", "GET", "/api/prom/configs/rules", a.getConfig},
-		{"set_rules", "POST", "/api/prom/configs/rules", a.setConfig},
-		{"get_templates", "GET", "/api/prom/configs/templates", a.getConfig},
-		{"set_templates", "POST", "/api/prom/configs/templates", a.setConfig},
-		{"get_alertmanager_config", "GET", "/api/prom/configs/alertmanager", a.getConfig},
-		{"set_alertmanager_config", "POST", "/api/prom/configs/alertmanager", a.setConfig},
-		{"validate_alertmanager_config", "POST", "/api/prom/configs/alertmanager/validate", a.validateAlertmanagerConfig},
-		{"deactivate_config", "DELETE", "/api/prom/configs/deactivate", a.deactivateConfig},
-		{"restore_config", "POST", "/api/prom/configs/restore", a.restoreConfig},
+		{"get_rules", "GET", "/api/prom/configs/rules", a.getConfig, true},
+		{"set_rules", "POST", "/api/prom/configs/rules", a.setConfig, true},
+		{"get_templates", "GET", "/api/prom/configs/templates", a.getConfig, true},
+		{"set_templates", "POST", "/api/prom/configs/templates", a.setConfig, true},
+		{"get_alertmanager_config", "GET", "/api/prom/configs/alertmanager", a.getConfig, true},
+		{"set_alertmanager_config", "POST", "/api/prom/configs/alertmanager", a.setConfig, true},
+		{"validate_alertmanager_config", "POST", "/api/prom/configs/alertmanager/validate", a.validateAlertmanagerConfig, true},
+		{"deactivate_config", "DELETE", "/api/prom/configs/deactivate", a.deactivateConfig, true},
+		{"restore_config", "POST", "/api/prom/configs/restore", a.restoreConfig, true},
 		// Internal APIs.
-		{"private_get_rules", "GET", "/private/api/prom/configs/rules", a.getConfigs},
-		{"private_get_alertmanager_config", "GET", "/private/api/prom/configs/alertmanager", a.getConfigs},
+		{"private_get_rules", "GET", "/private/api/prom/configs/rules", a.getConfigs, false},
+		{"private_get_alertmanager_config", "GET", "/private/api/prom/configs/alertmanager", a.getConfigs, false},
 	} {
-		r.Handle(route.path, route.handler).Methods(route.method).Name(route.name)
+		var handler http.Handler = route.handler
+		if route.auth && a.authMiddleware != nil {
+			handler = a.authMiddleware.Wrap(handler)
+		}
+		r.Handle(route.path, handler).Methods(route.method).Name(route.name)
 	}
 }
 
@@ -249,11 +269,35 @@ func validateRulesFiles(c userconfig.Config) error {
 
 func validateTemplateFiles(c userconfig.Config) error {
 	for fn, content := range c.TemplateFiles {
+		if err := validateTemplateFilename(fn); err != nil {
+			return err
+		}
 		if _, err := template.New(fn).Funcs(template.FuncMap(amtemplate.DefaultFuncs)).Parse(content); err != nil {
 			return err
 		}
 	}
 
+	return nil
+}
+
+// validateTemplateFilename rejects template filenames containing any path
+// component. A template filename with a path separator or a traversal
+// component can leave non-removable sub-directories under the per-tenant
+// Alertmanager data directory and permanently drive a config-reload loop
+// (see pkg/alertmanager/multitenant.go setConfig).
+func validateTemplateFilename(filename string) error {
+	if filename == "" {
+		return fmt.Errorf("invalid template name: the template name cannot be empty")
+	}
+	if strings.ContainsRune(filename, '/') || strings.ContainsRune(filename, filepath.Separator) {
+		return fmt.Errorf("invalid template name %q: the template name cannot contain any path", filename)
+	}
+	if filepath.Base(filename) != filename {
+		return fmt.Errorf("invalid template name %q: the template name cannot contain any path", filename)
+	}
+	if filepath.Dir(filepath.Clean(filename)) != "." {
+		return fmt.Errorf("invalid template name %q: the template name cannot contain any path", filename)
+	}
 	return nil
 }
 
