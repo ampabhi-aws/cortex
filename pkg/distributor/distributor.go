@@ -489,6 +489,19 @@ func (d *Distributor) checkSample(ctx context.Context, userID, cluster, replica 
 		return false, nil
 	}
 
+	// The cluster label value is retained on the heap (as a KV key, as a metric
+	// label on several metric vectors and as a key in in-memory maps) long after
+	// the request is served. If it is too long or not a valid Prometheus label
+	// value, don't use it for HA tracking: accept the sample so it still goes
+	// through normal label validation, but skip the HA tracker so an untrusted
+	// caller cannot grow distributor memory, /metrics cardinality or the shared
+	// KV store without bound. See
+	// https://github.com/cortexproject/cortex Continuum finding
+	// "Unvalidated HA cluster label".
+	if len(cluster) > d.limits.MaxLabelValueLength(userID) || !model.LabelValue(cluster).IsValid() {
+		return false, nil
+	}
+
 	// At this point we know we have both HA labels, we should lookup
 	// the cluster/instance here to see if we want to accept this sample.
 	err := d.HATracker.checkReplica(ctx, userID, cluster, replica, time.Now())
