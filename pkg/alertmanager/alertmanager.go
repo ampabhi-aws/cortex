@@ -491,12 +491,21 @@ func buildReceiverIntegrations(nc *config.Receiver, tmpl *template.Template, fir
 	httpOps := []commoncfg.HTTPClientOption{
 		commoncfg.WithDialContextFunc(firewallDialer.DialContext),
 	}
+	// The email integration does not take HTTPClientOptions. We instead
+	// pass the firewall dialer directly (via a locally vendored email.Option)
+	// so that both the plain-TCP and port-465 implicit-TLS code paths honour
+	// the receivers firewall (-alertmanager.receivers-firewall-block-*).
+	// Without this, tenant-controlled smarthost values could be dialed with a
+	// bare net.Dialer / tls.Dial and reach loopback/RFC1918/link-local hosts.
+	emailOps := []email.Option{
+		email.WithDialContextFunc(firewallDialer.DialContext),
+	}
 
 	for i, c := range nc.WebhookConfigs {
 		add("webhook", i, c, func(l log.Logger) (notify.Notifier, error) { return webhook.New(c, tmpl, l, httpOps...) })
 	}
 	for i, c := range nc.EmailConfigs {
-		add("email", i, c, func(l log.Logger) (notify.Notifier, error) { return email.New(c, tmpl, l), nil })
+		add("email", i, c, func(l log.Logger) (notify.Notifier, error) { return email.New(c, tmpl, l, emailOps...), nil })
 	}
 	for i, c := range nc.PagerdutyConfigs {
 		add("pagerduty", i, c, func(l log.Logger) (notify.Notifier, error) { return pagerduty.New(c, tmpl, l, httpOps...) })
