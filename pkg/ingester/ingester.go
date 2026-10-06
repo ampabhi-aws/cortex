@@ -127,7 +127,7 @@ func (cfg *Config) RegisterFlags(f *flag.FlagSet) {
 	f.DurationVar(&cfg.ActiveSeriesMetricsIdleTimeout, "ingester.active-series-metrics-idle-timeout", 10*time.Minute, "After what time a series is considered to be inactive.")
 
 	f.Float64Var(&cfg.DefaultLimits.MaxIngestionRate, "ingester.instance-limits.max-ingestion-rate", 0, "Max ingestion rate (samples/sec) that ingester will accept. This limit is per-ingester, not per-tenant. Additional push requests will be rejected. Current ingestion rate is computed as exponentially weighted moving average, updated every second. This limit only works when using blocks engine. 0 = unlimited.")
-	f.Int64Var(&cfg.DefaultLimits.MaxInMemoryTenants, "ingester.instance-limits.max-tenants", 0, "Max users that this ingester can hold. Requests from additional users will be rejected. This limit only works when using blocks engine. 0 = unlimited.")
+	f.Int64Var(&cfg.DefaultLimits.MaxInMemoryTenants, "ingester.instance-limits.max-tenants", 0, "Max users that this ingester can hold. Requests from additional users will be rejected. This limit only works when using blocks engine. 0 uses the fail-closed built-in default (10000); set to a negative value to disable the cap.")
 	f.Int64Var(&cfg.DefaultLimits.MaxInMemorySeries, "ingester.instance-limits.max-series", 0, "Max series that this ingester can hold (across all tenants). Requests to create additional series will be rejected. This limit only works when using blocks engine. 0 = unlimited.")
 	f.Int64Var(&cfg.DefaultLimits.MaxInflightPushRequests, "ingester.instance-limits.max-inflight-push-requests", 0, "Max inflight push requests that this ingester can handle (across all tenants). Additional requests will be rejected. 0 = unlimited.")
 
@@ -1782,9 +1782,25 @@ func (i *Ingester) getOrCreateTSDB(userID string, force bool) (*userTSDB, error)
 	}
 
 	gl := i.getInstanceLimits()
-	if gl != nil && gl.MaxInMemoryTenants > 0 {
-		if users := int64(len(i.TSDBState.dbs)); users >= gl.MaxInMemoryTenants {
-			return nil, errMaxUsersLimitReached
+	// Fail-closed cap on the number of distinct tenants held in memory by this
+	// ingester. Even when the operator leaves -ingester.instance-limits.max-tenants
+	// at its 0 default we still apply the built-in defaultMaxInMemoryTenants so
+	// that a caller able to assert an arbitrary X-Scope-OrgID cannot allocate
+	// unbounded per-tenant TSDBs. gl is nil during startup (WAL replay), in
+	// which case we skip the check so openExistingTSDB can reopen all pre-
+	// existing tenant directories. A negative configured value disables the cap.
+	if gl != nil {
+		maxTenants := defaultMaxInMemoryTenants
+		switch {
+		case gl.MaxInMemoryTenants > 0:
+			maxTenants = gl.MaxInMemoryTenants
+		case gl.MaxInMemoryTenants < 0:
+			maxTenants = 0 // operator opt-out
+		}
+		if maxTenants > 0 {
+			if users := int64(len(i.TSDBState.dbs)); users >= maxTenants {
+				return nil, errMaxUsersLimitReached
+			}
 		}
 	}
 
