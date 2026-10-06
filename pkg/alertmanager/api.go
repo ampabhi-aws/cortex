@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
 	"os"
 	"path/filepath"
@@ -21,6 +22,7 @@ import (
 	"github.com/cortexproject/cortex/pkg/tenant"
 	"github.com/cortexproject/cortex/pkg/util"
 	"github.com/cortexproject/cortex/pkg/util/concurrency"
+	"github.com/cortexproject/cortex/pkg/util/flagext"
 	util_log "github.com/cortexproject/cortex/pkg/util/log"
 )
 
@@ -45,6 +47,7 @@ var (
 	errTLSFileNotAllowed             = errors.New("setting TLS ca_file, cert_file and key_file is not allowed")
 	errSlackAPIURLFileNotAllowed     = errors.New("setting Slack api_url_file and global slack_api_url_file is not allowed")
 	errVictorOpsAPIKeyFileNotAllowed = errors.New("setting VictorOps api_key_file is not allowed")
+	errEmailSmarthostNotAllowed      = errors.New("the configured email smarthost is not allowed by the receivers firewall")
 )
 
 // UserConfig is used to communicate a users alertmanager configs
@@ -187,6 +190,16 @@ func validateUserConfig(logger log.Logger, cfg alertspb.AlertConfigDesc, limits 
 
 	// Validate the config recursively scanning it.
 	if err := validateAlertmanagerConfig(amCfg); err != nil {
+		return err
+	}
+
+	// Validate email smarthosts against the receivers firewall. This is a
+	// best-effort defence in depth: the authoritative enforcement happens at
+	// dial time in the (vendored) email notifier via firewallDialer, which
+	// cannot be bypassed by DNS rebinding. Rejecting obviously blocked
+	// smarthost values here lets tenants discover the problem at config
+	// upload time rather than at notification time.
+	if err := validateEmailConfigs(amCfg, limits, user); err != nil {
 		return err
 	}
 
@@ -448,4 +461,101 @@ func validateVictorOpsConfig(cfg config.VictorOpsConfig) error {
 		return errVictorOpsAPIKeyFileNotAllowed
 	}
 	return nil
+}
+
+// validateEmailConfigs walks all email receivers in the alertmanager config
+// and rejects any whose smarthost resolves to an address blocked by the
+// per-tenant receivers firewall. This closes a gap in validateAlertmanagerConfig
+// where EmailConfig had no case in the type switch, letting tenants point the
+// shared Alertmanager at loopback/RFC1918/link-local hosts (CWE-918).
+//
+// This is defence in depth: the vendored email notifier is also wired to the
+// FirewallDialer at dial time (see pkg/alertmanager/alertmanager.go), which is
+// the authoritative control and is resistant to DNS rebinding.
+func validateEmailConfigs(amCfg *config.Config, limits Limits, user string) error {
+	if amCfg == nil || limits == nil {
+		return nil
+	}
+	blockPrivate := limits.AlertmanagerReceiversBlockPrivateAddresses(user)
+	blockCIDRs := limits.AlertmanagerReceiversBlockCIDRNetworks(user)
+	// Fast path: when the firewall is disabled for this tenant there is
+	// nothing to enforce, so skip DNS resolution entirely.
+	if !blockPrivate && len(blockCIDRs) == 0 {
+		return nil
+	}
+	for _, rcv := range amCfg.Receivers {
+		for _, ec := range rcv.EmailConfigs {
+			if ec == nil {
+				continue
+			}
+			if err := validateEmailSmarthost(ec.Smarthost, blockPrivate, blockCIDRs); err != nil {
+				return err
+			}
+		}
+	}
+	// Also check the global smarthost if set, since receivers inherit it.
+	if amCfg.Global != nil {
+		if err := validateEmailSmarthost(amCfg.Global.SMTPSmarthost, blockPrivate, blockCIDRs); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// validateEmailSmarthost returns errEmailSmarthostNotAllowed when any IP that
+// smarthost.Host resolves to is blocked by the receivers firewall. An empty
+// host (nothing configured) and a bare IP literal are both handled. DNS
+// lookup failures are not treated as a validation failure since the smarthost
+// may be reachable at delivery time; the firewall dialer remains the
+// authoritative guard.
+func validateEmailSmarthost(hp config.HostPort, blockPrivate bool, blockCIDRs []flagext.CIDR) error {
+	if hp.Host == "" {
+		return nil
+	}
+	var ips []net.IP
+	if literal := net.ParseIP(hp.Host); literal != nil {
+		ips = []net.IP{literal}
+	} else {
+		resolved, err := net.LookupIP(hp.Host)
+		if err != nil {
+			// Can't resolve now; let the firewall dialer decide at delivery time.
+			return nil
+		}
+		ips = resolved
+	}
+	for _, ip := range ips {
+		if isBlockedByReceiversFirewall(ip, blockPrivate, blockCIDRs) {
+			return errEmailSmarthostNotAllowed
+		}
+	}
+	return nil
+}
+
+// isBlockedByReceiversFirewall mirrors the logic of util_net.FirewallDialer.control
+// but operates on an already-resolved IP so it can be used at config-validation time.
+func isBlockedByReceiversFirewall(ip net.IP, blockPrivate bool, blockCIDRs []flagext.CIDR) bool {
+	if blockPrivate && (isReceiverFirewallPrivate(ip) || isReceiverFirewallLocal(ip)) {
+		return true
+	}
+	for _, cidr := range blockCIDRs {
+		if cidr.Value.Contains(ip) {
+			return true
+		}
+	}
+	return false
+}
+
+func isReceiverFirewallLocal(ip net.IP) bool {
+	return ip.IsLoopback() || ip.IsLinkLocalUnicast() || ip.IsLinkLocalMulticast()
+}
+
+// isReceiverFirewallPrivate reports whether ip is a private address, matching
+// util_net.FirewallDialer's definition (RFC 1918 + RFC 4193).
+func isReceiverFirewallPrivate(ip net.IP) bool {
+	if ip4 := ip.To4(); ip4 != nil {
+		return ip4[0] == 10 ||
+			(ip4[0] == 172 && ip4[1]&0xf0 == 16) ||
+			(ip4[0] == 192 && ip4[1] == 168)
+	}
+	return len(ip) == net.IPv6len && ip[0]&0xfe == 0xfc
 }
