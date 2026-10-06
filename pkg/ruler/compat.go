@@ -136,6 +136,13 @@ type RulesLimits interface {
 	RulerTenantShardSize(userID string) int
 	RulerMaxRuleGroupsPerTenant(userID string) int
 	RulerMaxRulesPerRuleGroup(userID string) int
+	// RulerMinRuleEvaluationInterval is the minimum allowed per-group evaluation
+	// interval. Returning 0 disables the floor.
+	RulerMinRuleEvaluationInterval(userID string) time.Duration
+	// RulerMaxConcurrentRuleEvaluationsPerUser bounds how many of this ruler's
+	// PromQL engine slots a single tenant can hold at any given time. Returning
+	// 0 or a negative value disables the per-tenant bound.
+	RulerMaxConcurrentRuleEvaluationsPerUser(userID string) int
 }
 
 // EngineQueryFunc returns a new query function using the rules.EngineQueryFunc function
@@ -209,6 +216,31 @@ func RecordAndReportRuleQueryMetrics(qf rules.QueryFunc, queryTime prometheus.Co
 	}
 }
 
+// TenantConcurrencyQueryFunc wraps a rules.QueryFunc with a per-tenant
+// concurrency bound. It ensures that no single tenant can hold more than
+// maxConcurrent evaluation slots on the shared PromQL engine, preventing
+// one tenant from starving co-tenants' rule evaluations with a flood of
+// expensive queries (e.g. many short-interval rule groups whose templated
+// annotations trigger nested PromQL queries).
+//
+// When maxConcurrent <= 0 the per-tenant bound is disabled and qf is
+// returned unwrapped.
+func TenantConcurrencyQueryFunc(qf rules.QueryFunc, maxConcurrent int) rules.QueryFunc {
+	if maxConcurrent <= 0 {
+		return qf
+	}
+	sem := make(chan struct{}, maxConcurrent)
+	return func(ctx context.Context, qs string, t time.Time) (promql.Vector, error) {
+		select {
+		case sem <- struct{}{}:
+			defer func() { <-sem }()
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		}
+		return qf(ctx, qs, t)
+	}
+}
+
 // This interface mimicks rules.Manager API. Interface is used to simplify tests.
 type RulesManager interface {
 	// Starts rules manager. Blocks until Stop is called.
@@ -264,10 +296,22 @@ func DefaultTenantManagerFactory(cfg Config, p Pusher, q storage.Queryable, engi
 			queryTime = rulerQuerySeconds.WithLabelValues(userID)
 		}
 
+		// Compose the per-tenant query function. The chain is applied
+		// outside-in: tenant concurrency bound -> query-stats accounting ->
+		// error/metric accounting -> PromQL engine (with evaluation delay).
+		// The outermost TenantConcurrencyQueryFunc ensures a single tenant
+		// cannot occupy all of the shared engine's ActiveQueryTracker slots
+		// and starve other tenants' rule evaluations.
+		baseQF := MetricsQueryFunc(EngineQueryFunc(engine, q, overrides, userID), totalQueries, failedQueries)
+		queryFunc := TenantConcurrencyQueryFunc(
+			RecordAndReportRuleQueryMetrics(baseQF, queryTime, logger),
+			overrides.RulerMaxConcurrentRuleEvaluationsPerUser(userID),
+		)
+
 		return rules.NewManager(&rules.ManagerOptions{
 			Appendable:      NewPusherAppendable(p, userID, overrides, totalWrites, failedWrites),
 			Queryable:       q,
-			QueryFunc:       RecordAndReportRuleQueryMetrics(MetricsQueryFunc(EngineQueryFunc(engine, q, overrides, userID), totalQueries, failedQueries), queryTime, logger),
+			QueryFunc:       queryFunc,
 			Context:         user.InjectOrgID(ctx, userID),
 			ExternalURL:     cfg.ExternalURL.URL,
 			NotifyFunc:      SendAlerts(notifier, cfg.ExternalURL.URL.String()),
