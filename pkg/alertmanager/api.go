@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
 	"os"
 	"path/filepath"
@@ -21,6 +22,7 @@ import (
 	"github.com/cortexproject/cortex/pkg/tenant"
 	"github.com/cortexproject/cortex/pkg/util"
 	"github.com/cortexproject/cortex/pkg/util/concurrency"
+	"github.com/cortexproject/cortex/pkg/util/flagext"
 	util_log "github.com/cortexproject/cortex/pkg/util/log"
 )
 
@@ -45,6 +47,8 @@ var (
 	errTLSFileNotAllowed             = errors.New("setting TLS ca_file, cert_file and key_file is not allowed")
 	errSlackAPIURLFileNotAllowed     = errors.New("setting Slack api_url_file and global slack_api_url_file is not allowed")
 	errVictorOpsAPIKeyFileNotAllowed = errors.New("setting VictorOps api_key_file is not allowed")
+	errEmailSmarthostBlocked         = errors.New("email smarthost resolves to an address blocked by the Alertmanager receiver firewall")
+	errEmailSmarthostUnresolvable    = errors.New("email smarthost cannot be resolved")
 )
 
 // UserConfig is used to communicate a users alertmanager configs
@@ -186,7 +190,7 @@ func validateUserConfig(logger log.Logger, cfg alertspb.AlertConfigDesc, limits 
 	}
 
 	// Validate the config recursively scanning it.
-	if err := validateAlertmanagerConfig(amCfg); err != nil {
+	if err := validateAlertmanagerConfig(amCfg, newEmailSmarthostValidator(limits, user)); err != nil {
 		return err
 	}
 
@@ -304,10 +308,92 @@ func (am *MultitenantAlertmanager) ListAllConfigs(w http.ResponseWriter, r *http
 	<-done
 }
 
+// smarthostValidator validates an SMTP smarthost against the per-tenant
+// Alertmanager receiver firewall. It returns nil (no-op) when the firewall is
+// not configured for the tenant so that default deployments keep working.
+type smarthostValidator func(hostPort config.HostPort) error
+
+// newEmailSmarthostValidator returns a smarthostValidator that resolves the
+// smarthost host at upload time and rejects configurations whose smarthost
+// maps to a blocked CIDR, a private address, or a loopback/link-local address
+// when the operator has enabled the receiver firewall for the tenant.
+//
+// Validation alone cannot defeat DNS rebinding; it is combined with a dialer
+// level Control hook (see pkg/util/net/firewall_dialer.go and the email
+// notifier's WithDialer option) which runs post-DNS-resolution, pre-connect.
+func newEmailSmarthostValidator(limits Limits, user string) smarthostValidator {
+	if limits == nil {
+		return nil
+	}
+	blockPrivate := limits.AlertmanagerReceiversBlockPrivateAddresses(user)
+	blockCIDRs := limits.AlertmanagerReceiversBlockCIDRNetworks(user)
+	if !blockPrivate && len(blockCIDRs) == 0 {
+		// No firewall configured for this tenant: preserve existing behaviour.
+		return nil
+	}
+	return func(hp config.HostPort) error {
+		if hp.Host == "" {
+			return nil
+		}
+		ips, err := resolveHost(hp.Host)
+		if err != nil {
+			return errors.Wrap(errEmailSmarthostUnresolvable, hp.Host)
+		}
+		for _, ip := range ips {
+			if isSmarthostAddressBlocked(ip, blockPrivate, blockCIDRs) {
+				return errors.Wrapf(errEmailSmarthostBlocked, "%s -> %s", hp.Host, ip.String())
+			}
+		}
+		return nil
+	}
+}
+
+// resolveHost returns the IPs for host. If host is already a literal IP, it is
+// returned unchanged. Overridden in tests to avoid DNS.
+var resolveHost = func(host string) ([]net.IP, error) {
+	if ip := net.ParseIP(host); ip != nil {
+		return []net.IP{ip}, nil
+	}
+	addrs, err := net.LookupIP(host)
+	if err != nil {
+		return nil, err
+	}
+	return addrs, nil
+}
+
+func isSmarthostAddressBlocked(ip net.IP, blockPrivate bool, blockCIDRs []flagext.CIDR) bool {
+	if blockPrivate && (isPrivateIP(ip) || ip.IsLoopback() || ip.IsLinkLocalUnicast() || ip.IsLinkLocalMulticast() || ip.IsUnspecified()) {
+		return true
+	}
+	for _, cidr := range blockCIDRs {
+		if cidr.Value.Contains(ip) {
+			return true
+		}
+	}
+	return false
+}
+
+// isPrivateIP mirrors pkg/util/net/firewall_dialer.go so validation and the
+// dialer-level firewall stay in sync for the subset of addresses we can
+// resolve at upload time.
+func isPrivateIP(ip net.IP) bool {
+	if ip4 := ip.To4(); ip4 != nil {
+		return ip4[0] == 10 ||
+			(ip4[0] == 172 && ip4[1]&0xf0 == 16) ||
+			(ip4[0] == 192 && ip4[1] == 168)
+	}
+	return len(ip) == net.IPv6len && ip[0]&0xfe == 0xfc
+}
+
 // validateAlertmanagerConfig recursively scans the input config looking for data types for which
 // we have a specific validation and, whenever encountered, it runs their validation. Returns the
 // first error or nil if validation succeeds.
-func validateAlertmanagerConfig(cfg interface{}) error {
+//
+// validateEmailSmarthost, when non-nil, is additionally invoked for every
+// EmailConfig.Smarthost and GlobalConfig.SMTPSmarthost encountered in the
+// config tree. It is used to enforce the receiver firewall for email
+// (SSRF defense-in-depth).
+func validateAlertmanagerConfig(cfg interface{}, validateEmailSmarthost smarthostValidator) error {
 	v := reflect.ValueOf(cfg)
 	t := v.Type()
 
@@ -327,8 +413,22 @@ func validateAlertmanagerConfig(cfg interface{}) error {
 	// At this point the value can't be a pointer anymore.
 	switch t {
 	case reflect.TypeOf(config.GlobalConfig{}):
-		if err := validateGlobalConfig(v.Interface().(config.GlobalConfig)); err != nil {
+		gc := v.Interface().(config.GlobalConfig)
+		if err := validateGlobalConfig(gc); err != nil {
 			return err
+		}
+		if validateEmailSmarthost != nil {
+			if err := validateEmailSmarthost(gc.SMTPSmarthost); err != nil {
+				return err
+			}
+		}
+
+	case reflect.TypeOf(config.EmailConfig{}):
+		ec := v.Interface().(config.EmailConfig)
+		if validateEmailSmarthost != nil {
+			if err := validateEmailSmarthost(ec.Smarthost); err != nil {
+				return err
+			}
 		}
 
 	case reflect.TypeOf(commoncfg.HTTPClientConfig{}):
@@ -360,7 +460,7 @@ func validateAlertmanagerConfig(cfg interface{}) error {
 
 			// Skip any field value which can't be converted to interface (eg. primitive types).
 			if fieldValue.CanInterface() {
-				if err := validateAlertmanagerConfig(fieldValue.Interface()); err != nil {
+				if err := validateAlertmanagerConfig(fieldValue.Interface(), validateEmailSmarthost); err != nil {
 					return err
 				}
 			}
@@ -373,7 +473,7 @@ func validateAlertmanagerConfig(cfg interface{}) error {
 
 			// Skip any field value which can't be converted to interface (eg. primitive types).
 			if fieldValue.CanInterface() {
-				if err := validateAlertmanagerConfig(fieldValue.Interface()); err != nil {
+				if err := validateAlertmanagerConfig(fieldValue.Interface(), validateEmailSmarthost); err != nil {
 					return err
 				}
 			}
@@ -386,7 +486,7 @@ func validateAlertmanagerConfig(cfg interface{}) error {
 
 			// Skip any field value which can't be converted to interface (eg. primitive types).
 			if fieldValue.CanInterface() {
-				if err := validateAlertmanagerConfig(fieldValue.Interface()); err != nil {
+				if err := validateAlertmanagerConfig(fieldValue.Interface(), validateEmailSmarthost); err != nil {
 					return err
 				}
 			}

@@ -47,10 +47,28 @@ type Email struct {
 	tmpl     *template.Template
 	logger   log.Logger
 	hostname string
+	// dialer, when non-nil, is used to establish the TCP connection to the
+	// smarthost. This allows callers (eg. Cortex) to install a net.Dialer
+	// with a Control hook that performs an SSRF firewall check on the
+	// resolved IP, both for plain SMTP and for implicit-TLS (port 465).
+	dialer *net.Dialer
+}
+
+// Option configures an Email notifier.
+type Option func(*Email)
+
+// WithDialer configures the Email notifier to use the given *net.Dialer when
+// establishing the TCP connection to the smarthost. The dialer's Control hook
+// (if any) will run post-DNS-resolution and pre-connect, which is the only
+// DNS-rebinding-safe place to enforce an egress firewall for SMTP.
+func WithDialer(d *net.Dialer) Option {
+	return func(e *Email) {
+		e.dialer = d
+	}
 }
 
 // New returns a new Email notifier.
-func New(c *config.EmailConfig, t *template.Template, l log.Logger) *Email {
+func New(c *config.EmailConfig, t *template.Template, l log.Logger, opts ...Option) *Email {
 	if _, ok := c.Headers["Subject"]; !ok {
 		c.Headers["Subject"] = config.DefaultEmailSubject
 	}
@@ -66,7 +84,11 @@ func New(c *config.EmailConfig, t *template.Template, l log.Logger) *Email {
 	if err != nil {
 		h = "localhost.localdomain"
 	}
-	return &Email{conf: c, tmpl: t, logger: l, hostname: h}
+	e := &Email{conf: c, tmpl: t, logger: l, hostname: h}
+	for _, opt := range opts {
+		opt(e)
+	}
+	return e
 }
 
 // auth resolves a string of authentication mechanisms.
@@ -122,6 +144,14 @@ func (n *Email) Notify(ctx context.Context, as ...*types.Alert) (bool, error) {
 		err     error
 		success = false
 	)
+	// Use the configured dialer (which may install a firewall Control hook)
+	// when provided; otherwise fall back to a zero-value net.Dialer. The same
+	// dialer is used for implicit-TLS (port 465) so that the Control hook
+	// runs post-resolution, pre-connect, before any TLS handshake.
+	d := n.dialer
+	if d == nil {
+		d = &net.Dialer{}
+	}
 	if n.conf.Smarthost.Port == "465" {
 		tlsConfig, err := commoncfg.NewTLSConfig(&n.conf.TLSConfig)
 		if err != nil {
@@ -131,15 +161,18 @@ func (n *Email) Notify(ctx context.Context, as ...*types.Alert) (bool, error) {
 			tlsConfig.ServerName = n.conf.Smarthost.Host
 		}
 
-		conn, err = tls.Dial("tcp", n.conf.Smarthost.String(), tlsConfig)
+		rawConn, err := d.DialContext(ctx, "tcp", n.conf.Smarthost.String())
 		if err != nil {
+			return true, errors.Wrap(err, "establish connection to server")
+		}
+		tlsConn := tls.Client(rawConn, tlsConfig)
+		if err := tlsConn.HandshakeContext(ctx); err != nil {
+			rawConn.Close()
 			return true, errors.Wrap(err, "establish TLS connection to server")
 		}
+		conn = tlsConn
 	} else {
-		var (
-			d   = net.Dialer{}
-			err error
-		)
+		var err error
 		conn, err = d.DialContext(ctx, "tcp", n.conf.Smarthost.String())
 		if err != nil {
 			return true, errors.Wrap(err, "establish connection to server")
