@@ -1114,7 +1114,7 @@ func TestResultsCacheMaxFreshness(t *testing.T) {
 
 			// fill cache
 			key := constSplitter(day).GenerateCacheKey("1", req)
-			rc.(*resultsCache).put(ctx, key, []Extent{mkExtent(int64(modelNow)-(600*1e3), int64(modelNow))})
+			rc.(*resultsCache).put(ctx, "1", key, []Extent{mkExtent(int64(modelNow)-(600*1e3), int64(modelNow))})
 
 			resp, err := rc.Do(ctx, req)
 			require.NoError(t, err)
@@ -1145,27 +1145,27 @@ func Test_resultsCache_MissingData(t *testing.T) {
 	ctx := context.Background()
 
 	// fill up the cache
-	rc.put(ctx, "empty", []Extent{{
+	rc.put(ctx, "1", "empty", []Extent{{
 		Start:    100,
 		End:      200,
 		Response: nil,
 	}})
-	rc.put(ctx, "notempty", []Extent{mkExtent(100, 120)})
-	rc.put(ctx, "mixed", []Extent{mkExtent(100, 120), {
+	rc.put(ctx, "1", "notempty", []Extent{mkExtent(100, 120)})
+	rc.put(ctx, "1", "mixed", []Extent{mkExtent(100, 120), {
 		Start:    120,
 		End:      200,
 		Response: nil,
 	}})
 
-	extents, hit := rc.get(ctx, "empty")
+	extents, hit := rc.get(ctx, "1", "empty")
 	require.Empty(t, extents)
 	require.False(t, hit)
 
-	extents, hit = rc.get(ctx, "notempty")
+	extents, hit = rc.get(ctx, "1", "notempty")
 	require.Equal(t, len(extents), 1)
 	require.True(t, hit)
 
-	extents, hit = rc.get(ctx, "mixed")
+	extents, hit = rc.get(ctx, "1", "mixed")
 	require.Equal(t, len(extents), 0)
 	require.False(t, hit)
 }

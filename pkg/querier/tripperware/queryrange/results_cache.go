@@ -249,7 +249,7 @@ func (s resultsCache) Do(ctx context.Context, r tripperware.Request) (tripperwar
 		return s.next.Do(ctx, r)
 	}
 
-	cached, ok := s.get(ctx, key)
+	cached, ok := s.get(ctx, tenant.JoinTenantIDs(tenantIDs), key)
 	if ok {
 		response, extents, err = s.handleHit(ctx, r, cached, maxCacheTime)
 	} else {
@@ -261,7 +261,7 @@ func (s resultsCache) Do(ctx context.Context, r tripperware.Request) (tripperwar
 		if err != nil {
 			return nil, err
 		}
-		s.put(ctx, key, extents)
+		s.put(ctx, tenant.JoinTenantIDs(tenantIDs), key, extents)
 	}
 
 	if err == nil && !respWithStats {
@@ -600,8 +600,19 @@ func (s resultsCache) filterRecentExtents(req tripperware.Request, maxCacheFresh
 	return extents, nil
 }
 
-func (s resultsCache) get(ctx context.Context, key string) ([]Extent, bool) {
-	found, bufs, _ := s.cache.Fetch(ctx, []string{cache.HashKey(key)})
+// backendKey returns the key used to address the underlying cache backend.
+//
+// The tenant identifier is kept in cleartext as a prefix so that a hash
+// collision in the digested portion can never cross a tenant boundary: even if
+// two tenants' logical keys produced identical digests, their backend keys
+// would still differ. This defends against a collision-induced cache
+// suppression primitive against another tenant's cached entries.
+func (s resultsCache) backendKey(userID, key string) string {
+	return userID + "/" + cache.HashKey(key)
+}
+
+func (s resultsCache) get(ctx context.Context, userID, key string) ([]Extent, bool) {
+	found, bufs, _ := s.cache.Fetch(ctx, []string{s.backendKey(userID, key)})
 	if len(found) != 1 {
 		return nil, false
 	}
@@ -632,7 +643,7 @@ func (s resultsCache) get(ctx context.Context, key string) ([]Extent, bool) {
 	return resp.Extents, true
 }
 
-func (s resultsCache) put(ctx context.Context, key string, extents []Extent) {
+func (s resultsCache) put(ctx context.Context, userID, key string, extents []Extent) {
 	buf, err := proto.Marshal(&CachedResponse{
 		Key:     key,
 		Extents: extents,
@@ -642,7 +653,7 @@ func (s resultsCache) put(ctx context.Context, key string, extents []Extent) {
 		return
 	}
 
-	s.cache.Store(ctx, []string{cache.HashKey(key)}, [][]byte{buf})
+	s.cache.Store(ctx, []string{s.backendKey(userID, key)}, [][]byte{buf})
 }
 
 func jaegerSpanID(ctx context.Context) string {

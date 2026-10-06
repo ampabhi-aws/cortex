@@ -2,9 +2,9 @@ package cache
 
 import (
 	"context"
+	"crypto/sha256"
 	"encoding/hex"
 	"flag"
-	"hash/fnv"
 	"sync"
 	"time"
 
@@ -265,10 +265,17 @@ func (c *Memcached) Stop() {
 }
 
 // HashKey hashes key into something you can store in memcached.
+//
+// The previous implementation used a 64-bit FNV-1a digest, which is a
+// non-cryptographic hash and is algebraically invertible, allowing a tenant to
+// cheaply compute colliding cache keys for another tenant's logical key. The
+// plaintext key is still re-verified by callers, so a collision only degrades
+// into a cache miss (never a cross-tenant data leak), but a weak hash lets a
+// tenant deliberately suppress another tenant's cached entries. Switching to a
+// truncated SHA-256 (128 bits, hex-encoded = 32 bytes, well within memcached's
+// 250-byte key limit) makes targeted collisions computationally infeasible.
 func HashKey(key string) string {
-	hasher := fnv.New64a()
-	_, _ = hasher.Write([]byte(key)) // This'll never error.
-
-	// Hex because memcache errors for the bytes produced by the hash.
-	return hex.EncodeToString(hasher.Sum(nil))
+	sum := sha256.Sum256([]byte(key))
+	// Hex because memcache errors for the raw bytes produced by the hash.
+	return hex.EncodeToString(sum[:16]) // 128-bit, collision-resistant
 }
