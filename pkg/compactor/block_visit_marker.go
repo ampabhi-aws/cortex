@@ -100,6 +100,18 @@ func markBlocksVisited(
 	reader := bytes.NewReader(visitMarkerFileContent)
 	for _, block := range blocks {
 		blockID := block.ULID.String()
+		// Do not resurrect blocks that have already been hard-deleted (e.g. their
+		// source objects were cleaned up after compaction completed). Writing a
+		// visit marker to a non-existent block would recreate the block directory
+		// as an orphan containing only visit-mark.json, which the partial-block
+		// cleaner cannot remove because it has no deletion-mark.json.
+		if ok, existsErr := bkt.Exists(ctx, path.Join(blockID, metadata.MetaFilename)); existsErr != nil || !ok {
+			if existsErr != nil {
+				level.Warn(logger).Log("msg", "unable to check block existence before updating visit marker", "blockID", blockID, "err", existsErr)
+			}
+			reader.Reset(visitMarkerFileContent)
+			continue
+		}
 		if err := UpdateBlockVisitMarker(ctx, bkt, blockID, reader, blockVisitMarkerWriteFailed); err != nil {
 			level.Error(logger).Log("msg", "unable to upsert visit marker file content for block", "blockID", blockID, "err", err)
 		}
