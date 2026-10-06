@@ -2,6 +2,7 @@ package api
 
 import (
 	"context"
+	"crypto/subtle"
 	"flag"
 	"net/http"
 	"path"
@@ -18,6 +19,7 @@ import (
 	"github.com/cortexproject/cortex/pkg/alertmanager"
 	"github.com/cortexproject/cortex/pkg/alertmanager/alertmanagerpb"
 	"github.com/cortexproject/cortex/pkg/compactor"
+	configAPI "github.com/cortexproject/cortex/pkg/configs/api"
 	"github.com/cortexproject/cortex/pkg/cortexpb"
 	"github.com/cortexproject/cortex/pkg/distributor"
 	"github.com/cortexproject/cortex/pkg/distributor/distributorpb"
@@ -48,6 +50,14 @@ type Config struct {
 	AlertmanagerHTTPPrefix string `yaml:"alertmanager_http_prefix"`
 	PrometheusHTTPPrefix   string `yaml:"prometheus_http_prefix"`
 
+	// AdminAPIAuthToken is a shared operator credential used to gate the
+	// all-tenant "admin" endpoints (e.g. the legacy configs module's
+	// /private/api/prom/configs/* routes). When empty, those endpoints are
+	// disabled rather than left open — the caller-supplied X-Scope-OrgID
+	// header checked by AuthMiddleware is not sufficient to protect
+	// cross-tenant data. Compared in constant time to avoid timing attacks.
+	AdminAPIAuthToken string `yaml:"admin_api_auth_token"`
+
 	// The following configs are injected by the upstream caller.
 	ServerPrefix       string               `yaml:"-"`
 	LegacyHTTPPrefix   string               `yaml:"-"`
@@ -71,6 +81,7 @@ type Config struct {
 func (cfg *Config) RegisterFlags(f *flag.FlagSet) {
 	f.BoolVar(&cfg.ResponseCompression, "api.response-compression-enabled", false, "Use GZIP compression for API responses. Some endpoints serve large YAML or JSON blobs which can benefit from compression.")
 	f.Var(&cfg.HTTPRequestHeadersToLog, "api.http-request-headers-to-log", "Which HTTP Request headers to add to logs")
+	f.StringVar(&cfg.AdminAPIAuthToken, "api.admin-api-auth-token", "", "Shared operator token required (in the 'Authorization: Bearer <token>' header, or the 'X-Admin-API-Token' header) to call all-tenant admin endpoints such as the legacy configs module's /private/api/prom/configs/* routes. When empty, those endpoints are disabled rather than exposed.")
 	cfg.RegisterFlagsWithPrefix("", f)
 }
 
@@ -322,6 +333,62 @@ func (a *API) RegisterRulerAPI(r *ruler.API) {
 	a.RegisterRoute(path.Join(a.cfg.LegacyHTTPPrefix, "/rules/{namespace}"), http.HandlerFunc(r.CreateRuleGroup), true, "POST")
 	a.RegisterRoute(path.Join(a.cfg.LegacyHTTPPrefix, "/rules/{namespace}/{groupName}"), http.HandlerFunc(r.DeleteRuleGroup), true, "DELETE")
 	a.RegisterRoute(path.Join(a.cfg.LegacyHTTPPrefix, "/rules/{namespace}"), http.HandlerFunc(r.DeleteNamespace), true, "DELETE")
+}
+
+// AdminOnly returns an HTTP handler that gates the wrapped handler behind
+// a shared operator credential (api.admin-api-auth-token), compared in
+// constant time to prevent token-recovery timing attacks.
+//
+// This is intended for all-tenant / cross-tenant administrative endpoints
+// where AuthMiddleware's X-Scope-OrgID check is not a meaningful control
+// because the handler ignores the tenant and returns data from every tenant.
+//
+// The credential is accepted either as a bearer token in the standard
+// Authorization header ("Authorization: Bearer <token>") or in the
+// X-Admin-API-Token header. When no token is configured the handler
+// returns 404 so the admin surface is not advertised to unauthenticated
+// callers.
+func (a *API) AdminOnly(h http.Handler) http.Handler {
+	expected := a.cfg.AdminAPIAuthToken
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if expected == "" {
+			http.Error(w, "admin API disabled: api.admin-api-auth-token is not configured", http.StatusNotFound)
+			return
+		}
+		provided := r.Header.Get("X-Admin-API-Token")
+		if provided == "" {
+			if auth := r.Header.Get("Authorization"); strings.HasPrefix(auth, "Bearer ") {
+				provided = strings.TrimPrefix(auth, "Bearer ")
+			}
+		}
+		if provided == "" {
+			w.Header().Set("WWW-Authenticate", `Bearer realm="cortex-admin"`)
+			http.Error(w, "missing admin API credential", http.StatusUnauthorized)
+			return
+		}
+		if subtle.ConstantTimeCompare([]byte(provided), []byte(expected)) != 1 {
+			http.Error(w, "invalid admin API credential", http.StatusForbidden)
+			return
+		}
+		h.ServeHTTP(w, r)
+	})
+}
+
+// RegisterConfigsAPI registers the (deprecated) configs module through
+// pkg/api so that per-route auth is actually applied. Tenant-scoped routes
+// go through AuthMiddleware (presence of X-Scope-OrgID); the all-tenant
+// "admin" routes under /private/api/prom/configs/* are additionally gated
+// by an operator credential via AdminOnly, since those handlers ignore the
+// request's tenant and would otherwise disclose every tenant's rules and
+// Alertmanager configuration (including receiver secrets) to anyone who
+// can set an X-Scope-OrgID header.
+func (a *API) RegisterConfigsAPI(c *configAPI.API) {
+	for _, r := range c.TenantRoutes() {
+		a.RegisterRoute(r.Path, r.Handler, true, r.Method)
+	}
+	for _, r := range c.AdminRoutes() {
+		a.RegisterRoute(r.Path, a.AdminOnly(r.Handler), true, r.Method)
+	}
 }
 
 // RegisterRing registers the ring UI page associated with the distributor for writes.
