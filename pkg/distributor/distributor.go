@@ -37,6 +37,7 @@ import (
 	"github.com/cortexproject/cortex/pkg/util/limiter"
 	util_log "github.com/cortexproject/cortex/pkg/util/log"
 	util_math "github.com/cortexproject/cortex/pkg/util/math"
+	"github.com/cortexproject/cortex/pkg/util/operator"
 	"github.com/cortexproject/cortex/pkg/util/services"
 	"github.com/cortexproject/cortex/pkg/util/validation"
 )
@@ -1206,7 +1207,14 @@ func (d *Distributor) AllUserStats(ctx context.Context) ([]UserIDStats, error) {
 	perUserTotals := make(map[string]UserStats)
 
 	req := &ingester_client.UserStatsRequest{}
-	ctx = user.InjectOrgID(ctx, "1") // fake: ingester insists on having an org ID
+	// Ingester.AllUserStats is an operator-only cross-tenant RPC. The ingester
+	// no longer trusts an arbitrary X-Scope-OrgID header for this method, so
+	// mark the outgoing call with the internal operator metadata. We still
+	// inject a placeholder org ID because the shared gRPC auth interceptor
+	// (ServerUserHeaderInterceptor) rejects calls without one; the ingester
+	// side ignores its value and relies on the operator marker instead.
+	ctx = operator.AppendOutgoing(ctx)
+	ctx = user.InjectOrgID(ctx, "1") // placeholder: auth interceptor requires an org ID; AllUserStats authorises via operator.AppendOutgoing
 	// Not using d.ForReplicationSet(), so we can fail after first error.
 	replicationSet, err := d.ingestersRing.GetAllHealthy(ring.Read)
 	if err != nil {

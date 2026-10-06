@@ -48,6 +48,7 @@ import (
 	"github.com/cortexproject/cortex/pkg/util/extract"
 	logutil "github.com/cortexproject/cortex/pkg/util/log"
 	util_math "github.com/cortexproject/cortex/pkg/util/math"
+	"github.com/cortexproject/cortex/pkg/util/operator"
 	"github.com/cortexproject/cortex/pkg/util/services"
 	"github.com/cortexproject/cortex/pkg/util/spanlogger"
 	"github.com/cortexproject/cortex/pkg/util/validation"
@@ -1557,9 +1558,26 @@ func (i *Ingester) UserStats(ctx context.Context, req *client.UserStatsRequest) 
 }
 
 // AllUserStats returns ingestion statistics for all users known to this ingester.
-func (i *Ingester) AllUserStats(_ context.Context, _ *client.UserStatsRequest) (*client.UsersStatsResponse, error) {
+//
+// This is a cluster-wide, cross-tenant RPC: it discloses the full tenant
+// inventory on this ingester together with each tenant's head series count
+// and ingestion rates. It is intended to back the distributor's operator
+// aggregation endpoint (/distributor/all_user_stats) and must therefore
+// never be callable by a tenant-scoped peer. Because the shared gRPC auth
+// interceptor only checks that *some* X-Scope-OrgID value is present (per
+// Cortex's documented threat model, cf.
+// docs/guides/authentication-and-authorisation.md), we additionally require
+// an in-process operator marker set by the distributor via
+// operator.AppendOutgoing. Callers lacking the marker receive
+// codes.PermissionDenied so that enumerating tenants from the ingester gRPC
+// port with an arbitrary X-Scope-OrgID header is rejected.
+func (i *Ingester) AllUserStats(ctx context.Context, _ *client.UserStatsRequest) (*client.UsersStatsResponse, error) {
 	if err := i.checkRunning(); err != nil {
 		return nil, err
+	}
+
+	if !operator.IsInternalCaller(ctx) {
+		return nil, status.Error(codes.PermissionDenied, "AllUserStats is an operator-only RPC")
 	}
 
 	i.stoppedMtx.RLock()

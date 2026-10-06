@@ -39,6 +39,8 @@ import (
 	"github.com/weaveworks/common/user"
 	"golang.org/x/sync/errgroup"
 	"google.golang.org/grpc"
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/status"
 
 	"github.com/cortexproject/cortex/pkg/chunk"
 	"github.com/cortexproject/cortex/pkg/chunk/encoding"
@@ -48,6 +50,7 @@ import (
 	cortex_tsdb "github.com/cortexproject/cortex/pkg/storage/tsdb"
 	"github.com/cortexproject/cortex/pkg/util"
 	util_math "github.com/cortexproject/cortex/pkg/util/math"
+	"github.com/cortexproject/cortex/pkg/util/operator"
 	"github.com/cortexproject/cortex/pkg/util/services"
 	"github.com/cortexproject/cortex/pkg/util/test"
 	"github.com/cortexproject/cortex/pkg/util/validation"
@@ -3182,7 +3185,8 @@ func Test_Ingester_AllUserStats(t *testing.T) {
 	}
 
 	// Get label names
-	res, err := i.AllUserStats(context.Background(), &client.UserStatsRequest{})
+	operatorCtx := operator.WithIncomingForTest(context.Background())
+	res, err := i.AllUserStats(operatorCtx, &client.UserStatsRequest{})
 	require.NoError(t, err)
 
 	expect := []*client.UserIDStatsResponse{
@@ -3206,6 +3210,15 @@ func Test_Ingester_AllUserStats(t *testing.T) {
 		},
 	}
 	assert.ElementsMatch(t, expect, res.Stats)
+
+	// Callers that merely supply a tenant header (or no credential at all)
+	// must be rejected: AllUserStats is an operator-only RPC.
+	_, err = i.AllUserStats(context.Background(), &client.UserStatsRequest{})
+	require.Error(t, err)
+	require.Equal(t, codes.PermissionDenied, status.Code(err))
+	_, err = i.AllUserStats(user.InjectOrgID(context.Background(), "attacker"), &client.UserStatsRequest{})
+	require.Error(t, err)
+	require.Equal(t, codes.PermissionDenied, status.Code(err))
 }
 
 func TestIngesterCompactIdleBlock(t *testing.T) {
