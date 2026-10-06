@@ -7,8 +7,10 @@ import (
 	time "time"
 
 	"github.com/cortexproject/cortex/pkg/configs/userconfig"
+	"github.com/cortexproject/cortex/pkg/util/concurrency"
 
 	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 
 	"github.com/cortexproject/cortex/pkg/configs/client"
 )
@@ -182,4 +184,64 @@ groups:
 `,
 		},
 	}
+}
+
+// Test_ConfigRuleStoreListNamespaceDoesNotMutateCache ensures that filtering
+// by namespace never mutates the cached backing slice. Previously the filter
+// used an in-place `append(list[:ix], list[ix+1:]...)` which corrupted the
+// cached rule-group list for subsequent callers.
+func Test_ConfigRuleStoreListNamespaceDoesNotMutateCache(t *testing.T) {
+	mock := &MockClient{
+		cfgs: map[string]userconfig.VersionedRulesConfig{
+			"user": {
+				ID:        1,
+				Config:    fakeRuleConfig(),
+				DeletedAt: zeroTime,
+			},
+		},
+	}
+
+	store := NewConfigRuleStore(mock)
+
+	before, err := store.ListAllRuleGroups(context.Background())
+	require.NoError(t, err)
+	originalLen := len(before["user"])
+	require.Equal(t, 1, originalLen)
+	originalNamespace := before["user"][0].GetNamespace()
+
+	// Filter for a namespace that cannot match, which previously spliced the
+	// cached slice down to zero length.
+	filtered, err := store.ListRuleGroupsForUserAndNamespace(context.Background(), "user", "does-not-exist")
+	require.NoError(t, err)
+	require.Equal(t, 0, len(filtered))
+
+	after, err := store.ListAllRuleGroups(context.Background())
+	require.NoError(t, err)
+	require.Equal(t, originalLen, len(after["user"]), "filter must not mutate the cached rule-group list")
+	require.Equal(t, originalNamespace, after["user"][0].GetNamespace())
+}
+
+// Test_ConfigRuleStoreConcurrentListAllRuleGroups is the regression test for
+// the concurrent-map-writes vulnerability. It drives the store through
+// concurrency.ForEachUser with multiple tenants (mirroring the production
+// unauthenticated /ruler/rule_groups endpoint, which fans out with
+// fetchRulesConcurrency=16). Run with `go test -race` to catch regressions.
+func Test_ConfigRuleStoreConcurrentListAllRuleGroups(t *testing.T) {
+	cfgs := map[string]userconfig.VersionedRulesConfig{}
+	users := []string{"t1", "t2", "t3", "t4"}
+	for i, u := range users {
+		cfgs[u] = userconfig.VersionedRulesConfig{
+			ID:        userconfig.ID(i + 1),
+			Config:    fakeRuleConfig(),
+			DeletedAt: zeroTime,
+		}
+	}
+	mock := &MockClient{cfgs: cfgs}
+	store := NewConfigRuleStore(mock)
+
+	err := concurrency.ForEachUser(context.Background(), users, 16, func(ctx context.Context, userID string) error {
+		_, err := store.ListRuleGroupsForUserAndNamespace(ctx, userID, "")
+		return err
+	})
+	require.NoError(t, err)
 }

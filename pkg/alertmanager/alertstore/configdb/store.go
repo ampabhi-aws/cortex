@@ -3,6 +3,7 @@ package configdb
 import (
 	"context"
 	"errors"
+	"sync"
 
 	"github.com/cortexproject/cortex/pkg/alertmanager/alertspb"
 	"github.com/cortexproject/cortex/pkg/configs/client"
@@ -18,9 +19,19 @@ var (
 	errState    = errors.New("configdb alertmanager storage does not support state persistency")
 )
 
-// Store is a concrete implementation of RuleStore that sources rules from the config service
+// Store is a concrete implementation of RuleStore that sources rules from the config service.
+//
+// The mutable cache (alertConfigs and the since cursor) is guarded by mtx
+// because reloadConfigs is reached from many goroutines in parallel: the
+// unauthenticated admin endpoint fans out via concurrency.ForEachUser with
+// fetchConcurrency=16, and the Alertmanager poll loop runs on the same
+// instance. Without the mutex, concurrent writes to the Go map are detected
+// by the runtime and abort the whole process with an unrecoverable fatal
+// error that bypasses recover() and the HTTP server panic middleware.
 type Store struct {
 	configClient client.Client
+
+	mtx          sync.Mutex
 	since        userconfig.ID
 	alertConfigs map[string]alertspb.AlertConfigDesc
 }
@@ -114,10 +125,18 @@ func (c *Store) DeleteFullState(ctx context.Context, user string) error {
 }
 
 func (c *Store) reloadConfigs(ctx context.Context) (map[string]alertspb.AlertConfigDesc, error) {
-	configs, err := c.configClient.GetAlerts(ctx, c.since)
+	// Snapshot `since` under the lock so we don't observe a torn read.
+	c.mtx.Lock()
+	since := c.since
+	c.mtx.Unlock()
+
+	configs, err := c.configClient.GetAlerts(ctx, since)
 	if err != nil {
 		return nil, err
 	}
+
+	c.mtx.Lock()
+	defer c.mtx.Unlock()
 
 	for user, cfg := range configs.Configs {
 		if cfg.IsDeleted() {
@@ -140,7 +159,17 @@ func (c *Store) reloadConfigs(ctx context.Context) (map[string]alertspb.AlertCon
 		}
 	}
 
-	c.since = configs.GetLatestConfigID()
+	// Only move `since` forward: a concurrent reload may already have
+	// advanced it past this response's latest id.
+	if id := configs.GetLatestConfigID(); id > c.since {
+		c.since = id
+	}
 
-	return c.alertConfigs, nil
+	// Return a copy so callers can never observe or mutate the live cache,
+	// which would race with subsequent reloads.
+	out := make(map[string]alertspb.AlertConfigDesc, len(c.alertConfigs))
+	for k, v := range c.alertConfigs {
+		out[k] = v
+	}
+	return out, nil
 }
