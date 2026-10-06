@@ -48,6 +48,15 @@ type Config struct {
 	AlertmanagerHTTPPrefix string `yaml:"alertmanager_http_prefix"`
 	PrometheusHTTPPrefix   string `yaml:"prometheus_http_prefix"`
 
+	// When enabled, mounts the fgprof full-goroutine profiler on the HTTP
+	// listener. The handler is further protected by a bounded wrapper that
+	// caps the "seconds" query parameter, aborts when the client disconnects,
+	// and allows only one in-flight profile at a time. The route still
+	// requires that the HTTP listener itself be restricted (reverse proxy,
+	// network policy, mTLS) because the handler intentionally leaks
+	// goroutine stack function names and is CPU-intensive.
+	ProfilingEndpointsEnabled bool `yaml:"profiling_endpoints_enabled"`
+
 	// The following configs are injected by the upstream caller.
 	ServerPrefix       string               `yaml:"-"`
 	LegacyHTTPPrefix   string               `yaml:"-"`
@@ -71,6 +80,7 @@ type Config struct {
 func (cfg *Config) RegisterFlags(f *flag.FlagSet) {
 	f.BoolVar(&cfg.ResponseCompression, "api.response-compression-enabled", false, "Use GZIP compression for API responses. Some endpoints serve large YAML or JSON blobs which can benefit from compression.")
 	f.Var(&cfg.HTTPRequestHeadersToLog, "api.http-request-headers-to-log", "Which HTTP Request headers to add to logs")
+	f.BoolVar(&cfg.ProfilingEndpointsEnabled, "api.profiling-endpoints-enabled", false, "When enabled, exposes the fgprof full-goroutine profiler at /debug/fgprof, bounded to a single concurrent profile and a short duration cap. Disabled by default: /debug/fgprof is CPU-intensive and leaks goroutine stack function names, and should only be exposed on an operator-restricted listener.")
 	cfg.RegisterFlagsWithPrefix("", f)
 }
 
@@ -219,7 +229,14 @@ func (a *API) RegisterAPI(httpPathPrefix string, actualCfg interface{}, defaultC
 
 	a.RegisterRoute("/config", a.cfg.configHandler(actualCfg, defaultCfg), false, "GET")
 	a.RegisterRoute("/", indexHandler(httpPathPrefix, a.indexPage), false, "GET")
-	a.RegisterRoute("/debug/fgprof", fgprof.Handler(), false, "GET")
+
+	// /debug/fgprof is an unauthenticated, CPU-intensive full-goroutine
+	// profiler that is now opt-in. Even when enabled, requests are bounded
+	// in duration, serialised to a single in-flight profile and cancelled
+	// when the client disconnects. See CWE-770.
+	if a.cfg.ProfilingEndpointsEnabled {
+		a.RegisterRoute("/debug/fgprof", boundedProfiler(fgprof.Handler()), false, "GET")
+	}
 }
 
 // RegisterRuntimeConfig registers the endpoints associates with the runtime configuration

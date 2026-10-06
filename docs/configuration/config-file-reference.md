@@ -86,6 +86,14 @@ api:
   # CLI flag: -api.http-request-headers-to-log
   [http_request_headers_to_log: <list of string> | default = []]
 
+  # When enabled, exposes the fgprof full-goroutine profiler at /debug/fgprof,
+  # bounded to a single concurrent profile and a short duration cap. Disabled
+  # by default: /debug/fgprof is CPU-intensive and leaks goroutine stack
+  # function names, and should only be exposed on an operator-restricted
+  # listener.
+  # CLI flag: -api.profiling-endpoints-enabled
+  [profiling_endpoints_enabled: <boolean> | default = false]
+
 # The server_config configures the HTTP and gRPC server of the launched
 # service(s).
 [server: <server_config>]
