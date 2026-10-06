@@ -991,21 +991,18 @@ receivers:
 	_, exists := am.alertmanagers["user1"]
 	require.True(t, exists)
 
-	// Even after a poll...
+	// The fallback path no longer persists an empty config to the alert
+	// store (that was the DoS primitive abused by tenant-ID squatting);
+	// the per-tenant Alertmanager built from the fallback config is
+	// ephemeral and will be torn down on the next poll because the user
+	// still owns no persisted config.
 	err = am.loadAndSyncConfigs(ctx, reasonPeriodic)
 	require.NoError(t, err)
 
-	//  It does not remove the Alertmanager.
-	require.Len(t, am.alertmanagers, 1)
-	_, exists = am.alertmanagers["user1"]
-	require.True(t, exists)
+	require.Len(t, am.alertmanagers, 0)
 
-	// Remove the Alertmanager configuration.
-	require.NoError(t, store.DeleteAlertConfig(ctx, "user1"))
-	err = am.loadAndSyncConfigs(ctx, reasonPeriodic)
-	require.NoError(t, err)
-
-	// Even after removing it.. We start it again with the fallback configuration.
+	// A subsequent request re-provisions an ephemeral Alertmanager from
+	// the fallback config.
 	w = httptest.NewRecorder()
 	am.ServeHTTP(w, req.WithContext(user.InjectOrgID(req.Context(), "user1")))
 
