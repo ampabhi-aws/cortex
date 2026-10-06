@@ -1013,6 +1013,81 @@ receivers:
 	require.Equal(t, http.StatusOK, resp.StatusCode)
 }
 
+// TestMultitenantAlertmanager_ServeHTTPWithFallbackConfigPreservesStoredConfig
+// is a regression test for the fallback-config overwrite vulnerability where a
+// request served by an instance that does not have a per-tenant Alertmanager
+// in memory (e.g. a non-owning shard replica, or the window between a config
+// upload and the next poll) would unconditionally overwrite the tenant's real
+// stored config with an empty one via am.alertmanagerFromFallbackConfig.
+func TestMultitenantAlertmanager_ServeHTTPWithFallbackConfigPreservesStoredConfig(t *testing.T) {
+	ctx := context.Background()
+	amConfig := mockAlertmanagerConfig(t)
+
+	store := prepareInMemoryAlertStore()
+
+	externalURL := flagext.URLValue{}
+	require.NoError(t, externalURL.Set("http://localhost:8080/alertmanager"))
+	amConfig.ExternalURL = externalURL
+
+	fallbackCfg := `
+global:
+  smtp_smarthost: 'localhost:25'
+  smtp_from: 'youraddress@example.org'
+route:
+  receiver: example-email
+receivers:
+  - name: example-email
+    email_configs:
+    - to: 'youraddress@example.org'
+`
+
+	// Seed the store with a non-empty tenant config that must not be
+	// destroyed by any request-path code.
+	tenantRawCfg := `route:
+  receiver: tenant-webhook
+receivers:
+  - name: tenant-webhook
+`
+	original := alertspb.AlertConfigDesc{
+		User:      "user1",
+		RawConfig: tenantRawCfg,
+		Templates: []*alertspb.TemplateDesc{{Filename: "t.tmpl", Body: "template-body"}},
+	}
+	require.NoError(t, store.SetAlertConfig(ctx, original))
+
+	// Create the Multitenant Alertmanager but do NOT trigger an initial sync
+	// (so the tenant has no in-memory per-tenant Alertmanager yet, mirroring a
+	// non-owning shard replica).
+	am, err := createMultitenantAlertmanager(amConfig, nil, nil, store, nil, nil, log.NewNopLogger(), nil)
+	require.NoError(t, err)
+	am.fallbackConfig = fallbackCfg
+	t.Cleanup(func() {
+		am.alertmanagersMtx.Lock()
+		defer am.alertmanagersMtx.Unlock()
+		for _, uam := range am.alertmanagers {
+			uam.StopAndWait()
+		}
+	})
+
+	// Call the fallback-initialisation helper directly. This models what
+	// serveRequest would do on a replica that has no in-memory AM for user1,
+	// without needing a running ring.
+	_, err = am.alertmanagerFromFallbackConfig(ctx, "user1")
+	require.NoError(t, err)
+
+	// The stored config must be byte-identical to what was uploaded.
+	stored, err := store.GetAlertConfig(ctx, "user1")
+	require.NoError(t, err)
+	require.Equal(t, original.RawConfig, stored.RawConfig, "tenant RawConfig must not be overwritten by the fallback path")
+	require.Len(t, stored.Templates, len(original.Templates))
+	if len(stored.Templates) == len(original.Templates) {
+		for i := range original.Templates {
+			require.Equal(t, original.Templates[i].Filename, stored.Templates[i].Filename)
+			require.Equal(t, original.Templates[i].Body, stored.Templates[i].Body)
+		}
+	}
+}
+
 func TestMultitenantAlertmanager_InitialSyncWithSharding(t *testing.T) {
 	tc := []struct {
 		name          string

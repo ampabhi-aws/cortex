@@ -853,6 +853,15 @@ func (am *MultitenantAlertmanager) setConfig(cfg alertspb.AlertConfigDesc) error
 	defer am.alertmanagersMtx.Unlock()
 	existing, hasExisting := am.alertmanagers[cfg.User]
 
+	// Guard against replacing a known-good non-empty configuration with an
+	// empty one. This can happen when the fallback-initialisation path races
+	// with a periodic poll that reloaded the tenant's real config: refusing
+	// the empty config here is safer than silently dropping routing/receivers.
+	if cfg.RawConfig == "" && hasExisting && am.cfgs[cfg.User].RawConfig != "" {
+		level.Warn(am.logger).Log("msg", "ignoring attempt to replace a non-empty Alertmanager configuration with an empty one", "user", cfg.User)
+		return nil
+	}
+
 	rawCfg := cfg.RawConfig
 	if cfg.RawConfig == "" {
 		if am.fallbackConfig == "" {
@@ -1014,6 +1023,19 @@ func (am *MultitenantAlertmanager) serveRequest(w http.ResponseWriter, req *http
 		http.Error(w, err.Error(), http.StatusUnauthorized)
 		return
 	}
+
+	// When sharding is enabled, only the replicas that own the tenant are
+	// allowed to serve or initialise an Alertmanager for that tenant. Serving
+	// locally on a non-owning replica is unsafe because the tenant has no
+	// in-memory Alertmanager there, which would trigger the fallback-config
+	// initialisation path and historically overwrote the tenant's real config
+	// in object storage. Returning 503 lets the client retry via the load
+	// balancer and reach an owning replica.
+	if am.cfg.ShardingEnabled && !am.isUserOwned(userID) {
+		http.Error(w, "the Alertmanager is not the owner of the tenant on this instance", http.StatusServiceUnavailable)
+		return
+	}
+
 	am.alertmanagersMtx.Lock()
 	userAM, ok := am.alertmanagers[userID]
 	am.alertmanagersMtx.Unlock()
@@ -1024,10 +1046,17 @@ func (am *MultitenantAlertmanager) serveRequest(w http.ResponseWriter, req *http
 	}
 
 	if am.fallbackConfig != "" {
-		userAM, err = am.alertmanagerFromFallbackConfig(userID)
+		userAM, err = am.alertmanagerFromFallbackConfig(req.Context(), userID)
 		if err != nil {
 			level.Error(am.logger).Log("msg", "unable to initialize the Alertmanager with a fallback configuration", "user", userID, "err", err)
 			http.Error(w, "Failed to initialize the Alertmanager", http.StatusInternalServerError)
+			return
+		}
+		// Nil-check in case the per-tenant Alertmanager was concurrently removed
+		// (e.g. by a syncConfigs run) between creation and here. Without this
+		// guard, dereferencing userAM.mux would panic.
+		if userAM == nil {
+			http.Error(w, "the Alertmanager is not available", http.StatusServiceUnavailable)
 			return
 		}
 
@@ -1039,17 +1068,29 @@ func (am *MultitenantAlertmanager) serveRequest(w http.ResponseWriter, req *http
 	http.Error(w, "the Alertmanager is not configured", http.StatusNotFound)
 }
 
-func (am *MultitenantAlertmanager) alertmanagerFromFallbackConfig(userID string) (*Alertmanager, error) {
-	// Upload an empty config so that the Alertmanager is no de-activated in the next poll
+func (am *MultitenantAlertmanager) alertmanagerFromFallbackConfig(ctx context.Context, userID string) (*Alertmanager, error) {
+	// Only persist an empty placeholder config if the tenant has no config in
+	// the store yet. Previously this always called SetAlertConfig, which does a
+	// blind Upload and would overwrite (and permanently destroy) the tenant's
+	// real routing tree, receivers and template files whenever this helper ran
+	// on an instance that had no in-memory Alertmanager for the tenant
+	// (e.g. a non-owning shard replica, or any instance between an API upload
+	// and the next poll). The persisted placeholder is only required to keep
+	// the tenant "active" from the periodic poll's perspective, so we only need
+	// to write it when nothing is stored yet.
 	cfgDesc := alertspb.ToProto("", nil, userID)
-	err := am.store.SetAlertConfig(context.Background(), cfgDesc)
-	if err != nil {
-		return nil, err
+
+	if _, err := am.store.GetAlertConfig(ctx, userID); err != nil {
+		if !errors.Is(err, alertspb.ErrNotFound) {
+			return nil, err
+		}
+		if err := am.store.SetAlertConfig(ctx, cfgDesc); err != nil {
+			return nil, err
+		}
 	}
 
 	// Calling setConfig with an empty configuration will use the fallback config.
-	err = am.setConfig(cfgDesc)
-	if err != nil {
+	if err := am.setConfig(cfgDesc); err != nil {
 		return nil, err
 	}
 
