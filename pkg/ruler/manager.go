@@ -127,9 +127,15 @@ func (r *DefaultMultiTenantManager) syncRulesToManager(ctx context.Context, user
 	// have been updated
 	update, files, err := r.mapper.MapRules(user, groups.Formatted())
 	if err != nil {
+		// MapRules may partially succeed: some namespaces may have mapped
+		// successfully even when others (e.g. ones with unsafe names) did not.
+		// Log the problem but still continue so that one bad namespace cannot
+		// disable a tenant's entire rule set.
 		r.lastReloadSuccessful.WithLabelValues(user).Set(0)
-		level.Error(r.logger).Log("msg", "unable to map rule files", "user", user, "err", err)
-		return
+		level.Error(r.logger).Log("msg", "unable to map one or more rule files", "user", user, "err", err)
+		if len(files) == 0 {
+			return
+		}
 	}
 
 	manager, exists := r.userManagers[user]

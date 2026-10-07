@@ -119,6 +119,39 @@ func respondError(logger log.Logger, w http.ResponseWriter, msg string) {
 	}
 }
 
+// respondInvalidRequest writes a 400 Bad Request response for client-side
+// validation errors such as an invalid namespace or group identifier.
+func respondInvalidRequest(logger log.Logger, w http.ResponseWriter, msg string) {
+	b, err := json.Marshal(&response{
+		Status:    "error",
+		ErrorType: v1.ErrBadData,
+		Error:     msg,
+		Data:      nil,
+	})
+
+	if err != nil {
+		level.Error(logger).Log("msg", "error marshaling json response", "err", err)
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+
+	w.WriteHeader(http.StatusBadRequest)
+	if n, err := w.Write(b); err != nil {
+		level.Error(logger).Log("msg", "error writing response", "bytesWritten", n, "err", err)
+	}
+}
+
+// respondParseRequestError writes an appropriate response for errors returned
+// by parseRequest. Validation errors (bad namespace/group name) become a 400
+// while everything else falls back to the historic 500 response.
+func respondParseRequestError(logger log.Logger, w http.ResponseWriter, err error) {
+	if errors.Is(err, errInvalidRuleIdentifier) {
+		respondInvalidRequest(logger, w, err.Error())
+		return
+	}
+	respondError(logger, w, err.Error())
+}
+
 // API is used to handle HTTP requests for the ruler service
 type API struct {
 	ruler *Ruler
@@ -288,7 +321,21 @@ var (
 	ErrNoRuleGroups = errors.New("no rule groups found")
 	// ErrBadRuleGroup is returned when the provided rule group can not be unmarshalled
 	ErrBadRuleGroup = errors.New("unable to decoded rule group")
+	// errInvalidRuleIdentifier is returned when a namespace or group name contains
+	// values that would be unsafe to use as a filesystem path component.
+	errInvalidRuleIdentifier = errors.New("invalid namespace or group name: '', '.', '..' and values containing '/', '\\' or NUL are not allowed")
 )
+
+// validateRuleIdentifier rejects namespace or group identifiers that are unsafe
+// to use directly as a filesystem path component. In particular "." and ".."
+// collapse via filepath.Join and path separators would allow writing outside
+// the intended per-tenant directory on disk.
+func validateRuleIdentifier(s string) error {
+	if s == "" || s == "." || s == ".." || strings.ContainsAny(s, "/\\\x00") {
+		return errInvalidRuleIdentifier
+	}
+	return nil
+}
 
 func marshalAndSend(output interface{}, w http.ResponseWriter, logger log.Logger) {
 	d, err := yaml.Marshal(&output)
@@ -336,6 +383,10 @@ func parseNamespace(params map[string]string) (string, error) {
 		return "", err
 	}
 
+	if err := validateRuleIdentifier(namespace); err != nil {
+		return "", err
+	}
+
 	return namespace, nil
 }
 
@@ -349,6 +400,10 @@ func parseGroupName(params map[string]string) (string, error) {
 
 	groupName, err := url.PathUnescape(groupName)
 	if err != nil {
+		return "", err
+	}
+
+	if err := validateRuleIdentifier(groupName); err != nil {
 		return "", err
 	}
 
@@ -388,7 +443,7 @@ func (a *API) ListRules(w http.ResponseWriter, req *http.Request) {
 
 	userID, namespace, _, err := parseRequest(req, false, false)
 	if err != nil {
-		respondError(logger, w, err.Error())
+		respondParseRequestError(logger, w, err)
 		return
 	}
 
@@ -421,7 +476,7 @@ func (a *API) GetRuleGroup(w http.ResponseWriter, req *http.Request) {
 	logger := util_log.WithContext(req.Context(), a.logger)
 	userID, namespace, groupName, err := parseRequest(req, true, true)
 	if err != nil {
-		respondError(logger, w, err.Error())
+		respondParseRequestError(logger, w, err)
 		return
 	}
 
@@ -443,7 +498,7 @@ func (a *API) CreateRuleGroup(w http.ResponseWriter, req *http.Request) {
 	logger := util_log.WithContext(req.Context(), a.logger)
 	userID, namespace, _, err := parseRequest(req, true, false)
 	if err != nil {
-		respondError(logger, w, err.Error())
+		respondParseRequestError(logger, w, err)
 		return
 	}
 
@@ -513,7 +568,7 @@ func (a *API) DeleteNamespace(w http.ResponseWriter, req *http.Request) {
 
 	userID, namespace, _, err := parseRequest(req, true, false)
 	if err != nil {
-		respondError(logger, w, err.Error())
+		respondParseRequestError(logger, w, err)
 		return
 	}
 
@@ -535,7 +590,7 @@ func (a *API) DeleteRuleGroup(w http.ResponseWriter, req *http.Request) {
 
 	userID, namespace, groupName, err := parseRequest(req, true, true)
 	if err != nil {
-		respondError(logger, w, err.Error())
+		respondParseRequestError(logger, w, err)
 		return
 	}
 

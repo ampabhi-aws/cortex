@@ -396,6 +396,46 @@ func sliceContains(t *testing.T, find string, in []string) bool {
 	return false
 }
 
+// Test_mapper_MapRules_UnsafeNamespace verifies that the mapper refuses to
+// materialise rule namespaces that would collapse out of the per-user
+// directory via filepath.Join ("." or "..") while still writing any safe
+// namespaces supplied in the same call.
+func Test_mapper_MapRules_UnsafeNamespace(t *testing.T) {
+	l := log.NewLogfmtLogger(os.Stdout)
+	l = level.NewFilter(l, level.AllowInfo())
+	setupRuleSets()
+
+	for _, badNamespace := range []string{"..", "."} {
+		t.Run("namespace="+badNamespace, func(t *testing.T) {
+			m := &mapper{
+				Path:   "/rules",
+				FS:     afero.NewMemMapFs(),
+				logger: l,
+			}
+
+			ruleSet := map[string][]rulefmt.RuleGroup{
+				badNamespace: initialRuleSet["file /one"],
+				"file /one": initialRuleSet["file /one"],
+			}
+
+			updated, files, err := m.MapRules(testUser, ruleSet)
+			require.Error(t, err, "expected an error for unsafe namespace")
+			require.True(t, updated)
+			require.Len(t, files, 1, "the safe namespace should still be mapped")
+			require.Equal(t, fileOnePath, files[0])
+
+			// Ensure no file was written outside of the user directory.
+			exists, statErr := afero.Exists(m.FS, "/rules")
+			require.NoError(t, statErr)
+			require.True(t, exists)
+
+			info, statErr := m.FS.Stat("/rules")
+			require.NoError(t, statErr)
+			require.True(t, info.IsDir(), "/rules must remain a directory")
+		})
+	}
+}
+
 func TestYamlFormatting(t *testing.T) {
 	l := log.NewLogfmtLogger(os.Stdout)
 	l = level.NewFilter(l, level.AllowInfo())

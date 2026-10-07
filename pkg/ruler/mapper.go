@@ -2,6 +2,7 @@ package ruler
 
 import (
 	"crypto/md5"
+	"errors"
 	"net/url"
 	"path/filepath"
 	"sort"
@@ -75,20 +76,43 @@ func (m *mapper) MapRules(user string, ruleConfigs map[string][]rulefmt.RuleGrou
 
 	// user rule files will be stored as `/<path>/<userid>/<encoded filename>`
 	path := filepath.Join(m.Path, user)
-	err := m.FS.MkdirAll(path, 0777)
+	err := m.FS.MkdirAll(path, 0700)
 	if err != nil {
 		return false, nil, err
 	}
 
+	var mapErr error
 	// write all rule configs to disk
 	for filename, groups := range ruleConfigs {
 		// Store the encoded file name to better handle `/` characters
 		encodedFileName := url.PathEscape(filename)
+
+		// Defence in depth: refuse namespaces whose URL-escaped form would
+		// resolve outside the per-user directory via filepath.Join (for
+		// example "." or "..", which url.PathEscape leaves unchanged).
+		if encodedFileName == "" || encodedFileName == "." || encodedFileName == ".." {
+			level.Warn(m.logger).Log("msg", "skipping rule namespace with unsafe name", "user", user, "namespace", filename)
+			if mapErr == nil {
+				mapErr = errors.New("skipped rule namespace with unsafe name: " + filename)
+			}
+			continue
+		}
 		fullFileName := filepath.Join(path, encodedFileName)
+		if filepath.Dir(fullFileName) != path {
+			level.Warn(m.logger).Log("msg", "skipping rule namespace that resolves outside user directory", "user", user, "namespace", filename)
+			if mapErr == nil {
+				mapErr = errors.New("skipped rule namespace that escapes user directory: " + filename)
+			}
+			continue
+		}
 
 		fileUpdated, err := m.writeRuleGroupsIfNewer(groups, fullFileName)
 		if err != nil {
-			return false, nil, err
+			level.Warn(m.logger).Log("msg", "unable to write rule file", "user", user, "namespace", filename, "err", err)
+			if mapErr == nil {
+				mapErr = err
+			}
+			continue
 		}
 		filenames = append(filenames, fullFileName)
 		anyUpdated = anyUpdated || fileUpdated
@@ -121,7 +145,7 @@ func (m *mapper) MapRules(user string, ruleConfigs map[string][]rulefmt.RuleGrou
 		}
 	}
 
-	return anyUpdated, filenames, nil
+	return anyUpdated, filenames, mapErr
 }
 
 func (m *mapper) writeRuleGroupsIfNewer(groups []rulefmt.RuleGroup, filename string) (bool, error) {
@@ -152,7 +176,7 @@ func (m *mapper) writeRuleGroupsIfNewer(groups []rulefmt.RuleGroup, filename str
 	}
 
 	level.Info(m.logger).Log("msg", "updating rule file", "file", filename)
-	err = afero.WriteFile(m.FS, filename, d, 0777)
+	err = afero.WriteFile(m.FS, filename, d, 0600)
 	if err != nil {
 		return false, err
 	}
