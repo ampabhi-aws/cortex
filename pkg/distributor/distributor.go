@@ -484,8 +484,11 @@ func (d *Distributor) checkSample(ctx context.Context, userID, cluster, replica 
 		return false, nil
 	}
 
-	// If replica label is too long, don't use it. We accept the sample here, but it will fail validation later anyway.
-	if len(replica) > d.limits.MaxLabelValueLength(userID) {
+	// If replica or cluster label is too long, don't use it. We accept the sample here, but it will
+	// fail validation later anyway. We deliberately refuse to let an unvalidated, tenant-controlled
+	// label value reach the HA tracker's shared KV store or its Prometheus metric labels.
+	maxLabelValueLength := d.limits.MaxLabelValueLength(userID)
+	if len(replica) > maxLabelValueLength || len(cluster) > maxLabelValueLength {
 		return false, nil
 	}
 
