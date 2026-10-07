@@ -443,6 +443,18 @@ func (r *Ruler) ServeHTTP(w http.ResponseWriter, req *http.Request) {
 	}
 }
 
+// ForgetHandler is the admin-only entry point used to "forget" a ruler from
+// the ring. It is intentionally separate from ServeHTTP (which is the
+// read-only status page) so that the mutating verb can be registered behind
+// an authentication middleware without affecting the status-page listener.
+func (r *Ruler) ForgetHandler(w http.ResponseWriter, req *http.Request) {
+	if !r.cfg.EnableSharding {
+		http.Error(w, "ruler sharding is disabled", http.StatusBadRequest)
+		return
+	}
+	r.ring.ServeForgetHTTP(w, req)
+}
+
 func (r *Ruler) run(ctx context.Context) error {
 	level.Info(r.logger).Log("msg", "ruler up and running")
 
