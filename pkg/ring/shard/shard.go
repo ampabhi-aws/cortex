@@ -3,8 +3,8 @@ package shard
 import (
 	"crypto/md5"
 	"encoding/binary"
+	"io"
 	"math"
-	"unsafe"
 )
 
 var (
@@ -14,11 +14,13 @@ var (
 // ShuffleShardSeed returns seed for random number generator, computed from provided identifier.
 func ShuffleShardSeed(identifier, zone string) int64 {
 	// Use the identifier to compute a hash we'll use to seed the random.
+	// io.WriteString uses md5's StringWriter implementation when available,
+	// avoiding both allocations and the previous unsound unsafe string->[]byte conversion.
 	hasher := md5.New()
-	hasher.Write(yoloBuf(identifier)) // nolint:errcheck
+	_, _ = io.WriteString(hasher, identifier)
 	if zone != "" {
-		hasher.Write(seedSeparator) // nolint:errcheck
-		hasher.Write(yoloBuf(zone)) // nolint:errcheck
+		_, _ = hasher.Write(seedSeparator)
+		_, _ = io.WriteString(hasher, zone)
 	}
 	checksum := hasher.Sum(nil)
 
@@ -37,9 +39,4 @@ func ShuffleShardExpectedInstancesPerZone(shardSize, numZones int) int {
 // tenant. If zone-aware replication is disabled, the input numZones should be 1.
 func ShuffleShardExpectedInstances(shardSize, numZones int) int {
 	return ShuffleShardExpectedInstancesPerZone(shardSize, numZones) * numZones
-}
-
-// yoloBuf will return an unsafe pointer to a string, as the name yolo.yoloBuf implies use at your own risk.
-func yoloBuf(s string) []byte {
-	return *((*[]byte)(unsafe.Pointer(&s)))
 }
