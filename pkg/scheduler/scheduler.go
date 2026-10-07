@@ -4,6 +4,7 @@ import (
 	"context"
 	"flag"
 	"io"
+	"net"
 	"net/http"
 	"sync"
 	"time"
@@ -19,6 +20,9 @@ import (
 	"github.com/weaveworks/common/middleware"
 	"github.com/weaveworks/common/user"
 	"google.golang.org/grpc"
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/peer"
+	"google.golang.org/grpc/status"
 
 	"github.com/cortexproject/cortex/pkg/frontend/v2/frontendv2pb"
 	"github.com/cortexproject/cortex/pkg/scheduler/queue"
@@ -77,17 +81,27 @@ type connectedFrontend struct {
 	// When last frontend connection is closed, context is canceled.
 	ctx    context.Context
 	cancel context.CancelFunc
+
+	// authIdentity, when non-empty, is the X-Scope-OrgID presented on the
+	// gRPC stream when the frontend connected (set by an upstream auth
+	// gateway or mTLS-derived middleware). When present it is used to
+	// authorise per-request UserIDs during enqueueRequest.
+	authIdentity string
 }
 
 type Config struct {
-	MaxOutstandingPerTenant int               `yaml:"max_outstanding_requests_per_tenant"`
-	QuerierForgetDelay      time.Duration     `yaml:"querier_forget_delay"`
-	GRPCClientConfig        grpcclient.Config `yaml:"grpc_client_config" doc:"description=This configures the gRPC client used to report errors back to the query-frontend."`
+	MaxOutstandingPerTenant  int               `yaml:"max_outstanding_requests_per_tenant"`
+	QuerierForgetDelay       time.Duration     `yaml:"querier_forget_delay"`
+	GRPCClientConfig         grpcclient.Config `yaml:"grpc_client_config" doc:"description=This configures the gRPC client used to report errors back to the query-frontend."`
+	ValidateFrontendAddress  bool              `yaml:"validate_frontend_address"`
+	EnforceTenantFromAuthHdr bool              `yaml:"enforce_tenant_from_auth_header"`
 }
 
 func (cfg *Config) RegisterFlags(f *flag.FlagSet) {
 	f.IntVar(&cfg.MaxOutstandingPerTenant, "query-scheduler.max-outstanding-requests-per-tenant", 100, "Maximum number of outstanding requests per tenant per query-scheduler. In-flight requests above this limit will fail with HTTP response status code 429.")
 	f.DurationVar(&cfg.QuerierForgetDelay, "query-scheduler.querier-forget-delay", 0, "If a querier disconnects without sending notification about graceful shutdown, the query-scheduler will keep the querier in the tenant's shard until the forget delay has passed. This feature is useful to reduce the blast radius when shuffle-sharding is enabled.")
+	f.BoolVar(&cfg.ValidateFrontendAddress, "query-scheduler.validate-frontend-address", true, "If true, validate that the FrontendAddress declared by a frontend on the FrontendLoop stream resolves to the stream's peer IP. Mismatches are rejected. Prevents an attacker that can reach the scheduler's gRPC port from redirecting query results to an attacker-controlled host. When the declared address is unresolvable (e.g. tests) the check is skipped.")
+	f.BoolVar(&cfg.EnforceTenantFromAuthHdr, "query-scheduler.enforce-tenant-from-auth-header", true, "If true, when an X-Scope-OrgID header is present on the frontend's gRPC stream (set by an upstream auth gateway or mTLS-derived middleware), require the per-request UserID to be covered by that authenticated tenant list. Streams without the header are not affected.")
 	cfg.GRPCClientConfig.RegisterFlagsWithPrefix("query-scheduler.grpc-client-config", f)
 }
 
@@ -236,16 +250,42 @@ func (s *Scheduler) frontendConnected(frontend schedulerpb.SchedulerForFrontend_
 		return "", nil, errors.New("no frontend address")
 	}
 
+	// Mitigation for CWE-306 / cross-tenant query result theft: validate that
+	// the caller-declared delivery address is consistent with the stream's
+	// peer. Without this an attacker able to reach the scheduler's gRPC port
+	// can claim an arbitrary FrontendAddress and have the querier deliver
+	// another tenant's query results to a host they control (see
+	// pkg/querier/worker/scheduler_processor.go:runRequest).
+	if err := s.validateFrontendAddress(frontend.Context(), msg.FrontendAddress); err != nil {
+		level.Warn(s.log).Log("msg", "rejecting frontend INIT with invalid or spoofed FrontendAddress", "frontend", msg.FrontendAddress, "err", err)
+		return "", nil, err
+	}
+
 	s.connectedFrontendsMu.Lock()
 	defer s.connectedFrontendsMu.Unlock()
+
+	// Capture the authenticated identity (if any) that was present on the
+	// gRPC stream metadata before we switch to the long-lived frontend
+	// context (which is derived from context.Background() and therefore
+	// strips gRPC metadata).
+	authIdentity := ""
+	if id, _, err := user.ExtractFromGRPCRequest(frontend.Context()); err == nil {
+		authIdentity = id
+	}
 
 	cf := s.connectedFrontends[msg.FrontendAddress]
 	if cf == nil {
 		cf = &connectedFrontend{
-			connections: 0,
+			connections:  0,
+			authIdentity: authIdentity,
 		}
 		cf.ctx, cf.cancel = context.WithCancel(context.Background())
 		s.connectedFrontends[msg.FrontendAddress] = cf
+	} else if cf.authIdentity != authIdentity {
+		// Two different peers claim the same FrontendAddress but present
+		// different authenticated identities. Refuse the new stream to
+		// avoid conflating their request/cancel key spaces.
+		return "", nil, status.Errorf(codes.PermissionDenied, "frontend address %q already in use by a different authenticated identity", msg.FrontendAddress)
 	}
 
 	cf.connections++
@@ -283,6 +323,40 @@ func (s *Scheduler) enqueueRequest(frontendContext context.Context, frontendAddr
 	}
 
 	userID := msg.GetUserID()
+
+	// Mitigation for CWE-306: if the stream carries an authenticated tenant
+	// identity (via X-Scope-OrgID set by an upstream auth gateway or by
+	// mTLS-derived middleware), only allow enqueueing queries for tenants
+	// that identity is authorised to serve. Streams without the header
+	// retain the pre-existing behaviour.
+	if s.cfg.EnforceTenantFromAuthHdr {
+		s.connectedFrontendsMu.Lock()
+		cf := s.connectedFrontends[frontendAddr]
+		authIdentity := ""
+		if cf != nil {
+			authIdentity = cf.authIdentity
+		}
+		s.connectedFrontendsMu.Unlock()
+		if authIdentity != "" {
+			authTenants, aerr := tenant.TenantIDsFromOrgID(authIdentity)
+			if aerr != nil {
+				return status.Error(codes.PermissionDenied, "frontend presented an unparseable tenant identity")
+			}
+			authSet := make(map[string]struct{}, len(authTenants))
+			for _, t := range authTenants {
+				authSet[t] = struct{}{}
+			}
+			reqTenants, rerr := tenant.TenantIDsFromOrgID(userID)
+			if rerr != nil {
+				return rerr
+			}
+			for _, t := range reqTenants {
+				if _, ok := authSet[t]; !ok {
+					return status.Errorf(codes.PermissionDenied, "frontend not authorised to enqueue queries for tenant %q", t)
+				}
+			}
+		}
+	}
 
 	req := &schedulerRequest{
 		frontendAddress: frontendAddr,
@@ -476,6 +550,81 @@ func (s *Scheduler) forwardErrorToFrontend(ctx context.Context, req *schedulerRe
 		level.Warn(s.log).Log("msg", "failed to forward error to frontend", "frontend", req.frontendAddress, "err", err, "requestErr", requestErr)
 		return
 	}
+}
+
+// validateFrontendAddress verifies that msg.FrontendAddress declared on an
+// incoming FrontendLoop stream is a well-formed host:port and (when
+// ValidateFrontendAddress is enabled, the stream has a resolvable TCP peer
+// and the declared host resolves) that the peer IP is one of the IPs the
+// host resolves to. This blocks the tenant-spoofing + result-exfiltration
+// attack where an attacker reaches the scheduler's gRPC port and asks the
+// scheduler to deliver another tenant's query results to a host they
+// control. Addresses that are not resolvable in the current environment
+// (e.g. test placeholders like "frontend-12345" or hostnames that only
+// resolve inside the cluster) are allowed through so existing deployments
+// and tests are not broken.
+func (s *Scheduler) validateFrontendAddress(ctx context.Context, frontendAddress string) error {
+	if frontendAddress == "" {
+		return status.Error(codes.InvalidArgument, "empty frontend address")
+	}
+
+	if !s.cfg.ValidateFrontendAddress {
+		return nil
+	}
+
+	host, port, err := net.SplitHostPort(frontendAddress)
+	if err != nil || host == "" || port == "" {
+		// Address is not in host:port form (e.g. test placeholders or
+		// addresses only meaningful to the frontend itself). Nothing to
+		// compare against; let the stream proceed. The querier/scheduler
+		// will still fail to dial a bogus address later.
+		level.Debug(s.log).Log("msg", "skipping frontend address peer check: address is not host:port", "frontend", frontendAddress, "err", err)
+		return nil
+	}
+
+	p, ok := peer.FromContext(ctx)
+	if !ok || p == nil || p.Addr == nil {
+		return nil
+	}
+	tcpPeer, ok := p.Addr.(*net.TCPAddr)
+	if !ok {
+		return nil
+	}
+	peerIP := tcpPeer.IP
+
+	if declaredIP := net.ParseIP(host); declaredIP != nil {
+		if ipsEqualOrLoopback(declaredIP, peerIP) {
+			return nil
+		}
+		return status.Errorf(codes.PermissionDenied, "frontend address %q does not match stream peer %s", frontendAddress, peerIP)
+	}
+
+	resolveCtx, cancel := context.WithTimeout(ctx, 2*time.Second)
+	defer cancel()
+	addrs, err := net.DefaultResolver.LookupIPAddr(resolveCtx, host)
+	if err != nil || len(addrs) == 0 {
+		level.Debug(s.log).Log("msg", "skipping frontend address peer check: hostname did not resolve", "frontend", frontendAddress, "err", err)
+		return nil
+	}
+	for _, a := range addrs {
+		if ipsEqualOrLoopback(a.IP, peerIP) {
+			return nil
+		}
+	}
+	return status.Errorf(codes.PermissionDenied, "frontend address %q does not resolve to stream peer %s", frontendAddress, peerIP)
+}
+
+// ipsEqualOrLoopback returns true if the two IPs are equal, or if both
+// addresses are loopback (local development and tests frequently see one
+// side as 127.0.0.1 and the other as ::1 or vice versa).
+func ipsEqualOrLoopback(a, b net.IP) bool {
+	if a == nil || b == nil {
+		return false
+	}
+	if a.Equal(b) {
+		return true
+	}
+	return a.IsLoopback() && b.IsLoopback()
 }
 
 func (s *Scheduler) isRunningOrStopping() bool {
