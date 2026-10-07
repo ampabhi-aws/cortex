@@ -51,3 +51,46 @@ This can help to run Cortex in a trusted environment where you want to separate 
 into distinct namespaces by some criteria (e.g. teams, applications, etc).
 
 Be advised that **cortex-tenant** is a third-party community project and it's not maintained by Cortex team.
+
+### Destructive admin endpoints and ring mutations
+
+Cortex exposes a small set of destructive operator endpoints on the
+ordinary HTTP listener. These must never be reachable from untrusted
+callers, because a single unauthenticated request can take an ingester
+offline, trigger cross-tenant compaction/upload, or remove instances
+from the shared ring KV cluster-wide:
+
+- `POST /ingester/flush` and the legacy alias `POST /flush`
+- `POST /ingester/shutdown` and the legacy alias `POST /shutdown`
+- `POST <component>/ring` with a `forget=<instance-id>` form value, on
+  every ring status page (`/ingester/ring`, `/ring`, `/distributor/ring`,
+  `/ruler/ring`, `/ruler_ring`, `/store-gateway/ring`, `/compactor/ring`,
+  `/multitenant_alertmanager/ring`).
+
+Starting with this release, destructive endpoints are **disabled by
+default**:
+
+- `/ingester/flush`, `/ingester/shutdown`, `/flush`, `/shutdown` are not
+  registered unless `-api.enable-dangerous-ops=true` is set, and when
+  enabled only `POST` is accepted (plain browser `GET` navigation can no
+  longer trigger them).
+- `POST` (forget) on every ring page is rejected with `403 Forbidden`
+  unless `-ring.allow-mutations-via-http=true` is set. Even when enabled
+  the handler requires the request's `Origin`/`Referer` to match the
+  request `Host` so a cross-site browser form cannot drive the ring
+  mutation.
+- When the per-tenant `/ingester/flush` endpoint is called with an
+  authenticated tenant in the request context, the handler now ignores
+  cross-tenant values of the `tenant=` form parameter and only acts on
+  the authenticated tenant.
+
+As defence in depth your authenticating reverse proxy **must** deny the
+above paths and methods unless the caller is an authorised operator.
+An example deny list:
+
+```
+location ~ ^/(ingester/flush|ingester/shutdown|flush|shutdown)$ { return 403; }
+location ~ ^/(ingester|distributor|ruler|ruler_ring|store-gateway|compactor|multitenant_alertmanager)/ring$ {
+    if ($request_method = POST) { return 403; }
+}
+```

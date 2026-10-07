@@ -2491,6 +2491,27 @@ func (i *Ingester) flushHandler(w http.ResponseWriter, r *http.Request) {
 
 	tenants := r.Form[tenantParam]
 
+	// If the request carries an authenticated tenant in its context (set by
+	// the HTTP auth middleware in front of this handler), do not let the
+	// caller target other tenants via the `tenant` form parameter: either
+	// pin to the context tenant when no form value is supplied, or require
+	// every form value to match it. This closes the cross-tenant flush /
+	// forced-upload abuse described in CVE-tracking issue
+	// 01a1143e53f0708f86cae91009cc87f6.
+	if ctxTenant, ctxErr := tenant.TenantID(r.Context()); ctxErr == nil && ctxTenant != "" {
+		if len(tenants) == 0 {
+			tenants = []string{ctxTenant}
+		} else {
+			for _, t := range tenants {
+				if t != ctxTenant {
+					level.Warn(logutil.WithContext(r.Context(), i.logger)).Log("msg", "flush handler: tenant form parameter does not match authenticated tenant", "authenticated_tenant", ctxTenant, "requested_tenant", t)
+					http.Error(w, "forbidden: tenant does not match authenticated principal", http.StatusForbidden)
+					return
+				}
+			}
+		}
+	}
+
 	allowedUsers := util.NewAllowedTenants(tenants, nil)
 	run := func() {
 		ingCtx := i.BasicService.ServiceContext()
