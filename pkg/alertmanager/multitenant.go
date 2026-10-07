@@ -4,6 +4,7 @@ import (
 	"context"
 	"flag"
 	"fmt"
+	"net"
 	"net/http"
 	"net/url"
 	"os"
@@ -20,7 +21,9 @@ import (
 	amconfig "github.com/prometheus/alertmanager/config"
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/promauto"
+	common_config "github.com/prometheus/common/config"
 	tsdb_errors "github.com/prometheus/prometheus/tsdb/errors"
+	"github.com/prometheus/exporter-toolkit/web"
 	"github.com/weaveworks/common/httpgrpc"
 	"github.com/weaveworks/common/httpgrpc/server"
 	"github.com/weaveworks/common/user"
@@ -38,6 +41,7 @@ import (
 	"github.com/cortexproject/cortex/pkg/util/flagext"
 	util_log "github.com/cortexproject/cortex/pkg/util/log"
 	"github.com/cortexproject/cortex/pkg/util/services"
+	util_tls "github.com/cortexproject/cortex/pkg/util/tls"
 )
 
 const (
@@ -94,10 +98,21 @@ type ClusterConfig struct {
 	PeerTimeout      time.Duration          `yaml:"peer_timeout"`
 	GossipInterval   time.Duration          `yaml:"gossip_interval"`
 	PushPullInterval time.Duration          `yaml:"push_pull_interval"`
+
+	// TLSEnabled turns on mutual-TLS for the legacy upstream gossip mesh. When
+	// disabled, Cortex refuses to start a gossip listener on a non-loopback
+	// address because the mesh would otherwise be unauthenticated and
+	// cross-tenant state (silences, nflog) would be exposed to any peer that
+	// can reach the listener.
+	TLSEnabled bool                 `yaml:"tls_enabled"`
+	TLS        util_tls.ClientConfig `yaml:",inline"`
 }
 
 const (
-	defaultClusterAddr = "0.0.0.0:9094"
+	// defaultClusterAddr is intentionally empty: the legacy upstream gossip
+	// mesh (used when alertmanager sharding is disabled) is unauthenticated by
+	// default, so operators must explicitly opt in to opening the listener.
+	defaultClusterAddr = ""
 	defaultPeerTimeout = 15 * time.Second
 )
 
@@ -125,12 +140,66 @@ func (cfg *MultitenantAlertmanagerConfig) RegisterFlags(f *flag.FlagSet) {
 
 func (cfg *ClusterConfig) RegisterFlags(f *flag.FlagSet) {
 	prefix := "alertmanager.cluster."
-	f.StringVar(&cfg.ListenAddr, prefix+"listen-address", defaultClusterAddr, "Listen address and port for the cluster. Not specifying this flag disables high-availability mode.")
+	f.StringVar(&cfg.ListenAddr, prefix+"listen-address", defaultClusterAddr, "Listen address and port for the cluster. Leaving this empty disables high-availability mode. The legacy gossip mesh is unauthenticated unless -alertmanager.cluster.tls-enabled is set, so refuse to open it on a non-loopback address without TLS.")
 	f.StringVar(&cfg.AdvertiseAddr, prefix+"advertise-address", "", "Explicit address or hostname to advertise in cluster.")
 	f.Var(&cfg.Peers, prefix+"peers", "Comma-separated list of initial peers.")
 	f.DurationVar(&cfg.PeerTimeout, prefix+"peer-timeout", defaultPeerTimeout, "Time to wait between peers to send notifications.")
 	f.DurationVar(&cfg.GossipInterval, prefix+"gossip-interval", cluster.DefaultGossipInterval, "The interval between sending gossip messages. By lowering this value (more frequent) gossip messages are propagated across cluster more quickly at the expense of increased bandwidth usage.")
 	f.DurationVar(&cfg.PushPullInterval, prefix+"push-pull-interval", cluster.DefaultPushPullInterval, "The interval between gossip state syncs. Setting this interval lower (more frequent) will increase convergence speeds across larger clusters at the expense of increased bandwidth usage.")
+	f.BoolVar(&cfg.TLSEnabled, prefix+"tls-enabled", false, "Enable TLS (and client-certificate authentication) for the legacy upstream alertmanager gossip mesh. Required to open the listener on a non-loopback address.")
+	cfg.TLS.RegisterFlagsWithPrefix(prefix+"client", f)
+}
+
+// isLoopbackListenAddr returns true if the configured gossip listen address
+// is on the loopback interface (and so is only reachable from the local
+// host). An empty address is reported as loopback (listener disabled).
+func isLoopbackListenAddr(addr string) bool {
+	if addr == "" {
+		return true
+	}
+	host, _, err := net.SplitHostPort(addr)
+	if err != nil {
+		// If the address does not parse, treat it as non-loopback so we fail
+		// safe and refuse to start the unauthenticated mesh.
+		return false
+	}
+	if host == "" {
+		// A missing host component means memberlist will bind on all
+		// interfaces; this is not loopback.
+		return false
+	}
+	if ip := net.ParseIP(host); ip != nil {
+		return ip.IsLoopback()
+	}
+	return host == "localhost"
+}
+
+// buildClusterTLSConfig converts the Cortex-style ClientConfig into the TLS
+// transport config consumed by the vendored prometheus/alertmanager cluster
+// package. The same certificate/key/CA material is used for both the server
+// (inbound) and client (outbound) sides of the mesh, giving mutual TLS.
+func buildClusterTLSConfig(cfg util_tls.ClientConfig) (*cluster.TLSTransportConfig, error) {
+	if cfg.CertPath == "" || cfg.KeyPath == "" {
+		return nil, errors.New("alertmanager.cluster: tls_enabled requires both a certificate and key (set -alertmanager.cluster.client.tls-cert-path and -alertmanager.cluster.client.tls-key-path)")
+	}
+	if cfg.CAPath == "" {
+		return nil, errors.New("alertmanager.cluster: tls_enabled requires a CA bundle to authenticate peers (set -alertmanager.cluster.client.tls-ca-path)")
+	}
+	return &cluster.TLSTransportConfig{
+		TLSServerConfig: &web.TLSStruct{
+			TLSCertPath: cfg.CertPath,
+			TLSKeyPath:  cfg.KeyPath,
+			ClientCAs:   cfg.CAPath,
+			ClientAuth:  "RequireAndVerifyClientCert",
+		},
+		TLSClientConfig: &common_config.TLSConfig{
+			CAFile:             cfg.CAPath,
+			CertFile:           cfg.CertPath,
+			KeyFile:            cfg.KeyPath,
+			ServerName:         cfg.ServerName,
+			InsecureSkipVerify: cfg.InsecureSkipVerify,
+		},
+	}, nil
 }
 
 // Validate config and returns error on failure
@@ -303,6 +372,24 @@ func NewMultitenantAlertmanager(cfg *MultitenantAlertmanagerConfig, store alerts
 	var peer *cluster.Peer
 	// We need to take this case into account to support our legacy upstream clustering.
 	if cfg.Cluster.ListenAddr != "" && !cfg.ShardingEnabled {
+		// The vendored cluster.Create uses memberlist's DefaultLANConfig when
+		// no TLS transport is supplied, which gives neither authentication
+		// nor encryption. All tenants are multiplexed onto this one mesh
+		// under keys "nfl:<tenant>"/"sil:<tenant>", so an unauthenticated
+		// listener on a non-loopback address lets any network client
+		// cross-tenant read/write silences and the notification log. Refuse
+		// to open such a listener unless the operator has explicitly enabled
+		// TLS for the mesh.
+		var tlsTransportCfg *cluster.TLSTransportConfig
+		if cfg.Cluster.TLSEnabled {
+			tlsTransportCfg, err = buildClusterTLSConfig(cfg.Cluster.TLS)
+			if err != nil {
+				return nil, err
+			}
+		} else if !isLoopbackListenAddr(cfg.Cluster.ListenAddr) {
+			return nil, errors.New("alertmanager.cluster: refusing to start an unauthenticated gossip mesh on a non-loopback address; either bind -alertmanager.cluster.listen-address to a loopback address, enable -alertmanager.cluster.tls-enabled, or use -alertmanager.sharding-enabled=true")
+		}
+
 		peer, err = cluster.Create(
 			log.With(logger, "component", "cluster"),
 			registerer,
@@ -315,7 +402,7 @@ func NewMultitenantAlertmanager(cfg *MultitenantAlertmanagerConfig, store alerts
 			cluster.DefaultTcpTimeout,
 			cluster.DefaultProbeTimeout,
 			cluster.DefaultProbeInterval,
-			nil,
+			tlsTransportCfg,
 			false,
 		)
 		if err != nil {
