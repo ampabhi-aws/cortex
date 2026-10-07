@@ -13,6 +13,16 @@ import (
 	"github.com/cortexproject/cortex/pkg/ring/kv/memberlist"
 )
 
+// Sanity bounds applied to gossiped ingester entries. They are deliberately
+// generous so legitimate deployments (including large ingester fleets with
+// very high per-instance token counts) are not affected, but tight enough
+// to stop a malicious peer from registering a single pathological entry.
+const (
+	maxInstanceIDLength   = 253 // RFC 1035-ish DNS label-compatible upper bound.
+	maxInstanceAddrLength = 512 // room for IPv6 "[addr]:port" plus some overhead.
+	maxTokensPerInstance  = 10000
+)
+
 // ByAddr is a sortable list of InstanceDesc.
 type ByAddr []InstanceDesc
 
@@ -213,6 +223,22 @@ func (d *Desc) mergeWithTime(mergeable memberlist.Mergeable, localCAS bool, now 
 	for name, oing := range otherIngesterMap {
 		if oing.Timestamp > maxFutureLimit {
 			return nil, fmt.Errorf("ingester %s timestamp in the future, expected max of %d, got %d", name, maxFutureLimit, oing.Timestamp)
+		}
+
+		// Defence-in-depth: reject obviously malformed / abusive gossiped
+		// entries so a hostile or compromised peer cannot register an
+		// instance with pathological size and take over the hash ring.
+		// These bounds are deliberately generous so legitimate operation
+		// (including very large ingester fleets) is unaffected; they only
+		// stop attacker-crafted inputs.
+		if len(name) > maxInstanceIDLength {
+			return nil, fmt.Errorf("gossiped instance ID exceeds %d bytes (got %d)", maxInstanceIDLength, len(name))
+		}
+		if len(oing.Addr) > maxInstanceAddrLength {
+			return nil, fmt.Errorf("gossiped instance %q has address longer than %d bytes", name, maxInstanceAddrLength)
+		}
+		if len(oing.Tokens) > maxTokensPerInstance {
+			return nil, fmt.Errorf("gossiped instance %q claims %d tokens, more than the permitted maximum of %d", name, len(oing.Tokens), maxTokensPerInstance)
 		}
 
 		ting := thisIngesterMap[name]

@@ -126,10 +126,21 @@ func NewTCPTransport(config TCPTransportConfig, logger log.Logger) (*TCPTranspor
 	}
 
 	var err error
+	var listenTLSConfig *tls.Config
 	if config.TLSEnabled {
+		// Dial (outgoing) side: regular client config.
 		t.tlsConfig, err = config.TLS.GetTLSConfig()
 		if err != nil {
-			return nil, errors.Wrap(err, "unable to create TLS config")
+			return nil, errors.Wrap(err, "unable to create TLS client config")
+		}
+		// Listen (incoming) side: dedicated server config that REQUIRES and
+		// VERIFIES the peer's client certificate against the configured CA.
+		// Without this the listener defaults to ClientAuth: NoClientCert,
+		// meaning any anonymous caller is accepted and allowed to inject
+		// gossip state into the ring KV.
+		listenTLSConfig, err = config.TLS.GetServerTLSConfig()
+		if err != nil {
+			return nil, errors.Wrap(err, "unable to create TLS server config for memberlist listener")
 		}
 	}
 
@@ -151,7 +162,7 @@ func NewTCPTransport(config TCPTransportConfig, logger log.Logger) (*TCPTranspor
 
 		var tcpLn net.Listener
 		if config.TLSEnabled {
-			tcpLn, err = tls.Listen("tcp", tcpAddr.String(), t.tlsConfig)
+			tcpLn, err = tls.Listen("tcp", tcpAddr.String(), listenTLSConfig)
 			if err != nil {
 				return nil, errors.Wrapf(err, "failed to start TLS TCP listener on %q port %d", addr, port)
 			}
