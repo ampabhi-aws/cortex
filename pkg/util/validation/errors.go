@@ -128,9 +128,18 @@ func newTooManyLabelsError(series []cortexpb.LabelAdapter, limit int) Validation
 }
 
 func (e *tooManyLabelsError) Error() string {
+	// Render at most a handful of labels and clamp the resulting string with
+	// %.200q so that an attacker-controlled series carrying millions of labels
+	// cannot blow up the error message (and the log line / HTTP body derived
+	// from it) by orders of magnitude. The actual number of labels on the
+	// offending series is still reported through "actual".
+	series := e.series
+	if len(series) > 10 {
+		series = series[:10]
+	}
 	return fmt.Sprintf(
-		"series has too many labels (actual: %d, limit: %d) series: '%s'",
-		len(e.series), e.limit, cortexpb.FromLabelAdaptersToMetric(e.series).String())
+		"series has too many labels (actual: %d, limit: %d) series: %.200q",
+		len(e.series), e.limit, formatLabelSet(series))
 }
 
 type noMetricNameError struct{}
@@ -193,7 +202,12 @@ type exemplarValidationError struct {
 }
 
 func (e *exemplarValidationError) Error() string {
-	return fmt.Sprintf(e.message, e.timestamp, cortexpb.FromLabelAdaptersToLabels(e.seriesLabels).String(), cortexpb.FromLabelAdaptersToLabels(e.exemplarLabels).String())
+	// Clamp both the series and exemplar label renderings with %.200q so that an
+	// unbounded exemplar/series labelset cannot amplify into a multi-hundred-MB
+	// error message.
+	return fmt.Sprintf(e.message, e.timestamp,
+		fmt.Sprintf("%.200q", formatLabelSet(e.seriesLabels)),
+		fmt.Sprintf("%.200q", formatLabelSet(e.exemplarLabels)))
 }
 
 func newExemplarEmtpyLabelsError(seriesLabels []cortexpb.LabelAdapter, exemplarLabels []cortexpb.LabelAdapter, timestamp int64) ValidationError {

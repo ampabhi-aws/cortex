@@ -66,6 +66,17 @@ const (
 	// The combined length of the label names and values of an Exemplar's LabelSet MUST NOT exceed 128 UTF-8 characters
 	// https://github.com/OpenObservability/OpenMetrics/blob/main/specification/OpenMetrics.md#exemplars
 	ExemplarMaxLabelSetLength = 128
+
+	// HardMaxLabelsSizeBytes is a hard built-in ceiling (independent of the
+	// per-tenant MaxLabelsSizeBytes override) on the total size of a series'
+	// labels. Enforced at the very top of ValidateLabels so that a hostile
+	// remote-write series carrying millions of labels is rejected before any
+	// per-label iteration or before the error path tries to render the series.
+	// 2 MiB is far above the practical cap for a legitimate series (the
+	// default MaxLabelNamesPerSeries is 30 and the default MaxLabelValueLength
+	// is 2048, which is only ~64 KiB) but well below the
+	// -distributor.max-recv-msg-size (100 MiB) that bounds the whole request.
+	HardMaxLabelsSizeBytes = 2 * 1024 * 1024
 )
 
 // DiscardedSamples is a metric of the number of discarded samples, by reason.
@@ -175,6 +186,24 @@ type LabelValidationConfig interface {
 // ValidateLabels returns an err if the labels are invalid.
 // The returned error may retain the provided series labels.
 func ValidateLabels(cfg LabelValidationConfig, userID string, ls []cortexpb.LabelAdapter, skipLabelNameValidation bool) ValidationError {
+	// Reject the whole series on total size BEFORE any other check so that a
+	// hostile series with millions of labels is dropped before the
+	// too-many-labels branch has a chance to render it as a multi-hundred-MB
+	// error string. We always enforce a hard built-in ceiling
+	// (HardMaxLabelsSizeBytes) that is independent of the per-tenant
+	// MaxLabelsSizeBytes override, so the default configuration
+	// (MaxLabelsSizeBytes = 0, i.e. per-tenant override disabled) is still
+	// safe against a payload-amplification denial-of-service.
+	hardMax := HardMaxLabelsSizeBytes
+	hardTotal := 0
+	for _, l := range ls {
+		hardTotal += l.Size()
+		if hardTotal > hardMax {
+			DiscardedSamples.WithLabelValues(labelsSizeBytesExceeded, userID).Inc()
+			return labelSizeBytesExceededError(ls, hardTotal, hardMax)
+		}
+	}
+
 	if cfg.EnforceMetricName(userID) {
 		unsafeMetricName, err := extract.UnsafeMetricNameFromLabelAdapters(ls)
 		if err != nil {
