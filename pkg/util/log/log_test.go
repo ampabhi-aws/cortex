@@ -2,7 +2,9 @@ package log
 
 import (
 	"context"
+	"fmt"
 	"net/http"
+	"strings"
 	"testing"
 
 	"github.com/stretchr/testify/require"
@@ -15,7 +17,7 @@ func TestHeaderMapFromMetadata(t *testing.T) {
 
 	ctx := context.Background()
 
-	ctx = ContextWithHeaderMapFromMetadata(ctx, md)
+	ctx = ContextWithHeaderMapFromMetadata(ctx, md, []string{"TestHeader1", "TestHeader2"})
 
 	headerMap := HeaderMapFromContext(ctx)
 
@@ -31,10 +33,51 @@ func TestHeaderMapFromMetadataWithImproperLength(t *testing.T) {
 
 	ctx := context.Background()
 
-	ctx = ContextWithHeaderMapFromMetadata(ctx, md)
+	ctx = ContextWithHeaderMapFromMetadata(ctx, md, []string{"TestHeader1", "TestHeader2", "Test3"})
 
 	headerMap := HeaderMapFromContext(ctx)
 	require.Nil(t, headerMap)
+}
+
+func TestHeaderMapFromMetadataAllowListFiltersUnknownKeys(t *testing.T) {
+	md := metadata.New(nil)
+	md.Append(HeaderPropagationStringForRequestLogging,
+		"TestHeader1", "SomeInformation",
+		"NotAllowed", "Attacker",
+		"org_id", "victim-tenant",
+	)
+
+	ctx := ContextWithHeaderMapFromMetadata(context.Background(), md, []string{"TestHeader1"})
+
+	headerMap := HeaderMapFromContext(ctx)
+	require.NotNil(t, headerMap)
+	require.Equal(t, map[string]string{"TestHeader1": "SomeInformation"}, headerMap)
+}
+
+func TestHeaderMapFromMetadataEmptyAllowListDropsEverything(t *testing.T) {
+	md := metadata.New(nil)
+	md.Append(HeaderPropagationStringForRequestLogging, "a", "b", "c", "d")
+
+	ctx := ContextWithHeaderMapFromMetadata(context.Background(), md, nil)
+	require.Nil(t, HeaderMapFromContext(ctx))
+}
+
+func TestHeaderMapFromMetadataCapsPairsAndValueLength(t *testing.T) {
+	md := metadata.New(nil)
+	allowed := make([]string, 0, maxPropagatedHeaderPairs+5)
+	for i := 0; i < maxPropagatedHeaderPairs+5; i++ {
+		name := fmt.Sprintf("h%d", i)
+		allowed = append(allowed, name)
+		md.Append(HeaderPropagationStringForRequestLogging, name, strings.Repeat("x", maxPropagatedHeaderValueLen+100))
+	}
+
+	ctx := ContextWithHeaderMapFromMetadata(context.Background(), md, allowed)
+	headerMap := HeaderMapFromContext(ctx)
+	require.NotNil(t, headerMap)
+	require.LessOrEqual(t, len(headerMap), maxPropagatedHeaderPairs)
+	for _, v := range headerMap {
+		require.LessOrEqual(t, len(v), maxPropagatedHeaderValueLen)
+	}
 }
 
 func TestInjectHeadersIntoHTTPRequest(t *testing.T) {

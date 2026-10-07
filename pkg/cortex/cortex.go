@@ -226,6 +226,9 @@ func (c *Config) Validate(log log.Logger) error {
 	if err := c.Tracing.Validate(); err != nil {
 		return errors.Wrap(err, "invalid tracing config")
 	}
+	if err := c.API.Validate(); err != nil {
+		return errors.Wrap(err, "invalid api config")
+	}
 
 	return nil
 }
@@ -374,8 +377,9 @@ func (t *Cortex) setupThanosTracing() {
 // HTTP Headers through child gRPC calls
 func (t *Cortex) setupGRPCHeaderForwarding() {
 	if len(t.Cfg.API.HTTPRequestHeadersToLog) > 0 {
-		t.Cfg.Server.GRPCMiddleware = append(t.Cfg.Server.GRPCMiddleware, grpcutil.HTTPHeaderPropagationServerInterceptor)
-		t.Cfg.Server.GRPCStreamMiddleware = append(t.Cfg.Server.GRPCStreamMiddleware, grpcutil.HTTPHeaderPropagationStreamServerInterceptor)
+		allowed := append([]string(nil), t.Cfg.API.HTTPRequestHeadersToLog...)
+		t.Cfg.Server.GRPCMiddleware = append(t.Cfg.Server.GRPCMiddleware, grpcutil.HTTPHeaderPropagationServerInterceptorForHeaders(allowed))
+		t.Cfg.Server.GRPCStreamMiddleware = append(t.Cfg.Server.GRPCStreamMiddleware, grpcutil.HTTPHeaderPropagationStreamServerInterceptorForHeaders(allowed))
 	}
 }
 

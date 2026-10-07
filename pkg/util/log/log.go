@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"net/http"
 	"os"
+	"strings"
 
 	"github.com/go-kit/log"
 	kitlog "github.com/go-kit/log"
@@ -21,6 +22,14 @@ const (
 	headerMapContextKey contextKey = 0
 
 	HeaderPropagationStringForRequestLogging string = "x-http-header-forwarding-logging"
+
+	// maxPropagatedHeaderPairs caps the number of header entries copied out
+	// of caller-supplied gRPC metadata to prevent attacker-controlled log
+	// field explosion.
+	maxPropagatedHeaderPairs = 32
+	// maxPropagatedHeaderValueLen caps the length of each header value copied
+	// out of caller-supplied gRPC metadata.
+	maxPropagatedHeaderValueLen = 1024
 )
 
 var (
@@ -156,15 +165,43 @@ func InjectHeadersIntoHTTPRequest(headerMap map[string]string, request *http.Req
 	}
 }
 
-func ContextWithHeaderMapFromMetadata(ctx context.Context, md metadata.MD) context.Context {
+// ContextWithHeaderMapFromMetadata rebuilds the "headers to log" context value
+// from the caller-supplied gRPC metadata key
+// HeaderPropagationStringForRequestLogging. Only header names present in the
+// operator-configured `allowed` allow-list are retained; everything else is
+// dropped. This mirrors the HTTP ingress behaviour implemented in
+// pkg/api/middlewares.go. The function additionally caps the number of pairs
+// and the per-value length to protect downstream log sinks from unbounded
+// attacker-controlled input.
+func ContextWithHeaderMapFromMetadata(ctx context.Context, md metadata.MD, allowed []string) context.Context {
 	headersSlice, ok := md[HeaderPropagationStringForRequestLogging]
 	if !ok || len(headersSlice)%2 == 1 {
 		return ctx
 	}
 
+	// If the operator did not configure any headers to log, there is nothing
+	// to accept. The gRPC interceptors are only installed when the allow-list
+	// is non-empty, but we re-check here for defence in depth.
+	if len(allowed) == 0 {
+		return ctx
+	}
+
+	allow := make(map[string]struct{}, len(allowed))
+	for _, a := range allowed {
+		allow[strings.ToLower(a)] = struct{}{}
+	}
+
 	headerMap := make(map[string]string)
-	for i := 0; i < len(headersSlice); i += 2 {
-		headerMap[headersSlice[i]] = headersSlice[i+1]
+	for i := 0; i+1 < len(headersSlice) && len(headerMap) < maxPropagatedHeaderPairs; i += 2 {
+		name := headersSlice[i]
+		if _, ok := allow[strings.ToLower(name)]; !ok {
+			continue
+		}
+		value := headersSlice[i+1]
+		if len(value) > maxPropagatedHeaderValueLen {
+			value = value[:maxPropagatedHeaderValueLen]
+		}
+		headerMap[name] = value
 	}
 
 	return ContextWithHeaderMap(ctx, headerMap)

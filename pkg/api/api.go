@@ -3,6 +3,7 @@ package api
 import (
 	"context"
 	"flag"
+	"fmt"
 	"net/http"
 	"path"
 	"strings"
@@ -70,7 +71,7 @@ type Config struct {
 // RegisterFlags adds the flags required to config this to the given FlagSet.
 func (cfg *Config) RegisterFlags(f *flag.FlagSet) {
 	f.BoolVar(&cfg.ResponseCompression, "api.response-compression-enabled", false, "Use GZIP compression for API responses. Some endpoints serve large YAML or JSON blobs which can benefit from compression.")
-	f.Var(&cfg.HTTPRequestHeadersToLog, "api.http-request-headers-to-log", "Which HTTP Request headers to add to logs")
+	f.Var(&cfg.HTTPRequestHeadersToLog, "api.http-request-headers-to-log", "Which HTTP Request headers to add to logs. The values of listed headers are also propagated to downstream components via internal gRPC calls and are re-attached to internally-issued HTTP requests, so do NOT list credential-bearing headers (Authorization, Proxy-Authorization, Cookie, Set-Cookie, X-Amz-Security-Token, ...).")
 	cfg.RegisterFlagsWithPrefix("", f)
 }
 
@@ -78,6 +79,32 @@ func (cfg *Config) RegisterFlags(f *flag.FlagSet) {
 func (cfg *Config) RegisterFlagsWithPrefix(prefix string, f *flag.FlagSet) {
 	f.StringVar(&cfg.AlertmanagerHTTPPrefix, prefix+"http.alertmanager-http-prefix", "/alertmanager", "HTTP URL path under which the Alertmanager ui and api will be served.")
 	f.StringVar(&cfg.PrometheusHTTPPrefix, prefix+"http.prometheus-http-prefix", "/prometheus", "HTTP URL path under which the Prometheus api will be served.")
+}
+
+// deniedLoggedHeaders enumerates header names that MUST NOT be listed in
+// -api.http-request-headers-to-log, because the values of logged headers are
+// written in cleartext to the service log, propagated across internal gRPC
+// hops, and re-attached to internally-issued HTTP requests. Logging any of
+// these would disclose end-user credentials or session material.
+var deniedLoggedHeaders = map[string]struct{}{
+	"authorization":         {},
+	"proxy-authorization":   {},
+	"cookie":                {},
+	"set-cookie":            {},
+	"x-amz-security-token":  {},
+	"x-amz-content-sha256":  {},
+	"x-api-key":             {},
+}
+
+// Validate checks that the API Config is self-consistent and does not
+// enable logging of credential-bearing request headers.
+func (cfg *Config) Validate() error {
+	for _, h := range cfg.HTTPRequestHeadersToLog {
+		if _, denied := deniedLoggedHeaders[strings.ToLower(h)]; denied {
+			return fmt.Errorf("-api.http-request-headers-to-log: refusing to log credential-bearing header %q; the configured headers are copied verbatim to logs and propagated to downstream components", h)
+		}
+	}
+	return nil
 }
 
 // Push either wraps the distributor push function as configured or returns the distributor push directly.

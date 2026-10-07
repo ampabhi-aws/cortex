@@ -94,3 +94,25 @@ func TestNewApiWithoutHeaderLogging(t *testing.T) {
 	require.Nil(t, api.HTTPHeaderMiddleware)
 
 }
+
+func TestConfigValidate(t *testing.T) {
+	t.Run("empty is ok", func(t *testing.T) {
+		cfg := Config{}
+		require.NoError(t, cfg.Validate())
+	})
+
+	t.Run("regular header is ok", func(t *testing.T) {
+		cfg := Config{HTTPRequestHeadersToLog: []string{"X-Scope-OrgID"}}
+		require.NoError(t, cfg.Validate())
+	})
+
+	for _, denied := range []string{"Authorization", "authorization", "Proxy-Authorization", "Cookie", "Set-Cookie", "X-Amz-Security-Token", "X-API-Key"} {
+		denied := denied
+		t.Run("denies "+denied, func(t *testing.T) {
+			cfg := Config{HTTPRequestHeadersToLog: []string{denied}}
+			err := cfg.Validate()
+			require.Error(t, err)
+			require.Contains(t, err.Error(), "credential-bearing header")
+		})
+	}
+}

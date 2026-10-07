@@ -59,7 +59,10 @@ func WithSourceIPs(sourceIPs string, l log.Logger) log.Logger {
 func headersFromContext(ctx context.Context, l log.Logger) log.Logger {
 	headerContentsMap := HeaderMapFromContext(ctx)
 	for header, contents := range headerContentsMap {
-		l = kitlog.With(l, header, contents)
+		// Prefix forwarded request header fields so they can never collide
+		// with service-generated log fields such as `org_id`, `traceID`,
+		// `caller`, `level`, or `ts`.
+		l = kitlog.With(l, "http_header_"+header, contents)
 	}
 	return l
 }

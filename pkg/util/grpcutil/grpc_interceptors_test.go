@@ -68,7 +68,7 @@ func TestGRPCHeaderInjectionForHTTPPropagationServerInterceptor(t *testing.T) {
 
 	md, ok := metadata.FromOutgoingContext(ctx)
 	require.True(t, ok)
-	ctx = util_log.ContextWithHeaderMapFromMetadata(ctx, md)
+	ctx = util_log.ContextWithHeaderMapFromMetadata(ctx, md, []string{"Test1", "TestHeader2"})
 
 	headersMap := util_log.HeaderMapFromContext(ctx)
 
@@ -86,7 +86,7 @@ func TestGRPCHeaderDifferentLengthsForHTTPPropagationServerInterceptor(t *testin
 	ctx = metadata.AppendToOutgoingContext(ctx, util_log.HeaderPropagationStringForRequestLogging, "Results")
 	ctx = metadata.AppendToOutgoingContext(ctx, util_log.HeaderPropagationStringForRequestLogging, "Results2")
 
-	ctx = extractForwardedHeadersFromMetadata(ctx)
+	ctx = extractForwardedHeadersFromMetadata(ctx, nil)
 
 	assert.Nil(t, util_log.HeaderMapFromContext(ctx))
 }
