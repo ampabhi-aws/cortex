@@ -10,6 +10,7 @@ import (
 	"strings"
 	"sync"
 	"time"
+	"unicode/utf8"
 
 	"github.com/go-kit/log"
 	"github.com/go-kit/log/level"
@@ -486,6 +487,15 @@ func (d *Distributor) checkSample(ctx context.Context, userID, cluster, replica 
 
 	// If replica label is too long, don't use it. We accept the sample here, but it will fail validation later anyway.
 	if len(replica) > d.limits.MaxLabelValueLength(userID) {
+		return false, nil
+	}
+
+	// If cluster label is too long or is not valid UTF-8, don't use it as part of HA tracking.
+	// We accept the sample here as non-HA; it will fail label validation later anyway if it is
+	// still part of the series. This prevents a tenant-controlled value from being persisted
+	// into the HA KV store or used as a Prometheus metric label value (which would panic on
+	// invalid UTF-8 and could crash every distributor via the KV watch callback).
+	if len(cluster) > d.limits.MaxLabelValueLength(userID) || !utf8.ValidString(cluster) {
 		return false, nil
 	}
 
