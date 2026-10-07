@@ -27,7 +27,19 @@ import (
 var (
 	errNegativeUpdateTimeoutJitterMax = errors.New("HA tracker max update timeout jitter shouldn't be negative")
 	errInvalidFailoverTimeout         = "HA Tracker failover timeout (%v) must be at least 1s greater than update timeout - max jitter (%v)"
+
+	// errHAClusterLabelTooLong is returned by the HA tracker when a cluster label value is longer
+	// than maxHAClusterLabelLength. It is a defense-in-depth guard: callers (e.g. Distributor.checkSample)
+	// should already reject oversized values earlier against the per-tenant max_label_value_length limit.
+	errHAClusterLabelTooLong = errors.New("HA cluster label value too long")
 )
+
+// maxHAClusterLabelLength caps the length of the HA cluster label value accepted by the tracker,
+// so that an unvalidated, tenant-controlled value cannot be interpolated into a shared KV store key
+// or into Prometheus metric labels. It is intentionally larger than the Prometheus
+// -validation.max-length-label-value default (2048) to avoid rejecting values that would otherwise
+// pass label validation, while still bounding worst-case key/metric cardinality cost.
+const maxHAClusterLabelLength = 8 * 1024
 
 type haTrackerLimits interface {
 	// MaxHAClusters returns max number of clusters that HA tracker should track for a user.
@@ -234,6 +246,9 @@ func (c *haTracker) loop(ctx context.Context) error {
 			delete(c.elected, key)
 			c.electedReplicaChanges.DeleteLabelValues(user, cluster)
 			c.electedReplicaTimestamp.DeleteLabelValues(user, cluster)
+			// Also drop the kvCASCalls series for this (user, cluster) so that it does not leak
+			// cardinality forever when a cluster is deleted from the KV store.
+			c.kvCASCalls.DeleteLabelValues(user, cluster)
 
 			userClusters := c.clusters[user]
 			if userClusters != nil {
@@ -373,6 +388,13 @@ func (c *haTracker) checkReplica(ctx context.Context, userID, cluster, replica s
 	// If HA tracking isn't enabled then accept the sample
 	if !c.cfg.EnableHATracker {
 		return nil
+	}
+	// Defense in depth: cap the cluster label length before it is interpolated into the KV store key
+	// or into Prometheus metric label values. Callers are expected to validate the value against the
+	// per-tenant max_label_value_length first, but we re-check here so that no caller can bypass the
+	// bound.
+	if len(cluster) > maxHAClusterLabelLength {
+		return errHAClusterLabelTooLong
 	}
 	key := fmt.Sprintf("%s/%s", userID, cluster)
 
