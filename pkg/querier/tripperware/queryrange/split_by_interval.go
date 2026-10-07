@@ -101,14 +101,23 @@ func evaluateAtModifierFunction(query string, start, end int64) (string, error) 
 		return "", httpgrpc.Errorf(http.StatusBadRequest, "%s", err)
 	}
 	parser.Inspect(expr, func(n parser.Node, _ []parser.Node) error {
-		if selector, ok := n.(*parser.VectorSelector); ok {
-			switch selector.StartOrEnd {
+		switch e := n.(type) {
+		case *parser.VectorSelector:
+			switch e.StartOrEnd {
 			case parser.START:
-				selector.Timestamp = &start
+				e.Timestamp = &start
 			case parser.END:
-				selector.Timestamp = &end
+				e.Timestamp = &end
 			}
-			selector.StartOrEnd = 0
+			e.StartOrEnd = 0
+		case *parser.SubqueryExpr:
+			switch e.StartOrEnd {
+			case parser.START:
+				e.Timestamp = &start
+			case parser.END:
+				e.Timestamp = &end
+			}
+			e.StartOrEnd = 0
 		}
 		return nil
 	})
