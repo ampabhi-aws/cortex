@@ -306,6 +306,15 @@ func (u *userTSDB) casState(from, to tsdbState) bool {
 	return true
 }
 
+// maxBlocksPerHeadCompaction bounds the number of 2h block ranges that a single
+// userTSDB.compactHead invocation will walk. Without a bound, a far-future
+// sample timestamp in the head drives the loop for up to ~1.3e12 iterations
+// (one iteration per blockDuration between head MinTime and MaxTime), pinning
+// the single compaction goroutine for every tenant on the ingester. 64 blocks
+// is ~5 days at the default 2h block range, which is well above anything we
+// expect to see in practice.
+const maxBlocksPerHeadCompaction = 64
+
 // compactHead compacts the Head block at specified block durations avoiding a single huge block.
 func (u *userTSDB) compactHead(blockDuration int64) error {
 	if !u.casState(active, forceCompacting) {
@@ -323,7 +332,15 @@ func (u *userTSDB) compactHead(blockDuration int64) error {
 
 	minTime, maxTime := h.MinTime(), h.MaxTime()
 
-	for (minTime/blockDuration)*blockDuration != (maxTime/blockDuration)*blockDuration {
+	for it := 0; (minTime/blockDuration)*blockDuration != (maxTime/blockDuration)*blockDuration; it++ {
+		// Defence in depth: if the head spans an implausibly large number of block
+		// ranges (e.g. because a far-future sample timestamp leaked past the push
+		// validation), refuse to compact rather than livelocking the shared
+		// compaction goroutine for every tenant on this ingester.
+		if it >= maxBlocksPerHeadCompaction {
+			return errors.Errorf("head spans too many block ranges (min=%d max=%d blockDuration=%d), refusing to compact", minTime, maxTime, blockDuration)
+		}
+
 		// Data in Head spans across multiple block ranges, so we break it into blocks here.
 		// Block max time is exclusive, so we do a -1 here.
 		blockMaxTime := ((minTime/blockDuration)+1)*blockDuration - 1
@@ -945,6 +962,7 @@ func (i *Ingester) Push(ctx context.Context, req *cortexpb.WriteRequest) (*corte
 		startAppend               = time.Now()
 		sampleOutOfBoundsCount    = 0
 		sampleOutOfOrderCount     = 0
+		sampleTooFarInFutureCount = 0
 		newValueForTimestampCount = 0
 		perUserSeriesLimitCount   = 0
 		perMetricSeriesLimitCount = 0
@@ -958,6 +976,13 @@ func (i *Ingester) Push(ctx context.Context, req *cortexpb.WriteRequest) (*corte
 
 	// Walk the samples, appending them to the users database
 	app := db.Appender(ctx).(extendedAppender)
+	// Per-tenant limit for how far into the future a sample timestamp is allowed to be.
+	// This mirrors the check performed by the distributor's validation.ValidateSample
+	// (-validation.create-grace-period, default 10m) and defends the ingester-local
+	// write endpoints (POST /ingester/push, POST /push, cortex.Ingester/Push gRPC)
+	// against a far-future timestamp that would otherwise poison the per-tenant TSDB
+	// head and livelock the shared compaction goroutine.
+	creationGrace := i.limits.CreationGracePeriod(userID)
 	for _, ts := range req.Timeseries {
 		// The labels must be sorted (in our case, it's guaranteed a write request
 		// has sorted labels once hit the ingester).
@@ -970,6 +995,20 @@ func (i *Ingester) Push(ctx context.Context, req *cortexpb.WriteRequest) (*corte
 
 		for _, s := range ts.Samples {
 			var err error
+
+			// Reject samples whose timestamp is further in the future than
+			// -validation.create-grace-period allows. The distributor already
+			// performs this check; replicating it here ensures requests sent
+			// directly to the ingester (bypassing the distributor) cannot push
+			// head MaxTime arbitrarily far into the future.
+			if creationGrace > 0 && model.Time(s.TimestampMs) > model.Now().Add(creationGrace) {
+				failedSamplesCount++
+				sampleTooFarInFutureCount++
+				updateFirstPartial(func() error {
+					return wrappedTSDBIngestErr(storage.ErrOutOfBounds, model.Time(s.TimestampMs), ts.Labels)
+				})
+				continue
+			}
 
 			// If the cached reference exists, we try to use it.
 			if ref != 0 {
@@ -1100,6 +1139,9 @@ func (i *Ingester) Push(ctx context.Context, req *cortexpb.WriteRequest) (*corte
 	}
 	if sampleOutOfOrderCount > 0 {
 		validation.DiscardedSamples.WithLabelValues(sampleOutOfOrder, userID).Add(float64(sampleOutOfOrderCount))
+	}
+	if sampleTooFarInFutureCount > 0 {
+		validation.DiscardedSamples.WithLabelValues(sampleTooFarInFuture, userID).Add(float64(sampleTooFarInFutureCount))
 	}
 	if newValueForTimestampCount > 0 {
 		validation.DiscardedSamples.WithLabelValues(newValueForTimestamp, userID).Add(float64(newValueForTimestampCount))
@@ -2194,6 +2236,15 @@ func (i *Ingester) compactionLoop(ctx context.Context) error {
 	return nil
 }
 
+// perTenantCompactionTimeout bounds the time compactBlocks will spend on any
+// single tenant. Head compaction normally completes in seconds; capping each
+// tenant at a few minutes ensures a single misbehaving tenant can never stall
+// the shared compactionLoop goroutine and prevent other tenants' heads from
+// being truncated and shipped. The deadline is only enforced when the parent
+// context has no deadline of its own, so operator-triggered forced compactions
+// still respect their own cancellation.
+const perTenantCompactionTimeout = 5 * time.Minute
+
 // Compacts all compactable blocks. Force flag will force compaction even if head is not compactable yet.
 func (i *Ingester) compactBlocks(ctx context.Context, force bool, allowed *util.AllowedTenants) {
 	// Don't compact TSDB blocks while JOINING as there may be ongoing blocks transfers.
@@ -2221,6 +2272,16 @@ func (i *Ingester) compactBlocks(ctx context.Context, force bool, allowed *util.
 			return nil
 		}
 
+		// Enforce a per-tenant deadline so one misbehaving tenant cannot stall
+		// head truncation and block shipping for every other tenant on this
+		// ingester. If the caller already supplied a deadline we respect that.
+		tenantCtx := ctx
+		if _, hasDeadline := ctx.Deadline(); !hasDeadline {
+			var cancel context.CancelFunc
+			tenantCtx, cancel = context.WithTimeout(ctx, perTenantCompactionTimeout)
+			defer cancel()
+		}
+
 		var err error
 
 		i.TSDBState.compactionsTriggered.Inc()
@@ -2233,7 +2294,7 @@ func (i *Ingester) compactBlocks(ctx context.Context, force bool, allowed *util.
 
 		case i.TSDBState.compactionIdleTimeout > 0 && userDB.isIdle(time.Now(), i.TSDBState.compactionIdleTimeout):
 			reason = "idle"
-			level.Info(logutil.WithContext(ctx, i.logger)).Log("msg", "TSDB is idle, forcing compaction", "user", userID)
+			level.Info(logutil.WithContext(tenantCtx, i.logger)).Log("msg", "TSDB is idle, forcing compaction", "user", userID)
 			err = userDB.compactHead(i.cfg.BlocksStorageConfig.TSDB.BlockRanges[0].Milliseconds())
 
 		default:
@@ -2243,9 +2304,9 @@ func (i *Ingester) compactBlocks(ctx context.Context, force bool, allowed *util.
 
 		if err != nil {
 			i.TSDBState.compactionsFailed.Inc()
-			level.Warn(logutil.WithContext(ctx, i.logger)).Log("msg", "TSDB blocks compaction for user has failed", "user", userID, "err", err, "compactReason", reason)
+			level.Warn(logutil.WithContext(tenantCtx, i.logger)).Log("msg", "TSDB blocks compaction for user has failed", "user", userID, "err", err, "compactReason", reason)
 		} else {
-			level.Debug(logutil.WithContext(ctx, i.logger)).Log("msg", "TSDB blocks compaction completed successfully", "user", userID, "compactReason", reason)
+			level.Debug(logutil.WithContext(tenantCtx, i.logger)).Log("msg", "TSDB blocks compaction completed successfully", "user", userID, "compactReason", reason)
 		}
 
 		return nil
