@@ -276,10 +276,14 @@ func (s *Scheduler) enqueueRequest(frontendContext context.Context, frontendAddr
 
 	// Extract tracing information from headers in HTTP request. FrontendContext doesn't have the correct tracing
 	// information, since that is a long-running request.
+	// We intentionally ignore the extraction error here: tenant-supplied trace headers
+	// (e.g. a malformed `uber-trace-id`) must not fail enqueue. This matches how
+	// pkg/querier/worker/scheduler_processor.go handles it. Continue with a nil parent span.
 	tracer := opentracing.GlobalTracer()
 	parentSpanContext, err := httpgrpcutil.GetParentSpanForRequest(tracer, msg.HttpRequest)
 	if err != nil {
-		return err
+		level.Debug(s.log).Log("msg", "failed to extract tracing context from request headers, continuing without parent span", "err", err)
+		parentSpanContext = nil
 	}
 
 	userID := msg.GetUserID()
