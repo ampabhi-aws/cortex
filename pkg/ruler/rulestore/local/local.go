@@ -5,6 +5,7 @@ import (
 	"flag"
 	"os"
 	"path/filepath"
+	"strings"
 
 	"github.com/pkg/errors"
 	promRules "github.com/prometheus/prometheus/rules"
@@ -14,6 +15,12 @@ import (
 
 const (
 	Name = "local"
+
+	// maxRuleFileSize caps the amount of bytes read from a rule-group file
+	// before parsing. 16 MiB is well above any sensible rule-group YAML and
+	// prevents an attacker-chosen character device (e.g. /dev/zero) from
+	// triggering unbounded allocation inside the loader.
+	maxRuleFileSize = 16 * 1024 * 1024
 )
 
 type Config struct {
@@ -168,7 +175,27 @@ func (l *Client) loadAllRulesGroupsForUser(ctx context.Context, userID string) (
 }
 
 func (l *Client) loadAllRulesGroupsForUserAndNamespace(_ context.Context, userID string, namespace string) (rulespb.RuleGroupList, error) {
-	filename := filepath.Join(l.cfg.Directory, userID, namespace)
+	base := filepath.Clean(filepath.Join(l.cfg.Directory, userID)) + string(os.PathSeparator)
+	filename := filepath.Clean(filepath.Join(base, namespace))
+	if !strings.HasPrefix(filename, base) {
+		return nil, errors.New("invalid namespace")
+	}
+
+	// Refuse non-regular files (devices, sockets, FIFOs, directories) so that an
+	// attacker-controlled path cannot cause unbounded reads (e.g. /dev/zero).
+	// Stat (not Lstat) follows symlinks so the existing operator practice of
+	// placing symlinks in the rule directory keeps working, while the
+	// base-prefix containment check above still prevents directory escape.
+	info, err := os.Stat(filename)
+	if err != nil {
+		return nil, errors.Wrapf(err, "unable to stat rule group %s", namespace)
+	}
+	if !info.Mode().IsRegular() {
+		return nil, errors.New("rule group is not a regular file")
+	}
+	if info.Size() > maxRuleFileSize {
+		return nil, errors.New("rule group file exceeds maximum allowed size")
+	}
 
 	rulegroups, allErrors := l.loader.Load(filename)
 	if len(allErrors) > 0 {
