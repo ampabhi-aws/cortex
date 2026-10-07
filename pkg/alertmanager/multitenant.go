@@ -872,6 +872,15 @@ func (am *MultitenantAlertmanager) setConfig(cfg alertspb.AlertConfigDesc) error
 			// working configuration.
 			return fmt.Errorf("invalid Cortex configuration for %v: %v", cfg.User, err)
 		}
+		// Defence in depth: re-run the same validation applied by the config API
+		// so configs reaching the store by other routes (configdb backend, direct
+		// object-storage write, etc.) are rejected before being handed to the
+		// notifier builder.
+		if err == nil && userAmConfig != nil {
+			if vErr := validateAlertmanagerConfig(userAmConfig); vErr != nil {
+				return fmt.Errorf("invalid Cortex configuration for %v: %v", cfg.User, vErr)
+			}
+		}
 	}
 
 	// We can have an empty configuration here if:
