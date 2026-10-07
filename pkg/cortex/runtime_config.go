@@ -7,6 +7,8 @@ import (
 
 	"gopkg.in/yaml.v2"
 
+	"github.com/weaveworks/common/user"
+
 	"github.com/cortexproject/cortex/pkg/ingester"
 	"github.com/cortexproject/cortex/pkg/ring/kv"
 	"github.com/cortexproject/cortex/pkg/util"
@@ -126,6 +128,23 @@ func runtimeConfigHandler(runtimeCfgManager *runtimeconfig.Manager, defaultLimit
 			return
 		}
 
+		// To avoid disclosing the full tenant inventory (every tenant ID along
+		// with its limit overrides) to any caller that happens to reach this
+		// endpoint, when the request carries a tenant ID we restrict the output
+		// to that tenant's overrides only. The full document is only returned
+		// when no tenant ID is set in the request context (i.e. the endpoint is
+		// being accessed by an operator through an admin proxy that strips the
+		// X-Scope-OrgID header).
+		visible := cfg
+		if orgID, err := user.ExtractOrgID(r.Context()); err == nil && orgID != "" {
+			tenantView := *cfg
+			tenantView.TenantLimits = nil
+			if limits, found := cfg.TenantLimits[orgID]; found && limits != nil {
+				tenantView.TenantLimits = map[string]*validation.Limits{orgID: limits}
+			}
+			visible = &tenantView
+		}
+
 		var output interface{}
 		switch r.URL.Query().Get("mode") {
 		case "diff":
@@ -133,13 +152,13 @@ func runtimeConfigHandler(runtimeCfgManager *runtimeconfig.Manager, defaultLimit
 			// we set defaultLimits for every tenant that exists in runtime config.
 			defaultCfg := runtimeConfigValues{}
 			defaultCfg.TenantLimits = map[string]*validation.Limits{}
-			for k, v := range cfg.TenantLimits {
+			for k, v := range visible.TenantLimits {
 				if v != nil {
 					defaultCfg.TenantLimits[k] = &defaultLimits
 				}
 			}
 
-			cfgYaml, err := util.YAMLMarshalUnmarshal(cfg)
+			cfgYaml, err := util.YAMLMarshalUnmarshal(visible)
 			if err != nil {
 				http.Error(w, err.Error(), http.StatusInternalServerError)
 				return
@@ -158,7 +177,7 @@ func runtimeConfigHandler(runtimeCfgManager *runtimeconfig.Manager, defaultLimit
 			}
 
 		default:
-			output = cfg
+			output = visible
 		}
 		util.WriteYAMLResponse(w, output)
 	}
