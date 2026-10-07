@@ -141,6 +141,17 @@ func (kvs *KVInitService) ServeHTTP(w http.ResponseWriter, req *http.Request) {
 		}
 
 		if len(req.Form[deleteMessagesParam]) > 0 && req.Form[deleteMessagesParam][0] == "true" {
+			// deleteSentReceivedMessages mutates in-process state and must not be
+			// triggered by a safe method such as GET. Requiring POST prevents
+			// cross-origin triggering (e.g. via <img src=...>) and aligns the
+			// handler with the Post/Redirect/Get pattern already used by the
+			// ring forget endpoint. CSRF validation is delegated to the fronting
+			// proxy via the $__CSRF_TOKEN_PLACEHOLDER__ hidden field.
+			if req.Method != http.MethodPost {
+				http.Error(w, "deleteMessages requires POST", http.StatusMethodNotAllowed)
+				return
+			}
+
 			kv.deleteSentReceivedMessages()
 
 			// Redirect back.
@@ -360,7 +371,11 @@ const pageContent = `
 
 		<h2>Received Messages</h2>
 
-		<a href="?deleteMessages=true">Delete All Messages (received and sent)</a>
+		<form action="" method="POST" style="display:inline">
+			<input type="hidden" name="deleteMessages" value="true">
+			<input type="hidden" name="csrf_token" value="$__CSRF_TOKEN_PLACEHOLDER__">
+			<button type="submit">Delete All Messages (received and sent)</button>
+		</form>
 
 		<table width="100%" border="1">
 			<thead>
@@ -396,7 +411,11 @@ const pageContent = `
 
 		<h2>Sent Messages</h2>
 
-		<a href="?deleteMessages=true">Delete All Messages (received and sent)</a>
+		<form action="" method="POST" style="display:inline">
+			<input type="hidden" name="deleteMessages" value="true">
+			<input type="hidden" name="csrf_token" value="$__CSRF_TOKEN_PLACEHOLDER__">
+			<button type="submit">Delete All Messages (received and sent)</button>
+		</form>
 
 		<table width="100%" border="1">
 			<thead>
