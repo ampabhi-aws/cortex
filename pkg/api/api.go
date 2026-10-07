@@ -219,7 +219,15 @@ func (a *API) RegisterAPI(httpPathPrefix string, actualCfg interface{}, defaultC
 
 	a.RegisterRoute("/config", a.cfg.configHandler(actualCfg, defaultCfg), false, "GET")
 	a.RegisterRoute("/", indexHandler(httpPathPrefix, a.indexPage), false, "GET")
-	a.RegisterRoute("/debug/fgprof", fgprof.Handler(), false, "GET")
+	// Wrap the vendored fgprof handler so that /debug/fgprof cannot be used
+	// for an unauthenticated stop-the-world DoS. The vendored handler accepts
+	// an attacker-controlled `seconds` query parameter with no upper bound
+	// and ignores r.Context() on client disconnect, which allows a single
+	// request to pin the process into a continuous 99 Hz STW sampler until
+	// restart. boundedProfilingHandler caps the duration, serialises
+	// sessions to one in-flight profile at a time, and wraps the handler in
+	// an http.TimeoutHandler so the sampler is unblocked at the deadline.
+	a.RegisterRoute("/debug/fgprof", boundedProfilingHandler(fgprof.Handler(), defaultMaxProfilingSeconds), false, "GET")
 }
 
 // RegisterRuntimeConfig registers the endpoints associates with the runtime configuration
