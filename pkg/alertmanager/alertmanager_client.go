@@ -34,15 +34,19 @@ type Client interface {
 
 // ClientConfig is the configuration struct for the alertmanager client.
 type ClientConfig struct {
-	RemoteTimeout time.Duration    `yaml:"remote_timeout"`
-	TLSEnabled    bool             `yaml:"tls_enabled"`
-	TLS           tls.ClientConfig `yaml:",inline"`
+	RemoteTimeout         time.Duration    `yaml:"remote_timeout"`
+	TLSEnabled            bool             `yaml:"tls_enabled"`
+	TLS                   tls.ClientConfig `yaml:",inline"`
+	MaxConcurrentRequests int              `yaml:"max_concurrent_requests"`
+	MaxMergeBodiesBytes   int64            `yaml:"max_merge_bodies_bytes"`
 }
 
 // RegisterFlagsWithPrefix registers flags with prefix.
 func (cfg *ClientConfig) RegisterFlagsWithPrefix(prefix string, f *flag.FlagSet) {
 	f.BoolVar(&cfg.TLSEnabled, prefix+".tls-enabled", cfg.TLSEnabled, "Enable TLS in the GRPC client. This flag needs to be enabled when any other TLS flag is set. If set to false, insecure connection to gRPC server will be used.")
 	f.DurationVar(&cfg.RemoteTimeout, prefix+".remote-timeout", 2*time.Second, "Timeout for downstream alertmanagers.")
+	f.IntVar(&cfg.MaxConcurrentRequests, prefix+".max-concurrent-requests", 100, "Maximum number of concurrent in-flight distributor requests to the alertmanagers. 0 to disable the limit.")
+	f.Int64Var(&cfg.MaxMergeBodiesBytes, prefix+".max-merge-bodies-bytes", 64<<20, "Maximum aggregate size (bytes) of per-peer response bodies kept in memory before merging quorum reads. Requests exceeding this limit are failed before more memory is allocated. 0 to disable the limit.")
 	cfg.TLS.RegisterFlagsWithPrefix(prefix, f)
 }
 
@@ -50,11 +54,19 @@ type alertmanagerClientsPool struct {
 	pool *client.Pool
 }
 
-func newAlertmanagerClientsPool(discovery client.PoolServiceDiscovery, amClientCfg ClientConfig, logger log.Logger, reg prometheus.Registerer) ClientsPool {
+// newAlertmanagerClientsPoolWithMaxMsgSize builds the inter-alertmanager gRPC client
+// pool. The caller configures the gRPC Max{Recv,Send}MsgSize so that it stays consistent
+// with the HTTP body limit advertised by -alertmanager.max-recv-msg-size. This avoids the
+// previous hard-coded 4 MB send cap that silently failed 4-16 MB writes after they had
+// already been buffered and fanned out.
+func newAlertmanagerClientsPoolWithMaxMsgSize(discovery client.PoolServiceDiscovery, amClientCfg ClientConfig, maxMsgSize int, logger log.Logger, reg prometheus.Registerer) ClientsPool {
+	if maxMsgSize <= 0 {
+		maxMsgSize = 16 * 1024 * 1024
+	}
 	// We prefer sane defaults instead of exposing further config options.
 	grpcCfg := grpcclient.Config{
-		MaxRecvMsgSize:      16 * 1024 * 1024,
-		MaxSendMsgSize:      4 * 1024 * 1024,
+		MaxRecvMsgSize:      maxMsgSize,
+		MaxSendMsgSize:      maxMsgSize,
 		GRPCCompression:     "",
 		RateLimit:           0,
 		RateLimitBurst:      0,
