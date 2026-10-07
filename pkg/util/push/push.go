@@ -29,6 +29,13 @@ func Handler(maxRecvMsgSize int, sourceIPs *middleware.SourceIPExtractor, push F
 			}
 		}
 		var req cortexpb.PreallocWriteRequest
+		// Bound the total body a client can send regardless of the declared
+		// Content-Length header. http.MaxBytesReader short-circuits reads
+		// (and connection reuse) once the limit is exceeded, so a client
+		// cannot force the server to buffer more than maxRecvMsgSize bytes.
+		if maxRecvMsgSize > 0 {
+			r.Body = http.MaxBytesReader(w, r.Body, int64(maxRecvMsgSize))
+		}
 		err := util.ParseProtoReader(ctx, r.Body, int(r.ContentLength), maxRecvMsgSize, &req, util.RawSnappy)
 		if err != nil {
 			level.Error(logger).Log("err", err.Error())
