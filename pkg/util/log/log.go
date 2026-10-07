@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"net/http"
 	"os"
+	"strings"
 
 	"github.com/go-kit/log"
 	kitlog "github.com/go-kit/log"
@@ -21,6 +22,17 @@ const (
 	headerMapContextKey contextKey = 0
 
 	HeaderPropagationStringForRequestLogging string = "x-http-header-forwarding-logging"
+
+	// maxForwardedLogHeaders bounds the number of key/value pairs the gRPC
+	// metadata header-forwarding channel will accept from a peer. Beyond
+	// this count, the inbound metadata is treated as malformed and the
+	// context is returned unchanged.
+	maxForwardedLogHeaders = 32
+
+	// maxForwardedLogHeaderValueLen bounds the length (in bytes) of each
+	// value carried in the gRPC metadata header-forwarding channel. Longer
+	// values are truncated before being stored in the request context.
+	maxForwardedLogHeaderValueLen = 1024
 )
 
 var (
@@ -150,21 +162,58 @@ func ContextWithHeaderMap(ctx context.Context, headerMap map[string]string) cont
 }
 
 // InjectHeadersIntoHTTPRequest injects the logging header map from the context into the request headers.
+//
+// NOTE: this helper is intentionally not called on the internal query path
+// (see pkg/querier/tripperware/roundtrip.go). Re-attaching captured headers as
+// live HTTP headers on downstream requests would re-expose credential-bearing
+// headers (Authorization, Cookie, ...) to every downstream component. The gRPC
+// metadata channel already carries the map for logging purposes.
 func InjectHeadersIntoHTTPRequest(headerMap map[string]string, request *http.Request) {
 	for header, contents := range headerMap {
 		request.Header.Add(header, contents)
 	}
 }
 
-func ContextWithHeaderMapFromMetadata(ctx context.Context, md metadata.MD) context.Context {
+// ContextWithHeaderMapFromMetadata extracts the inbound
+// HeaderPropagationStringForRequestLogging metadata key from a gRPC metadata
+// map and stores the key/value pairs on the context so they become structured
+// log fields for the request. The pairs are filtered against allowedTargets
+// (case-insensitive); if allowedTargets is empty or nil no pairs are accepted,
+// matching the behaviour of the HTTP middleware when no
+// -api.http-request-headers-to-log is configured. The pair count and each
+// value's length are bounded to prevent an untrusted gRPC peer from forging
+// arbitrary structured log fields or inflating log lines.
+func ContextWithHeaderMapFromMetadata(ctx context.Context, md metadata.MD, allowedTargets ...string) context.Context {
 	headersSlice, ok := md[HeaderPropagationStringForRequestLogging]
 	if !ok || len(headersSlice)%2 == 1 {
 		return ctx
 	}
 
+	if len(headersSlice)/2 > maxForwardedLogHeaders {
+		return ctx
+	}
+
+	var allowed map[string]struct{}
+	if len(allowedTargets) > 0 {
+		allowed = make(map[string]struct{}, len(allowedTargets))
+		for _, t := range allowedTargets {
+			allowed[strings.ToLower(t)] = struct{}{}
+		}
+	}
+
 	headerMap := make(map[string]string)
 	for i := 0; i < len(headersSlice); i += 2 {
-		headerMap[headersSlice[i]] = headersSlice[i+1]
+		key := headersSlice[i]
+		val := headersSlice[i+1]
+		if allowed != nil {
+			if _, ok := allowed[strings.ToLower(key)]; !ok {
+				continue
+			}
+		}
+		if len(val) > maxForwardedLogHeaderValueLen {
+			val = val[:maxForwardedLogHeaderValueLen]
+		}
+		headerMap[key] = val
 	}
 
 	return ContextWithHeaderMap(ctx, headerMap)

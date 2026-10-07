@@ -32,7 +32,6 @@ import (
 
 	"github.com/cortexproject/cortex/pkg/tenant"
 	"github.com/cortexproject/cortex/pkg/util"
-	util_log "github.com/cortexproject/cortex/pkg/util/log"
 )
 
 // HandlerFunc is like http.HandlerFunc, but for Handler.
@@ -187,9 +186,10 @@ func (q roundTripper) Do(ctx context.Context, r Request) (Response, error) {
 		return nil, err
 	}
 
-	if headerMap := util_log.HeaderMapFromContext(ctx); headerMap != nil {
-		util_log.InjectHeadersIntoHTTPRequest(headerMap, request)
-	}
+	// NOTE: credential-bearing request headers must not be re-attached as
+	// live HTTP headers on internal query requests. The gRPC metadata
+	// channel (see pkg/util/grpcutil/util.go injectForwardedHeadersIntoMetadata)
+	// already carries the map for logging purposes.
 
 	if err := user.InjectOrgIDIntoHTTPRequest(ctx, request); err != nil {
 		return nil, httpgrpc.Errorf(http.StatusBadRequest, err.Error())
