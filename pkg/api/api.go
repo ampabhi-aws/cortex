@@ -45,6 +45,16 @@ type ConfigHandler func(actualCfg interface{}, defaultCfg interface{}) http.Hand
 type Config struct {
 	ResponseCompression bool `yaml:"response_compression_enabled"`
 
+	// EnableDangerousOps gates registration of destructive admin endpoints
+	// (ingester shutdown/flush and ring forget via POST). When false (the
+	// default) these routes are not mounted at all, so no network caller
+	// can trigger an ingester shutdown, cross-tenant flush, or ring forget
+	// — even if the Cortex authentication proxy in front of the process is
+	// bypassed or misconfigured. Operators who need these endpoints must
+	// opt in explicitly and are expected to restrict access via a trusted
+	// reverse proxy / network policy / mTLS.
+	EnableDangerousOps bool `yaml:"enable_dangerous_ops"`
+
 	AlertmanagerHTTPPrefix string `yaml:"alertmanager_http_prefix"`
 	PrometheusHTTPPrefix   string `yaml:"prometheus_http_prefix"`
 
@@ -70,6 +80,7 @@ type Config struct {
 // RegisterFlags adds the flags required to config this to the given FlagSet.
 func (cfg *Config) RegisterFlags(f *flag.FlagSet) {
 	f.BoolVar(&cfg.ResponseCompression, "api.response-compression-enabled", false, "Use GZIP compression for API responses. Some endpoints serve large YAML or JSON blobs which can benefit from compression.")
+	f.BoolVar(&cfg.EnableDangerousOps, "api.enable-dangerous-ops", false, "Enable destructive admin HTTP endpoints: /ingester/flush, /ingester/shutdown, /flush, /shutdown and POST (forget) on every */ring page. When false (the default) these endpoints are not registered and all POSTs to ring pages are rejected, so an unauthenticated caller cannot shut down an ingester, trigger cross-tenant flushes or remove instances from the shared ring KV even if the auth proxy in front of Cortex is bypassed. Operators who need these endpoints must opt in explicitly and restrict access via a trusted reverse proxy / network policy / mTLS.")
 	f.Var(&cfg.HTTPRequestHeadersToLog, "api.http-request-headers-to-log", "Which HTTP Request headers to add to logs")
 	cfg.RegisterFlagsWithPrefix("", f)
 }
@@ -263,15 +274,26 @@ type Ingester interface {
 func (a *API) RegisterIngester(i Ingester, pushConfig distributor.Config) {
 	client.RegisterIngesterServer(a.server.GRPC, i)
 
-	a.indexPage.AddLink(SectionDangerous, "/ingester/flush", "Trigger a Flush of data from Ingester to storage")
-	a.indexPage.AddLink(SectionDangerous, "/ingester/shutdown", "Trigger Ingester Shutdown (Dangerous)")
-	a.RegisterRoute("/ingester/flush", http.HandlerFunc(i.FlushHandler), false, "GET", "POST")
-	a.RegisterRoute("/ingester/shutdown", http.HandlerFunc(i.ShutdownHandler), false, "GET", "POST")
+	if a.cfg.EnableDangerousOps {
+		// Destructive admin endpoints — only registered when explicitly
+		// opted in via -api.enable-dangerous-ops. We also drop GET so that
+		// a plain browser navigation / URL preview / crawler following the
+		// index page cannot trigger a shutdown or a cross-tenant flush, and
+		// we wrap them in the auth middleware so a tenant ID is required in
+		// the request (an external reverse proxy is still required for real
+		// authentication — see docs/guides/authentication-and-authorisation.md).
+		a.indexPage.AddLink(SectionDangerous, "/ingester/flush", "Trigger a Flush of data from Ingester to storage")
+		a.indexPage.AddLink(SectionDangerous, "/ingester/shutdown", "Trigger Ingester Shutdown (Dangerous)")
+		a.RegisterRoute("/ingester/flush", http.HandlerFunc(i.FlushHandler), true, "POST")
+		a.RegisterRoute("/ingester/shutdown", http.HandlerFunc(i.ShutdownHandler), true, "POST")
+
+		// Legacy Routes
+		a.RegisterRoute("/flush", http.HandlerFunc(i.FlushHandler), true, "POST")
+		a.RegisterRoute("/shutdown", http.HandlerFunc(i.ShutdownHandler), true, "POST")
+	}
 	a.RegisterRoute("/ingester/push", push.Handler(pushConfig.MaxRecvMsgSize, a.sourceIPs, i.Push), true, "POST") // For testing and debugging.
 
-	// Legacy Routes
-	a.RegisterRoute("/flush", http.HandlerFunc(i.FlushHandler), false, "GET", "POST")
-	a.RegisterRoute("/shutdown", http.HandlerFunc(i.ShutdownHandler), false, "GET", "POST")
+	// Legacy push route (not destructive, kept unconditional for back-compat).
 	a.RegisterRoute("/push", push.Handler(pushConfig.MaxRecvMsgSize, a.sourceIPs, i.Push), true, "POST") // For testing and debugging.
 }
 

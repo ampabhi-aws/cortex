@@ -7,6 +7,7 @@ import (
 	"html/template"
 	"math"
 	"net/http"
+	"net/url"
 	"sort"
 	"strings"
 	"time"
@@ -123,6 +124,22 @@ type httpResponse struct {
 
 func (r *Ring) ServeHTTP(w http.ResponseWriter, req *http.Request) {
 	if req.Method == http.MethodPost {
+		// Ring forget is a cluster-wide, cross-tenant mutation of the shared
+		// ring KV. Reject it unless an operator has explicitly opted in to
+		// allow ring mutations over HTTP, and also require a same-origin
+		// Origin/Referer so the browser form cannot be driven from an
+		// attacker-controlled page (basic CSRF defence — the handler already
+		// implements PRG "to work with CSRF middleware" but the middleware
+		// was not actually present).
+		if !r.cfg.AllowRingMutationsViaHTTP {
+			http.Error(w, "ring mutations via HTTP are disabled; enable with -ring.allow-mutations-via-http (and only behind a trusted reverse proxy)", http.StatusForbidden)
+			return
+		}
+		if !isSameOriginRequest(req) {
+			http.Error(w, "forbidden: cross-origin ring mutation rejected", http.StatusForbidden)
+			return
+		}
+
 		ingesterID := req.FormValue("forget")
 		if err := r.forget(req.Context(), ingesterID); err != nil {
 			level.Error(r.logger).Log("msg", "error forgetting instance", "err", err)
@@ -217,4 +234,32 @@ func writeJSONResponse(w http.ResponseWriter, v httpResponse) {
 	// Write will trigger sending Status code, so we cannot send a different status code afterwards.
 	// Also this isn't internal error, but error communicating with client.
 	_, _ = w.Write(data)
+}
+
+// isSameOriginRequest performs a conservative CSRF defence for a browser
+// form POST: either the Origin header must match the request host, or (if
+// Origin is absent, as some non-browser clients do) the Referer header must
+// match. Requests with neither header are accepted — those are typically
+// trusted server-to-server callers (curl, operator scripts) that an admin
+// has explicitly placed inside the trust boundary by enabling
+// -ring.allow-mutations-via-http.
+func isSameOriginRequest(req *http.Request) bool {
+	check := func(raw string) bool {
+		if raw == "" {
+			return false
+		}
+		u, err := url.Parse(raw)
+		if err != nil || u.Host == "" {
+			return false
+		}
+		return strings.EqualFold(u.Host, req.Host)
+	}
+
+	if origin := req.Header.Get("Origin"); origin != "" {
+		return check(origin)
+	}
+	if referer := req.Header.Get("Referer"); referer != "" {
+		return check(referer)
+	}
+	return true
 }

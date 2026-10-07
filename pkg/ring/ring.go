@@ -125,6 +125,13 @@ type Config struct {
 	ZoneAwarenessEnabled bool                   `yaml:"zone_awareness_enabled"`
 	ExcludedZones        flagext.StringSliceCSV `yaml:"excluded_zones"`
 
+	// AllowRingMutationsViaHTTP gates POST (?forget=<id>) on the ring HTTP
+	// pages. When false (the default) Ring.ServeHTTP rejects every POST
+	// with 403 so an unauthenticated caller cannot remove instances from
+	// the shared Consul/etcd/memberlist ring KV even if it reaches the
+	// Cortex HTTP listener directly.
+	AllowRingMutationsViaHTTP bool `yaml:"allow_ring_mutations_via_http"`
+
 	// Whether the shuffle-sharding subring cache is disabled. This option is set
 	// internally and never exposed to the user.
 	SubringCacheDisabled bool `yaml:"-"`
@@ -143,6 +150,7 @@ func (cfg *Config) RegisterFlagsWithPrefix(prefix string, f *flag.FlagSet) {
 	f.IntVar(&cfg.ReplicationFactor, prefix+"distributor.replication-factor", 3, "The number of ingesters to write to and read from.")
 	f.BoolVar(&cfg.ZoneAwarenessEnabled, prefix+"distributor.zone-awareness-enabled", false, "True to enable the zone-awareness and replicate ingested samples across different availability zones.")
 	f.Var(&cfg.ExcludedZones, prefix+"distributor.excluded-zones", "Comma-separated list of zones to exclude from the ring. Instances in excluded zones will be filtered out from the ring.")
+	f.BoolVar(&cfg.AllowRingMutationsViaHTTP, prefix+"ring.allow-mutations-via-http", false, "Allow mutating the ring via HTTP POST (?forget=<instance-id>) on the ring status pages. When false (the default) every POST to a ring page is rejected with 403 so an unauthenticated caller cannot remove instances from the shared ring KV. Only enable this behind a trusted reverse proxy / mTLS.")
 }
 
 type instanceInfo struct {
