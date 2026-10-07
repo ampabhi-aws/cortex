@@ -202,6 +202,14 @@ func validateUserConfig(logger log.Logger, cfg alertspb.AlertConfigDesc, limits 
 		return fmt.Errorf(errTooManyTemplates, len(cfg.Templates), l)
 	}
 
+	// Bound the number of entries in the `templates:` list of the Alertmanager config.
+	// Each entry is passed to template.FromGlobs which globs + parses the matched
+	// files once for the text set and once for the html set, so an unbounded list
+	// multiplies template parsing cost. Reuse the templates-count limit as a cap.
+	if l := limits.AlertmanagerMaxTemplatesCount(user); l > 0 && len(amCfg.Templates) > l {
+		return fmt.Errorf(errTooManyTemplates, len(amCfg.Templates), l)
+	}
+
 	if maxSize := limits.AlertmanagerMaxTemplateSize(user); maxSize > 0 {
 		for _, tmpl := range cfg.Templates {
 			if size := len(tmpl.GetBody()); size > maxSize {
@@ -241,9 +249,19 @@ func validateUserConfig(logger log.Logger, cfg alertspb.AlertConfigDesc, limits 
 		}
 	}
 
-	templateFiles := make([]string, len(amCfg.Templates))
-	for i, t := range amCfg.Templates {
-		templateFiles[i] = filepath.Join(userTempDir, t)
+	// De-duplicate the template paths before calling FromGlobs. template.FromGlobs
+	// re-globs, re-reads and re-parses every matched file once per entry (for both
+	// the text and the html set); duplicate entries (including repeated wildcards
+	// such as `- '*'`) would otherwise amplify parsing cost quadratically.
+	seen := make(map[string]struct{}, len(amCfg.Templates))
+	templateFiles := make([]string, 0, len(amCfg.Templates))
+	for _, t := range amCfg.Templates {
+		p := filepath.Join(userTempDir, t)
+		if _, ok := seen[p]; ok {
+			continue
+		}
+		seen[p] = struct{}{}
+		templateFiles = append(templateFiles, p)
 	}
 
 	_, err = template.FromGlobs(templateFiles...)
