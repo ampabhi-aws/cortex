@@ -1646,13 +1646,44 @@ func TestIngester_Push_ShouldNotCreateTSDBIfNotInActiveState(t *testing.T) {
 	// Mock request
 	userID := "test"
 	ctx := user.InjectOrgID(context.Background(), userID)
-	req := &cortexpb.WriteRequest{}
+	req := cortexpb.ToWriteRequest(
+		[]labels.Labels{labels.FromStrings(labels.MetricName, "test")},
+		[]cortexpb.Sample{{Value: 1, TimestampMs: 9}},
+		nil,
+		cortexpb.API)
 
 	res, err := i.Push(ctx, req)
 	assert.Equal(t, wrapWithUser(fmt.Errorf(errTSDBCreateIncompatibleState, "PENDING"), userID).Error(), err.Error())
 	assert.Nil(t, res)
 
 	// Check if the TSDB has been created
+	_, tsdbCreated := i.TSDBState.dbs[userID]
+	assert.False(t, tsdbCreated)
+}
+
+func TestIngester_Push_ShouldNotCreateTSDBForEmptyRequest(t *testing.T) {
+	cfg := defaultIngesterTestConfig(t)
+
+	i, err := prepareIngesterWithBlocksStorage(t, cfg, nil)
+	require.NoError(t, err)
+	require.NoError(t, services.StartAndAwaitRunning(context.Background(), i))
+	defer services.StopAndAwaitTerminated(context.Background(), i) //nolint:errcheck
+
+	// Wait until the ingester is ACTIVE
+	test.Poll(t, 100*time.Millisecond, ring.ACTIVE, func() interface{} {
+		return i.lifecycler.GetState()
+	})
+
+	userID := "test"
+	ctx := user.InjectOrgID(context.Background(), userID)
+
+	// Pushing an empty request must not create a TSDB — this prevents
+	// unauthenticated callers from exhausting ingester resources by spraying
+	// tenant IDs with zero-byte payloads.
+	res, err := i.Push(ctx, &cortexpb.WriteRequest{})
+	require.NoError(t, err)
+	assert.Equal(t, &cortexpb.WriteResponse{}, res)
+
 	_, tsdbCreated := i.TSDBState.dbs[userID]
 	assert.False(t, tsdbCreated)
 }
@@ -2377,7 +2408,7 @@ func TestIngester_OpenExistingTSDBOnStartup(t *testing.T) {
 				require.NotNil(t, i.getTSDB("user4"))
 			},
 		},
-		"should fail and rollback if an error occur while loading a TSDB on concurrency > number of TSDBs": {
+		"should log and continue if a TSDB cannot be opened (concurrency > number of TSDBs)": {
 			concurrency: 10,
 			setup: func(t *testing.T, dir string) {
 				// Create a fake TSDB on disk with an empty chunks head segment file (it's invalid unless
@@ -2390,13 +2421,15 @@ func TestIngester_OpenExistingTSDBOnStartup(t *testing.T) {
 				require.NoError(t, os.MkdirAll(filepath.Join(dir, "user1", "dummy"), 0700))
 			},
 			check: func(t *testing.T, i *Ingester) {
-				require.Equal(t, 0, len(i.TSDBState.dbs))
+				// user0's TSDB failed to open and is skipped (log-and-continue),
+				// but the ingester must still open user1 and remain healthy so
+				// one bogus/corrupt tenant directory cannot DoS startup.
+				require.Equal(t, 1, len(i.TSDBState.dbs))
 				require.Nil(t, i.getTSDB("user0"))
-				require.Nil(t, i.getTSDB("user1"))
+				require.NotNil(t, i.getTSDB("user1"))
 			},
-			expectedErr: "unable to open TSDB for user user0",
 		},
-		"should fail and rollback if an error occur while loading a TSDB on concurrency < number of TSDBs": {
+		"should log and continue if a TSDB cannot be opened (concurrency < number of TSDBs)": {
 			concurrency: 2,
 			setup: func(t *testing.T, dir string) {
 				require.NoError(t, os.MkdirAll(filepath.Join(dir, "user0", "dummy"), 0700))
@@ -2412,14 +2445,15 @@ func TestIngester_OpenExistingTSDBOnStartup(t *testing.T) {
 				require.NoError(t, os.WriteFile(filepath.Join(dir, "user2", "chunks_head", "00000002"), nil, 0700))
 			},
 			check: func(t *testing.T, i *Ingester) {
-				require.Equal(t, 0, len(i.TSDBState.dbs))
-				require.Nil(t, i.getTSDB("user0"))
-				require.Nil(t, i.getTSDB("user1"))
+				// user2's TSDB failed and is skipped (log-and-continue), all
+				// others must still be opened.
+				require.Equal(t, 4, len(i.TSDBState.dbs))
+				require.NotNil(t, i.getTSDB("user0"))
+				require.NotNil(t, i.getTSDB("user1"))
 				require.Nil(t, i.getTSDB("user2"))
-				require.Nil(t, i.getTSDB("user3"))
-				require.Nil(t, i.getTSDB("user4"))
+				require.NotNil(t, i.getTSDB("user3"))
+				require.NotNil(t, i.getTSDB("user4"))
 			},
-			expectedErr: "unable to open TSDB for user user2",
 		},
 	}
 
