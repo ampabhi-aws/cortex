@@ -310,14 +310,23 @@ func clusterWait(position func() int, timeout time.Duration) func() time.Duratio
 
 // ApplyConfig applies a new configuration to an Alertmanager.
 func (am *Alertmanager) ApplyConfig(userID string, conf *config.Config, rawCfg string) error {
-	templateFiles := make([]string, len(conf.Templates))
-	for i, t := range conf.Templates {
+	// De-duplicate the resolved template paths before calling FromGlobs.
+	// template.FromGlobs re-globs, re-reads and re-parses every matched file once
+	// per entry (for both the text and the html set); duplicate entries (including
+	// repeated wildcards such as `- '*'`) would otherwise amplify parsing cost
+	// quadratically.
+	seen := make(map[string]struct{}, len(conf.Templates))
+	templateFiles := make([]string, 0, len(conf.Templates))
+	for _, t := range conf.Templates {
 		templateFilepath, err := safeTemplateFilepath(filepath.Join(am.cfg.TenantDataDir, templatesDir), t)
 		if err != nil {
 			return err
 		}
-
-		templateFiles[i] = templateFilepath
+		if _, ok := seen[templateFilepath]; ok {
+			continue
+		}
+		seen[templateFilepath] = struct{}{}
+		templateFiles = append(templateFiles, templateFilepath)
 	}
 
 	tmpl, err := template.FromGlobs(templateFiles...)
