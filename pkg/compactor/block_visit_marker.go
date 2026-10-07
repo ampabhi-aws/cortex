@@ -15,6 +15,7 @@ import (
 	"github.com/pkg/errors"
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/thanos-io/objstore"
+	"github.com/thanos-io/thanos/pkg/block"
 	"github.com/thanos-io/thanos/pkg/block/metadata"
 
 	"github.com/cortexproject/cortex/pkg/util/runutil"
@@ -98,8 +99,24 @@ func markBlocksVisited(
 		return
 	}
 	reader := bytes.NewReader(visitMarkerFileContent)
-	for _, block := range blocks {
-		blockID := block.ULID.String()
+	for _, b := range blocks {
+		if ctx.Err() != nil {
+			return
+		}
+		blockID := b.ULID.String()
+		// Non-resurrecting: skip blocks whose meta.json no longer exists or whose
+		// deletion-mark.json is present. Otherwise a stale heartbeat would
+		// re-create the block prefix (containing only visit-mark.json) after the
+		// cleaner has hard-deleted it, producing permanent "phantom" partial
+		// blocks.
+		if ok, existsErr := bkt.Exists(ctx, path.Join(blockID, block.MetaFilename)); existsErr == nil && !ok {
+			level.Info(logger).Log("msg", "block no longer exists, skip marking it visited", "blockID", blockID)
+			continue
+		}
+		if ok, existsErr := bkt.Exists(ctx, path.Join(blockID, metadata.DeletionMarkFilename)); existsErr == nil && ok {
+			level.Info(logger).Log("msg", "block is marked for deletion, skip marking it visited", "blockID", blockID)
+			continue
+		}
 		if err := UpdateBlockVisitMarker(ctx, bkt, blockID, reader, blockVisitMarkerWriteFailed); err != nil {
 			level.Error(logger).Log("msg", "unable to upsert visit marker file content for block", "blockID", blockID, "err", err)
 		}

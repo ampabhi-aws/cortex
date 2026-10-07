@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"path"
+	"strings"
 	"testing"
 	"time"
 
@@ -355,6 +356,16 @@ func TestShuffleShardingPlanner_Plan(t *testing.T) {
 				visitMarkerFileContent, _ := json.Marshal(blockVisitMarker)
 				bkt.MockGet(visitMarkerFile, string(visitMarkerFileContent), nil)
 			}
+			// The heartbeat goroutine kicked off by Plan() calls Exists() on
+			// <blockID>/meta.json and <blockID>/deletion-mark.json for each
+			// resulting block before uploading the visit marker. Mock these so
+			// the async goroutine doesn't panic the test.
+			bkt.On("Exists", mock.Anything, mock.MatchedBy(func(name string) bool {
+				return strings.HasSuffix(name, "/meta.json")
+			})).Return(true, nil)
+			bkt.On("Exists", mock.Anything, mock.MatchedBy(func(name string) bool {
+				return strings.HasSuffix(name, "/deletion-mark.json")
+			})).Return(false, nil)
 			bkt.MockUpload(mock.Anything, nil)
 
 			registerer := prometheus.NewPedanticRegistry()
