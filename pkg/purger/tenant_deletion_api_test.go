@@ -6,6 +6,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"path"
+	"strings"
 	"testing"
 
 	"github.com/go-kit/log"
@@ -27,6 +28,47 @@ func TestDeleteTenant(t *testing.T) {
 	}
 
 	{
+		// Unknown tenant (no data in the bucket) must be rejected so that this
+		// endpoint cannot be used to mint arbitrary new top-level prefixes.
+		ctx := context.Background()
+		ctx = user.InjectOrgID(ctx, "fake")
+
+		req := &http.Request{}
+		resp := httptest.NewRecorder()
+		api.DeleteTenant(resp, req.WithContext(ctx))
+
+		require.Equal(t, http.StatusNotFound, resp.Code)
+		require.Nil(t, bkt.Objects()[path.Join("fake", tsdb.TenantDeletionMarkPath)])
+	}
+
+	{
+		// Invalid tenant ID (unsupported character) must be rejected.
+		ctx := context.Background()
+		ctx = user.InjectOrgID(ctx, "bad tenant")
+
+		req := &http.Request{}
+		resp := httptest.NewRecorder()
+		api.DeleteTenant(resp, req.WithContext(ctx))
+
+		require.Equal(t, http.StatusBadRequest, resp.Code)
+	}
+
+	{
+		// Tenant ID longer than 150 chars must be rejected.
+		ctx := context.Background()
+		ctx = user.InjectOrgID(ctx, strings.Repeat("a", 151))
+
+		req := &http.Request{}
+		resp := httptest.NewRecorder()
+		api.DeleteTenant(resp, req.WithContext(ctx))
+
+		require.Equal(t, http.StatusBadRequest, resp.Code)
+	}
+
+	{
+		// Known tenant (with existing data) is accepted and a deletion mark is written.
+		require.NoError(t, bkt.Upload(context.Background(), path.Join("fake", "01EQK4QKFHVSZYVJ908Y7HH9E0", "meta.json"), bytes.NewReader([]byte("data"))))
+
 		ctx := context.Background()
 		ctx = user.InjectOrgID(ctx, "fake")
 
@@ -37,6 +79,14 @@ func TestDeleteTenant(t *testing.T) {
 		require.Equal(t, http.StatusOK, resp.Code)
 		objs := bkt.Objects()
 		require.NotNil(t, objs[path.Join("fake", tsdb.TenantDeletionMarkPath)])
+		firstMark := objs[path.Join("fake", tsdb.TenantDeletionMarkPath)]
+
+		// A repeated POST for the same tenant must be a no-op (idempotent) so
+		// that finished_time cannot be reset to keep the prefix alive forever.
+		resp2 := httptest.NewRecorder()
+		api.DeleteTenant(resp2, req.WithContext(ctx))
+		require.Equal(t, http.StatusOK, resp2.Code)
+		require.Equal(t, firstMark, bkt.Objects()[path.Join("fake", tsdb.TenantDeletionMarkPath)])
 	}
 }
 

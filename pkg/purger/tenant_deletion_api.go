@@ -52,6 +52,50 @@ func (api *TenantDeletionAPI) DeleteTenant(w http.ResponseWriter, r *http.Reques
 		return
 	}
 
+	// Always validate the tenant ID with the strict charset/length rules
+	// (same as MultiResolver) before using it as a storage prefix. The
+	// default SingleResolver only rejects path-traversal segments, which is
+	// not sufficient here because the handler will create a brand new
+	// top-level prefix in the shared blocks bucket for any accepted value.
+	// Without this, an attacker that can pick arbitrary X-Scope-OrgID values
+	// can mint unbounded fake tenant prefixes and starve the compactor
+	// cleanup loop (CWE-770).
+	if err := tenant.ValidTenantID(userID); err != nil {
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
+
+	// Only accept the request if the tenant already has data in the bucket.
+	// This prevents an attacker from using this endpoint to create arbitrary
+	// new top-level prefixes that the compactor must then process every
+	// cleanup cycle.
+	hasData, err := api.tenantHasData(ctx, userID)
+	if err != nil {
+		level.Error(api.logger).Log("msg", "failed to check tenant existence in bucket", "user", userID, "err", err)
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	if !hasData {
+		http.Error(w, "unknown tenant", http.StatusNotFound)
+		return
+	}
+
+	// Make the endpoint idempotent: if a deletion mark already exists do not
+	// overwrite it, otherwise a repeated POST would reset finished_time to 0
+	// and keep the prefix alive forever (the compactor's final cleanup only
+	// runs after finished_time + tenant-cleanup-delay has elapsed).
+	existing, err := cortex_tsdb.ReadTenantDeletionMark(ctx, api.bucketClient, userID)
+	if err != nil {
+		level.Error(api.logger).Log("msg", "failed to read tenant deletion mark", "user", userID, "err", err)
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	if existing != nil {
+		level.Info(api.logger).Log("msg", "tenant deletion mark already exists, request is a no-op", "user", userID)
+		w.WriteHeader(http.StatusOK)
+		return
+	}
+
 	err = cortex_tsdb.WriteTenantDeletionMark(r.Context(), api.bucketClient, userID, api.cfgProvider, cortex_tsdb.NewTenantDeletionMark(time.Now()))
 	if err != nil {
 		level.Error(api.logger).Log("msg", "failed to write tenant deletion mark", "user", userID, "err", err)
@@ -63,6 +107,27 @@ func (api *TenantDeletionAPI) DeleteTenant(w http.ResponseWriter, r *http.Reques
 	level.Info(api.logger).Log("msg", "tenant deletion mark in blocks storage created", "user", userID)
 
 	w.WriteHeader(http.StatusOK)
+}
+
+// tenantHasData reports whether the given tenant currently has any object in
+// the blocks bucket. It is used to reject tenant-deletion requests for tenants
+// whose prefix does not yet exist, so that the handler cannot be used to mint
+// arbitrary new top-level prefixes.
+func (api *TenantDeletionAPI) tenantHasData(ctx context.Context, userID string) (bool, error) {
+	var errFound = errors.New("found")
+
+	userBucket := bucket.NewUserBucketClient(userID, api.bucketClient, api.cfgProvider)
+	err := userBucket.Iter(ctx, "", func(string) error {
+		// Short-circuit: any single entry is enough to confirm the tenant exists.
+		return errFound
+	})
+	if errors.Is(err, errFound) {
+		return true, nil
+	}
+	if err != nil {
+		return false, err
+	}
+	return false, nil
 }
 
 type DeleteTenantStatusResponse struct {
