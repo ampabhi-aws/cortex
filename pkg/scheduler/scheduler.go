@@ -19,6 +19,8 @@ import (
 	"github.com/weaveworks/common/middleware"
 	"github.com/weaveworks/common/user"
 	"google.golang.org/grpc"
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/status"
 
 	"github.com/cortexproject/cortex/pkg/frontend/v2/frontendv2pb"
 	"github.com/cortexproject/cortex/pkg/scheduler/queue"
@@ -29,6 +31,7 @@ import (
 	"github.com/cortexproject/cortex/pkg/util/httpgrpcutil"
 	"github.com/cortexproject/cortex/pkg/util/services"
 	"github.com/cortexproject/cortex/pkg/util/validation"
+	"github.com/cortexproject/cortex/pkg/util/workerauth"
 )
 
 var (
@@ -392,9 +395,19 @@ func (s *Scheduler) QuerierLoop(querier schedulerpb.SchedulerForQuerier_QuerierL
 	return errSchedulerIsNotRunning
 }
 
-func (s *Scheduler) NotifyQuerierShutdown(_ context.Context, req *schedulerpb.NotifyQuerierShutdownRequest) (*schedulerpb.NotifyQuerierShutdownResponse, error) {
-	level.Info(s.log).Log("msg", "received shutdown notification from querier", "querier", req.GetQuerierID())
-	s.requestQueue.NotifyQuerierShutdown(req.GetQuerierID())
+func (s *Scheduler) NotifyQuerierShutdown(ctx context.Context, req *schedulerpb.NotifyQuerierShutdownRequest) (*schedulerpb.NotifyQuerierShutdownResponse, error) {
+	peerID, err := workerauth.AuthenticatedPeerID(ctx)
+	if err != nil {
+		level.Warn(s.log).Log("msg", "rejecting unauthenticated querier shutdown notification", "err", err, "querier", req.GetQuerierID())
+		return nil, status.Error(codes.Unauthenticated, "caller is not an authorized querier")
+	}
+	if req.GetQuerierID() != peerID {
+		level.Warn(s.log).Log("msg", "rejecting querier shutdown notification: querier ID does not match authenticated peer", "peer", peerID, "querier", req.GetQuerierID())
+		return nil, status.Error(codes.PermissionDenied, "cannot notify shutdown for another querier")
+	}
+
+	level.Info(s.log).Log("msg", "received shutdown notification from querier", "querier", peerID)
+	s.requestQueue.NotifyQuerierShutdown(peerID)
 
 	return &schedulerpb.NotifyQuerierShutdownResponse{}, nil
 }
