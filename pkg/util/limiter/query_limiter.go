@@ -54,6 +54,14 @@ func AddQueryLimiterToContext(ctx context.Context, limiter *QueryLimiter) contex
 	return context.WithValue(ctx, ctxKey, limiter)
 }
 
+// QueryLimiterCtxKey returns the context key used to attach a QueryLimiter
+// to a context. Callers that want to detect whether a limiter has already
+// been installed (and avoid overwriting it) can use this with
+// ctx.Value(limiter.QueryLimiterCtxKey()).
+func QueryLimiterCtxKey() interface{} {
+	return ctxKey
+}
+
 // QueryLimiterFromContextWithFallback returns a QueryLimiter from the current context.
 // If there is not a QueryLimiter on the context it will return a new no-op limiter.
 func QueryLimiterFromContextWithFallback(ctx context.Context) *QueryLimiter {
