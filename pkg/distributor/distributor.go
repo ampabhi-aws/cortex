@@ -1267,3 +1267,14 @@ func (d *Distributor) ServeHTTP(w http.ResponseWriter, req *http.Request) {
 		util.WriteHTMLResponse(w, ringNotEnabledPage)
 	}
 }
+
+// ServeForgetHTTP is the admin-only entry point used to "forget" a distributor
+// from the distributors ring. It is kept separate from ServeHTTP (status page)
+// so the mutating verb can be registered behind an authentication middleware.
+func (d *Distributor) ServeForgetHTTP(w http.ResponseWriter, req *http.Request) {
+	if d.distributorsRing == nil {
+		http.Error(w, "distributors ring is not enabled", http.StatusBadRequest)
+		return
+	}
+	d.distributorsRing.ServeForgetHTTP(w, req)
+}

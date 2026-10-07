@@ -51,3 +51,18 @@ func (c *StoreGateway) RingHandler(w http.ResponseWriter, req *http.Request) {
 
 	c.ring.ServeHTTP(w, req)
 }
+
+// ForgetHandler is the admin-only entry point used to "forget" a store-gateway
+// from the ring. It is kept separate from RingHandler (status page) so that
+// the mutating verb can be registered behind an authentication middleware.
+func (c *StoreGateway) ForgetHandler(w http.ResponseWriter, req *http.Request) {
+	if !c.gatewayCfg.ShardingEnabled {
+		http.Error(w, "store gateway sharding is disabled", http.StatusBadRequest)
+		return
+	}
+	if c.State() != services.Running {
+		http.Error(w, "store gateway is not running yet", http.StatusServiceUnavailable)
+		return
+	}
+	c.ring.ServeForgetHTTP(w, req)
+}

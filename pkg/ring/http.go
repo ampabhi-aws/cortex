@@ -121,25 +121,59 @@ type httpResponse struct {
 	ShowTokens bool           `json:"-"`
 }
 
+// ServeHTTP renders the (read-only) ring status page. It explicitly rejects
+// state-mutating verbs: the "forget" action must only be exposed via
+// ServeForgetHTTP so an authentication/authorisation middleware can be
+// applied in front of it. See CWE-1220 / unauthenticated-forget vulnerability.
 func (r *Ring) ServeHTTP(w http.ResponseWriter, req *http.Request) {
 	if req.Method == http.MethodPost {
-		ingesterID := req.FormValue("forget")
-		if err := r.forget(req.Context(), ingesterID); err != nil {
-			level.Error(r.logger).Log("msg", "error forgetting instance", "err", err)
-		}
-
-		// Implement PRG pattern to prevent double-POST and work with CSRF middleware.
-		// https://en.wikipedia.org/wiki/Post/Redirect/Get
-
-		// http.Redirect() would convert our relative URL to absolute, which is not what we want.
-		// Browser knows how to do that, and it also knows real URL. Furthermore it will also preserve tokens parameter.
-		// Note that relative Location URLs are explicitly allowed by specification, so we're not doing anything wrong here.
-		w.Header().Set("Location", "#")
-		w.WriteHeader(http.StatusFound)
-
+		// Default-deny: mutation is only allowed on the explicit, admin-gated
+		// ServeForgetHTTP handler. Returning 403 here means that any caller
+		// which reaches the status-page listener cannot alter ring state even
+		// if the operator has forgotten to register the admin route.
+		http.Error(w, "forget is disabled on this listener", http.StatusForbidden)
 		return
 	}
 
+	r.serveStatusPage(w, req)
+}
+
+// ServeForgetHTTP is the admin-only mutating handler backing the "Forget"
+// button rendered by the status page. It must be registered behind an
+// authentication middleware (see pkg/api/api.go). Any method other than POST
+// is rejected so this handler cannot be accidentally re-used as a status page.
+func (r *Ring) ServeForgetHTTP(w http.ResponseWriter, req *http.Request) {
+	if req.Method != http.MethodPost {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
+	ingesterID := req.FormValue("forget")
+	if ingesterID == "" {
+		http.Error(w, "missing forget parameter", http.StatusBadRequest)
+		return
+	}
+
+	if err := r.forget(req.Context(), ingesterID); err != nil {
+		level.Error(r.logger).Log("msg", "error forgetting instance", "err", err, "instance", ingesterID, "remote", req.RemoteAddr)
+		http.Error(w, "error forgetting instance", http.StatusInternalServerError)
+		return
+	}
+
+	// Audit log so operators have a record of every successful ring mutation.
+	level.Info(r.logger).Log("msg", "instance forgotten from ring via HTTP", "instance", ingesterID, "remote", req.RemoteAddr, "path", req.URL.Path)
+
+	// Implement PRG pattern to prevent double-POST and work with CSRF middleware.
+	// https://en.wikipedia.org/wiki/Post/Redirect/Get
+
+	// http.Redirect() would convert our relative URL to absolute, which is not what we want.
+	// Browser knows how to do that, and it also knows real URL. Furthermore it will also preserve tokens parameter.
+	// Note that relative Location URLs are explicitly allowed by specification, so we're not doing anything wrong here.
+	w.Header().Set("Location", "#")
+	w.WriteHeader(http.StatusFound)
+}
+
+func (r *Ring) serveStatusPage(w http.ResponseWriter, req *http.Request) {
 	r.mtx.RLock()
 	defer r.mtx.RUnlock()
 
