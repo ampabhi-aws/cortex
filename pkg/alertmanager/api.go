@@ -4,7 +4,9 @@ import (
 	"context"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
+	"net/url"
 	"os"
 	"path/filepath"
 	"reflect"
@@ -45,6 +47,7 @@ var (
 	errTLSFileNotAllowed             = errors.New("setting TLS ca_file, cert_file and key_file is not allowed")
 	errSlackAPIURLFileNotAllowed     = errors.New("setting Slack api_url_file and global slack_api_url_file is not allowed")
 	errVictorOpsAPIKeyFileNotAllowed = errors.New("setting VictorOps api_key_file is not allowed")
+	errEmptyHostNotAllowed           = errors.New("host must not be empty")
 )
 
 // UserConfig is used to communicate a users alertmanager configs
@@ -350,6 +353,41 @@ func validateAlertmanagerConfig(cfg interface{}) error {
 		if err := validateVictorOpsConfig(v.Interface().(config.VictorOpsConfig)); err != nil {
 			return err
 		}
+
+	case reflect.TypeOf(config.EmailConfig{}):
+		if err := validateEmailConfig(v.Interface().(config.EmailConfig)); err != nil {
+			return err
+		}
+
+	case reflect.TypeOf(config.WebhookConfig{}):
+		if err := validateWebhookConfig(v.Interface().(config.WebhookConfig)); err != nil {
+			return err
+		}
+
+	case reflect.TypeOf(config.PagerdutyConfig{}):
+		if err := validatePagerdutyConfig(v.Interface().(config.PagerdutyConfig)); err != nil {
+			return err
+		}
+
+	case reflect.TypeOf(config.OpsGenieConfig{}):
+		if err := validateOpsGenieConfig(v.Interface().(config.OpsGenieConfig)); err != nil {
+			return err
+		}
+
+	case reflect.TypeOf(config.WechatConfig{}):
+		if err := validateWechatConfig(v.Interface().(config.WechatConfig)); err != nil {
+			return err
+		}
+
+	case reflect.TypeOf(config.SNSConfig{}):
+		if err := validateSNSConfig(v.Interface().(config.SNSConfig)); err != nil {
+			return err
+		}
+
+	case reflect.TypeOf(config.TelegramConfig{}):
+		if err := validateTelegramConfig(v.Interface().(config.TelegramConfig)); err != nil {
+			return err
+		}
 	}
 
 	// If the input config is a struct, recursively iterate on all fields.
@@ -411,6 +449,24 @@ func validateReceiverHTTPConfig(cfg commoncfg.HTTPClientConfig) error {
 	if cfg.OAuth2 != nil && cfg.OAuth2.ClientSecretFile != "" {
 		return errOAuth2SecretFileNotAllowed
 	}
+	// Validate destinations the HTTP client config can dial outside of the
+	// FirewallDialer-covered path (OAuth2 token fetch builds its own transport
+	// without the Cortex firewall dialer; proxy_url is honoured without the
+	// firewall as well because the upstream Go http.Transport uses it directly).
+	if cfg.ProxyURL.URL != nil {
+		if err := validateDestinationURL(cfg.ProxyURL.URL); err != nil {
+			return errors.Wrap(err, "proxy_url")
+		}
+	}
+	if cfg.OAuth2 != nil && cfg.OAuth2.TokenURL != "" {
+		u, err := url.Parse(cfg.OAuth2.TokenURL)
+		if err != nil {
+			return errors.Wrap(err, "oauth2 token_url")
+		}
+		if err := validateDestinationURL(u); err != nil {
+			return errors.Wrap(err, "oauth2 token_url")
+		}
+	}
 	return validateReceiverTLSConfig(cfg.TLSConfig)
 }
 
@@ -438,6 +494,11 @@ func validateSlackConfig(cfg config.SlackConfig) error {
 	if cfg.APIURLFile != "" {
 		return errSlackAPIURLFileNotAllowed
 	}
+	if cfg.APIURL != nil && cfg.APIURL.URL != nil {
+		if err := validateDestinationURL(cfg.APIURL.URL); err != nil {
+			return errors.Wrap(err, "slack api_url")
+		}
+	}
 	return nil
 }
 
@@ -446,6 +507,133 @@ func validateSlackConfig(cfg config.SlackConfig) error {
 func validateVictorOpsConfig(cfg config.VictorOpsConfig) error {
 	if cfg.APIKeyFile != "" {
 		return errVictorOpsAPIKeyFileNotAllowed
+	}
+	if cfg.APIURL != nil && cfg.APIURL.URL != nil {
+		if err := validateDestinationURL(cfg.APIURL.URL); err != nil {
+			return errors.Wrap(err, "victorops api_url")
+		}
+	}
+	return nil
+}
+
+// validateEmailConfig rejects tenant-authored smarthosts pointing at private,
+// loopback or link-local addresses. The vendored email notifier dials the
+// smarthost with a bare net.Dialer{} that bypasses the per-tenant
+// FirewallDialer, so this positive admission-time check is the primary
+// defence for the email integration.
+func validateEmailConfig(cfg config.EmailConfig) error {
+	if cfg.Smarthost.Host == "" {
+		return nil
+	}
+	if err := validateDestinationHost(cfg.Smarthost.Host); err != nil {
+		return errors.Wrap(err, "email smarthost")
+	}
+	return nil
+}
+
+// validateWebhookConfig rejects webhook URLs pointing at internal addresses.
+func validateWebhookConfig(cfg config.WebhookConfig) error {
+	if cfg.URL != nil && cfg.URL.URL != nil {
+		if err := validateDestinationURL(cfg.URL.URL); err != nil {
+			return errors.Wrap(err, "webhook url")
+		}
+	}
+	return nil
+}
+
+// validatePagerdutyConfig rejects PagerDuty api_url values pointing at internal addresses.
+func validatePagerdutyConfig(cfg config.PagerdutyConfig) error {
+	if cfg.URL != nil && cfg.URL.URL != nil {
+		if err := validateDestinationURL(cfg.URL.URL); err != nil {
+			return errors.Wrap(err, "pagerduty url")
+		}
+	}
+	return nil
+}
+
+// validateOpsGenieConfig rejects OpsGenie api_url values pointing at internal addresses.
+func validateOpsGenieConfig(cfg config.OpsGenieConfig) error {
+	if cfg.APIURL != nil && cfg.APIURL.URL != nil {
+		if err := validateDestinationURL(cfg.APIURL.URL); err != nil {
+			return errors.Wrap(err, "opsgenie api_url")
+		}
+	}
+	return nil
+}
+
+// validateWechatConfig rejects WeChat api_url values pointing at internal addresses.
+func validateWechatConfig(cfg config.WechatConfig) error {
+	if cfg.APIURL != nil && cfg.APIURL.URL != nil {
+		if err := validateDestinationURL(cfg.APIURL.URL); err != nil {
+			return errors.Wrap(err, "wechat api_url")
+		}
+	}
+	return nil
+}
+
+// validateSNSConfig rejects SNS api_url values pointing at internal addresses.
+func validateSNSConfig(cfg config.SNSConfig) error {
+	if cfg.APIUrl != "" {
+		u, err := url.Parse(cfg.APIUrl)
+		if err != nil {
+			return errors.Wrap(err, "sns api_url")
+		}
+		if err := validateDestinationURL(u); err != nil {
+			return errors.Wrap(err, "sns api_url")
+		}
+	}
+	return nil
+}
+
+// validateTelegramConfig rejects Telegram api_url values pointing at internal addresses.
+func validateTelegramConfig(cfg config.TelegramConfig) error {
+	if cfg.APIUrl != nil && cfg.APIUrl.URL != nil {
+		if err := validateDestinationURL(cfg.APIUrl.URL); err != nil {
+			return errors.Wrap(err, "telegram api_url")
+		}
+	}
+	return nil
+}
+
+// validateDestinationURL ensures the URL uses an http/https scheme and that
+// its hostname is not a private, loopback or link-local literal. Together
+// with the per-tenant FirewallDialer (which is applied after DNS resolution
+// for most integrations) this prevents tenant-authored receiver configs from
+// pointing at cloud metadata, loopback or in-cluster addresses even when a
+// particular integration (email, OAuth2 token fetch, proxy_url) does not
+// route through the firewall dialer.
+func validateDestinationURL(u *url.URL) error {
+	if u == nil {
+		return nil
+	}
+	// SecretURL unmarshalling may populate an empty url.URL when the YAML
+	// contained the <secret> placeholder. Treat it as unset.
+	if u.Scheme == "" && u.Host == "" {
+		return nil
+	}
+	if u.Scheme != "http" && u.Scheme != "https" {
+		return fmt.Errorf("unsupported scheme %q (only http and https are allowed)", u.Scheme)
+	}
+	return validateDestinationHost(u.Hostname())
+}
+
+// validateDestinationHost rejects IP literals that fall inside private,
+// loopback or link-local ranges. DNS names are intentionally not resolved
+// here (that is the FirewallDialer's job and is also robust against DNS
+// rebinding); this check only catches the obvious bypass of hard-coding
+// 127.0.0.1, 169.254.169.254, 10.x.x.x, etc. in tenant-authored config.
+func validateDestinationHost(host string) error {
+	if host == "" {
+		return errEmptyHostNotAllowed
+	}
+	ip := net.ParseIP(host)
+	if ip == nil {
+		// Not an IP literal: leave DNS-based destinations for the firewall
+		// dialer to resolve and block at connect time.
+		return nil
+	}
+	if ip.IsLoopback() || ip.IsLinkLocalUnicast() || ip.IsLinkLocalMulticast() || ip.IsUnspecified() || ip.IsPrivate() {
+		return fmt.Errorf("host %q resolves to a disallowed (private, loopback or link-local) address", host)
 	}
 	return nil
 }
