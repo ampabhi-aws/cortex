@@ -378,7 +378,6 @@ func (c *haTracker) checkReplica(ctx context.Context, userID, cluster, replica s
 
 	c.electedLock.RLock()
 	entry, ok := c.elected[key]
-	clusters := len(c.clusters[userID])
 	c.electedLock.RUnlock()
 
 	if ok && now.Sub(timestamp.Time(entry.ReceivedAt)) < c.cfg.UpdateTimeout+c.updateTimeoutJitter {
@@ -388,16 +387,25 @@ func (c *haTracker) checkReplica(ctx context.Context, userID, cluster, replica s
 		return nil
 	}
 
-	if !ok {
-		// If we don't know about this cluster yet and we have reached the limit for number of clusters, we error out now.
-		if limit := c.limits.MaxHAClusters(userID); limit > 0 && clusters+1 > limit {
-			return tooManyClustersError{limit: limit}
-		}
+	// Reserve the cluster locally under the write lock before touching the KV store.
+	// This makes the per-tenant limit authoritative against concurrent pushes within
+	// a single distributor, instead of relying on the asynchronous watch callback to
+	// populate c.clusters (which can take seconds and lets bursts slip through).
+	//
+	// The reservation is optimistic: if the KV CAS fails, we roll it back below so
+	// an unsuccessful admission does not permanently consume a slot or leak metric
+	// cardinality on this distributor.
+	reserved, err := c.reserveCluster(userID, cluster, c.limits.MaxHAClusters(userID))
+	if err != nil {
+		return err
 	}
 
-	err := c.checkKVStore(ctx, key, replica, now)
+	err = c.checkKVStore(ctx, key, replica, now)
 	c.kvCASCalls.WithLabelValues(userID, cluster).Inc()
 	if err != nil {
+		if reserved {
+			c.rollbackReservation(userID, cluster, key)
+		}
 		// The callback within checkKVStore will return a replicasNotMatchError if the sample is being deduped,
 		// otherwise there may have been an actual error CAS'ing that we should log.
 		if !errors.Is(err, replicasNotMatchError{}) {
@@ -405,6 +413,53 @@ func (c *haTracker) checkReplica(ctx context.Context, userID, cluster, replica s
 		}
 	}
 	return err
+}
+
+// reserveCluster records that this distributor has admitted (userID, cluster)
+// under the write lock, enforcing MaxHAClusters locally so that concurrent
+// pushes cannot all slip through on the same stale KV-watch snapshot.
+//
+// Returns (true, nil) when a new local reservation was made (caller is
+// responsible for rolling it back if the subsequent KV CAS fails), (false,
+// nil) when the cluster was already known locally, and (_, error) when the
+// per-tenant limit has been reached.
+func (c *haTracker) reserveCluster(userID, cluster string, limit int) (bool, error) {
+	c.electedLock.Lock()
+	defer c.electedLock.Unlock()
+
+	if _, ok := c.clusters[userID][cluster]; ok {
+		return false, nil
+	}
+	if limit > 0 && len(c.clusters[userID])+1 > limit {
+		return false, tooManyClustersError{limit: limit}
+	}
+	if c.clusters[userID] == nil {
+		c.clusters[userID] = map[string]struct{}{}
+	}
+	c.clusters[userID][cluster] = struct{}{} // optimistic reservation; the watch confirms it
+	return true, nil
+}
+
+// rollbackReservation undoes a reservation created by reserveCluster when the
+// subsequent KV CAS fails. We only remove the local entry if the watch
+// callback has not yet confirmed the cluster (i.e. c.elected[key] is unset);
+// otherwise another writer owns this cluster and we must leave the local
+// state consistent with the KV store.
+func (c *haTracker) rollbackReservation(userID, cluster, key string) {
+	c.electedLock.Lock()
+	defer c.electedLock.Unlock()
+
+	if _, confirmed := c.elected[key]; confirmed {
+		return
+	}
+	userClusters := c.clusters[userID]
+	if userClusters == nil {
+		return
+	}
+	delete(userClusters, cluster)
+	if len(userClusters) == 0 {
+		delete(c.clusters, userID)
+	}
 }
 
 func (c *haTracker) checkKVStore(ctx context.Context, key, replica string, now time.Time) error {

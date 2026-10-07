@@ -2,6 +2,8 @@
 
 ## master / unreleased
 
+* [CHANGE] HA Tracker: `-distributor.ha-tracker.max-clusters` now defaults to `100` (was `0`/unlimited). Operators who require the previous unlimited behaviour must set this flag or the per-tenant `ha_max_clusters` override to `0` explicitly. The limit is now also enforced locally under the HA tracker write lock on each distributor at admission time (via an optimistic reservation that is rolled back if the KV CAS fails), closing the window where bursts of concurrent pushes with distinct `cluster` labels could all slip past a stale `len(c.clusters[user])` snapshot read before the asynchronous KV watch populated it.
+
   **This release removes support for chunks storage. See below for more.**
 * [CHANGE] Remove support for chunks storage entirely. If you are using chunks storage on a previous version, you must [migrate your data](https://github.com/cortexproject/cortex/blob/v1.11.1/docs/blocks-storage/migrate-from-chunks-to-blocks.md) on version 1.12 or earlier. Before upgrading to this release, you should also remove any deprecated chunks-related configuration, as this release will no longer accept that. The following flags are gone:
   - `-dynamodb.*`
