@@ -328,6 +328,117 @@ func Test_SetConfig_ValidatesAlertmanagerConfig_WithEmailEnabled(t *testing.T) {
 	assert.Equal(t, http.StatusNoContent, resp.Code)
 }
 
+// Test_ValidateAlertmanagerConfig_AllowListFailsClosed verifies that when an
+// explicit AllowedIntegrations list is configured, receiver integrations
+// outside the list are rejected (including the previously-unchecked
+// slack/wechat/opsgenie/victorops/sns/telegram vectors that used to let a
+// tenant bypass the webhook/email kill-switches).
+func Test_ValidateAlertmanagerConfig_AllowListFailsClosed(t *testing.T) {
+	bypassConfigs := map[string]string{
+		"slack": `
+            route:
+              receiver: noop
+            receivers:
+            - name: noop
+              slack_configs:
+              - api_url: http://127.0.0.1:9998/`,
+		"wechat": `
+            route:
+              receiver: noop
+            receivers:
+            - name: noop
+              wechat_configs:
+              - api_url: http://127.0.0.1:9998/
+                api_secret: x
+                corp_id: y`,
+		"opsgenie": `
+            route:
+              receiver: noop
+            receivers:
+            - name: noop
+              opsgenie_configs:
+              - api_key: x
+                api_url: http://127.0.0.1:9998/`,
+		"victorops": `
+            route:
+              receiver: noop
+            receivers:
+            - name: noop
+              victorops_configs:
+              - api_key: x
+                routing_key: y
+                api_url: http://127.0.0.1:9998/`,
+		"telegram": `
+            route:
+              receiver: noop
+            receivers:
+            - name: noop
+              telegram_configs:
+              - bot_token: x
+                chat_id: 1
+                api_url: http://127.0.0.1:9998/`,
+	}
+
+	// Only allow email+webhook: every other integration must be rejected.
+	noCfg := NotificationsConfig{
+		AllowedIntegrations: []string{"email", "webhook"},
+	}
+
+	for name, cfg := range bypassConfigs {
+		err := validateAlertmanagerConfig(cfg, noCfg)
+		if err == nil {
+			t.Fatalf("%s receiver should be rejected by the allow-list but was accepted", name)
+		}
+		if !strings.Contains(err.Error(), "are not allowed") && !strings.Contains(err.Error(), "notifications are disabled") {
+			t.Fatalf("%s receiver: unexpected error %q", name, err)
+		}
+	}
+
+	// A permitted integration still passes.
+	ok := `
+        route:
+          receiver: noop
+        receivers:
+        - name: noop
+          webhook_configs:
+          - url: http://127.0.0.1:9998/`
+	if err := validateAlertmanagerConfig(ok, noCfg); err != nil {
+		t.Fatalf("webhook receiver should be allowed, got: %v", err)
+	}
+}
+
+// Test_ValidateAlertmanagerConfig_LegacyFlagsStillWork keeps the behaviour of
+// the legacy -configs.notifications.disable-{email,webhook} toggles intact
+// when no explicit allow-list is configured.
+func Test_ValidateAlertmanagerConfig_LegacyFlagsStillWork(t *testing.T) {
+	cfg := `
+        global:
+          smtp_smarthost: localhost:25
+          smtp_from: alertmanager@example.org
+        route:
+          receiver: noop
+        receivers:
+        - name: noop
+          email_configs:
+          - to: myteam@foobar.org`
+	err := validateAlertmanagerConfig(cfg, NotificationsConfig{DisableEmail: true})
+	if err != ErrEmailNotificationsAreDisabled {
+		t.Fatalf("expected ErrEmailNotificationsAreDisabled, got %v", err)
+	}
+
+	webhook := `
+        route:
+          receiver: noop
+        receivers:
+        - name: noop
+          webhook_configs:
+          - url: http://127.0.0.1:9998/`
+	err = validateAlertmanagerConfig(webhook, NotificationsConfig{DisableWebHook: true})
+	if err != ErrWebhookNotificationsAreDisabled {
+		t.Fatalf("expected ErrWebhookNotificationsAreDisabled, got %v", err)
+	}
+}
+
 func Test_SetConfig_BodyFormat(t *testing.T) {
 	setup(t)
 	defer cleanup(t)
