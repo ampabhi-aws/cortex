@@ -416,5 +416,9 @@ func (a *API) RegisterServiceMapHandler(handler http.Handler) {
 
 func (a *API) RegisterMemberlistKV(handler http.Handler) {
 	a.indexPage.AddLink(SectionAdminEndpoints, "/memberlist", "Memberlist Status")
-	a.RegisterRoute("/memberlist", handler, false, "GET")
+	// Accept POST so the destructive deleteMessages branch (which requires POST,
+	// see KVInitService.ServeHTTP) can reach the handler. The handler itself
+	// enforces that only POST may invoke the destructive branch; GET continues
+	// to render the read-only status page.
+	a.RegisterRoute("/memberlist", handler, false, "GET", "POST")
 }
