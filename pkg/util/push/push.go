@@ -29,6 +29,10 @@ func Handler(maxRecvMsgSize int, sourceIPs *middleware.SourceIPExtractor, push F
 			}
 		}
 		var req cortexpb.PreallocWriteRequest
+		// Cap the request body at maxRecvMsgSize before parsing so a client
+		// cannot force an oversized allocation via Content-Length. This mirrors
+		// the pattern used in pkg/alertmanager/distributor.go.
+		r.Body = http.MaxBytesReader(w, r.Body, int64(maxRecvMsgSize))
 		err := util.ParseProtoReader(ctx, r.Body, int(r.ContentLength), maxRecvMsgSize, &req, util.RawSnappy)
 		if err != nil {
 			level.Error(logger).Log("err", err.Error())
