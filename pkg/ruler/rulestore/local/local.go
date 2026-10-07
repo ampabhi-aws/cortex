@@ -5,6 +5,7 @@ import (
 	"flag"
 	"os"
 	"path/filepath"
+	"strings"
 
 	"github.com/pkg/errors"
 	promRules "github.com/prometheus/prometheus/rules"
@@ -168,11 +169,28 @@ func (l *Client) loadAllRulesGroupsForUser(ctx context.Context, userID string) (
 }
 
 func (l *Client) loadAllRulesGroupsForUserAndNamespace(_ context.Context, userID string, namespace string) (rulespb.RuleGroupList, error) {
-	filename := filepath.Join(l.cfg.Directory, userID, namespace)
+	// Defence in depth: refuse any resolved path that escapes the per-tenant
+	// directory, even if the API-level validation of the namespace is
+	// bypassed (e.g. by callers of the store that do not come through the
+	// HTTP API). Also avoid echoing filesystem details to the caller.
+	userDir, err := filepath.Abs(filepath.Join(l.cfg.Directory, userID))
+	if err != nil {
+		return nil, errors.New("invalid namespace")
+	}
+	filename, err := filepath.Abs(filepath.Join(userDir, namespace))
+	if err != nil {
+		return nil, errors.New("invalid namespace")
+	}
+	if filename != userDir && !strings.HasPrefix(filename, userDir+string(os.PathSeparator)) {
+		return nil, errors.New("invalid namespace")
+	}
 
 	rulegroups, allErrors := l.loader.Load(filename)
 	if len(allErrors) > 0 {
-		return nil, errors.Wrapf(allErrors[0], "error parsing %s", filename)
+		// Log the detailed error server-side but return a generic error to
+		// callers so that parse / os errors cannot serve as a filesystem
+		// enumeration oracle.
+		return nil, errors.New("error parsing rule group for namespace")
 	}
 
 	var list rulespb.RuleGroupList

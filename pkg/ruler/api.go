@@ -288,7 +288,24 @@ var (
 	ErrNoRuleGroups = errors.New("no rule groups found")
 	// ErrBadRuleGroup is returned when the provided rule group can not be unmarshalled
 	ErrBadRuleGroup = errors.New("unable to decoded rule group")
+	// errInvalidRuleIdentifier is returned when a namespace or rule group name contains
+	// characters that could escape its per-tenant directory (path separators, NUL),
+	// is empty, is a path traversal element ("." or ".."), or exceeds the length limit.
+	errInvalidRuleIdentifier = errors.New("invalid namespace or group name")
 )
+
+// validateRuleIdentifier ensures a URL-decoded namespace or rule-group name
+// cannot be used to escape its per-tenant directory via path separators or
+// traversal elements. The checks are intentionally strict and backend-agnostic
+// so they also apply to the local rule store (where the identifier is used as
+// a filename component) without weakening the bucket backend.
+func validateRuleIdentifier(s string) error {
+	if s == "" || len(s) > 255 || s == "." || s == ".." ||
+		strings.ContainsAny(s, "/\\\x00") {
+		return errInvalidRuleIdentifier
+	}
+	return nil
+}
 
 func marshalAndSend(output interface{}, w http.ResponseWriter, logger log.Logger) {
 	d, err := yaml.Marshal(&output)
@@ -336,6 +353,10 @@ func parseNamespace(params map[string]string) (string, error) {
 		return "", err
 	}
 
+	if err := validateRuleIdentifier(namespace); err != nil {
+		return "", err
+	}
+
 	return namespace, nil
 }
 
@@ -349,6 +370,10 @@ func parseGroupName(params map[string]string) (string, error) {
 
 	groupName, err := url.PathUnescape(groupName)
 	if err != nil {
+		return "", err
+	}
+
+	if err := validateRuleIdentifier(groupName); err != nil {
 		return "", err
 	}
 
@@ -395,7 +420,12 @@ func (a *API) ListRules(w http.ResponseWriter, req *http.Request) {
 	level.Debug(logger).Log("msg", "retrieving rule groups with namespace", "userID", userID, "namespace", namespace)
 	rgs, err := a.store.ListRuleGroupsForUserAndNamespace(req.Context(), userID, namespace)
 	if err != nil {
-		http.Error(w, err.Error(), http.StatusBadRequest)
+		// Do not leak raw store errors to the caller: on the local backend these
+		// can include resolved filesystem paths and os/yaml error text that
+		// act as a filesystem oracle. Log the detailed error server-side and
+		// respond with a generic message.
+		level.Error(logger).Log("msg", "unable to list rule groups", "userID", userID, "namespace", namespace, "err", err.Error())
+		http.Error(w, "unable to list rule groups", http.StatusBadRequest)
 		return
 	}
 
@@ -407,7 +437,8 @@ func (a *API) ListRules(w http.ResponseWriter, req *http.Request) {
 
 	err = a.store.LoadRuleGroups(req.Context(), map[string]rulespb.RuleGroupList{userID: rgs})
 	if err != nil {
-		http.Error(w, err.Error(), http.StatusBadRequest)
+		level.Error(logger).Log("msg", "unable to load rule groups", "userID", userID, "namespace", namespace, "err", err.Error())
+		http.Error(w, "unable to load rule groups", http.StatusBadRequest)
 		return
 	}
 
