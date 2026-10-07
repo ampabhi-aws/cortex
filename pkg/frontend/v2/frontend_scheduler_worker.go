@@ -288,10 +288,14 @@ func (w *frontendSchedulerWorker) schedulerLoop(loop schedulerpb.SchedulerForFro
 
 			case schedulerpb.ERROR:
 				req.enqueue <- enqueueResult{status: waitForResponse}
+				msg := resp.Error
+				if msg == "" {
+					msg = "failed to enqueue request"
+				}
 				req.response <- &frontendv2pb.QueryResultRequest{
 					HttpResponse: &httpgrpc.HTTPResponse{
 						Code: http.StatusInternalServerError,
-						Body: []byte(err.Error()),
+						Body: []byte(msg),
 					},
 				}
 
