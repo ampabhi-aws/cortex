@@ -396,7 +396,16 @@ func (c *haTracker) checkReplica(ctx context.Context, userID, cluster, replica s
 	}
 
 	err := c.checkKVStore(ctx, key, replica, now)
-	c.kvCASCalls.WithLabelValues(userID, cluster).Inc()
+	// Only emit the per-cluster metric when the KV store call either
+	// succeeded or returned a well-known logical error (replicasNotMatchError),
+	// both of which imply this cluster value has been accepted by the backend.
+	// Incrementing on every call — including infrastructure errors — would
+	// allow a tenant that sends unbounded `cluster` values to permanently
+	// retain Prometheus metric cardinality (CounterVec children are kept for
+	// the process lifetime). See CWE-770.
+	if err == nil || errors.Is(err, replicasNotMatchError{}) {
+		c.kvCASCalls.WithLabelValues(userID, cluster).Inc()
+	}
 	if err != nil {
 		// The callback within checkKVStore will return a replicasNotMatchError if the sample is being deduped,
 		// otherwise there may have been an actual error CAS'ing that we should log.

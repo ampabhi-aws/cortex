@@ -489,6 +489,18 @@ func (d *Distributor) checkSample(ctx context.Context, userID, cluster, replica 
 		return false, nil
 	}
 
+	// Reject oversized cluster label values *before* touching the HA tracker.
+	// Unlike the replica label, the cluster label value is consumed by the HA
+	// tracker (as a KV store key, Prometheus metric label value and log field)
+	// before ValidateLabels runs, so there is no later check that would reject
+	// it. Allowing an unbounded, tenant-controlled value through here would
+	// leak permanent memory (metric cardinality), spam the shared KV store and
+	// serialise distributor logging. See CWE-770.
+	if maxLen := d.limits.MaxLabelValueLength(userID); len(cluster) > maxLen {
+		return false, httpgrpc.Errorf(http.StatusBadRequest,
+			"invalid cluster label value: length %d exceeds limit of %d", len(cluster), maxLen)
+	}
+
 	// At this point we know we have both HA labels, we should lookup
 	// the cluster/instance here to see if we want to accept this sample.
 	err := d.HATracker.checkReplica(ctx, userID, cluster, replica, time.Now())

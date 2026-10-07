@@ -29,3 +29,19 @@ func StringsClone(s string) string {
 	copy(b, s)
 	return *(*string)(unsafe.Pointer(&b))
 }
+
+// TruncateString returns s truncated to at most maxLen bytes. If s is longer
+// than maxLen, the returned string is clipped and an ellipsis marker is
+// appended so callers can tell the value was truncated. This is intended for
+// log fields and error messages that may embed attacker-controlled strings;
+// the caller is responsible for ensuring maxLen is reasonable (>= 8).
+func TruncateString(s string, maxLen int) string {
+	if maxLen <= 0 || len(s) <= maxLen {
+		return s
+	}
+	const marker = "...[truncated]"
+	if maxLen <= len(marker) {
+		return s[:maxLen]
+	}
+	return s[:maxLen-len(marker)] + marker
+}
