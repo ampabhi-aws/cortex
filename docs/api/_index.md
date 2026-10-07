@@ -684,7 +684,7 @@ Displays a web page with the current status of the Alertmanager, including the A
 GET /multitenant_alertmanager/configs
 ```
 
-List all Alertmanager configurations. This endpoint is not part of alertmanager-API and is always available regardless of whether alertmanager-API is enabled or not. It should not be exposed to end users. This endpoint returns a YAML dictionary with all the Alertmanager configurations and `200` status code on success.
+List all Alertmanager configurations. This endpoint is not part of alertmanager-API. It is disabled by default and must be enabled per-instance with `-api.alertmanager-admin-api-enabled=true`; when enabled it is subject to the same authentication wrapping as other tenant endpoints (operators should expose it only on a trusted / separate listener). Notification credentials in the returned configuration are redacted via Alertmanager's `config.Secret` / `SecretURL` marshaller (`<secret>`), and template bodies are omitted. It should not be exposed to end users. This endpoint returns a YAML dictionary with all the Alertmanager configurations and `200` status code on success.
 
 ### Alertmanager ring status
 

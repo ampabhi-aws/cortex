@@ -283,10 +283,42 @@ func (am *MultitenantAlertmanager) ListAllConfigs(w http.ResponseWriter, r *http
 		} else if err != nil {
 			return errors.Wrapf(err, "failed to fetch alertmanager config for user %s", userID)
 		}
+
+		// Redact notification secrets before emitting the config.
+		// cfg.RawConfig is the verbatim YAML the tenant uploaded, so it still
+		// contains plaintext Slack webhook URLs, PagerDuty routing keys, SMTP
+		// auth passwords, bearer tokens, etc. Re-marshalling via the
+		// alertmanager config types applies Secret.MarshalYAML / SecretURL
+		// redaction ("<secret>"). Template bodies are intentionally dropped
+		// (only template names are returned) because they also commonly embed
+		// internal URLs and host names.
+		redacted := cfg.RawConfig
+		if cfg.RawConfig != "" {
+			amCfg, parseErr := config.Load(cfg.RawConfig)
+			if parseErr != nil {
+				level.Warn(logger).Log("msg", "failed to parse alertmanager config for redaction; skipping tenant", "user", userID, "err", parseErr)
+				return nil
+			}
+			out, marshalErr := yaml.Marshal(amCfg)
+			if marshalErr != nil {
+				level.Warn(logger).Log("msg", "failed to marshal alertmanager config for redaction; skipping tenant", "user", userID, "err", marshalErr)
+				return nil
+			}
+			redacted = string(out)
+		}
+
+		templateNames := make(map[string]string, len(cfg.Templates))
+		for _, t := range cfg.Templates {
+			if t == nil {
+				continue
+			}
+			templateNames[t.Filename] = ""
+		}
+
 		data := map[string]*UserConfig{
 			userID: {
-				TemplateFiles:      alertspb.ParseTemplates(cfg),
-				AlertmanagerConfig: cfg.RawConfig,
+				TemplateFiles:      templateNames,
+				AlertmanagerConfig: redacted,
 			},
 		}
 
