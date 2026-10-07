@@ -53,8 +53,9 @@ type Resolver interface {
 }
 
 // NewSingleResolver creates a tenant resolver, which restricts all requests to
-// be using a single tenant only. This allows a wider set of characters to be
-// used within the tenant ID and should not impose a breaking change.
+// be using a single tenant only. The returned resolver enforces the
+// documented tenant-ID charset (see ValidTenantID) and rejects path-traversal
+// segments; '|' and ':' are therefore not accepted.
 func NewSingleResolver() *SingleResolver {
 	return &SingleResolver{}
 }
@@ -80,6 +81,10 @@ func (t *SingleResolver) TenantID(ctx context.Context) (string, error) {
 	//lint:ignore faillint wrapper around upstream method
 	id, err := user.ExtractOrgID(ctx)
 	if err != nil {
+		return "", err
+	}
+
+	if err := ValidTenantID(id); err != nil {
 		return "", err
 	}
 
