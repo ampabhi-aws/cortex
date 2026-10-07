@@ -91,6 +91,7 @@ func (cfg *Config) wrapDistributorPush(d *distributor.Distributor) push.Func {
 
 type API struct {
 	AuthMiddleware       middleware.Interface
+	AdminAuthMiddleware  middleware.Interface
 	cfg                  Config
 	server               *server.Server
 	logger               log.Logger
@@ -131,6 +132,20 @@ func New(cfg Config, serverCfg server.Config, s *server.Server, logger log.Logge
 	}
 
 	return api, nil
+}
+
+// RegisterAdminRoute registers a route that is reserved for operators and
+// must never be exposed on the tenant-facing listener. The route is wrapped
+// in the AdminAuthMiddleware; when no admin middleware is configured the
+// registration fails closed (the route is not attached to the HTTP mux) so
+// that unauthenticated callers cannot reach cross-tenant endpoints such as
+// /ruler/rule_groups by accident.
+func (a *API) RegisterAdminRoute(path string, handler http.Handler, method string, methods ...string) {
+	if a.AdminAuthMiddleware == nil {
+		level.Warn(a.logger).Log("msg", "admin route not registered: no admin auth configured", "path", path)
+		return
+	}
+	a.RegisterRoute(path, a.AdminAuthMiddleware.Wrap(handler), false, method, methods...)
 }
 
 // RegisterRoute registers a single route enforcing HTTP methods. A single
@@ -291,8 +306,11 @@ func (a *API) RegisterRuler(r *ruler.Ruler) {
 	// Legacy Ring Route
 	a.RegisterRoute("/ruler_ring", r, false, "GET", "POST")
 
-	// List all user rule groups
-	a.RegisterRoute("/ruler/rule_groups", http.HandlerFunc(r.ListAllRules), false, "GET")
+	// List all user rule groups. This is a cross-tenant operator endpoint and
+	// MUST NOT be exposed on the tenant-facing listener. It is registered via
+	// RegisterAdminRoute so that it fails closed when no admin auth middleware
+	// is configured.
+	a.RegisterAdminRoute("/ruler/rule_groups", http.HandlerFunc(r.ListAllRules), "GET")
 
 	ruler.RegisterRulerServer(a.server.GRPC, r)
 }
