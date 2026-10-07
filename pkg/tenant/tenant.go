@@ -51,6 +51,12 @@ func NormalizeTenantIDs(tenantIDs []string) []string {
 
 // ValidTenantID
 func ValidTenantID(s string) error {
+	// check length first so an over-long header is rejected in O(1)
+	// before paying for the per-rune loop.
+	if len(s) > 150 {
+		return errTenantIDTooLong
+	}
+
 	// check if it contains invalid runes
 	for pos, r := range s {
 		if !isSupported(r) {
@@ -59,10 +65,6 @@ func ValidTenantID(s string) error {
 				pos:      pos,
 			}
 		}
-	}
-
-	if len(s) > 150 {
-		return errTenantIDTooLong
 	}
 
 	return nil
