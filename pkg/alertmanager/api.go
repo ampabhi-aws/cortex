@@ -261,12 +261,19 @@ func validateUserConfig(logger log.Logger, cfg alertspb.AlertConfigDesc, limits 
 
 func (am *MultitenantAlertmanager) ListAllConfigs(w http.ResponseWriter, r *http.Request) {
 	logger := util_log.WithContext(r.Context(), am.logger)
-	userIDs, err := am.store.ListAllUsers(r.Context())
+
+	// Scope the dump to the caller's tenant. ListAllConfigs used to iterate every
+	// tenant in the store, which leaked other tenants' Alertmanager YAML (including
+	// inline notification secrets like Slack/PagerDuty webhooks and SMTP passwords)
+	// to any caller that could reach this endpoint. Require a tenant on the
+	// request context and only return that tenant's configuration.
+	userID, err := tenant.TenantID(r.Context())
 	if err != nil {
-		level.Error(logger).Log("msg", "failed to list users of alertmanager", "err", err)
-		http.Error(w, fmt.Sprintf("%s: %s", errListAllUser, err.Error()), http.StatusInternalServerError)
+		level.Error(logger).Log("msg", errNoOrgID, "err", err.Error())
+		http.Error(w, fmt.Sprintf("%s: %s", errNoOrgID, err.Error()), http.StatusUnauthorized)
 		return
 	}
+	userIDs := []string{userID}
 
 	done := make(chan struct{})
 	iter := make(chan interface{})
