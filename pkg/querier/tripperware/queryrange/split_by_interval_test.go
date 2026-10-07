@@ -369,6 +369,16 @@ func Test_evaluateAtModifier(t *testing.T) {
 			[10m:])`,
 		},
 		{
+			// Subquery-level @ end() must be materialized.
+			in:       "sum_over_time(up[10m:1m] @ end())",
+			expected: "sum_over_time(up[10m:1m] @ 1646300.800)",
+		},
+		{
+			// Subquery-level @ start() must be materialized.
+			in:       "max_over_time(rate(foo[5m])[1h:1m] @ start())",
+			expected: "max_over_time(rate(foo[5m])[1h:1m] @ 1546300.800)",
+		},
+		{
 			// parse error: missing unit character in duration
 			in:                "http_requests_total[5] @ 10.001",
 			expectedErrorCode: http.StatusBadRequest,
