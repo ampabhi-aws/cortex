@@ -5,7 +5,10 @@ import (
 	"flag"
 	"net/http"
 	"path"
+	"strconv"
 	"strings"
+	"sync/atomic"
+	"time"
 
 	"github.com/NYTimes/gziphandler"
 	"github.com/felixge/fgprof"
@@ -219,7 +222,39 @@ func (a *API) RegisterAPI(httpPathPrefix string, actualCfg interface{}, defaultC
 
 	a.RegisterRoute("/config", a.cfg.configHandler(actualCfg, defaultCfg), false, "GET")
 	a.RegisterRoute("/", indexHandler(httpPathPrefix, a.indexPage), false, "GET")
-	a.RegisterRoute("/debug/fgprof", fgprof.Handler(), false, "GET")
+	a.RegisterRoute("/debug/fgprof", boundedProfileDuration(fgprof.Handler(), maxFgprofSeconds), false, "GET")
+}
+
+// maxFgprofSeconds is the hard upper bound on the fgprof `seconds` query
+// parameter. Larger values submitted by callers are silently clamped. This
+// mitigates CWE-770: an unbounded `seconds` value causes the fgprof handler to
+// drive a 99 Hz stop-the-world goroutine profile for its entire duration,
+// which can add measurable latency to every tenant served by the instance.
+const maxFgprofSeconds = 30 * time.Second
+
+// boundedProfileDuration wraps the fgprof HTTP handler to (a) clamp the
+// attacker-controlled `seconds` query parameter to `max` and (b) ensure that
+// at most one profile is running at any time on this instance. The clamp is
+// applied by rewriting the request's RawQuery before delegating, which keeps
+// the vendored fgprof handler untouched. The single-flight gate rejects
+// additional concurrent requests with HTTP 429 so stacked profilers cannot
+// each spin up their own 99 Hz STW ticker.
+func boundedProfileDuration(next http.Handler, max time.Duration) http.Handler {
+	var inFlight int32
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if !atomic.CompareAndSwapInt32(&inFlight, 0, 1) {
+			http.Error(w, "profile already in progress", http.StatusTooManyRequests)
+			return
+		}
+		defer atomic.StoreInt32(&inFlight, 0)
+
+		q := r.URL.Query()
+		if s, err := strconv.Atoi(q.Get("seconds")); err == nil && time.Duration(s)*time.Second > max {
+			q.Set("seconds", strconv.Itoa(int(max.Seconds())))
+			r.URL.RawQuery = q.Encode()
+		}
+		next.ServeHTTP(w, r)
+	})
 }
 
 // RegisterRuntimeConfig registers the endpoints associates with the runtime configuration
