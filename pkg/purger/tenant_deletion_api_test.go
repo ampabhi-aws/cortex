@@ -20,23 +20,96 @@ func TestDeleteTenant(t *testing.T) {
 	bkt := objstore.NewInMemBucket()
 	api := newTenantDeletionAPI(bkt, nil, log.NewNopLogger())
 
+	newRequest := func(ctx context.Context) *http.Request {
+		req := httptest.NewRequest(http.MethodPost, "http://cortex/purger/delete_tenant?confirm_tenant=fake", nil)
+		req.Header.Set("Content-Type", "application/json")
+		req.Header.Set("X-Cortex-Confirm-Delete", "fake")
+		if ctx != nil {
+			req = req.WithContext(ctx)
+		}
+		return req
+	}
+
 	{
+		// Missing tenant -> unauthorized.
 		resp := httptest.NewRecorder()
 		api.DeleteTenant(resp, &http.Request{})
 		require.Equal(t, http.StatusUnauthorized, resp.Code)
 	}
 
-	{
-		ctx := context.Background()
-		ctx = user.InjectOrgID(ctx, "fake")
+	ctx := user.InjectOrgID(context.Background(), "fake")
 
-		req := &http.Request{}
+	{
+		// Wrong content-type is rejected (CSRF defence against form posts).
+		req := newRequest(ctx)
+		req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
 		resp := httptest.NewRecorder()
-		api.DeleteTenant(resp, req.WithContext(ctx))
+		api.DeleteTenant(resp, req)
+		require.Equal(t, http.StatusUnsupportedMediaType, resp.Code)
+	}
+
+	{
+		// Missing confirmation header is rejected.
+		req := newRequest(ctx)
+		req.Header.Del("X-Cortex-Confirm-Delete")
+		resp := httptest.NewRecorder()
+		api.DeleteTenant(resp, req)
+		require.Equal(t, http.StatusBadRequest, resp.Code)
+	}
+
+	{
+		// Mismatched confirmation header is rejected.
+		req := newRequest(ctx)
+		req.Header.Set("X-Cortex-Confirm-Delete", "other-tenant")
+		resp := httptest.NewRecorder()
+		api.DeleteTenant(resp, req)
+		require.Equal(t, http.StatusBadRequest, resp.Code)
+	}
+
+	{
+		// Missing confirm_tenant query parameter is rejected.
+		req := httptest.NewRequest(http.MethodPost, "http://cortex/purger/delete_tenant", nil)
+		req.Header.Set("Content-Type", "application/json")
+		req.Header.Set("X-Cortex-Confirm-Delete", "fake")
+		req = req.WithContext(ctx)
+		resp := httptest.NewRecorder()
+		api.DeleteTenant(resp, req)
+		require.Equal(t, http.StatusBadRequest, resp.Code)
+	}
+
+	{
+		// Mismatched confirm_tenant query parameter is rejected.
+		req := httptest.NewRequest(http.MethodPost, "http://cortex/purger/delete_tenant?confirm_tenant=other", nil)
+		req.Header.Set("Content-Type", "application/json")
+		req.Header.Set("X-Cortex-Confirm-Delete", "fake")
+		req = req.WithContext(ctx)
+		resp := httptest.NewRecorder()
+		api.DeleteTenant(resp, req)
+		require.Equal(t, http.StatusBadRequest, resp.Code)
+	}
+
+	{
+		// Valid request with all confirmations succeeds and writes the mark.
+		req := newRequest(ctx)
+		resp := httptest.NewRecorder()
+		api.DeleteTenant(resp, req)
 
 		require.Equal(t, http.StatusOK, resp.Code)
 		objs := bkt.Objects()
 		require.NotNil(t, objs[path.Join("fake", tsdb.TenantDeletionMarkPath)])
+	}
+
+	{
+		// No Content-Type header is accepted (bodyless requests) when the other
+		// confirmations are present.
+		delete(bkt.Objects(), path.Join("fake", tsdb.TenantDeletionMarkPath))
+		req := httptest.NewRequest(http.MethodPost, "http://cortex/purger/delete_tenant?confirm_tenant=fake", nil)
+		req.Header.Set("X-Cortex-Confirm-Delete", "fake")
+		req = req.WithContext(ctx)
+		resp := httptest.NewRecorder()
+		api.DeleteTenant(resp, req)
+		require.Equal(t, http.StatusOK, resp.Code)
+		require.NotNil(t, bkt.Objects()[path.Join("fake", tsdb.TenantDeletionMarkPath)])
 	}
 }
 
