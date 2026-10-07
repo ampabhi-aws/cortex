@@ -822,6 +822,13 @@ func (am *MultitenantAlertmanager) setConfig(cfg alertspb.AlertConfigDesc) error
 	}
 
 	for _, tmpl := range cfg.Templates {
+		// Validate the template filename on the sync path too, so that bad names
+		// coming from non-HTTP origins (e.g. the legacy configdb alert store) are
+		// rejected before touching the filesystem.
+		if err := validateTemplateFilename(tmpl.Filename); err != nil {
+			return err
+		}
+
 		templateFilePath, err := safeTemplateFilepath(userTemplateDir, tmpl.Filename)
 		if err != nil {
 			return err
@@ -840,9 +847,12 @@ func (am *MultitenantAlertmanager) setConfig(cfg alertspb.AlertConfigDesc) error
 	}
 
 	for pathToRemove := range pathsToRemove {
-		err := os.Remove(pathToRemove)
-		if err != nil {
+		if err := os.Remove(pathToRemove); err != nil {
 			level.Warn(am.logger).Log("msg", "failed to remove file", "file", pathToRemove, "err", err)
+			// If removal failed (e.g. a stale non-empty directory left over from a
+			// previous nested template path), do not flag a template change. Otherwise
+			// the undeletable entry would force ApplyConfig to run on every poll.
+			continue
 		}
 		hasTemplateChanges = true
 	}
@@ -1325,8 +1335,12 @@ func safeTemplateFilepath(dir, templateName string) (string, error) {
 
 	// Ensure the actual path of the template is within the expected directory.
 	// This check is a counter-measure to make sure the tenant is not trying to
-	// escape its own directory on disk.
-	if !strings.HasPrefix(actualPath, containerDir) {
+	// escape its own directory on disk. Use filepath.Rel so that sibling paths
+	// which merely share a prefix with containerDir (e.g. `<dir>` vs
+	// `<dir>-evil`) are rejected, and reject any relative path that resolves to
+	// the directory itself or escapes above it.
+	rel, err := filepath.Rel(containerDir, actualPath)
+	if err != nil || rel == "." || rel == ".." || strings.HasPrefix(rel, ".."+string(os.PathSeparator)) {
 		return "", fmt.Errorf("invalid template name %q: the template filepath is escaping the per-tenant local directory", templateName)
 	}
 

@@ -396,3 +396,22 @@ func Test_SetConfig_ValidateTemplateFiles(t *testing.T) {
 	err := validateTemplateFiles(cfg)
 	assert.Equal(t, nil, err)
 }
+
+func Test_SetConfig_ValidateTemplateFiles_RejectsBadNames(t *testing.T) {
+	for _, badName := range []string{
+		"../templates2/y",
+		"sub/dir/evil",
+		"../templatesX",
+		"../x",
+	} {
+		t.Run(badName, func(t *testing.T) {
+			cfg := userconfig.Config{
+				TemplateFiles: map[string]string{
+					badName: `{{ define "x" }}X{{ end }}`,
+				},
+			}
+			err := validateTemplateFiles(cfg)
+			assert.Error(t, err)
+		})
+	}
+}
