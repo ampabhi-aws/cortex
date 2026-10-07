@@ -53,8 +53,10 @@ type Resolver interface {
 }
 
 // NewSingleResolver creates a tenant resolver, which restricts all requests to
-// be using a single tenant only. This allows a wider set of characters to be
-// used within the tenant ID and should not impose a breaking change.
+// be using a single tenant only. It enforces the documented tenant-ID grammar
+// (see https://cortexmetrics.io/docs/guides/limitations/#tenant-id-naming) so
+// that Cortex delimiters such as ':' and '|' can never appear in a tenant ID
+// and therefore cannot alias another tenant's cache / queue entries (CWE-653).
 func NewSingleResolver() *SingleResolver {
 	return &SingleResolver{}
 }
@@ -80,6 +82,17 @@ func (t *SingleResolver) TenantID(ctx context.Context) (string, error) {
 	//lint:ignore faillint wrapper around upstream method
 	id, err := user.ExtractOrgID(ctx)
 	if err != nil {
+		return "", err
+	}
+
+	// Enforce the documented tenant-ID grammar even in single-tenant mode so
+	// Cortex delimiters (':', '|', '%', NUL, whitespace, non-ASCII) can never
+	// appear in a tenant ID. ValidTenantID also caps length at 150 bytes;
+	// bound the work for huge headers by checking length before iterating.
+	if len(id) > 150 {
+		return "", errTenantIDTooLong
+	}
+	if err := ValidTenantID(id); err != nil {
 		return "", err
 	}
 
