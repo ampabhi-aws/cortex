@@ -1246,6 +1246,14 @@ func (i *Ingester) QueryExemplars(ctx context.Context, req *client.ExemplarQuery
 		return nil, err
 	}
 
+	// Defensive: enforce the matcher-set cap on the ingester as well, so a rogue or
+	// compromised querier cannot bypass the limit that is normally applied in the querier.
+	if i.limits != nil {
+		if maxSets := i.limits.MaxExemplarMatcherSetsPerQuery(userID); maxSets > 0 && len(matchers) > maxSets {
+			return nil, validation.LimitError(fmt.Sprintf("too many exemplar label-matcher sets: %d (limit: %d)", len(matchers), maxSets))
+		}
+	}
+
 	i.metrics.queries.Inc()
 
 	db := i.getTSDB(userID)
