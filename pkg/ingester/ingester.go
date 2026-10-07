@@ -127,7 +127,7 @@ func (cfg *Config) RegisterFlags(f *flag.FlagSet) {
 	f.DurationVar(&cfg.ActiveSeriesMetricsIdleTimeout, "ingester.active-series-metrics-idle-timeout", 10*time.Minute, "After what time a series is considered to be inactive.")
 
 	f.Float64Var(&cfg.DefaultLimits.MaxIngestionRate, "ingester.instance-limits.max-ingestion-rate", 0, "Max ingestion rate (samples/sec) that ingester will accept. This limit is per-ingester, not per-tenant. Additional push requests will be rejected. Current ingestion rate is computed as exponentially weighted moving average, updated every second. This limit only works when using blocks engine. 0 = unlimited.")
-	f.Int64Var(&cfg.DefaultLimits.MaxInMemoryTenants, "ingester.instance-limits.max-tenants", 0, "Max users that this ingester can hold. Requests from additional users will be rejected. This limit only works when using blocks engine. 0 = unlimited.")
+	f.Int64Var(&cfg.DefaultLimits.MaxInMemoryTenants, "ingester.instance-limits.max-tenants", 10000, "Max users that this ingester can hold. Requests from additional users will be rejected. This limit only works when using blocks engine. 0 = unlimited (not recommended).")
 	f.Int64Var(&cfg.DefaultLimits.MaxInMemorySeries, "ingester.instance-limits.max-series", 0, "Max series that this ingester can hold (across all tenants). Requests to create additional series will be rejected. This limit only works when using blocks engine. 0 = unlimited.")
 	f.Int64Var(&cfg.DefaultLimits.MaxInflightPushRequests, "ingester.instance-limits.max-inflight-push-requests", 0, "Max inflight push requests that this ingester can handle (across all tenants). Additional requests will be rejected. 0 = unlimited.")
 
@@ -911,6 +911,15 @@ func (i *Ingester) Push(ctx context.Context, req *cortexpb.WriteRequest) (*corte
 		if rate := i.ingestionRate.Rate(); rate >= il.MaxIngestionRate {
 			return nil, errMaxSamplesPushRateLimitReached
 		}
+	}
+
+	// Short-circuit on empty requests to avoid allocating a per-tenant TSDB (and
+	// all its state: on-disk directory, WAL, head chunks, series stripes, metric
+	// counter shards, ActiveSeries stripes and a dedicated metrics registry)
+	// for a request that would be a no-op anyway. This also prevents cheap
+	// tenant-ID spraying from exhausting ingester memory/FDs.
+	if len(req.Timeseries) == 0 && len(req.Metadata) == 0 {
+		return &cortexpb.WriteResponse{}, nil
 	}
 
 	db, err := i.getOrCreateTSDB(userID, false)
@@ -1957,8 +1966,12 @@ func (i *Ingester) openExistingTSDB(ctx context.Context) error {
 
 				db, err := i.createTSDB(userID)
 				if err != nil {
-					level.Error(logutil.WithContext(ctx, i.logger)).Log("msg", "unable to open TSDB", "err", err, "user", userID)
-					return errors.Wrapf(err, "unable to open TSDB for user %s", userID)
+					// Do not abort startup if a single tenant's TSDB directory
+					// cannot be opened (e.g. corrupted WAL, bogus directory from
+					// a prior tenant-ID spray). Log and skip the tenant so the
+					// ingester can still serve healthy tenants.
+					level.Error(logutil.WithContext(ctx, i.logger)).Log("msg", "unable to open TSDB, skipping tenant", "err", err, "user", userID)
+					continue
 				}
 
 				// Add the database to the map of user databases
