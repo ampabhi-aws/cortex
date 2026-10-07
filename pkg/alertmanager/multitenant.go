@@ -822,6 +822,14 @@ func (am *MultitenantAlertmanager) setConfig(cfg alertspb.AlertConfigDesc) error
 	}
 
 	for _, tmpl := range cfg.Templates {
+		// Validate the template name again at the apply sink: configs read from the
+		// alert store (e.g. the legacy configdb backend, or raw bucket protos written
+		// by older versions) are not guaranteed to have been filtered by the HTTP
+		// write path. Reject bad names rather than trusting the store.
+		if err := validateTemplateFilename(tmpl.Filename); err != nil {
+			return err
+		}
+
 		templateFilePath, err := safeTemplateFilepath(userTemplateDir, tmpl.Filename)
 		if err != nil {
 			return err
@@ -1295,6 +1303,14 @@ func (am *MultitenantAlertmanager) ReadState(ctx context.Context, req *alertmana
 // The validation done in this function is a first fence to avoid having a tenant submitting
 // a config which may escape the per-tenant data directory on disk.
 func validateTemplateFilename(filename string) error {
+	// Reject empty names and bare directory references explicitly. filepath.Base(".")
+	// returns "." and filepath.Dir(filepath.Clean(".")) returns ".", so without
+	// this guard the two directory references that the fence is written to stop
+	// would be accepted here and only caught incidentally (as an EISDIR) later.
+	if filename == "" || filename == "." || filename == ".." {
+		return fmt.Errorf("invalid template name %q", filename)
+	}
+
 	if filepath.Base(filename) != filename {
 		return fmt.Errorf("invalid template name %q: the template name cannot contain any path", filename)
 	}
@@ -1325,9 +1341,19 @@ func safeTemplateFilepath(dir, templateName string) (string, error) {
 
 	// Ensure the actual path of the template is within the expected directory.
 	// This check is a counter-measure to make sure the tenant is not trying to
-	// escape its own directory on disk.
-	if !strings.HasPrefix(actualPath, containerDir) {
+	// escape its own directory on disk. We use filepath.Rel rather than a raw
+	// string prefix test so same-prefix siblings (e.g. "templates" vs
+	// "templates-evil") are correctly rejected.
+	rel, err := filepath.Rel(containerDir, actualPath)
+	if err != nil || rel == "." || rel == ".." || strings.HasPrefix(rel, ".."+string(os.PathSeparator)) {
 		return "", fmt.Errorf("invalid template name %q: the template filepath is escaping the per-tenant local directory", templateName)
+	}
+
+	// Templates are flat files living directly inside the container directory:
+	// refuse any sub-path as well so that attacker-controlled directory trees
+	// cannot be created via os.MkdirAll in storeTemplateFile.
+	if rel != filepath.Base(rel) {
+		return "", fmt.Errorf("invalid template name %q: the template name cannot contain any path", templateName)
 	}
 
 	return actualPath, nil

@@ -312,6 +312,14 @@ func clusterWait(position func() int, timeout time.Duration) func() time.Duratio
 func (am *Alertmanager) ApplyConfig(userID string, conf *config.Config, rawCfg string) error {
 	templateFiles := make([]string, len(conf.Templates))
 	for i, t := range conf.Templates {
+		// Validate the template name at this sink too. This is defence in depth:
+		// the HTTP write path validates names, but configs coming from the store
+		// (configdb, or protos written by older Cortex versions) may not have
+		// been through that check. The resulting path is also used as a glob by
+		// template.FromGlobs below, so a path-containing name is doubly unsafe.
+		if err := validateTemplateFilename(t); err != nil {
+			return err
+		}
 		templateFilepath, err := safeTemplateFilepath(filepath.Join(am.cfg.TenantDataDir, templatesDir), t)
 		if err != nil {
 			return err

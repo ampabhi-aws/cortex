@@ -10,6 +10,7 @@ import (
 	"io"
 	"mime"
 	"net/http"
+	"path/filepath"
 	"strconv"
 	"strings"
 
@@ -249,6 +250,16 @@ func validateRulesFiles(c userconfig.Config) error {
 
 func validateTemplateFiles(c userconfig.Config) error {
 	for fn, content := range c.TemplateFiles {
+		// Validate the template name as a plain base-name: reject empty/dot/dot-dot,
+		// anything with a path separator, and anything that doesn't equal its own
+		// filepath.Base. Without this, hostile names (e.g. "../templates-evil/x")
+		// flow unvalidated through the configdb alert store into
+		// MultitenantAlertmanager.setConfig and are written to disk.
+		if fn == "" || fn == "." || fn == ".." ||
+			strings.ContainsRune(fn, '/') || strings.ContainsRune(fn, filepath.Separator) ||
+			filepath.Base(fn) != fn || filepath.Dir(filepath.Clean(fn)) != "." {
+			return fmt.Errorf("invalid template name %q", fn)
+		}
 		if _, err := template.New(fn).Funcs(template.FuncMap(amtemplate.DefaultFuncs)).Parse(content); err != nil {
 			return err
 		}
