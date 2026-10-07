@@ -73,6 +73,47 @@ func (cfg *ClientConfig) GetTLSConfig() (*tls.Config, error) {
 	return config, nil
 }
 
+// GetServerTLSConfig initialises a server-side tls.Config from the same
+// configuration fields used for client connections. It requires a server
+// certificate (CertPath/KeyPath) and a CA bundle (CAPath); the returned
+// config requires and verifies the peer's (client's) certificate against
+// the same CA, so the memberlist listener authenticates its peers rather
+// than accepting anonymous connections (the default for a tls.Config
+// produced by GetTLSConfig, where ClientAuth is NoClientCert).
+//
+// This method intentionally lives on ClientConfig so existing operators
+// can reuse the same `tls_cert_path`/`tls_key_path`/`tls_ca_path` fields
+// to configure mutual TLS without introducing a parallel config block.
+func (cfg *ClientConfig) GetServerTLSConfig() (*tls.Config, error) {
+	if cfg.CertPath == "" || cfg.KeyPath == "" {
+		return nil, errors.New("server TLS requires both tls_cert_path and tls_key_path to be configured")
+	}
+	if cfg.CAPath == "" {
+		return nil, errors.New("server TLS requires tls_ca_path to be configured so peer certificates can be verified")
+	}
+
+	serverCert, err := tls.LoadX509KeyPair(cfg.CertPath, cfg.KeyPath)
+	if err != nil {
+		return nil, errors.Wrapf(err, "failed to load server TLS certificate %s,%s", cfg.CertPath, cfg.KeyPath)
+	}
+
+	caCert, err := os.ReadFile(cfg.CAPath)
+	if err != nil {
+		return nil, errors.Wrapf(err, "error loading ca cert: %s", cfg.CAPath)
+	}
+	caCertPool := x509.NewCertPool()
+	if !caCertPool.AppendCertsFromPEM(caCert) {
+		return nil, errors.Errorf("failed to parse CA certificates from %s", cfg.CAPath)
+	}
+
+	return &tls.Config{
+		Certificates: []tls.Certificate{serverCert},
+		ClientCAs:    caCertPool,
+		ClientAuth:   tls.RequireAndVerifyClientCert,
+		MinVersion:   tls.VersionTLS12,
+	}, nil
+}
+
 // GetGRPCDialOptions creates GRPC DialOptions for TLS
 func (cfg *ClientConfig) GetGRPCDialOptions(enabled bool) ([]grpc.DialOption, error) {
 	if !enabled {

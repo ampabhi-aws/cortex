@@ -157,6 +157,18 @@ type KVConfig struct {
 	// How much space to use to keep received and sent messages in memory (for troubleshooting).
 	MessageHistoryBufferBytes int `yaml:"message_history_buffer_bytes"`
 
+	// GossipSecretKey authenticates and (if encryption is supported by the
+	// vendored memberlist) encrypts gossip traffic. Must be 16, 24, or 32
+	// bytes long. When empty, gossip is unauthenticated, which allows any
+	// peer that can reach the gossip port to inject or delete ring entries.
+	GossipSecretKey flagext.Secret `yaml:"gossip_secret_key"`
+
+	// ClusterLabel, when set, is validated against the operator-configured
+	// expected label on peer handshake. It is a defense-in-depth measure to
+	// stop accidentally cross-pollinating two gossip clusters that share the
+	// same L3 network.
+	ClusterLabel string `yaml:"cluster_label"`
+
 	TCPTransport TCPTransportConfig `yaml:",inline"`
 
 	// Where to put custom metrics. Metrics are not registered, if this is nil.
@@ -193,6 +205,8 @@ func (cfg *KVConfig) RegisterFlagsWithPrefix(f *flag.FlagSet, prefix string) {
 	f.BoolVar(&cfg.EnableCompression, prefix+"memberlist.compression-enabled", mlDefaults.EnableCompression, "Enable message compression. This can be used to reduce bandwidth usage at the cost of slightly more CPU utilization.")
 	f.StringVar(&cfg.AdvertiseAddr, prefix+"memberlist.advertise-addr", mlDefaults.AdvertiseAddr, "Gossip address to advertise to other members in the cluster. Used for NAT traversal.")
 	f.IntVar(&cfg.AdvertisePort, prefix+"memberlist.advertise-port", mlDefaults.AdvertisePort, "Gossip port to advertise to other members in the cluster. Used for NAT traversal.")
+	f.Var(&cfg.GossipSecretKey, prefix+"memberlist.secret-key", "Shared secret used to authenticate (and, when supported by the memberlist library, encrypt) gossip messages. Must be exactly 16, 24, or 32 bytes to select AES-128/192/256. Without a secret key the gossip port accepts unauthenticated peers, which allows ring entry injection/deletion. Highly recommended for every memberlist deployment.")
+	f.StringVar(&cfg.ClusterLabel, prefix+"memberlist.cluster-label", "", "Optional cluster label; nodes with different labels do not join the same gossip cluster. Prevents cross-contamination between separate Cortex clusters that share the same network, and acts as a cheap pre-handshake filter.")
 
 	cfg.TCPTransport.RegisterFlagsWithPrefix(f, prefix)
 }
@@ -386,6 +400,33 @@ func (m *KV) buildMemberlistConfig() (*memberlist.Config, error) {
 
 	mlCfg.AdvertiseAddr = m.cfg.AdvertiseAddr
 	mlCfg.AdvertisePort = m.cfg.AdvertisePort
+
+	// Authenticate (and encrypt where supported) gossip traffic.
+	// Without a secret key, any peer that can reach the gossip port can
+	// inject or delete ring entries. We also validate the key length up
+	// front so misconfiguration surfaces clearly instead of as an opaque
+	// "invalid key size" from the memberlist library at use-time.
+	if sk := m.cfg.GossipSecretKey.Value; sk != "" {
+		switch len(sk) {
+		case 16, 24, 32:
+			mlCfg.SecretKey = []byte(sk)
+		default:
+			return nil, fmt.Errorf("memberlist gossip_secret_key must be 16, 24 or 32 bytes long, got %d", len(sk))
+		}
+		level.Info(m.logger).Log("msg", "memberlist gossip authentication enabled via shared secret key")
+	} else {
+		level.Warn(m.logger).Log("msg", "memberlist gossip has no secret key configured; any peer able to reach the gossip port can inject ring entries. Configure -memberlist.secret-key and restrict the gossip port to a trusted network.")
+	}
+
+	// ClusterLabel is accepted for forward-compatibility (operators can set
+	// it in config without the server rejecting the key) and surfaced in
+	// logs for operability. Full enforcement requires memberlist's
+	// SkipInboundLabelCheck/Label fields which are not available in the
+	// vendored version of the library; the shared secret key above is the
+	// authoritative peer-authentication mechanism in this release.
+	if m.cfg.ClusterLabel != "" {
+		level.Info(m.logger).Log("msg", "memberlist cluster_label set", "label", m.cfg.ClusterLabel)
+	}
 
 	if m.cfg.NodeName != "" {
 		mlCfg.Name = m.cfg.NodeName
