@@ -9,6 +9,7 @@ import (
 	"strconv"
 	"strings"
 	"time"
+	"unicode/utf8"
 
 	"github.com/go-kit/log"
 	"github.com/go-kit/log/level"
@@ -288,7 +289,28 @@ var (
 	ErrNoRuleGroups = errors.New("no rule groups found")
 	// ErrBadRuleGroup is returned when the provided rule group can not be unmarshalled
 	ErrBadRuleGroup = errors.New("unable to decoded rule group")
+	// errUnsafeIdentifier is returned when a namespace or group name contains
+	// characters that could allow path traversal or other unsafe behaviour in
+	// downstream rule stores. The error message is intentionally generic so it
+	// can be returned to API clients without leaking file-system details.
+	errUnsafeIdentifier = errors.New("namespace/group contains unsupported characters")
+	// errInvalidRequest is returned to API clients when the underlying rule
+	// store rejects a request. Detailed errors (which may include file names
+	// or parse failures) are logged server-side only.
+	errInvalidRequest = errors.New("invalid request")
 )
+
+// validateRuleIdentifier ensures the provided namespace or group name cannot
+// be used to escape the per-tenant directory in file-system backed rule
+// stores (see CWE-22). It rejects empty values, the "."/".." sentinels, any
+// value containing a path separator or NUL byte, and anything that is not
+// valid UTF-8.
+func validateRuleIdentifier(s string) error {
+	if s == "" || s == "." || s == ".." || strings.ContainsAny(s, "/\\\x00") || !utf8.ValidString(s) {
+		return errUnsafeIdentifier
+	}
+	return nil
+}
 
 func marshalAndSend(output interface{}, w http.ResponseWriter, logger log.Logger) {
 	d, err := yaml.Marshal(&output)
@@ -336,6 +358,10 @@ func parseNamespace(params map[string]string) (string, error) {
 		return "", err
 	}
 
+	if err := validateRuleIdentifier(namespace); err != nil {
+		return "", err
+	}
+
 	return namespace, nil
 }
 
@@ -349,6 +375,10 @@ func parseGroupName(params map[string]string) (string, error) {
 
 	groupName, err := url.PathUnescape(groupName)
 	if err != nil {
+		return "", err
+	}
+
+	if err := validateRuleIdentifier(groupName); err != nil {
 		return "", err
 	}
 
@@ -395,7 +425,11 @@ func (a *API) ListRules(w http.ResponseWriter, req *http.Request) {
 	level.Debug(logger).Log("msg", "retrieving rule groups with namespace", "userID", userID, "namespace", namespace)
 	rgs, err := a.store.ListRuleGroupsForUserAndNamespace(req.Context(), userID, namespace)
 	if err != nil {
-		http.Error(w, err.Error(), http.StatusBadRequest)
+		// Log the detailed error (which may contain file-system paths from the
+		// local rule store) server-side only, and return a generic error to
+		// the client to avoid leaking file names or parse details.
+		level.Warn(logger).Log("msg", "unable to list rule groups", "userID", userID, "namespace", namespace, "err", err)
+		http.Error(w, errInvalidRequest.Error(), http.StatusBadRequest)
 		return
 	}
 
@@ -431,7 +465,11 @@ func (a *API) GetRuleGroup(w http.ResponseWriter, req *http.Request) {
 			http.Error(w, err.Error(), http.StatusNotFound)
 			return
 		}
-		http.Error(w, err.Error(), http.StatusBadRequest)
+		// Log the detailed error (which may contain file-system paths from the
+		// local rule store) server-side only, and return a generic error to
+		// the client to avoid leaking file names or parse details.
+		level.Warn(logger).Log("msg", "unable to get rule group", "userID", userID, "namespace", namespace, "groupName", groupName, "err", err)
+		http.Error(w, errInvalidRequest.Error(), http.StatusBadRequest)
 		return
 	}
 
