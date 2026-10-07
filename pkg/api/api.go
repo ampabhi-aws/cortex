@@ -416,5 +416,6 @@ func (a *API) RegisterServiceMapHandler(handler http.Handler) {
 
 func (a *API) RegisterMemberlistKV(handler http.Handler) {
 	a.indexPage.AddLink(SectionAdminEndpoints, "/memberlist", "Memberlist Status")
-	a.RegisterRoute("/memberlist", handler, false, "GET")
+	// POST is required for the deleteMessages action (state mutation).
+	a.RegisterRoute("/memberlist", handler, false, "GET", "POST")
 }
