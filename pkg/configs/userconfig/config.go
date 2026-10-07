@@ -106,6 +106,15 @@ type Config struct {
 	AlertmanagerConfig string
 }
 
+// String implements fmt.Stringer so that accidental %s/%v formatting of a
+// Config does not leak the tenant's Alertmanager notification secrets
+// (SMTP passwords, Slack webhook URLs, PagerDuty routing keys, bearer
+// tokens, etc.) into logs. See CWE-215.
+func (c Config) String() string { return "userconfig.Config{redacted}" }
+
+// GoString implements fmt.GoStringer so that %#v also redacts the payload.
+func (c Config) GoString() string { return c.String() }
+
 // configCompat is a compatibility struct to support old JSON config blobs
 // saved in the config DB that didn't have a rule format version yet and
 // just had a top-level field for the rule files.
@@ -185,6 +194,15 @@ type View struct {
 	Config    Config    `json:"config"`
 	DeletedAt time.Time `json:"deleted_at"`
 }
+
+// String redacts the embedded Config so that logging a View via %s/%v does
+// not leak notification secrets. Only the non-sensitive ID is preserved.
+func (v View) String() string {
+	return fmt.Sprintf("userconfig.View{ID:%d, Config:redacted}", v.ID)
+}
+
+// GoString ensures %#v also redacts the embedded Config.
+func (v View) GoString() string { return v.String() }
 
 // IsDeleted tells you if the config is deleted.
 func (v View) IsDeleted() bool {
