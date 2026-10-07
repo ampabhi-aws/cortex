@@ -795,7 +795,23 @@ The Purger service provides APIs for requesting deletion of tenants.
 POST /purger/delete_tenant
 ```
 
-Request deletion of ALL tenant data. Only works with blocks storage. Experimental.
+Request deletion of ALL tenant data. Only works with blocks storage.
+
+In addition to writing a tenant-deletion mark to the blocks storage, this endpoint
+also deletes the tenant's rule groups (via the ruler store) and the tenant's
+Alertmanager configuration (via the Alertmanager store) when those stores are
+configured. Deployments that run the ruler or Alertmanager in a separate process
+should ensure the purger process is configured with the same `ruler_storage` and
+`alertmanager_storage` configuration so the deletion covers every store.
+
+Note: query-frontend/results-cache entries that were populated from the deleted
+tenant's data are not actively invalidated by this endpoint; they are evicted by
+the cache TTL (`-frontend.default-validity`, `*-cache.memcached.expiration`,
+`*-cache.redis.expiration`), which defaults to `0` (no expiration). Operators that
+require derived data to be purged on deletion should configure a non-zero cache
+validity.
+
+Experimental.
 
 _Requires [authentication](#authentication)._
 
@@ -805,7 +821,22 @@ _Requires [authentication](#authentication)._
 GET /purger/delete_tenant_status
 ```
 
-Returns status of tenant deletion. Output format to be defined. Experimental.
+Returns status of tenant deletion as a JSON object with per-store booleans and an
+overall `deleted` verdict:
+
+```json
+{
+  "tenant_id": "<tenant>",
+  "blocks_deleted": true,
+  "rule_groups_deleted": true,
+  "alertmanager_config_deleted": true,
+  "deleted": true
+}
+```
+
+`deleted` is `true` only when every per-store check reports that the tenant's
+data has been removed. Automation should wait for `deleted` rather than any
+single per-store boolean. Experimental.
 
 _Requires [authentication](#authentication)._
 
