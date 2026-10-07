@@ -7,6 +7,7 @@ import (
 	"html/template"
 	"math"
 	"net/http"
+	"net/url"
 	"sort"
 	"strings"
 	"time"
@@ -121,8 +122,56 @@ type httpResponse struct {
 	ShowTokens bool           `json:"-"`
 }
 
+// isSameOrigin returns true when the request's Origin and/or Referer headers
+// agree with the request's own Host, i.e. the POST is same-origin. Requests
+// that carry neither header (typical for CLI tools such as curl invoked
+// directly against the component by an operator) are also treated as
+// same-origin: browser-driven cross-site POSTs always have at least one of
+// these headers populated and would therefore be rejected.
+func isSameOrigin(req *http.Request) bool {
+	host := req.Host
+
+	if origin := req.Header.Get("Origin"); origin != "" && origin != "null" {
+		u, err := url.Parse(origin)
+		if err != nil || u.Host == "" {
+			return false
+		}
+		if !strings.EqualFold(u.Host, host) {
+			return false
+		}
+	}
+
+	if referer := req.Header.Get("Referer"); referer != "" {
+		u, err := url.Parse(referer)
+		if err != nil || u.Host == "" {
+			return false
+		}
+		if !strings.EqualFold(u.Host, host) {
+			return false
+		}
+	}
+
+	return true
+}
+
 func (r *Ring) ServeHTTP(w http.ResponseWriter, req *http.Request) {
 	if req.Method == http.MethodPost {
+		// Enforce a same-origin check on the forget mutation to defeat
+		// cross-site request forgery: browser-issued cross-origin POSTs
+		// always carry an Origin (or at minimum a Referer) header, so we
+		// reject the request when either is present but does not match the
+		// request's own Host. Requests with neither header (operator CLI
+		// tools such as curl) are permitted, matching the existing admin
+		// surface contract.
+		if !isSameOrigin(req) {
+			level.Warn(r.logger).Log("msg", "rejecting cross-origin POST to ring page",
+				"origin", req.Header.Get("Origin"),
+				"referer", req.Header.Get("Referer"),
+				"host", req.Host)
+			http.Error(w, "cross-origin request rejected", http.StatusForbidden)
+			return
+		}
+
 		ingesterID := req.FormValue("forget")
 		if err := r.forget(req.Context(), ingesterID); err != nil {
 			level.Error(r.logger).Log("msg", "error forgetting instance", "err", err)
