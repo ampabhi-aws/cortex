@@ -2,7 +2,7 @@
 LOG_LEVEL="info"
 
 # Path to Cortex YAML configuration file.
-CONFIG_FILE="/etc/cortex/single-process-config.yaml"
+CONFIG_FILE="/etc/cortex/cortex.yaml"
 
 # Custom user defined arguments.
 CUSTOM_ARGS=""

@@ -17,8 +17,13 @@ case "$1" in
 	 useradd -m -r -g cortex -d /var/lib/cortex -s /sbin/nologin -c "cortex user" cortex
      fi
 
-     chmod 640 /etc/cortex/single-process-config.yaml
-     chown root:$CORTEX_GROUP /etc/cortex/single-process-config.yaml
+     chmod 640 /etc/cortex/cortex.yaml
+     chown root:$CORTEX_GROUP /etc/cortex/cortex.yaml
+     install -d -o $CORTEX_USER -g $CORTEX_GROUP -m 750 /var/lib/cortex
+     install -d -o $CORTEX_USER -g $CORTEX_GROUP -m 750 /var/lib/cortex/blocks
+     install -d -o $CORTEX_USER -g $CORTEX_GROUP -m 750 /var/lib/cortex/tsdb
+     install -d -o $CORTEX_USER -g $CORTEX_GROUP -m 750 /var/lib/cortex/tsdb-sync
+     install -d -o $CORTEX_USER -g $CORTEX_GROUP -m 750 /var/lib/cortex/compactor
 
      if [ -z ${2+x} ] &&  [ "$RESTART_ON_UPGRADE" == "true" ]; then
 	 if command -v systemctl 2>/dev/null; then

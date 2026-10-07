@@ -1,0 +1,67 @@
+# Hardened default Cortex configuration shipped by the deb/rpm packages.
+#
+# IMPORTANT: Cortex itself only checks that the X-Scope-OrgID header is
+# present when auth_enabled is true; it does not authenticate the caller.
+# You MUST place an authenticating reverse proxy (nginx with auth_basic,
+# oauth2-proxy, an API gateway, etc.) in front of the HTTP (9009) and
+# gRPC (9095) ports before exposing this host beyond localhost.
+#
+# This file intentionally binds to 127.0.0.1 and uses the local filesystem
+# backend so that a fresh install never serves metrics to the network or
+# writes to an externally-controlled S3 bucket.  Edit it to match your
+# deployment, then restart cortex.service.
+
+# Require every request to carry an X-Scope-OrgID header. Without this
+# Cortex substitutes the tenant "fake" for every unauthenticated caller.
+auth_enabled: true
+
+server:
+  # Bind to loopback only. Change to a routable address ONLY after an
+  # authenticating reverse proxy is in place (see packaging/README.md).
+  http_listen_address: 127.0.0.1
+  http_listen_port: 9009
+  grpc_listen_address: 127.0.0.1
+  grpc_listen_port: 9095
+
+# Single-process ingester/distributor with an in-memory ring.
+distributor:
+  shard_by_all_labels: true
+  pool:
+    health_check_ingesters: true
+
+ingester_client:
+  grpc_client_config:
+    max_recv_msg_size: 104857600
+    max_send_msg_size: 104857600
+    grpc_compression: gzip
+
+ingester:
+  lifecycler:
+    # On a single node, we don't need to replicate blocks.
+    ring:
+      kvstore:
+        store: inmemory
+      replication_factor: 1
+
+# Use the local filesystem for blocks and TSDB. Never default to a
+# third-party global S3 bucket name such as "cortex".
+blocks_storage:
+  backend: filesystem
+  bucket_store:
+    sync_dir: /var/lib/cortex/tsdb-sync
+  filesystem:
+    dir: /var/lib/cortex/blocks
+  tsdb:
+    dir: /var/lib/cortex/tsdb
+
+compactor:
+  data_dir: /var/lib/cortex/compactor
+  sharding_ring:
+    kvstore:
+      store: inmemory
+
+ruler:
+  enable_api: false
+
+frontend_worker:
+  match_max_concurrent: true
