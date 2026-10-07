@@ -17,6 +17,7 @@ import (
 
 	"github.com/cortexproject/cortex/pkg/cortexpb"
 	"github.com/cortexproject/cortex/pkg/util"
+	"github.com/cortexproject/cortex/pkg/util/flagext"
 	util_log "github.com/cortexproject/cortex/pkg/util/log"
 )
 
@@ -218,4 +219,23 @@ func (b bytesBuffered) BytesBuffer() *bytes.Buffer {
 func TestIsRequestBodyTooLargeRegression(t *testing.T) {
 	_, err := io.ReadAll(http.MaxBytesReader(httptest.NewRecorder(), io.NopCloser(bytes.NewReader([]byte{1, 2, 3, 4})), 1))
 	assert.True(t, util.IsRequestBodyTooLarge(err))
+}
+
+func TestBasicAuth_PasswordRedactedInYAML(t *testing.T) {
+	// Regression: util.BasicAuth.Password must never be YAML-marshalled in cleartext,
+	// otherwise unauthenticated callers of GET /config can read it.
+	ba := util.BasicAuth{Username: "alice", Password: flagext.Secret{Value: "super-secret-password"}}
+	out, err := yaml.Marshal(ba)
+	require.NoError(t, err)
+	s := string(out)
+	assert.NotContains(t, s, "super-secret-password", "cleartext password leaked into YAML dump: %s", s)
+	assert.Contains(t, s, "********", "password should be redacted: %s", s)
+
+	// Round-trip: a configured password still deserialises so that non-redacted
+	// values (e.g. loaded from a config file or set from flags) work at runtime.
+	var in util.BasicAuth
+	require.NoError(t, yaml.Unmarshal([]byte("basic_auth_username: alice\nbasic_auth_password: plaintext\n"), &in))
+	assert.Equal(t, "alice", in.Username)
+	assert.Equal(t, "plaintext", in.Password.Value)
+	assert.True(t, in.IsEnabled())
 }
