@@ -2797,19 +2797,19 @@ The `limits_config` configures default and per-tenant limits imposed by Cortex s
 [alertmanager_notification_rate_limit_per_integration: <map of string to float64> | default = {}]
 
 # Maximum size of configuration file for Alertmanager that tenant can upload via
-# Alertmanager API. 0 = no limit.
+# Alertmanager API. 0 = no limit (not recommended).
 # CLI flag: -alertmanager.max-config-size-bytes
-[alertmanager_max_config_size_bytes: <int> | default = 0]
+[alertmanager_max_config_size_bytes: <int> | default = 16777216]
 
 # Maximum number of templates in tenant's Alertmanager configuration uploaded
-# via Alertmanager API. 0 = no limit.
+# via Alertmanager API. 0 = no limit (not recommended).
 # CLI flag: -alertmanager.max-templates-count
-[alertmanager_max_templates_count: <int> | default = 0]
+[alertmanager_max_templates_count: <int> | default = 100]
 
 # Maximum size of single template in tenant's Alertmanager configuration
-# uploaded via Alertmanager API. 0 = no limit.
+# uploaded via Alertmanager API. 0 = no limit (not recommended).
 # CLI flag: -alertmanager.max-template-size-bytes
-[alertmanager_max_template_size_bytes: <int> | default = 0]
+[alertmanager_max_template_size_bytes: <int> | default = 1048576]
 
 # Maximum number of aggregation groups in Alertmanager's dispatcher that a
 # tenant can have. Each active aggregation group uses single goroutine. When the

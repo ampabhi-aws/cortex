@@ -560,7 +560,11 @@ template_files:
 				require.Equal(t, http.StatusCreated, resp.StatusCode)
 				require.Equal(t, "", string(body))
 			} else {
-				require.Equal(t, http.StatusBadRequest, resp.StatusCode)
+				expectedStatus := http.StatusBadRequest
+				if tc.maxConfigSize > 0 && len(tc.cfg) > tc.maxConfigSize {
+					expectedStatus = http.StatusRequestEntityTooLarge
+				}
+				require.Equal(t, expectedStatus, resp.StatusCode)
 				require.Equal(t, tc.err.Error()+"\n", string(body))
 			}
 		})
