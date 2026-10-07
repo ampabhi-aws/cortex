@@ -771,10 +771,10 @@ func (am *MultitenantAlertmanager) isUserOwned(userID string) bool {
 func (am *MultitenantAlertmanager) syncConfigs(cfgs map[string]alertspb.AlertConfigDesc) {
 	level.Debug(am.logger).Log("msg", "adding configurations", "num_configs", len(cfgs))
 	for user, cfg := range cfgs {
-		err := am.setConfig(cfg)
+		err := am.setConfigSafe(cfg)
 		if err != nil {
 			am.multitenantMetrics.lastReloadSuccessful.WithLabelValues(user).Set(float64(0))
-			level.Warn(am.logger).Log("msg", "error applying config", "err", err)
+			level.Warn(am.logger).Log("msg", "error applying config", "user", user, "err", err)
 			continue
 		}
 
@@ -803,6 +803,20 @@ func (am *MultitenantAlertmanager) syncConfigs(cfgs map[string]alertspb.AlertCon
 		userAM.StopAndWait()
 		level.Info(am.logger).Log("msg", "deactivated per-tenant alertmanager", "user", userID)
 	}
+}
+
+// setConfigSafe wraps setConfig with a deferred recover so a panic triggered by
+// a single tenant's configuration (for example an unmarshalled nil pointer
+// surfacing from inside the vendored Alertmanager/notifier code) cannot kill
+// the shared MultitenantAlertmanager goroutine and crash the whole process.
+func (am *MultitenantAlertmanager) setConfigSafe(cfg alertspb.AlertConfigDesc) (err error) {
+	defer func() {
+		if r := recover(); r != nil {
+			err = fmt.Errorf("panic while applying alertmanager config for user %s: %v", cfg.User, r)
+			level.Error(am.logger).Log("msg", "recovered from panic while applying alertmanager config", "user", cfg.User, "err", err)
+		}
+	}()
+	return am.setConfig(cfg)
 }
 
 // setConfig applies the given configuration to the alertmanager for `userID`,
@@ -870,6 +884,17 @@ func (am *MultitenantAlertmanager) setConfig(cfg alertspb.AlertConfigDesc) error
 			// This means that if a user has a working config and
 			// they submit a broken one, the Manager will keep running the last known
 			// working configuration.
+			return fmt.Errorf("invalid Cortex configuration for %v: %v", cfg.User, err)
+		}
+	}
+
+	// Guard against configurations persisted in the store that would leave a
+	// receiver integration with a nil *HTTPClientConfig (e.g. a pre-existing
+	// object with `global: {http_config: null}` written before this validation
+	// existed). Without this check, loading such a config here would panic in
+	// the vendored notifier constructors and crash the Alertmanager goroutine.
+	if userAmConfig != nil {
+		if err := validateAlertmanagerHTTPConfigs(userAmConfig); err != nil {
 			return fmt.Errorf("invalid Cortex configuration for %v: %v", cfg.User, err)
 		}
 	}
