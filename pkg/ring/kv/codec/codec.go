@@ -1,9 +1,18 @@
 package codec
 
 import (
+	"fmt"
+
 	"github.com/gogo/protobuf/proto"
 	"github.com/golang/snappy"
 )
+
+// MaxDecodedSize is the maximum uncompressed size (in bytes) that Proto.Decode
+// will accept. The ring and HA tracker Desc messages carry per-instance state
+// for an entire cluster, but 64 MiB is still a generous upper bound and keeps
+// a hostile peer from forcing a multi-gigabyte allocation on the gossip path.
+// See the "Snappy decompression bomb" advisory for background.
+const MaxDecodedSize = 64 << 20
 
 // Codec allows KV clients to serialise and deserialise values.
 type Codec interface {
@@ -29,14 +38,26 @@ func (p Proto) CodecID() string {
 	return p.id
 }
 
-// Decode implements Codec
-func (p Proto) Decode(bytes []byte) (interface{}, error) {
-	out := p.factory()
-	bytes, err := snappy.Decode(nil, bytes)
+// Decode implements Codec.
+//
+// Decode validates the attacker-controllable uncompressed length declared in
+// the snappy header before allocating the destination buffer, so a tiny
+// compressed payload cannot force a multi-gigabyte heap allocation (a
+// decompression bomb against the memberlist gossip listener).
+func (p Proto) Decode(data []byte) (interface{}, error) {
+	dLen, err := snappy.DecodedLen(data)
 	if err != nil {
 		return nil, err
 	}
-	if err := proto.Unmarshal(bytes, out); err != nil {
+	if dLen > MaxDecodedSize {
+		return nil, fmt.Errorf("snappy-decoded value too large: %d > %d", dLen, MaxDecodedSize)
+	}
+	out := p.factory()
+	decoded, err := snappy.Decode(make([]byte, 0, dLen), data)
+	if err != nil {
+		return nil, err
+	}
+	if err := proto.Unmarshal(decoded, out); err != nil {
 		return nil, err
 	}
 	return out, nil
