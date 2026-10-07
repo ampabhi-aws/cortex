@@ -5,6 +5,7 @@ import (
 	"flag"
 	"os"
 	"path/filepath"
+	"strings"
 
 	"github.com/pkg/errors"
 	promRules "github.com/prometheus/prometheus/rules"
@@ -15,6 +16,8 @@ import (
 const (
 	Name = "local"
 )
+
+var errInvalidNamespace = errors.New("invalid namespace")
 
 type Config struct {
 	Directory string `yaml:"directory"`
@@ -168,10 +171,27 @@ func (l *Client) loadAllRulesGroupsForUser(ctx context.Context, userID string) (
 }
 
 func (l *Client) loadAllRulesGroupsForUserAndNamespace(_ context.Context, userID string, namespace string) (rulespb.RuleGroupList, error) {
-	filename := filepath.Join(l.cfg.Directory, userID, namespace)
+	// Defence in depth: even though the API layer validates the namespace via
+	// validateRuleIdentifier, re-check containment here so a mis-wired caller
+	// (or future refactor) cannot escape the per-tenant directory via `..`,
+	// absolute paths or path separators. The error message is intentionally
+	// generic — the file-system path is not echoed back to the caller.
+	base, err := filepath.Abs(filepath.Join(l.cfg.Directory, userID))
+	if err != nil {
+		return nil, errInvalidNamespace
+	}
+	filename, err := filepath.Abs(filepath.Join(base, namespace))
+	if err != nil {
+		return nil, errInvalidNamespace
+	}
+	if filename != base && !strings.HasPrefix(filename, base+string(os.PathSeparator)) {
+		return nil, errInvalidNamespace
+	}
 
 	rulegroups, allErrors := l.loader.Load(filename)
 	if len(allErrors) > 0 {
+		// Wrap with the resolved file name for server-side diagnostics; API
+		// handlers must not forward this error verbatim to clients.
 		return nil, errors.Wrapf(allErrors[0], "error parsing %s", filename)
 	}
 
