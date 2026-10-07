@@ -1804,7 +1804,10 @@ func (i *Ingester) getOrCreateTSDB(userID string, force bool) (*userTSDB, error)
 // createTSDB creates a TSDB for a given userID, and returns the created db.
 func (i *Ingester) createTSDB(userID string) (*userTSDB, error) {
 	tsdbPromReg := prometheus.NewRegistry()
-	udir := i.cfg.BlocksStorageConfig.TSDB.BlocksDir(userID)
+	udir, err := i.cfg.BlocksStorageConfig.TSDB.BlocksDir(userID)
+	if err != nil {
+		return nil, err
+	}
 	userLogger := logutil.WithUserID(userID, i.logger)
 
 	blockRanges := i.cfg.BlocksStorageConfig.TSDB.BlockRanges.ToMilliseconds()

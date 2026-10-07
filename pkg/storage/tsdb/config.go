@@ -50,6 +50,7 @@ var (
 	errInvalidWALSegmentSizeBytes   = errors.New("invalid TSDB WAL segment size bytes")
 	errInvalidStripeSize            = errors.New("invalid TSDB stripe size")
 	errEmptyBlockranges             = errors.New("empty block ranges for TSDB")
+	errEmptyUserID                  = errors.New("empty tenant ID for TSDB blocks dir")
 )
 
 // BlocksStorageConfig holds the config information for the blocks storage.
@@ -213,9 +214,13 @@ func (cfg *TSDBConfig) Validate() error {
 }
 
 // BlocksDir returns the directory path where TSDB blocks and wal should be
-// stored by the ingester
-func (cfg *TSDBConfig) BlocksDir(userID string) string {
-	return filepath.Join(cfg.Dir, userID)
+// stored by the ingester. Returns an error if userID is empty to prevent
+// per-tenant paths from collapsing onto the shared data root.
+func (cfg *TSDBConfig) BlocksDir(userID string) (string, error) {
+	if userID == "" {
+		return "", errEmptyUserID
+	}
+	return filepath.Join(cfg.Dir, userID), nil
 }
 
 // IsShippingEnabled returns whether blocks shipping is enabled.

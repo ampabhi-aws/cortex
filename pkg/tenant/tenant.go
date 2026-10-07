@@ -12,6 +12,7 @@ import (
 
 var (
 	errTenantIDTooLong = errors.New("tenant ID is too long: max 150 characters")
+	errTenantIDEmpty   = errors.New("tenant ID is empty")
 )
 
 type errTenantIDUnsupportedCharacter struct {
@@ -51,6 +52,12 @@ func NormalizeTenantIDs(tenantIDs []string) []string {
 
 // ValidTenantID
 func ValidTenantID(s string) error {
+	// reject empty tenant IDs; they collapse per-tenant paths and prefixes
+	// onto the shared data root (see pkg/tenant/resolver.go).
+	if len(s) == 0 {
+		return errTenantIDEmpty
+	}
+
 	// check if it contains invalid runes
 	for pos, r := range s {
 		if !isSupported(r) {
