@@ -113,3 +113,19 @@ func parseView(t *testing.T, b []byte) userconfig.View {
 	require.NoError(t, err, "Could not unmarshal JSON: %v", string(b))
 	return x
 }
+
+// redactViewForTest returns a copy of v whose Alertmanager configuration has
+// been passed through the same redaction path getConfigs uses when it serves
+// cross-tenant private endpoints. Tests compare against this because the
+// handler never emits the raw Alertmanager YAML on those endpoints.
+func redactViewForTest(t *testing.T, v userconfig.View) userconfig.View {
+	t.Helper()
+	if v.Config.AlertmanagerConfig == "" {
+		return v
+	}
+	redacted, err := redactAlertmanagerConfig(v.Config.AlertmanagerConfig)
+	require.NoError(t, err, "failed to redact alertmanager config: %q", v.Config.AlertmanagerConfig)
+	out := v
+	out.Config.AlertmanagerConfig = redacted
+	return out
+}

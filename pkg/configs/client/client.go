@@ -142,6 +142,14 @@ func doRequest(endpoint string, timeout time.Duration, tlsConfig *tls.Config, si
 	}
 
 	req.Header.Set("User-Agent", fmt.Sprintf("Cortex/%s", version.Version))
+	// The /private/api/prom/configs/* endpoints are cross-tenant and now
+	// require an operator identity to prevent unauthenticated cross-tenant
+	// disclosure. Cortex itself ships no credential authentication; the
+	// identity is carried as X-Scope-OrgID so that a mounted auth middleware
+	// (or a fronting proxy) can enforce it. The caller is expected to
+	// network-isolate the configs listener; this header merely satisfies the
+	// identity check.
+	req.Header.Set("X-Scope-OrgID", "cortex-configs-client")
 
 	resp, err := client.Do(req)
 	if err != nil {

@@ -591,7 +591,10 @@ func (t *Cortex) initConfig() (serv services.Service, err error) {
 	}
 
 	t.ConfigAPI = configAPI.New(t.ConfigDB, t.Cfg.Configs.API)
-	t.ConfigAPI.RegisterRoutes(t.Server.HTTP)
+	// Mount the configs router behind the shared auth middleware so the
+	// cross-tenant /private/api/prom/configs/* routes cannot be reached by
+	// unauthenticated callers through the tenant-facing HTTP listener.
+	t.ConfigAPI.RegisterRoutes(t.Server.HTTP, t.API.AuthMiddleware)
 	return services.NewIdleService(nil, func(_ error) error {
 		t.ConfigDB.Close()
 		return nil

@@ -15,10 +15,12 @@ import (
 
 	"gopkg.in/yaml.v2"
 
+	"github.com/go-kit/log"
 	"github.com/go-kit/log/level"
 	"github.com/gorilla/mux"
 	amconfig "github.com/prometheus/alertmanager/config"
 	amtemplate "github.com/prometheus/alertmanager/template"
+	"github.com/weaveworks/common/middleware"
 
 	"github.com/cortexproject/cortex/pkg/configs/db"
 	"github.com/cortexproject/cortex/pkg/configs/userconfig"
@@ -81,8 +83,20 @@ func (a *API) admin(w http.ResponseWriter, r *http.Request) {
 `)
 }
 
-// RegisterRoutes registers the configs API HTTP routes with the provided Router.
-func (a *API) RegisterRoutes(r *mux.Router) {
+// RegisterRoutes registers the configs API HTTP routes with the provided
+// Router. Optional middlewares are applied to every registered handler, so
+// callers can enforce authentication/authorization at mount time. Nil entries
+// in middlewares are ignored.
+func (a *API) RegisterRoutes(r *mux.Router, middlewares ...middleware.Interface) {
+	wrap := func(h http.Handler) http.Handler {
+		for i := len(middlewares) - 1; i >= 0; i-- {
+			if middlewares[i] == nil {
+				continue
+			}
+			h = middlewares[i].Wrap(h)
+		}
+		return h
+	}
 	for _, route := range []struct {
 		name, method, path string
 		handler            http.HandlerFunc
@@ -99,11 +113,13 @@ func (a *API) RegisterRoutes(r *mux.Router) {
 		{"validate_alertmanager_config", "POST", "/api/prom/configs/alertmanager/validate", a.validateAlertmanagerConfig},
 		{"deactivate_config", "DELETE", "/api/prom/configs/deactivate", a.deactivateConfig},
 		{"restore_config", "POST", "/api/prom/configs/restore", a.restoreConfig},
-		// Internal APIs.
+		// Internal APIs. These expose cross-tenant data and require an
+		// operator identity enforced by getConfigs itself and, when mounted on
+		// a tenant-facing listener, by the caller-provided middlewares above.
 		{"private_get_rules", "GET", "/private/api/prom/configs/rules", a.getConfigs},
 		{"private_get_alertmanager_config", "GET", "/private/api/prom/configs/alertmanager", a.getConfigs},
 	} {
-		r.Handle(route.path, route.handler).Methods(route.method).Name(route.name)
+		r.Handle(route.path, wrap(route.handler)).Methods(route.method).Name(route.name)
 	}
 }
 
@@ -263,10 +279,38 @@ type ConfigsView struct {
 	Configs map[string]userconfig.View `json:"configs"`
 }
 
+// getConfigs serves the cross-tenant /private/api/prom/configs/* endpoints.
+//
+// These routes expose every tenant's rules and raw Alertmanager configuration
+// and are intended for operator / intra-cluster use only. We therefore:
+//
+//  1. Require an identity on the request (same guard the per-tenant sibling
+//     handlers use via tenant.ExtractTenantIDFromHTTPRequest). This mirrors
+//     the behaviour of getConfig/setConfig/deactivateConfig/restoreConfig and
+//     prevents unauthenticated callers from obtaining a cross-tenant dump
+//     when the deprecated configs module is enabled.
+//  2. Redact secret fields inside each tenant's Alertmanager configuration
+//     before serialising, by re-marshalling through prometheus/alertmanager's
+//     typed config (its Secret/SecretURL fields marshal to "<secret>").
+//     Configs that fail to parse (e.g. legacy entries that pre-date validation)
+//     are returned with their Alertmanager YAML replaced by a placeholder
+//     rather than leaking the raw document.
 func (a *API) getConfigs(w http.ResponseWriter, r *http.Request) {
+	logger := util_log.WithContext(r.Context(), util_log.Logger)
+
+	// Operator identity required. The configs service ships no credential
+	// auth of its own, so this at minimum enforces that a reverse proxy /
+	// mounted auth middleware has asserted an identity (X-Scope-OrgID). The
+	// value is deliberately not used to scope the query - these endpoints are
+	// cross-tenant by design - but requiring it closes the unauthenticated
+	// cross-tenant disclosure.
+	if _, _, err := tenant.ExtractTenantIDFromHTTPRequest(r); err != nil {
+		http.Error(w, err.Error(), http.StatusUnauthorized)
+		return
+	}
+
 	var cfgs map[string]userconfig.View
 	var cfgErr error
-	logger := util_log.WithContext(r.Context(), util_log.Logger)
 	rawSince := r.FormValue("since")
 	if rawSince == "" {
 		cfgs, cfgErr = a.db.GetAllConfigs(r.Context())
@@ -287,13 +331,52 @@ func (a *API) getConfigs(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	view := ConfigsView{Configs: cfgs}
+	redacted := make(map[string]userconfig.View, len(cfgs))
+	for id, v := range cfgs {
+		redacted[id] = redactView(v, logger)
+	}
+
+	view := ConfigsView{Configs: redacted}
 	w.Header().Set("Content-Type", "application/json")
 	if err := json.NewEncoder(w).Encode(view); err != nil {
 		// XXX: Untested
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
 	}
+}
+
+// redactView returns a copy of v whose Alertmanager configuration has had
+// its secret fields replaced with "<secret>". The original value is left
+// untouched. Rules files are returned verbatim: they are user-authored
+// Prometheus rule YAML and have no typed secret fields.
+func redactView(v userconfig.View, logger log.Logger) userconfig.View {
+	if v.Config.AlertmanagerConfig == "" {
+		return v
+	}
+	redactedAM, err := redactAlertmanagerConfig(v.Config.AlertmanagerConfig)
+	if err != nil {
+		level.Warn(logger).Log("msg", "failed to parse alertmanager config for redaction, omitting raw body", "err", err)
+		// Fail closed: never emit the raw document if we could not parse it.
+		redactedAM = "# alertmanager config omitted: failed to parse for secret redaction\n"
+	}
+	out := v
+	out.Config.AlertmanagerConfig = redactedAM
+	return out
+}
+
+// redactAlertmanagerConfig parses the given Alertmanager configuration and
+// re-serialises it so that fields typed as config_util.Secret / SecretURL are
+// emitted as the string "<secret>" rather than their real values.
+func redactAlertmanagerConfig(raw string) (string, error) {
+	cfg, err := amconfig.Load(raw)
+	if err != nil {
+		return "", err
+	}
+	out, err := yaml.Marshal(cfg)
+	if err != nil {
+		return "", err
+	}
+	return string(out), nil
 }
 
 func (a *API) deactivateConfig(w http.ResponseWriter, r *http.Request) {
