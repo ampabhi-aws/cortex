@@ -81,35 +81,57 @@ func (a *API) admin(w http.ResponseWriter, r *http.Request) {
 `)
 }
 
+// Route describes a single HTTP route exposed by the configs API.
+type Route struct {
+	Name    string
+	Method  string
+	Path    string
+	Handler http.HandlerFunc
+	// Auth indicates whether the API-wrapper authentication middleware must be
+	// applied when this route is registered through pkg/api.
+	Auth bool
+}
+
+// Routes returns the HTTP routes exposed by the configs API. It is used by
+// pkg/api.API to register the routes through the standard middleware chain
+// (AuthMiddleware + HTTPHeaderMiddleware) rather than directly on the raw mux.
+func (a *API) Routes() []Route {
+	return []Route{
+		{Name: "root", Method: "GET", Path: "/", Handler: a.admin, Auth: false},
+		// Dedicated APIs for updating rules config. In the future, these *must*
+		// be used. They operate on behalf of the authenticated tenant.
+		{Name: "get_rules", Method: "GET", Path: "/api/prom/configs/rules", Handler: a.getConfig, Auth: true},
+		{Name: "set_rules", Method: "POST", Path: "/api/prom/configs/rules", Handler: a.setConfig, Auth: true},
+		{Name: "get_templates", Method: "GET", Path: "/api/prom/configs/templates", Handler: a.getConfig, Auth: true},
+		{Name: "set_templates", Method: "POST", Path: "/api/prom/configs/templates", Handler: a.setConfig, Auth: true},
+		{Name: "get_alertmanager_config", Method: "GET", Path: "/api/prom/configs/alertmanager", Handler: a.getConfig, Auth: true},
+		{Name: "set_alertmanager_config", Method: "POST", Path: "/api/prom/configs/alertmanager", Handler: a.setConfig, Auth: true},
+		{Name: "validate_alertmanager_config", Method: "POST", Path: "/api/prom/configs/alertmanager/validate", Handler: a.validateAlertmanagerConfig, Auth: true},
+		{Name: "deactivate_config", Method: "DELETE", Path: "/api/prom/configs/deactivate", Handler: a.deactivateConfig, Auth: true},
+		{Name: "restore_config", Method: "POST", Path: "/api/prom/configs/restore", Handler: a.restoreConfig, Auth: true},
+		// Internal cross-tenant APIs. These are intentionally not wrapped with
+		// the per-tenant AuthMiddleware because they enumerate every tenant's
+		// configuration; operators are expected to isolate the /private/* path
+		// at the ingress (dedicated listener or network policy).
+		{Name: "private_get_rules", Method: "GET", Path: "/private/api/prom/configs/rules", Handler: a.getConfigs, Auth: false},
+		{Name: "private_get_alertmanager_config", Method: "GET", Path: "/private/api/prom/configs/alertmanager", Handler: a.getConfigs, Auth: false},
+	}
+}
+
 // RegisterRoutes registers the configs API HTTP routes with the provided Router.
 func (a *API) RegisterRoutes(r *mux.Router) {
-	for _, route := range []struct {
-		name, method, path string
-		handler            http.HandlerFunc
-	}{
-		{"root", "GET", "/", a.admin},
-		// Dedicated APIs for updating rules config. In the future, these *must*
-		// be used.
-		{"get_rules", "GET", "/api/prom/configs/rules", a.getConfig},
-		{"set_rules", "POST", "/api/prom/configs/rules", a.setConfig},
-		{"get_templates", "GET", "/api/prom/configs/templates", a.getConfig},
-		{"set_templates", "POST", "/api/prom/configs/templates", a.setConfig},
-		{"get_alertmanager_config", "GET", "/api/prom/configs/alertmanager", a.getConfig},
-		{"set_alertmanager_config", "POST", "/api/prom/configs/alertmanager", a.setConfig},
-		{"validate_alertmanager_config", "POST", "/api/prom/configs/alertmanager/validate", a.validateAlertmanagerConfig},
-		{"deactivate_config", "DELETE", "/api/prom/configs/deactivate", a.deactivateConfig},
-		{"restore_config", "POST", "/api/prom/configs/restore", a.restoreConfig},
-		// Internal APIs.
-		{"private_get_rules", "GET", "/private/api/prom/configs/rules", a.getConfigs},
-		{"private_get_alertmanager_config", "GET", "/private/api/prom/configs/alertmanager", a.getConfigs},
-	} {
-		r.Handle(route.path, route.handler).Methods(route.method).Name(route.name)
+	for _, route := range a.Routes() {
+		r.Handle(route.Path, route.Handler).Methods(route.Method).Name(route.Name)
 	}
 }
 
 // getConfig returns the request configuration.
 func (a *API) getConfig(w http.ResponseWriter, r *http.Request) {
-	userID, _, err := tenant.ExtractTenantIDFromHTTPRequest(r)
+	// Resolve the tenant from the authenticated request context (populated by
+	// the API auth middleware). Do not trust the raw X-Scope-OrgID header, so
+	// that routes registered through the API wrapper cannot have their tenant
+	// identity overridden by the client.
+	userID, err := tenant.TenantID(r.Context())
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusUnauthorized)
 		return
@@ -147,7 +169,9 @@ func (a *API) getConfig(w http.ResponseWriter, r *http.Request) {
 }
 
 func (a *API) setConfig(w http.ResponseWriter, r *http.Request) {
-	userID, _, err := tenant.ExtractTenantIDFromHTTPRequest(r)
+	// Resolve the tenant from the authenticated request context (populated by
+	// the API auth middleware). Do not trust the raw X-Scope-OrgID header.
+	userID, err := tenant.TenantID(r.Context())
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusUnauthorized)
 		return
@@ -297,7 +321,9 @@ func (a *API) getConfigs(w http.ResponseWriter, r *http.Request) {
 }
 
 func (a *API) deactivateConfig(w http.ResponseWriter, r *http.Request) {
-	userID, _, err := tenant.ExtractTenantIDFromHTTPRequest(r)
+	// Resolve the tenant from the authenticated request context (populated by
+	// the API auth middleware). Do not trust the raw X-Scope-OrgID header.
+	userID, err := tenant.TenantID(r.Context())
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusUnauthorized)
 		return
@@ -319,7 +345,9 @@ func (a *API) deactivateConfig(w http.ResponseWriter, r *http.Request) {
 }
 
 func (a *API) restoreConfig(w http.ResponseWriter, r *http.Request) {
-	userID, _, err := tenant.ExtractTenantIDFromHTTPRequest(r)
+	// Resolve the tenant from the authenticated request context (populated by
+	// the API auth middleware). Do not trust the raw X-Scope-OrgID header.
+	userID, err := tenant.TenantID(r.Context())
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusUnauthorized)
 		return
