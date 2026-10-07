@@ -215,6 +215,25 @@ func TestFrontendFailedCancellation(t *testing.T) {
 	})
 }
 
+func TestFrontendSchedulerErrorStatusDoesNotPanic(t *testing.T) {
+	// Regression test: when the scheduler replies with Status=ERROR (e.g. because a
+	// malformed Uber-Trace-Id made trace extraction fail), the frontend's
+	// scheduler loop previously called err.Error() on a provably-nil local error,
+	// panicking and killing the whole query-frontend process. The fix must use
+	// resp.Error and additionally recover any panic in the worker goroutine.
+	const userID = "test"
+
+	f, _ := setupFrontend(t, func(f *Frontend, msg *schedulerpb.FrontendToScheduler) *schedulerpb.SchedulerToFrontend {
+		return &schedulerpb.SchedulerToFrontend{Status: schedulerpb.ERROR, Error: "boom"}
+	})
+
+	resp, err := f.RoundTripGRPC(user.InjectOrgID(context.Background(), userID), &httpgrpc.HTTPRequest{})
+	require.NoError(t, err)
+	require.NotNil(t, resp)
+	require.Equal(t, int32(500), resp.Code)
+	require.Equal(t, []byte("boom"), resp.Body)
+}
+
 type mockScheduler struct {
 	t *testing.T
 	f *Frontend

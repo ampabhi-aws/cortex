@@ -279,7 +279,13 @@ func (s *Scheduler) enqueueRequest(frontendContext context.Context, frontendAddr
 	tracer := opentracing.GlobalTracer()
 	parentSpanContext, err := httpgrpcutil.GetParentSpanForRequest(tracer, msg.HttpRequest)
 	if err != nil {
-		return err
+		// Malformed client-provided tracing headers (e.g. a corrupt Uber-Trace-Id) must
+		// not fail the enqueue: that would be reported back to the frontend as a
+		// scheduler ERROR status, which is both attacker-reachable and historically
+		// crashed the frontend. Log and continue without a parent span, matching the
+		// querier's behaviour (pkg/querier/worker/scheduler_processor.go).
+		level.Warn(s.log).Log("msg", "failed to extract tracing information from request headers; continuing without parent span", "err", err)
+		parentSpanContext = nil
 	}
 
 	userID := msg.GetUserID()
