@@ -490,8 +490,15 @@ func (c *Compactor) starting(ctx context.Context) error {
 	// Wrap the bucket client to write block deletion marks in the global location too.
 	c.bucketClient = bucketindex.BucketWithGlobalMarkers(c.bucketClient)
 
-	// Create the users scanner.
-	c.usersScanner = cortex_tsdb.NewUsersScanner(c.bucketClient, c.ownUserForCleanUp, c.parentLogger)
+	// Create the users scanner for the destructive blocks cleaner path.
+	// Use strict (fail-closed) ownership semantics so that a shared
+	// compactor-ring fault (empty ring, KV outage, too many unhealthy
+	// instances, or an unexpected replica count) does not cause every
+	// replica to simultaneously claim every tenant and race on hard block
+	// deletions / bucket-index rewrites. This matches the sibling
+	// non-destructive compactUsers path, which already skips tenants on
+	// ownership-check errors.
+	c.usersScanner = cortex_tsdb.NewUsersScannerStrict(c.bucketClient, c.ownUserForCleanUp, c.parentLogger)
 
 	// Create the blocks cleaner (service).
 	c.blocksCleaner = NewBlocksCleaner(BlocksCleanerConfig{

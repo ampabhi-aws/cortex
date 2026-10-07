@@ -19,13 +19,38 @@ type UsersScanner struct {
 	bucketClient objstore.Bucket
 	logger       log.Logger
 	isOwned      func(userID string) (bool, error)
+	// strictOwnership makes ScanUsers skip tenants when the ownership check
+	// returns an error (fail-closed). When false, tenants are retained on
+	// ownership-check errors (fail-open), preserving the historical lenient
+	// behaviour expected by metrics-only / read-only scans (e.g. querier
+	// bucket scan, thanosconvert).
+	strictOwnership bool
 }
 
+// NewUsersScanner creates a UsersScanner that retains a tenant when the
+// ownership check returns an error (fail-open). Prefer
+// NewUsersScannerStrict for destructive consumers like the blocks cleaner.
 func NewUsersScanner(bucketClient objstore.Bucket, isOwned func(userID string) (bool, error), logger log.Logger) *UsersScanner {
 	return &UsersScanner{
 		bucketClient: bucketClient,
 		logger:       logger,
 		isOwned:      isOwned,
+	}
+}
+
+// NewUsersScannerStrict creates a UsersScanner that skips a tenant when the
+// ownership check returns an error (fail-closed). This matches the sibling
+// compaction path (see Compactor.compactUsers) and is required for the
+// destructive BlocksCleaner path, because every compactor replica observes
+// the same ring state and a shared ring fault would otherwise cause every
+// replica to simultaneously claim every tenant, violating the
+// single-owner invariant for cleanup.
+func NewUsersScannerStrict(bucketClient objstore.Bucket, isOwned func(userID string) (bool, error), logger log.Logger) *UsersScanner {
+	return &UsersScanner{
+		bucketClient:    bucketClient,
+		logger:          logger,
+		isOwned:         isOwned,
+		strictOwnership: true,
 	}
 }
 
@@ -50,6 +75,15 @@ func (s *UsersScanner) ScanUsers(ctx context.Context) (users, markedForDeletion 
 		// Check if it's owned by this instance.
 		owned, err := s.isOwned(userID)
 		if err != nil {
+			if s.strictOwnership {
+				// Fail-closed: skip the tenant rather than assume ownership.
+				// This is critical for destructive consumers (e.g. the blocks
+				// cleaner) where fail-open would cause every replica to claim
+				// every tenant on a shared ring fault.
+				level.Warn(s.logger).Log("msg", "unable to check if user is owned by this shard; skipping", "user", userID, "err", err)
+				users = append(users[:ix], users[ix+1:]...)
+				continue
+			}
 			level.Warn(s.logger).Log("msg", "unable to check if user is owned by this shard", "user", userID, "err", err)
 		} else if !owned {
 			users = append(users[:ix], users[ix+1:]...)
