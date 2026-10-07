@@ -151,6 +151,28 @@ func TestFrontendEnqueueFailure(t *testing.T) {
 	require.True(t, strings.Contains(err.Error(), "failed to enqueue request"))
 }
 
+// TestFrontendSchedulerErrorStatus is a regression test for a nil-pointer dereference
+// in the ERROR arm of the frontend v2 scheduler worker: the worker used to call
+// err.Error() on an already-nil error, which panicked and crashed the whole
+// query-frontend process. It must now use resp.Error and surface it as an HTTP 500
+// without panicking.
+func TestFrontendSchedulerErrorStatus(t *testing.T) {
+	const (
+		userID  = "test"
+		errBody = "boom"
+	)
+
+	f, _ := setupFrontend(t, func(f *Frontend, msg *schedulerpb.FrontendToScheduler) *schedulerpb.SchedulerToFrontend {
+		return &schedulerpb.SchedulerToFrontend{Status: schedulerpb.ERROR, Error: errBody}
+	})
+
+	resp, err := f.RoundTripGRPC(user.InjectOrgID(context.Background(), userID), &httpgrpc.HTTPRequest{})
+	require.NoError(t, err)
+	require.NotNil(t, resp)
+	require.Equal(t, int32(500), resp.Code)
+	require.Equal(t, []byte(errBody), resp.Body)
+}
+
 func TestFrontendCancellation(t *testing.T) {
 	f, ms := setupFrontend(t, nil)
 

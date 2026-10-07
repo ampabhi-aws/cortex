@@ -184,6 +184,11 @@ func (w *frontendSchedulerWorker) start() {
 		w.wg.Add(1)
 		go func() {
 			defer w.wg.Done()
+			defer func() {
+				if p := recover(); p != nil {
+					level.Error(w.log).Log("msg", "panic in scheduler worker", "panic", p)
+				}
+			}()
 			w.runOne(w.ctx, client)
 		}()
 	}
@@ -291,7 +296,7 @@ func (w *frontendSchedulerWorker) schedulerLoop(loop schedulerpb.SchedulerForFro
 				req.response <- &frontendv2pb.QueryResultRequest{
 					HttpResponse: &httpgrpc.HTTPResponse{
 						Code: http.StatusInternalServerError,
-						Body: []byte(err.Error()),
+						Body: []byte(resp.Error),
 					},
 				}
 
