@@ -35,6 +35,15 @@ type Distributor struct {
 	maxRecvMsgSize   int64
 	requestsInFlight sync.WaitGroup
 
+	// inflight is a bounded, non-blocking semaphore limiting the number of
+	// concurrently fanned-out requests this distributor will accept. It is nil
+	// when the configured MaxConcurrentRequests is <= 0 (unlimited).
+	inflight chan struct{}
+
+	// maxMergeBodiesBytes caps the aggregate size (in bytes) of per-peer response
+	// bodies retained in memory before merging a quorum read. <= 0 disables.
+	maxMergeBodiesBytes int64
+
 	alertmanagerRing        ring.ReadRing
 	alertmanagerClientsPool ClientsPool
 
@@ -44,15 +53,20 @@ type Distributor struct {
 // NewDistributor constructs a new Distributor
 func NewDistributor(cfg ClientConfig, maxRecvMsgSize int64, alertmanagersRing *ring.Ring, alertmanagerClientsPool ClientsPool, logger log.Logger, reg prometheus.Registerer) (d *Distributor, err error) {
 	if alertmanagerClientsPool == nil {
-		alertmanagerClientsPool = newAlertmanagerClientsPool(client.NewRingServiceDiscovery(alertmanagersRing), cfg, logger, reg)
+		alertmanagerClientsPool = newAlertmanagerClientsPoolWithMaxMsgSize(client.NewRingServiceDiscovery(alertmanagersRing), cfg, int(maxRecvMsgSize), logger, reg)
 	}
 
 	d = &Distributor{
 		cfg:                     cfg,
 		logger:                  logger,
 		maxRecvMsgSize:          maxRecvMsgSize,
+		maxMergeBodiesBytes:     cfg.MaxMergeBodiesBytes,
 		alertmanagerRing:        alertmanagersRing,
 		alertmanagerClientsPool: alertmanagerClientsPool,
+	}
+
+	if cfg.MaxConcurrentRequests > 0 {
+		d.inflight = make(chan struct{}, cfg.MaxConcurrentRequests)
 	}
 
 	d.Service = services.NewBasicService(nil, d.running, nil)
@@ -122,6 +136,21 @@ func (d *Distributor) DistributeRequest(w http.ResponseWriter, r *http.Request) 
 	d.requestsInFlight.Add(1)
 	defer d.requestsInFlight.Done()
 
+	// Enforce a global in-flight cap before buffering the request body or
+	// fanning it out to every replica. Overload is reported to the client as
+	// 503 Service Unavailable with a Retry-After hint rather than consuming
+	// heap shared with every other tenant on the process.
+	if d.inflight != nil {
+		select {
+		case d.inflight <- struct{}{}:
+			defer func() { <-d.inflight }()
+		default:
+			w.Header().Set("Retry-After", "1")
+			http.Error(w, "too many in-flight alertmanager requests", http.StatusServiceUnavailable)
+			return
+		}
+	}
+
 	userID, err := tenant.TenantID(r.Context())
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusUnauthorized)
@@ -177,6 +206,7 @@ func (d *Distributor) doQuorum(userID string, w http.ResponseWriter, r *http.Req
 	}
 
 	var responses []*httpgrpc.HTTPResponse
+	var responsesTotalBytes int64
 	var responsesMtx sync.Mutex
 	grpcHeaders := httpToHttpgrpcHeaders(r.Header)
 	err = ring.DoBatch(r.Context(), RingOp, d.alertmanagerRing, []uint32{shardByUser(userID)}, func(am ring.InstanceDesc, _ []int) error {
@@ -200,6 +230,13 @@ func (d *Distributor) doQuorum(userID string, w http.ResponseWriter, r *http.Req
 		}
 
 		responsesMtx.Lock()
+		if d.maxMergeBodiesBytes > 0 {
+			responsesTotalBytes += int64(len(resp.Body))
+			if responsesTotalBytes > d.maxMergeBodiesBytes {
+				responsesMtx.Unlock()
+				return errors.Errorf("aggregate alertmanager response size %d exceeds configured limit %d", responsesTotalBytes, d.maxMergeBodiesBytes)
+			}
+		}
 		responses = append(responses, resp)
 		responsesMtx.Unlock()
 
@@ -339,9 +376,18 @@ func respondFromMultipleHTTPGRPCResponses(w http.ResponseWriter, logger log.Logg
 	bodies := make([][]byte, len(responses))
 	for i, r := range responses {
 		bodies[i] = r.Body
+		// Release the reference inside the httpgrpc response so the body can be
+		// freed as soon as the merger has consumed it, rather than being kept
+		// alive until the slice itself goes out of scope.
+		r.Body = nil
 	}
 
 	body, err := merger.MergeResponses(bodies)
+	// Drop references to per-peer bodies once merged so the garbage collector
+	// can reclaim them before we write the (potentially large) merged body.
+	for i := range bodies {
+		bodies[i] = nil
+	}
 	if err != nil {
 		level.Error(logger).Log("msg", "failed to merge responses for request", "err", err)
 		w.WriteHeader(http.StatusInternalServerError)
