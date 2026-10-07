@@ -8,6 +8,7 @@ import (
 	"os"
 	"path/filepath"
 	"reflect"
+	"strings"
 
 	"github.com/go-kit/log"
 	"github.com/go-kit/log/level"
@@ -36,6 +37,22 @@ const (
 	errTooManyTemplates      = "too many templates in the configuration: %d (limit: %d)"
 	errTemplateTooBig        = "template %s is too big: %d bytes (limit: %d bytes)"
 
+	// defaultMaxConfigSize is the absolute upper bound applied to Alertmanager
+	// config uploads when the operator has not configured an explicit cap. It is
+	// a safety net to prevent a single tenant from exhausting the shared
+	// Alertmanager process memory via /api/v1/alerts.
+	defaultMaxConfigSize = 16 << 20
+
+	// defaultMaxTemplatesCount is the absolute upper bound applied to the
+	// number of templates accepted in a single config upload when the operator
+	// has not configured an explicit cap.
+	defaultMaxTemplatesCount = 100
+
+	// defaultMaxTemplateSizeBytes is the absolute upper bound applied to the
+	// size of a single template when the operator has not configured an
+	// explicit cap.
+	defaultMaxTemplateSizeBytes = 1 << 20
+
 	fetchConcurrency = 16
 )
 
@@ -46,6 +63,18 @@ var (
 	errSlackAPIURLFileNotAllowed     = errors.New("setting Slack api_url_file and global slack_api_url_file is not allowed")
 	errVictorOpsAPIKeyFileNotAllowed = errors.New("setting VictorOps api_key_file is not allowed")
 )
+
+// isRequestBodyTooLargeErr reports whether err was produced by
+// http.MaxBytesReader when the request body exceeded the configured cap.
+// The standard library returns a plain error with the message
+// "http: request body too large" from the reader; we match on that
+// substring to remain compatible across Go versions.
+func isRequestBodyTooLargeErr(err error) bool {
+	if err == nil {
+		return false
+	}
+	return strings.Contains(err.Error(), "request body too large")
+}
 
 // UserConfig is used to communicate a users alertmanager configs
 type UserConfig struct {
@@ -100,36 +129,50 @@ func (am *MultitenantAlertmanager) SetUserConfig(w http.ResponseWriter, r *http.
 		return
 	}
 
-	var input io.Reader
+	// Always bound the request body regardless of the per-tenant override so
+	// that a tenant cannot drive the shared Alertmanager process to OOM by
+	// uploading an arbitrarily large configuration. The per-tenant override is
+	// still honoured when it is lower than the hard cap; 0 (= no tenant
+	// override) falls back to the hard cap, and a tenant override above the
+	// hard cap is clamped down.
+	hardCap := defaultMaxConfigSize
+	if am.cfg != nil && am.cfg.MaxRecvMsgSize > 0 {
+		hardCap = int(am.cfg.MaxRecvMsgSize)
+	}
 	maxConfigSize := am.limits.AlertmanagerMaxConfigSize(userID)
-	if maxConfigSize > 0 {
-		// LimitReader will return EOF after reading specified number of bytes. To check if
-		// we have read too many bytes, allow one extra byte.
-		input = io.LimitReader(r.Body, int64(maxConfigSize)+1)
-	} else {
-		input = r.Body
+	if maxConfigSize <= 0 || maxConfigSize > hardCap {
+		maxConfigSize = hardCap
 	}
 
-	payload, err := io.ReadAll(input)
-	if err != nil {
-		level.Error(logger).Log("msg", errReadingConfiguration, "err", err.Error())
-		http.Error(w, fmt.Sprintf("%s: %s", errReadingConfiguration, err.Error()), http.StatusBadRequest)
-		return
-	}
+	// MaxBytesReader enforces the cap at the HTTP layer: once the reader has
+	// consumed more than the limit it returns an error AND signals the
+	// response to close the connection, so we do not keep buffering past the
+	// cap. Allow one extra byte so we can distinguish "exactly at the limit"
+	// from "over the limit".
+	r.Body = http.MaxBytesReader(w, r.Body, int64(maxConfigSize)+1)
 
-	if maxConfigSize > 0 && len(payload) > maxConfigSize {
-		msg := fmt.Sprintf(errConfigurationTooBig, maxConfigSize)
-		level.Warn(logger).Log("msg", msg)
-		http.Error(w, msg, http.StatusBadRequest)
-		return
-	}
-
+	// Decode directly from the bounded reader to avoid double buffering (the
+	// previous implementation copied the whole body into a []byte and then
+	// into the YAML object graph, roughly doubling the heap footprint).
 	cfg := &UserConfig{}
-	err = yaml.Unmarshal(payload, cfg)
-	if err != nil {
-		level.Error(logger).Log("msg", errMarshallingYAML, "err", err.Error())
-		http.Error(w, fmt.Sprintf("%s: %s", errMarshallingYAML, err.Error()), http.StatusBadRequest)
-		return
+	decoder := yaml.NewDecoder(r.Body)
+	if err := decoder.Decode(cfg); err != nil {
+		// http.MaxBytesReader returns an error with the message
+		// "http: request body too large" when the limit is exceeded.
+		if isRequestBodyTooLargeErr(err) {
+			msg := fmt.Sprintf(errConfigurationTooBig, maxConfigSize)
+			level.Warn(logger).Log("msg", msg)
+			http.Error(w, msg, http.StatusRequestEntityTooLarge)
+			return
+		}
+		// An empty body is reported as io.EOF by the decoder; defer the
+		// "empty configuration" error to validateUserConfig so the response
+		// shape matches the historical behaviour.
+		if !errors.Is(err, io.EOF) {
+			level.Error(logger).Log("msg", errMarshallingYAML, "err", err.Error())
+			http.Error(w, fmt.Sprintf("%s: %s", errMarshallingYAML, err.Error()), http.StatusBadRequest)
+			return
+		}
 	}
 
 	cfgDesc := alertspb.ToProto(cfg.AlertmanagerConfig, cfg.TemplateFiles, userID)
@@ -197,16 +240,25 @@ func validateUserConfig(logger log.Logger, cfg alertspb.AlertConfigDesc, limits 
 		}
 	}
 
-	// Check template limits.
-	if l := limits.AlertmanagerMaxTemplatesCount(user); l > 0 && len(cfg.Templates) > l {
-		return fmt.Errorf(errTooManyTemplates, len(cfg.Templates), l)
+	// Check template limits. Enforce a safe non-zero cap even when the operator
+	// has not configured one so that a tenant cannot write unbounded template
+	// data to the shared Alertmanager local data directory. A tenant override
+	// of 0 means "use the built-in default", not "disable the limit".
+	maxTemplates := limits.AlertmanagerMaxTemplatesCount(user)
+	if maxTemplates <= 0 {
+		maxTemplates = defaultMaxTemplatesCount
+	}
+	if len(cfg.Templates) > maxTemplates {
+		return fmt.Errorf(errTooManyTemplates, len(cfg.Templates), maxTemplates)
 	}
 
-	if maxSize := limits.AlertmanagerMaxTemplateSize(user); maxSize > 0 {
-		for _, tmpl := range cfg.Templates {
-			if size := len(tmpl.GetBody()); size > maxSize {
-				return fmt.Errorf(errTemplateTooBig, tmpl.GetFilename(), size, maxSize)
-			}
+	maxTemplateSize := limits.AlertmanagerMaxTemplateSize(user)
+	if maxTemplateSize <= 0 {
+		maxTemplateSize = defaultMaxTemplateSizeBytes
+	}
+	for _, tmpl := range cfg.Templates {
+		if size := len(tmpl.GetBody()); size > maxTemplateSize {
+			return fmt.Errorf(errTemplateTooBig, tmpl.GetFilename(), size, maxTemplateSize)
 		}
 	}
 
