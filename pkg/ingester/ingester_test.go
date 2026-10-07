@@ -3181,8 +3181,11 @@ func Test_Ingester_AllUserStats(t *testing.T) {
 		db.ingestedRuleSamples.Tick()
 	}
 
-	// Get label names
-	res, err := i.AllUserStats(context.Background(), &client.UserStatsRequest{})
+	// AllUserStats is now scoped to the caller's tenant (prior behaviour
+	// returned every tenant resident on the ingester, which leaked the
+	// cross-tenant inventory).
+	ctx := user.InjectOrgID(context.Background(), "user-1")
+	res, err := i.AllUserStats(ctx, &client.UserStatsRequest{})
 	require.NoError(t, err)
 
 	expect := []*client.UserIDStatsResponse{
@@ -3195,17 +3198,20 @@ func Test_Ingester_AllUserStats(t *testing.T) {
 				RuleIngestionRate: 0,
 			},
 		},
-		{
-			UserId: "user-2",
-			Data: &client.UserStatsResponse{
-				IngestionRate:     0.13333333333333333,
-				NumSeries:         2,
-				ApiIngestionRate:  0.13333333333333333,
-				RuleIngestionRate: 0,
-			},
-		},
 	}
 	assert.ElementsMatch(t, expect, res.Stats)
+
+	// A caller whose tenant is not resident on the ingester gets an empty
+	// response, not another tenant's data.
+	ctx = user.InjectOrgID(context.Background(), "unknown-user")
+	res, err = i.AllUserStats(ctx, &client.UserStatsRequest{})
+	require.NoError(t, err)
+	assert.Empty(t, res.Stats)
+
+	// Without any tenant in context the RPC must refuse to return data
+	// (previously it returned every tenant's stats).
+	_, err = i.AllUserStats(context.Background(), &client.UserStatsRequest{})
+	require.Error(t, err)
 }
 
 func TestIngesterCompactIdleBlock(t *testing.T) {

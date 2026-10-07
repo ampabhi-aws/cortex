@@ -1556,25 +1556,44 @@ func (i *Ingester) UserStats(ctx context.Context, req *client.UserStatsRequest) 
 	return createUserStats(db), nil
 }
 
-// AllUserStats returns ingestion statistics for all users known to this ingester.
-func (i *Ingester) AllUserStats(_ context.Context, _ *client.UserStatsRequest) (*client.UsersStatsResponse, error) {
+// AllUserStats returns ingestion statistics scoped to the caller's tenant.
+//
+// Historically this RPC returned the full set of tenants resident on the
+// ingester along with each tenant's ingestion rates and in-memory series
+// count. That cross-tenant disclosure (CWE-1212 / CWE-653) is a confirmed
+// authorization defect: the method name implies an operator aggregation,
+// but the gRPC endpoint has no operator identity -- the only credential
+// available is the attacker-supplied X-Scope-OrgID header, which every
+// other handler in this file compares against the data it returns. To
+// match the house pattern (see UserStats above) and prevent any tenant
+// from enumerating the inventory of co-tenants plus their usage
+// telemetry, the response is now restricted to the caller's own tenant.
+//
+// Operators that need the cross-tenant admin view must enforce an
+// external operator identity (e.g. mTLS SAN / token check) in front of
+// an operator-only aggregator; the ingester gRPC port, which trusts
+// X-Scope-OrgID completely, is not an appropriate place to serve that
+// data.
+func (i *Ingester) AllUserStats(ctx context.Context, _ *client.UserStatsRequest) (*client.UsersStatsResponse, error) {
 	if err := i.checkRunning(); err != nil {
+		return nil, err
+	}
+
+	userID, err := tenant.TenantID(ctx)
+	if err != nil {
 		return nil, err
 	}
 
 	i.stoppedMtx.RLock()
 	defer i.stoppedMtx.RUnlock()
 
-	users := i.TSDBState.dbs
+	response := &client.UsersStatsResponse{}
 
-	response := &client.UsersStatsResponse{
-		Stats: make([]*client.UserIDStatsResponse, 0, len(users)),
-	}
-	for userID, db := range users {
-		response.Stats = append(response.Stats, &client.UserIDStatsResponse{
+	if db := i.getTSDB(userID); db != nil {
+		response.Stats = []*client.UserIDStatsResponse{{
 			UserId: userID,
 			Data:   createUserStats(db),
-		})
+		}}
 	}
 	return response, nil
 }
