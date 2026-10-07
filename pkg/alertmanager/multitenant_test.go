@@ -1968,6 +1968,31 @@ func TestSafeTemplateFilepath(t *testing.T) {
 			template:    "../test.tmpl",
 			expectedErr: errors.New(`invalid template name "../test.tmpl": the template filepath is escaping the per-tenant local directory`),
 		},
+		"should fail if the provided template is a same-prefix sibling of the dir": {
+			dir:         "/data/tenant/templates",
+			template:    "../templates-evil/payload.tmpl",
+			expectedErr: errors.New(`invalid template name "../templates-evil/payload.tmpl": the template filepath is escaping the per-tenant local directory`),
+		},
+		"should fail if the provided template is a nested sub-path": {
+			dir:         "/data/tenant/templates",
+			template:    "sub/dir/payload.tmpl",
+			expectedErr: errors.New(`invalid template name "sub/dir/payload.tmpl": the template name cannot contain any path`),
+		},
+		"should fail for the dot directory reference": {
+			dir:         "/data/tenant/templates",
+			template:    ".",
+			expectedErr: errors.New(`invalid template name ".": the template filepath is escaping the per-tenant local directory`),
+		},
+		"should fail for the dot-dot directory reference": {
+			dir:         "/data/tenant/templates",
+			template:    "..",
+			expectedErr: errors.New(`invalid template name "..": the template filepath is escaping the per-tenant local directory`),
+		},
+		"should fail for templatesX/../templatesY sibling bypass": {
+			dir:         "/data/tenant/templates",
+			template:    "../templatesX/../templatesY/p",
+			expectedErr: errors.New(`invalid template name "../templatesX/../templatesY/p": the template filepath is escaping the per-tenant local directory`),
+		},
 	}
 
 	for testName, testData := range tests {
@@ -1975,6 +2000,31 @@ func TestSafeTemplateFilepath(t *testing.T) {
 			actualPath, actualErr := safeTemplateFilepath(testData.dir, testData.template)
 			assert.Equal(t, testData.expectedErr, actualErr)
 			assert.Equal(t, testData.expectedPath, actualPath)
+		})
+	}
+}
+
+func TestValidateTemplateFilename(t *testing.T) {
+	tests := map[string]struct {
+		filename string
+		wantErr  bool
+	}{
+		"plain name is accepted":           {filename: "test.tmpl", wantErr: false},
+		"empty name is rejected":            {filename: "", wantErr: true},
+		"dot is rejected":                   {filename: ".", wantErr: true},
+		"dot-dot is rejected":               {filename: "..", wantErr: true},
+		"relative escape is rejected":       {filename: "../templates-evil/x.tmpl", wantErr: true},
+		"nested path is rejected":           {filename: "sub/dir/x.tmpl", wantErr: true},
+		"absolute path is rejected":         {filename: "/etc/passwd", wantErr: true},
+	}
+	for name, tc := range tests {
+		t.Run(name, func(t *testing.T) {
+			err := validateTemplateFilename(tc.filename)
+			if tc.wantErr {
+				assert.Error(t, err)
+			} else {
+				assert.NoError(t, err)
+			}
 		})
 	}
 }
@@ -1993,6 +2043,53 @@ func TestStoreTemplateFile(t *testing.T) {
 	changed, err = storeTemplateFile(filepath.Join(testTemplateDir, "some-template"), "new content") // reusing previous content
 	require.NoError(t, err)
 	require.False(t, changed)
+}
+
+// TestMultitenantAlertmanager_setConfig_rejectsBadTemplateNames exercises the
+// apply path directly (bypassing the HTTP API's validateUserConfig) to prove
+// that setConfig self-defends against template names that could escape the
+// per-tenant templates directory, create arbitrary sub-paths, or reference
+// the directory itself.
+func TestMultitenantAlertmanager_setConfig_rejectsBadTemplateNames(t *testing.T) {
+	hostile := []string{
+		"../templates-evil/payload.tmpl",
+		"sub/dir/payload.tmpl",
+		".",
+		"..",
+		"",
+		"../templatesX/../templatesY/p",
+	}
+
+	for _, name := range hostile {
+		t.Run(fmt.Sprintf("name=%q", name), func(t *testing.T) {
+			store := prepareInMemoryAlertStore()
+			cfg := mockAlertmanagerConfig(t)
+			reg := prometheus.NewPedanticRegistry()
+			am, err := createMultitenantAlertmanager(cfg, nil, nil, store, nil, nil, log.NewNopLogger(), reg)
+			require.NoError(t, err)
+
+			err = am.setConfig(alertspb.AlertConfigDesc{
+				User:      "tenant-a",
+				RawConfig: simpleConfigOne,
+				Templates: []*alertspb.TemplateDesc{{
+					Filename: name,
+					Body:     `{{ define "x" }}owned{{ end }}`,
+				}},
+			})
+			require.Error(t, err, "setConfig must reject hostile template name %q", name)
+
+			// The user template directory must not contain the hostile file,
+			// and no sibling directory (such as `templates-evil`) must have
+			// been created in the tenant's data directory.
+			tenantDir := filepath.Join(cfg.DataDir, "tenant-a")
+			if entries, err := os.ReadDir(tenantDir); err == nil {
+				for _, e := range entries {
+					require.NotContains(t, e.Name(), "templates-evil",
+						"sibling directory was created despite rejection")
+				}
+			}
+		})
+	}
 }
 
 func TestMultitenantAlertmanager_verifyRateLimitedEmailConfig(t *testing.T) {
