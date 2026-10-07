@@ -8,6 +8,7 @@ linters:
     - gofmt
     - misspell
     - depguard
+    - govet
 
 linters-settings:
   staticcheck:
@@ -19,6 +20,12 @@ linters-settings:
     exclude: ./.errcheck-exclude
   goimports:
     local-prefixes: "github.com/cortexproject/cortex"
+
+  govet:
+    # Explicitly keep the unsafeptr analyzer enabled so we never regress on
+    # patterns that reinterpret a Go string header as a slice header.
+    enable:
+      - unsafeptr
 
   depguard:
     list-type: blacklist

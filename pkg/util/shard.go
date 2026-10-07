@@ -3,6 +3,7 @@ package util
 import (
 	"crypto/md5"
 	"encoding/binary"
+	"io"
 	"math"
 )
 
@@ -19,11 +20,13 @@ var (
 // ShuffleShardSeed returns seed for random number generator, computed from provided identifier.
 func ShuffleShardSeed(identifier, zone string) int64 {
 	// Use the identifier to compute an hash we'll use to seed the random.
+	// io.WriteString uses md5's StringWriter implementation when available,
+	// avoiding both allocations and the previous unsound unsafe string->[]byte conversion.
 	hasher := md5.New()
-	hasher.Write(YoloBuf(identifier)) // nolint:errcheck
+	_, _ = io.WriteString(hasher, identifier)
 	if zone != "" {
-		hasher.Write(seedSeparator) // nolint:errcheck
-		hasher.Write(YoloBuf(zone)) // nolint:errcheck
+		_, _ = hasher.Write(seedSeparator)
+		_, _ = io.WriteString(hasher, zone)
 	}
 	checksum := hasher.Sum(nil)
 
