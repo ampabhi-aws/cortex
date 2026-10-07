@@ -73,8 +73,9 @@ type MultitenantAlertmanagerConfig struct {
 	ShardingEnabled bool       `yaml:"sharding_enabled"`
 	ShardingRing    RingConfig `yaml:"sharding_ring"`
 
-	FallbackConfigFile string `yaml:"fallback_config_file"`
-	AutoWebhookRoot    string `yaml:"auto_webhook_root"`
+	FallbackConfigFile           string `yaml:"fallback_config_file"`
+	AutoWebhookRoot              string `yaml:"auto_webhook_root"`
+	AutoProvisionFallbackTenants bool   `yaml:"auto_provision_fallback_tenants"`
 
 	Cluster ClusterConfig `yaml:"cluster"`
 
@@ -116,6 +117,7 @@ func (cfg *MultitenantAlertmanagerConfig) RegisterFlags(f *flag.FlagSet) {
 	f.BoolVar(&cfg.EnableAPI, "experimental.alertmanager.enable-api", false, "Enable the experimental alertmanager config api.")
 
 	f.BoolVar(&cfg.ShardingEnabled, "alertmanager.sharding-enabled", false, "Shard tenants across multiple alertmanager instances.")
+	f.BoolVar(&cfg.AutoProvisionFallbackTenants, "alertmanager.auto-provision-fallback-tenants", true, "When a fallback configuration is set and a request arrives for a tenant that has no stored Alertmanager configuration, auto-provision the tenant by persisting an empty configuration and starting an Alertmanager for it. When set to false, requests for unknown tenants are rejected with 404 and no persistent state is created from the read path.")
 
 	cfg.AlertmanagerClient.RegisterFlagsWithPrefix("alertmanager.alertmanager-client", f)
 	cfg.Persister.RegisterFlagsWithPrefix("alertmanager", f)
@@ -814,6 +816,15 @@ func (am *MultitenantAlertmanager) setConfig(cfg alertspb.AlertConfigDesc) error
 	var userTemplateDir = filepath.Join(am.getTenantDirectory(cfg.User), templatesDir)
 	var pathsToRemove = make(map[string]struct{})
 
+	// isEmptyPlaceholder is true when the incoming config is an empty placeholder
+	// (no RawConfig and no templates). In that case we must NOT purge on-disk
+	// template files, because the empty placeholder is synthesised by code paths
+	// such as the fallback-config path and does not represent the tenant having
+	// explicitly emptied their config. Purging would silently destroy the
+	// tenant's templates during a transient read on a non-owning replica or
+	// during the ring/poll window.
+	isEmptyPlaceholder := cfg.RawConfig == "" && len(cfg.Templates) == 0
+
 	// List existing files to keep track the ones to be removed
 	if oldTemplateFiles, err := os.ReadDir(userTemplateDir); err == nil {
 		for _, file := range oldTemplateFiles {
@@ -839,12 +850,14 @@ func (am *MultitenantAlertmanager) setConfig(cfg alertspb.AlertConfigDesc) error
 		}
 	}
 
-	for pathToRemove := range pathsToRemove {
-		err := os.Remove(pathToRemove)
-		if err != nil {
-			level.Warn(am.logger).Log("msg", "failed to remove file", "file", pathToRemove, "err", err)
+	if !isEmptyPlaceholder {
+		for pathToRemove := range pathsToRemove {
+			err := os.Remove(pathToRemove)
+			if err != nil {
+				level.Warn(am.logger).Log("msg", "failed to remove file", "file", pathToRemove, "err", err)
+			}
+			hasTemplateChanges = true
 		}
-		hasTemplateChanges = true
 	}
 
 	level.Debug(am.logger).Log("msg", "setting config", "user", cfg.User)
@@ -1014,6 +1027,19 @@ func (am *MultitenantAlertmanager) serveRequest(w http.ResponseWriter, req *http
 		http.Error(w, err.Error(), http.StatusUnauthorized)
 		return
 	}
+
+	// When sharding is enabled, only the replica(s) owning the tenant in the
+	// ring should serve/provision an Alertmanager for them locally. Serving
+	// (and especially provisioning via the fallback path) on a non-owning
+	// replica can wipe the tenant's stored configuration and create orphaned
+	// per-tenant state on the wrong instance. The Distributor is responsible
+	// for proxying known paths to an owner; anything that lands here on a
+	// non-owner should be rejected rather than served locally.
+	if am.cfg.ShardingEnabled && !am.isUserOwned(userID) {
+		http.Error(w, "the Alertmanager for this tenant is not served by this instance", http.StatusNotFound)
+		return
+	}
+
 	am.alertmanagersMtx.Lock()
 	userAM, ok := am.alertmanagers[userID]
 	am.alertmanagersMtx.Unlock()
@@ -1025,6 +1051,11 @@ func (am *MultitenantAlertmanager) serveRequest(w http.ResponseWriter, req *http
 
 	if am.fallbackConfig != "" {
 		userAM, err = am.alertmanagerFromFallbackConfig(userID)
+		if err == errNotUploadingFallback {
+			level.Debug(am.logger).Log("msg", "not auto-provisioning Alertmanager for unknown tenant", "user", userID)
+			http.Error(w, "the Alertmanager is not configured", http.StatusNotFound)
+			return
+		}
 		if err != nil {
 			level.Error(am.logger).Log("msg", "unable to initialize the Alertmanager with a fallback configuration", "user", userID, "err", err)
 			http.Error(w, "Failed to initialize the Alertmanager", http.StatusInternalServerError)
@@ -1039,17 +1070,37 @@ func (am *MultitenantAlertmanager) serveRequest(w http.ResponseWriter, req *http
 	http.Error(w, "the Alertmanager is not configured", http.StatusNotFound)
 }
 
+// errNotUploadingFallback is returned by alertmanagerFromFallbackConfig when
+// auto-provisioning is disabled and the tenant has no stored configuration.
+var errNotUploadingFallback = errors.New("not auto-provisioning fallback alertmanager for unknown tenant")
+
 func (am *MultitenantAlertmanager) alertmanagerFromFallbackConfig(userID string) (*Alertmanager, error) {
-	// Upload an empty config so that the Alertmanager is no de-activated in the next poll
-	cfgDesc := alertspb.ToProto("", nil, userID)
-	err := am.store.SetAlertConfig(context.Background(), cfgDesc)
-	if err != nil {
+	// Fetch any existing stored configuration first. We must never blindly
+	// overwrite an existing stored config with the empty placeholder, which
+	// would silently destroy the tenant's receivers, routes and templates
+	// (see CVE-style fallback-overwrite). Only when the tenant genuinely has
+	// no stored config (ErrNotFound) do we upload the empty placeholder, and
+	// then only when operator-controlled auto-provisioning is enabled.
+	ctx := context.Background()
+	cfg, err := am.store.GetAlertConfig(ctx, userID)
+	switch {
+	case errors.Is(err, alertspb.ErrNotFound):
+		if !am.cfg.AutoProvisionFallbackTenants {
+			return nil, errNotUploadingFallback
+		}
+		cfg = alertspb.ToProto("", nil, userID)
+		if err := am.store.SetAlertConfig(ctx, cfg); err != nil {
+			return nil, err
+		}
+	case err != nil:
 		return nil, err
 	}
 
-	// Calling setConfig with an empty configuration will use the fallback config.
-	err = am.setConfig(cfgDesc)
-	if err != nil {
+	// Apply the (possibly pre-existing) config. If the stored config is
+	// non-empty this starts the Alertmanager with the tenant's real config;
+	// if it is the empty placeholder, setConfig will fall back to the
+	// operator-provided fallback configuration.
+	if err := am.setConfig(cfg); err != nil {
 		return nil, err
 	}
 
