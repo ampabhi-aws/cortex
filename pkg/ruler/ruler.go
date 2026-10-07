@@ -520,12 +520,19 @@ func (r *Ruler) listRules(ctx context.Context) (result map[string]rulespb.RuleGr
 		return
 	}
 
-	for userID := range result {
+	// Build a filtered map rather than mutating the one returned by the store:
+	// some rule stores (notably configdb) return a reference to internal cached
+	// state, and deleting from it would corrupt the cache and race with other
+	// callers.
+	filtered := make(map[string]rulespb.RuleGroupList, len(result))
+	for userID, groups := range result {
 		if !r.allowedTenants.IsAllowed(userID) {
 			level.Debug(r.logger).Log("msg", "ignoring rule groups for user, not allowed", "user", userID)
-			delete(result, userID)
+			continue
 		}
+		filtered[userID] = groups
 	}
+	result = filtered
 	return
 }
 
