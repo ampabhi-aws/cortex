@@ -1,6 +1,7 @@
 package querytee
 
 import (
+	"crypto/sha256"
 	"fmt"
 	"net/http"
 	"strconv"
@@ -28,6 +29,10 @@ type ProxyEndpoint struct {
 
 	// The route name used to track metrics.
 	routeName string
+
+	// logQueryContent opts in to logging the raw tenant query string and
+	// full customer metric labels / sample values. See ProxyConfig.LogQueryContent.
+	logQueryContent bool
 }
 
 func NewProxyEndpoint(backends []*ProxyBackend, routeName string, metrics *ProxyMetrics, logger log.Logger, comparator ResponsesComparator) *ProxyEndpoint {
@@ -49,8 +54,28 @@ func NewProxyEndpoint(backends []*ProxyBackend, routeName string, metrics *Proxy
 	}
 }
 
+// queryHash returns a short, non-reversible hash of the raw query string so
+// that operators can correlate log lines for the same query without logging
+// tenant PromQL / label matchers verbatim.
+func queryHash(rawQuery string) string {
+	sum := sha256.Sum256([]byte(rawQuery))
+	return fmt.Sprintf("%x", sum)[:16]
+}
+
+// queryLogKV returns the key/value pair to use when identifying a query in a
+// log line. If query-content logging is enabled it returns the raw query; by
+// default it returns only a short SHA-256 prefix of the query, so that tenant
+// PromQL and customer label matchers never reach the log sink.
+func (p *ProxyEndpoint) queryLogKV(rawQuery string) (string, string) {
+	if p.logQueryContent {
+		return "query", rawQuery
+	}
+	return "query_hash", queryHash(rawQuery)
+}
+
 func (p *ProxyEndpoint) ServeHTTP(w http.ResponseWriter, r *http.Request) {
-	level.Debug(p.logger).Log("msg", "Received request", "path", r.URL.Path, "query", r.URL.RawQuery)
+	qKey, qVal := p.queryLogKV(r.URL.RawQuery)
+	level.Debug(p.logger).Log("msg", "Received request", "route", p.routeName, "path", r.URL.Path, qKey, qVal)
 
 	// Send the same request to all backends.
 	resCh := make(chan *backendResponse, len(p.backends))
@@ -60,7 +85,14 @@ func (p *ProxyEndpoint) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	downstreamRes := p.waitBackendResponseForDownstream(resCh)
 
 	if downstreamRes.err != nil {
-		http.Error(w, downstreamRes.err.Error(), http.StatusInternalServerError)
+		// Log the full backend error for operator debugging, but never
+		// return it to the client: the error string embeds the internal
+		// backend URL (scheme/host/port/path) rewritten in
+		// proxy_backend.createBackendRequest, plus dial/DNS/TLS detail.
+		// Returning that verbatim leaks internal topology to any
+		// unauthenticated caller of the query-tee port.
+		level.Warn(p.logger).Log("msg", "backend request failed", "route", p.routeName, "backend", downstreamRes.backend.name, "err", downstreamRes.err)
+		http.Error(w, "upstream request failed", http.StatusBadGateway)
 	} else {
 		w.WriteHeader(downstreamRes.status)
 		if _, err := w.Write(downstreamRes.body); err != nil {
@@ -103,7 +135,8 @@ func (p *ProxyEndpoint) executeBackendRequests(r *http.Request, resCh chan *back
 				lvl = level.Warn
 			}
 
-			lvl(p.logger).Log("msg", "Backend response", "path", r.URL.Path, "query", r.URL.RawQuery, "backend", b.name, "status", status, "elapsed", elapsed)
+			qKey, qVal := p.queryLogKV(r.URL.RawQuery)
+			lvl(p.logger).Log("msg", "Backend response", "route", p.routeName, "path", r.URL.Path, qKey, qVal, "backend", b.name, "status", status, "elapsed", elapsed)
 			p.metrics.requestDuration.WithLabelValues(res.backend.name, r.Method, p.routeName, strconv.Itoa(res.statusCode())).Observe(elapsed.Seconds())
 
 			// Keep track of the response if required.
@@ -132,8 +165,18 @@ func (p *ProxyEndpoint) executeBackendRequests(r *http.Request, resCh chan *back
 		result := comparisonSuccess
 		err := p.compareResponses(expectedResponse, actualResponse)
 		if err != nil {
-			level.Error(util_log.Logger).Log("msg", "response comparison failed", "route-name", p.routeName,
-				"query", r.URL.RawQuery, "err", err)
+			qKey, qVal := p.queryLogKV(r.URL.RawQuery)
+			// The comparator error message encodes the full customer
+			// label set (model.Metric.String()) and sometimes sample
+			// values. Only emit it verbatim when the operator has
+			// explicitly opted in to logging tenant query content.
+			if p.logQueryContent {
+				level.Error(util_log.Logger).Log("msg", "response comparison failed", "route-name", p.routeName,
+					qKey, qVal, "err", err)
+			} else {
+				level.Error(util_log.Logger).Log("msg", "response comparison failed", "route-name", p.routeName,
+					qKey, qVal, "err", "redacted (enable -log.query-content to see tenant content)")
+			}
 			result = comparisonFailed
 		}
 

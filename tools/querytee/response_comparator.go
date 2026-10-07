@@ -109,9 +109,18 @@ func compareMatrix(expectedRaw, actualRaw json.RawMessage, tolerance float64) er
 			err := fmt.Errorf("expected %d samples for metric %s but got %d", expectedMetricLen,
 				expectedMetric.Metric, actualMetricLen)
 			if expectedMetricLen > 0 && actualMetricLen > 0 {
-				level.Error(util_log.Logger).Log("msg", err.Error(), "oldest-expected-ts", expectedMetric.Values[0].Timestamp,
+				// Log the metric fingerprint rather than the full customer
+				// label set, and omit the sample values; the label set and
+				// sample values are tenant-sensitive content that must not
+				// be written to an operator log sink by default.
+				level.Error(util_log.Logger).Log("msg", "sample count mismatch",
+					"metric_fingerprint", expectedMetric.Metric.Fingerprint().String(),
+					"expected-samples", expectedMetricLen,
+					"actual-samples", actualMetricLen,
+					"oldest-expected-ts", expectedMetric.Values[0].Timestamp,
 					"newest-expected-ts", expectedMetric.Values[expectedMetricLen-1].Timestamp,
-					"oldest-actual-ts", actualMetric.Values[0].Timestamp, "newest-actual-ts", actualMetric.Values[actualMetricLen-1].Timestamp)
+					"oldest-actual-ts", actualMetric.Values[0].Timestamp,
+					"newest-actual-ts", actualMetric.Values[actualMetricLen-1].Timestamp)
 			}
 			return err
 		}

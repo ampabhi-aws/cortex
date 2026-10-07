@@ -32,6 +32,13 @@ type ProxyConfig struct {
 	CompareResponses               bool
 	ValueComparisonTolerance       float64
 	PassThroughNonRegisteredRoutes bool
+	// LogQueryContent, when true, opts in to logging the raw tenant query
+	// string and the full customer metric label set / sample values on the
+	// Backend-response, request and comparison-failure log lines. Defaults
+	// to false because those strings are tenant-sensitive content; when it
+	// is enabled the query-tee logs must be treated at the same sensitivity
+	// level as tenant query logs.
+	LogQueryContent bool
 }
 
 func (cfg *ProxyConfig) RegisterFlags(f *flag.FlagSet) {
@@ -42,6 +49,7 @@ func (cfg *ProxyConfig) RegisterFlags(f *flag.FlagSet) {
 	f.BoolVar(&cfg.CompareResponses, "proxy.compare-responses", false, "Compare responses between preferred and secondary endpoints for supported routes.")
 	f.Float64Var(&cfg.ValueComparisonTolerance, "proxy.value-comparison-tolerance", 0.000001, "The tolerance to apply when comparing floating point values in the responses. 0 to disable tolerance and require exact match (not recommended).")
 	f.BoolVar(&cfg.PassThroughNonRegisteredRoutes, "proxy.passthrough-non-registered-routes", false, "Passthrough requests for non-registered routes to preferred backend.")
+	f.BoolVar(&cfg.LogQueryContent, "log.query-content", false, "If enabled, query-tee will log the raw tenant query string and full customer metric label set / sample values on backend-response and comparison-failure log lines. Treat these logs at the same sensitivity level as tenant query logs. Disabled by default; only a short SHA-256 prefix of the query string and the metric fingerprint are logged.")
 }
 
 type Route struct {
@@ -163,7 +171,9 @@ func (p *Proxy) Start() error {
 		if p.cfg.CompareResponses {
 			comparator = route.ResponseComparator
 		}
-		router.Path(route.Path).Methods(route.Methods...).Handler(NewProxyEndpoint(p.backends, route.RouteName, p.metrics, p.logger, comparator))
+		endpoint := NewProxyEndpoint(p.backends, route.RouteName, p.metrics, p.logger, comparator)
+		endpoint.logQueryContent = p.cfg.LogQueryContent
+		router.Path(route.Path).Methods(route.Methods...).Handler(endpoint)
 	}
 
 	if p.cfg.PassThroughNonRegisteredRoutes {

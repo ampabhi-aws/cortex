@@ -105,15 +105,32 @@ func (b *ProxyBackend) doBackendRequest(req *http.Request) (int, []byte, error) 
 	// Execute the request.
 	res, err := b.client.Do(req.WithContext(ctx))
 	if err != nil {
-		return 0, nil, errors.Wrap(err, "executing backend request")
+		// http.Client.Do returns a *url.Error whose string form embeds the
+		// internal backend URL (scheme, host, port, path, query) that we
+		// rewrote in createBackendRequest, plus dial/DNS/TLS details.
+		// Strip the URL so that neither the response path (which would
+		// otherwise disclose internal topology to an unauthenticated
+		// caller) nor the operator log line echoes those fields.
+		return 0, nil, errors.Wrapf(stripURLFromError(err), "executing request against backend %s", b.name)
 	}
 
 	// Read the entire response body.
 	defer res.Body.Close()
 	body, err := io.ReadAll(res.Body)
 	if err != nil {
-		return 0, nil, errors.Wrap(err, "reading backend response")
+		return 0, nil, errors.Wrapf(stripURLFromError(err), "reading response from backend %s", b.name)
 	}
 
 	return res.StatusCode, body, nil
+}
+
+// stripURLFromError unwraps *url.Error so that the resulting error no longer
+// contains the operator-configured internal backend URL. The caller is
+// expected to re-wrap with a backend name only (never the URL).
+func stripURLFromError(err error) error {
+	var urlErr *url.Error
+	if errors.As(err, &urlErr) && urlErr.Err != nil {
+		return urlErr.Err
+	}
+	return err
 }
