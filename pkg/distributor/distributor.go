@@ -489,6 +489,16 @@ func (d *Distributor) checkSample(ctx context.Context, userID, cluster, replica 
 		return false, nil
 	}
 
+	// Likewise, if the cluster label value is too long, don't use it for HA dedupe.
+	// Otherwise it would be written verbatim as the HA-tracker KV key, as a key in
+	// the in-process elected/clusters maps, and as a Prometheus label value on
+	// several metric vectors - letting a tenant uncontrollably grow heap, metric
+	// cardinality and KV write load on the shared Consul/etcd store. The series
+	// will still be rejected later by label-value-length validation.
+	if len(cluster) > d.limits.MaxLabelValueLength(userID) {
+		return false, nil
+	}
+
 	// At this point we know we have both HA labels, we should lookup
 	// the cluster/instance here to see if we want to accept this sample.
 	err := d.HATracker.checkReplica(ctx, userID, cluster, replica, time.Now())
