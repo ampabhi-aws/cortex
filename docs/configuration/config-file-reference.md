@@ -143,6 +143,16 @@ tenant_federation:
   # CLI flag: -tenant-federation.enabled
   [enabled: <boolean> | default = false]
 
+  # The maximum number of tenants allowed for a single federated query.
+  # Requests with more tenants are rejected with HTTP 400 before any
+  # sub-querier is allocated. Set to 0 to disable the limit (not recommended
+  # in multi-tenant deployments). Note: Cortex applies no authorization to
+  # the self-asserted tenant list in X-Scope-OrgID, so the authenticating
+  # proxy in front of Cortex must also restrict which tenant IDs a caller
+  # may list.
+  # CLI flag: -tenant-federation.max-tenants
+  [max_tenants: <int> | default = 0]
+
 # The ruler_config configures the Cortex ruler.
 [ruler: <ruler_config>]
 
