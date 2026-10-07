@@ -288,6 +288,9 @@ var (
 	ErrNoRuleGroups = errors.New("no rule groups found")
 	// ErrBadRuleGroup is returned when the provided rule group can not be unmarshalled
 	ErrBadRuleGroup = errors.New("unable to decoded rule group")
+	// ErrInvalidNamespace signals that the namespace provided in the request is
+	// not a valid, filesystem-safe identifier.
+	ErrInvalidNamespace = errors.New("invalid namespace")
 )
 
 func marshalAndSend(output interface{}, w http.ResponseWriter, logger log.Logger) {
@@ -333,7 +336,17 @@ func parseNamespace(params map[string]string) (string, error) {
 
 	namespace, err := url.PathUnescape(namespace)
 	if err != nil {
-		return "", err
+		return "", ErrInvalidNamespace
+	}
+
+	// Reject namespaces that could escape the per-tenant rule directory on
+	// filesystem-backed stores (mirrors the existing tenant-ID guard in
+	// pkg/tenant/resolver.go). The router runs in encoded-path mode, so
+	// percent-encoded traversal sequences (e.g. %2e%2e%2f) reach us here as
+	// decoded "../" and must be rejected before being passed to the store.
+	if namespace == "" || namespace == "." || namespace == ".." ||
+		strings.ContainsAny(namespace, "/\\") || strings.ContainsRune(namespace, 0) {
+		return "", ErrInvalidNamespace
 	}
 
 	return namespace, nil
@@ -395,7 +408,12 @@ func (a *API) ListRules(w http.ResponseWriter, req *http.Request) {
 	level.Debug(logger).Log("msg", "retrieving rule groups with namespace", "userID", userID, "namespace", namespace)
 	rgs, err := a.store.ListRuleGroupsForUserAndNamespace(req.Context(), userID, namespace)
 	if err != nil {
-		http.Error(w, err.Error(), http.StatusBadRequest)
+		// Do not echo raw store errors to the caller: on filesystem-backed
+		// stores they may include absolute paths or snippets of parsed file
+		// contents (an existence/partial-read oracle). Log the detail and
+		// return a generic error message.
+		level.Warn(logger).Log("msg", "unable to list rule groups", "userID", userID, "namespace", namespace, "err", err)
+		http.Error(w, "unable to list rule groups", http.StatusBadRequest)
 		return
 	}
 
