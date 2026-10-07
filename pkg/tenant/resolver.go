@@ -3,11 +3,44 @@ package tenant
 import (
 	"context"
 	"errors"
+	"fmt"
 	"net/http"
 	"strings"
+	"sync/atomic"
 
 	"github.com/weaveworks/common/user"
 )
+
+// defaultMaxTenantIDs is the default upper bound on how many tenant IDs may be
+// present in a single federated request. It is used by MultiResolver when no
+// override has been installed via SetMaxTenantIDs. The default is intentionally
+// conservative: real deployments rarely federate across more than a handful of
+// tenants, while an unbounded list enables single-request fan-out DoS
+// (CWE-770) via the merge queryable.
+const defaultMaxTenantIDs = 10
+
+// maxTenantIDs holds the current cap on the number of tenant IDs permitted in
+// a federated X-Scope-OrgID. A value of 0 disables the check (unbounded). Set
+// via SetMaxTenantIDs during process startup from the tenant-federation
+// config.
+var maxTenantIDs int32 = defaultMaxTenantIDs
+
+// SetMaxTenantIDs installs the maximum number of tenant IDs allowed in a
+// single federated request. A non-positive value disables the limit
+// (unbounded) and should only be used in tests or where an outer component is
+// known to enforce an equivalent bound.
+func SetMaxTenantIDs(n int) {
+	if n < 0 {
+		n = 0
+	}
+	atomic.StoreInt32(&maxTenantIDs, int32(n))
+}
+
+// MaxTenantIDs returns the current limit on tenant IDs per request (0 means
+// unbounded).
+func MaxTenantIDs() int {
+	return int(atomic.LoadInt32(&maxTenantIDs))
+}
 
 var defaultResolver Resolver = NewSingleResolver()
 
@@ -130,6 +163,9 @@ func (t *MultiResolver) TenantIDs(ctx context.Context) ([]string, error) {
 	}
 
 	orgIDs := strings.Split(orgID, tenantIDsLabelSeparator)
+	if maxN := MaxTenantIDs(); maxN > 0 && len(orgIDs) > maxN {
+		return nil, fmt.Errorf("too many tenant IDs: %d (max %d)", len(orgIDs), maxN)
+	}
 	for _, orgID := range orgIDs {
 		if err := ValidTenantID(orgID); err != nil {
 			return nil, err

@@ -333,6 +333,7 @@ func New(cfg Config) (*Cortex, error) {
 	if cfg.TenantFederation.Enabled {
 		util_log.WarnExperimentalUse("tenant-federation")
 		tenant.WithDefaultResolver(tenant.NewMultiResolver())
+		tenant.SetMaxTenantIDs(cfg.TenantFederation.MaxTenants)
 	}
 
 	// Don't check auth header on TransferChunks, as we weren't originally
