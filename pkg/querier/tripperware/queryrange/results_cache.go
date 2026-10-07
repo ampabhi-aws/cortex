@@ -17,6 +17,7 @@ import (
 	otlog "github.com/opentracing/opentracing-go/log"
 	"github.com/pkg/errors"
 	"github.com/prometheus/client_golang/prometheus"
+	"github.com/prometheus/client_golang/prometheus/promauto"
 	"github.com/prometheus/common/model"
 	"github.com/prometheus/prometheus/model/timestamp"
 	"github.com/prometheus/prometheus/promql"
@@ -164,6 +165,12 @@ type resultsCache struct {
 	cacheGenNumberLoader       CacheGenNumberLoader
 	shouldCache                ShouldCacheFn
 	cacheQueryableSamplesStats bool
+
+	// keyMismatchCounter counts cache responses whose embedded plaintext key
+	// does not match the requested key. In a correctly operating cluster this
+	// should be zero; a non-zero value indicates either a hash collision or an
+	// attempt by another tenant to poison the shared cache.
+	keyMismatchCounter prometheus.Counter
 }
 
 // NewResultsCacheMiddleware creates results cache middleware from config.
@@ -195,6 +202,11 @@ func NewResultsCacheMiddleware(
 		c = cache.NewCacheGenNumMiddleware(c)
 	}
 
+	keyMismatchCounter := promauto.With(reg).NewCounter(prometheus.CounterOpts{
+		Name: "cortex_frontend_results_cache_key_mismatch_total",
+		Help: "Total number of results-cache fetches whose embedded plaintext key did not match the requested key. A non-zero value indicates a hash collision or a cache-poisoning attempt.",
+	})
+
 	return tripperware.MiddlewareFunc(func(next tripperware.Handler) tripperware.Handler {
 		return &resultsCache{
 			logger:                     logger,
@@ -209,6 +221,7 @@ func NewResultsCacheMiddleware(
 			cacheGenNumberLoader:       cacheGenNumberLoader,
 			shouldCache:                shouldCache,
 			cacheQueryableSamplesStats: cfg.CacheQueryableSamplesStats,
+			keyMismatchCounter:         keyMismatchCounter,
 		}
 	}), c, nil
 }
@@ -619,6 +632,18 @@ func (s resultsCache) get(ctx context.Context, key string) ([]Extent, bool) {
 	}
 
 	if resp.Key != key {
+		// A non-matching key means either an (astronomically unlikely with
+		// SHA-256) hash collision, or a cache-poisoning attempt from another
+		// tenant on a shared cache backend. Emit a dedicated metric/log line
+		// so the event is observable rather than silently reported as a miss.
+		if s.keyMismatchCounter != nil {
+			s.keyMismatchCounter.Inc()
+		}
+		level.Warn(util_log.WithContext(ctx, s.logger)).Log(
+			"msg", "results cache key mismatch; treating as miss",
+			"requested_key", key,
+			"stored_key", resp.Key,
+		)
 		return nil, false
 	}
 

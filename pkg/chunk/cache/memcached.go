@@ -2,9 +2,9 @@ package cache
 
 import (
 	"context"
+	"crypto/sha256"
 	"encoding/hex"
 	"flag"
-	"hash/fnv"
 	"sync"
 	"time"
 
@@ -265,10 +265,19 @@ func (c *Memcached) Stop() {
 }
 
 // HashKey hashes key into something you can store in memcached.
+//
+// It uses SHA-256 truncated to 128 bits (16 bytes), hex-encoded to a 32-byte
+// ASCII string. The previous implementation used a 64-bit FNV-1a digest, which
+// is both too narrow (generic birthday collisions at ~2^32 work) and
+// invertible, allowing a tenant on a shared results cache to construct keys
+// that collide with another tenant's results-cache key and mutually evict it
+// (CWE-328). A collision-resistant digest removes that attack surface while
+// the hex output remains well under memcached's 250-byte key limit. The
+// plaintext-key comparison in results_cache.go remains in place as
+// defence in depth.
 func HashKey(key string) string {
-	hasher := fnv.New64a()
-	_, _ = hasher.Write([]byte(key)) // This'll never error.
-
-	// Hex because memcache errors for the bytes produced by the hash.
-	return hex.EncodeToString(hasher.Sum(nil))
+	sum := sha256.Sum256([]byte(key))
+	// 128 bits is more than sufficient for cache-key collision resistance and
+	// keeps the hex-encoded output short (32 bytes).
+	return hex.EncodeToString(sum[:16])
 }
