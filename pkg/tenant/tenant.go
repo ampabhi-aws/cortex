@@ -90,7 +90,6 @@ func isSupported(c rune) bool {
 		c == '-' ||
 		c == '_' ||
 		c == '.' ||
-		c == '*' ||
 		c == '\'' ||
 		c == '(' ||
 		c == ')'

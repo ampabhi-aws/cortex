@@ -311,13 +311,28 @@ func clusterWait(position func() int, timeout time.Duration) func() time.Duratio
 // ApplyConfig applies a new configuration to an Alertmanager.
 func (am *Alertmanager) ApplyConfig(userID string, conf *config.Config, rawCfg string) error {
 	templateFiles := make([]string, len(conf.Templates))
+	dir := filepath.Join(am.cfg.TenantDataDir, templatesDir)
+	absDir, err := filepath.Abs(dir)
+	if err != nil {
+		return err
+	}
 	for i, t := range conf.Templates {
-		templateFilepath, err := safeTemplateFilepath(filepath.Join(am.cfg.TenantDataDir, templatesDir), t)
+		templateFilepath, err := safeTemplateFilepath(dir, t)
 		if err != nil {
 			return err
 		}
 
-		templateFiles[i] = templateFilepath
+		// template.FromGlobs treats each path as a glob pattern (filepath.Glob
+		// + text/template.ParseGlob). The tenant-controlled directory prefix
+		// (`<DataDir>/<tenantID>/templates`) is derived from a self-asserted
+		// `X-Scope-OrgID` and must therefore be glob-escaped so a tenant whose
+		// ID contains a glob metacharacter cannot expand the pattern across
+		// other tenants' template directories.
+		if strings.HasPrefix(templateFilepath, absDir) {
+			templateFiles[i] = escapeGlobMeta(templateFilepath[:len(absDir)]) + templateFilepath[len(absDir):]
+		} else {
+			templateFiles[i] = templateFilepath
+		}
 	}
 
 	tmpl, err := template.FromGlobs(templateFiles...)
@@ -731,4 +746,28 @@ func alertSize(alert model.Alert) int {
 	}
 	size += len(alert.GeneratorURL)
 	return size
+}
+
+// escapeGlobMeta escapes filesystem glob metacharacters (`*`, `?`, `[` and
+// `\`) with a backslash so the resulting string is treated as a literal
+// path segment by filepath.Glob and text/template.ParseGlob on POSIX. It is
+// used to neutralise glob metacharacters that may appear in a tenant-
+// controlled path prefix before passing it to template.FromGlobs. Note:
+// filepath.Match disables escaping on Windows (`\` is a path separator),
+// so operators running on Windows must rely on `containsUnsafePathSegments`
+// in pkg/tenant to reject tenant IDs containing glob metacharacters.
+func escapeGlobMeta(p string) string {
+	if !strings.ContainsAny(p, "\\*?[]") {
+		return p
+	}
+	var b strings.Builder
+	b.Grow(len(p) + 4)
+	for _, r := range p {
+		switch r {
+		case '\\', '*', '?', '[', ']':
+			b.WriteByte('\\')
+		}
+		b.WriteRune(r)
+	}
+	return b.String()
 }

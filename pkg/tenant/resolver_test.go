@@ -99,6 +99,30 @@ func TestSingleResolver(t *testing.T) {
 			errTenantID:  errInvalidTenantID,
 			errTenantIDs: errInvalidTenantID,
 		},
+		{
+			name:         "containing-asterisk",
+			headerValue:  strptr("glob*star"),
+			errTenantID:  errInvalidTenantID,
+			errTenantIDs: errInvalidTenantID,
+		},
+		{
+			name:         "containing-question-mark",
+			headerValue:  strptr("q?mark"),
+			errTenantID:  errInvalidTenantID,
+			errTenantIDs: errInvalidTenantID,
+		},
+		{
+			name:         "containing-open-bracket",
+			headerValue:  strptr("bracket["),
+			errTenantID:  errInvalidTenantID,
+			errTenantIDs: errInvalidTenantID,
+		},
+		{
+			name:         "containing-close-bracket",
+			headerValue:  strptr("bracket]"),
+			errTenantID:  errInvalidTenantID,
+			errTenantIDs: errInvalidTenantID,
+		},
 	}...) {
 		t.Run(tc.name, tc.test(r))
 	}
