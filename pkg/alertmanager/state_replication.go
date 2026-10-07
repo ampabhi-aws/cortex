@@ -144,16 +144,28 @@ func (s *state) AddState(key string, cs cluster.State, _ prometheus.Registerer) 
 
 // MergePartialState merges a received partial message with an internal state.
 func (s *state) MergePartialState(p *clusterpb.Part) error {
+	// Validate the key against the set of registered keys before touching any
+	// metric. p.Key is caller-controlled (it arrives over gRPC as part of a
+	// clusterpb.Part), and prometheus.CounterVec.WithLabelValues permanently
+	// retains a child metric per distinct label value. Using unvalidated input
+	// as a label value would allow a caller to cause unbounded label cardinality
+	// growth, consuming memory and CPU on each /metrics scrape.
+	s.mtx.Lock()
+	st, ok := s.states[p.Key]
+	s.mtx.Unlock()
+	if !ok {
+		// Do NOT create a metric child for an unknown key; use a bounded,
+		// well-known label value instead.
+		s.partialStateMergesFailed.WithLabelValues("unknown").Inc()
+		return fmt.Errorf("key not found while merging")
+	}
+
+	// p.Key is now known to be one of the registered keys (added via AddState),
+	// so it is safe to use as a label value.
 	s.partialStateMergesTotal.WithLabelValues(p.Key).Inc()
 
 	s.mtx.Lock()
 	defer s.mtx.Unlock()
-	st, ok := s.states[p.Key]
-	if !ok {
-		s.partialStateMergesFailed.WithLabelValues(p.Key).Inc()
-		return fmt.Errorf("key not found while merging")
-	}
-
 	if err := st.Merge(p.Data); err != nil {
 		s.partialStateMergesFailed.WithLabelValues(p.Key).Inc()
 		return err
