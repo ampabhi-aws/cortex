@@ -419,6 +419,54 @@ alertmanager_config: |
 			err: errors.Wrap(errVictorOpsAPIKeyFileNotAllowed, "error validating Alertmanager config"),
 		},
 		{
+			name: "Should return error if OpsGenie api_key_file is set in receiver",
+			cfg: `
+alertmanager_config: |
+  receivers:
+    - name: default-receiver
+      opsgenie_configs:
+        - api_key_file: /secrets
+
+  route:
+    receiver: 'default-receiver'
+`,
+			err: errors.Wrap(errOpsGenieAPIKeyFileNotAllowed, "error validating Alertmanager config"),
+		},
+		{
+			name: "Should return error if global opsgenie_api_key_file is set",
+			cfg: `
+alertmanager_config: |
+  global:
+    opsgenie_api_key_file: /secrets
+
+  receivers:
+    - name: default-receiver
+      webhook_configs:
+        - url: http://localhost
+
+  route:
+    receiver: 'default-receiver'
+`,
+			err: errors.Wrap(errOpsGenieAPIKeyFileNotAllowed, "error validating Alertmanager config"),
+		},
+		{
+			name: "Should return error if global opsgenie_api_key_file is set together with a receiver api_url (bypass via merge)",
+			cfg: `
+alertmanager_config: |
+  global:
+    opsgenie_api_key_file: /secrets
+
+  receivers:
+    - name: default-receiver
+      opsgenie_configs:
+        - api_url: http://attacker.example.com/
+
+  route:
+    receiver: 'default-receiver'
+`,
+			err: errors.Wrap(errOpsGenieAPIKeyFileNotAllowed, "error validating Alertmanager config"),
+		},
+		{
 			name: "should return error if template is wrong",
 			cfg: `
 alertmanager_config: |
