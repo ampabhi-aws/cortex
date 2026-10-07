@@ -29,6 +29,10 @@ type DefaultMultiTenantManager struct {
 
 	mapper *mapper
 
+	// limits provides per-tenant limits consulted during rule-group sync.
+	// May be nil (e.g. in tests) in which case limit-based clamping is skipped.
+	limits RulesLimits
+
 	// Structs for holding per-user Prometheus rules Managers
 	// and a corresponding metrics struct
 	userManagerMtx     sync.Mutex
@@ -47,7 +51,7 @@ type DefaultMultiTenantManager struct {
 	logger                        log.Logger
 }
 
-func NewDefaultMultiTenantManager(cfg Config, managerFactory ManagerFactory, reg prometheus.Registerer, logger log.Logger) (*DefaultMultiTenantManager, error) {
+func NewDefaultMultiTenantManager(cfg Config, managerFactory ManagerFactory, reg prometheus.Registerer, logger log.Logger, limits RulesLimits) (*DefaultMultiTenantManager, error) {
 	ncfg, err := buildNotifierConfig(&cfg)
 	if err != nil {
 		return nil, err
@@ -66,6 +70,7 @@ func NewDefaultMultiTenantManager(cfg Config, managerFactory ManagerFactory, reg
 		mapper:             newMapper(cfg.RulePath, logger),
 		userManagers:       map[string]RulesManager{},
 		userManagerMetrics: userManagerMetrics,
+		limits:             limits,
 		managersTotal: promauto.With(reg).NewGauge(prometheus.GaugeOpts{
 			Namespace: "cortex",
 			Name:      "ruler_managers_total",
@@ -123,6 +128,31 @@ func (r *DefaultMultiTenantManager) SyncRuleGroups(ctx context.Context, ruleGrou
 // syncRulesToManager maps the rule files to disk, detects any changes and will create/update the
 // the users Prometheus Rules Manager.
 func (r *DefaultMultiTenantManager) syncRulesToManager(ctx context.Context, user string, groups rulespb.RuleGroupList) {
+	// Clamp any tenant-supplied group interval that is below the configured per-tenant
+	// minimum. This defends against groups whose interval was persisted before the
+	// RulerMinRuleEvaluationInterval limit was configured (or raised), ensuring they
+	// cannot keep driving a tight evaluation loop on the shared ruler.
+	if r.limits != nil {
+		if min := r.limits.RulerMinRuleEvaluationInterval(user); min > 0 {
+			for _, g := range groups {
+				if g == nil {
+					continue
+				}
+				if g.Interval != 0 && g.Interval < min {
+					level.Warn(r.logger).Log(
+						"msg", "clamping rule group interval to configured minimum",
+						"user", user,
+						"group", g.Name,
+						"namespace", g.Namespace,
+						"requested", g.Interval,
+						"minimum", min,
+					)
+					g.Interval = min
+				}
+			}
+		}
+	}
+
 	// Map the files to disk and return the file names to be passed to the users manager if they
 	// have been updated
 	update, files, err := r.mapper.MapRules(user, groups.Formatted())

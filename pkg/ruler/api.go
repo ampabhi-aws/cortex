@@ -2,6 +2,7 @@ package ruler
 
 import (
 	"encoding/json"
+	"fmt"
 	io "io"
 	"net/http"
 	"net/url"
@@ -473,6 +474,18 @@ func (a *API) CreateRuleGroup(w http.ResponseWriter, req *http.Request) {
 		}
 
 		http.Error(w, strings.Join(e, ", "), http.StatusBadRequest)
+		return
+	}
+
+	// Enforce the per-tenant minimum rule-group evaluation interval. This prevents a tenant
+	// from supplying a tiny `interval:` (e.g. `1ms`) that would cause a tight PromQL
+	// evaluation loop on the shared multi-tenant ruler and starve other tenants.
+	if minInterval := a.ruler.limits.RulerMinRuleEvaluationInterval(userID); minInterval > 0 &&
+		rg.Interval != 0 && time.Duration(rg.Interval) < minInterval {
+		err := fmt.Errorf("rule group interval %s is below the minimum allowed %s",
+			time.Duration(rg.Interval), minInterval)
+		level.Error(logger).Log("msg", "rule group interval below minimum", "err", err.Error(), "user", userID)
+		http.Error(w, err.Error(), http.StatusBadRequest)
 		return
 	}
 
