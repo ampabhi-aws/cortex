@@ -1023,6 +1023,17 @@ func (am *MultitenantAlertmanager) serveRequest(w http.ResponseWriter, req *http
 		return
 	}
 
+	// When sharding is enabled, only the replica that owns the tenant may
+	// bootstrap a per-tenant Alertmanager. A non-owner must not touch the
+	// tenant's config object (which the fallback bootstrap path would
+	// otherwise overwrite with an empty config), nor run a rogue second
+	// Alertmanager for the tenant. Fail closed and let the client retry
+	// against the owner (or via the ring-aware Distributor).
+	if am.cfg.ShardingEnabled && !am.isUserOwned(userID) {
+		http.Error(w, "this instance does not own the tenant's Alertmanager", http.StatusServiceUnavailable)
+		return
+	}
+
 	if am.fallbackConfig != "" {
 		userAM, err = am.alertmanagerFromFallbackConfig(userID)
 		if err != nil {
@@ -1040,6 +1051,20 @@ func (am *MultitenantAlertmanager) serveRequest(w http.ResponseWriter, req *http
 }
 
 func (am *MultitenantAlertmanager) alertmanagerFromFallbackConfig(userID string) (*Alertmanager, error) {
+	// Refuse to overwrite an existing configuration. The fallback bootstrap
+	// path writes an empty config to the alert store so the owning replica
+	// will pick the tenant up on its next poll; if a real config already
+	// exists in the store, that write would silently destroy the tenant's
+	// alertmanager_config and template_files. Any error other than
+	// "not found" is also fatal here: we must not clobber on uncertainty.
+	if existing, err := am.store.GetAlertConfig(context.Background(), userID); err == nil {
+		if existing.RawConfig != "" {
+			return nil, fmt.Errorf("refusing to overwrite existing alertmanager config for user %s", userID)
+		}
+	} else if !errors.Is(err, alertspb.ErrNotFound) {
+		return nil, err
+	}
+
 	// Upload an empty config so that the Alertmanager is no de-activated in the next poll
 	cfgDesc := alertspb.ToProto("", nil, userID)
 	err := am.store.SetAlertConfig(context.Background(), cfgDesc)
