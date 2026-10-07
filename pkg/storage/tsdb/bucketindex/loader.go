@@ -29,6 +29,20 @@ type LoaderConfig struct {
 	UpdateOnStaleInterval time.Duration
 	UpdateOnErrorInterval time.Duration
 	IdleTimeout           time.Duration
+
+	// MaxIndexes caps the number of entries kept in the in-memory bucket
+	// index cache. A value of 0 disables the cap. Setting a positive value
+	// protects against attacker-keyed cache growth caused by requests
+	// supplying arbitrary tenant IDs (e.g. via a federated X-Scope-OrgID
+	// header) because each caller-supplied ID would otherwise occupy a
+	// cache entry until IdleTimeout expires.
+	MaxIndexes int
+
+	// NotFoundIdleTimeout caps how long an ErrIndexNotFound negative-cache
+	// entry is kept. If 0 or greater than IdleTimeout, IdleTimeout is used.
+	// A shorter value is strongly recommended when the tenant list is
+	// attacker-influenced so that unknown tenant IDs do not accumulate.
+	NotFoundIdleTimeout time.Duration
 }
 
 // Loader is responsible to lazy load bucket indexes and, once loaded for the first time,
@@ -138,9 +152,52 @@ func (l *Loader) cacheIndex(userID string, idx *Index, err error) {
 	l.indexesMx.Lock()
 	defer l.indexesMx.Unlock()
 
+	// Bound attacker-keyed cache growth. If the cap is reached and this is
+	// a new entry, evict the least-recently-requested entry (preferring
+	// negative-cache entries) so unknown tenant IDs cannot grow the map
+	// without bound.
+	if l.cfg.MaxIndexes > 0 {
+		if _, exists := l.indexes[userID]; !exists && len(l.indexes) >= l.cfg.MaxIndexes {
+			l.evictOneLocked()
+		}
+	}
+
 	// Not an issue if, due to concurrency, another index was already cached
 	// and we overwrite it: last will win.
 	l.indexes[userID] = newCachedIndex(idx, err)
+}
+
+// evictOneLocked removes a single entry from the cache under indexesMx.
+// It prefers to evict a negative-cache (ErrIndexNotFound) entry; if none
+// is present it evicts the least-recently-requested entry.
+func (l *Loader) evictOneLocked() {
+	var (
+		negativeVictim string
+		negativeFound  bool
+		oldestID       string
+		oldestRequest  int64
+		haveOldest     bool
+	)
+	for id, entry := range l.indexes {
+		if entry.err != nil && errors.Is(entry.err, ErrIndexNotFound) {
+			negativeVictim = id
+			negativeFound = true
+			break
+		}
+		req := entry.requestedAt.Load()
+		if !haveOldest || req < oldestRequest {
+			oldestID = id
+			oldestRequest = req
+			haveOldest = true
+		}
+	}
+	if negativeFound {
+		delete(l.indexes, negativeVictim)
+		return
+	}
+	if haveOldest {
+		delete(l.indexes, oldestID)
+	}
 }
 
 // checkCachedIndexes checks all cached indexes and, for each of them, does two things:
@@ -175,9 +232,18 @@ func (l *Loader) checkCachedIndexesToUpdateAndDelete() (toUpdate, toDelete []str
 		// UpdateOnStaleInterval, we don't consider ErrIndexNotFound as an error with regards to the
 		// refresh interval and so it will updated once stale.
 		isError := entry.err != nil && !errors.Is(entry.err, ErrIndexNotFound)
+		isNotFound := entry.err != nil && errors.Is(entry.err, ErrIndexNotFound)
+
+		// Apply a shorter idle timeout to ErrIndexNotFound entries so that
+		// callers supplying arbitrary (non-existent) tenant IDs cannot grow
+		// the in-memory cache for the full IdleTimeout window.
+		idleTimeout := l.cfg.IdleTimeout
+		if isNotFound && l.cfg.NotFoundIdleTimeout > 0 && l.cfg.NotFoundIdleTimeout < idleTimeout {
+			idleTimeout = l.cfg.NotFoundIdleTimeout
+		}
 
 		switch {
-		case now.Sub(entry.getRequestedAt()) >= l.cfg.IdleTimeout:
+		case now.Sub(entry.getRequestedAt()) >= idleTimeout:
 			toDelete = append(toDelete, userID)
 		case isError && now.Sub(entry.getUpdatedAt()) >= l.cfg.UpdateOnErrorInterval:
 			toUpdate = append(toUpdate, userID)

@@ -307,6 +307,18 @@ type BucketIndexConfig struct {
 	UpdateOnErrorInterval time.Duration `yaml:"update_on_error_interval"`
 	IdleTimeout           time.Duration `yaml:"idle_timeout"`
 	MaxStalePeriod        time.Duration `yaml:"max_stale_period"`
+
+	// MaxIndexes bounds the number of cached bucket-index entries kept in
+	// memory by the querier. 0 disables the cap. Setting a positive value
+	// is recommended when tenant-federation is enabled since the tenant
+	// list in X-Scope-OrgID is attacker-influenced.
+	MaxIndexes int `yaml:"max_indexes"`
+
+	// NotFoundIdleTimeout caps how long an ErrIndexNotFound entry is kept
+	// in the in-memory cache. If 0 or greater than IdleTimeout, IdleTimeout
+	// is used. A short value (e.g. 1-5 minutes) is recommended so unknown
+	// tenant IDs cannot accumulate.
+	NotFoundIdleTimeout time.Duration `yaml:"not_found_idle_timeout"`
 }
 
 func (cfg *BucketIndexConfig) RegisterFlagsWithPrefix(f *flag.FlagSet, prefix string) {
@@ -314,4 +326,6 @@ func (cfg *BucketIndexConfig) RegisterFlagsWithPrefix(f *flag.FlagSet, prefix st
 	f.DurationVar(&cfg.UpdateOnErrorInterval, prefix+"update-on-error-interval", time.Minute, "How frequently a bucket index, which previously failed to load, should be tried to load again. This option is used only by querier.")
 	f.DurationVar(&cfg.IdleTimeout, prefix+"idle-timeout", time.Hour, "How long a unused bucket index should be cached. Once this timeout expires, the unused bucket index is removed from the in-memory cache. This option is used only by querier.")
 	f.DurationVar(&cfg.MaxStalePeriod, prefix+"max-stale-period", time.Hour, "The maximum allowed age of a bucket index (last updated) before queries start failing because the bucket index is too old. The bucket index is periodically updated by the compactor, while this check is enforced in the querier (at query time).")
+	f.IntVar(&cfg.MaxIndexes, prefix+"max-indexes", 0, "Maximum number of bucket-index entries cached in memory by the querier. 0 disables the cap. Set a positive value to bound attacker-keyed cache growth when tenant-federation is enabled.")
+	f.DurationVar(&cfg.NotFoundIdleTimeout, prefix+"not-found-idle-timeout", 5*time.Minute, "How long a bucket-index not-found negative-cache entry is kept in memory by the querier. If greater than idle-timeout or 0, idle-timeout is used. Must be set to a short duration to bound memory growth from unknown tenant IDs.")
 }

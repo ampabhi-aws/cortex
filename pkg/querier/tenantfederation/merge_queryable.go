@@ -3,6 +3,7 @@ package tenantfederation
 import (
 	"context"
 	"fmt"
+	"net/http"
 	"sort"
 	"strings"
 
@@ -11,11 +12,14 @@ import (
 	"github.com/prometheus/prometheus/storage"
 	"github.com/prometheus/prometheus/tsdb/chunkenc"
 	tsdb_errors "github.com/prometheus/prometheus/tsdb/errors"
+	"github.com/weaveworks/common/httpgrpc"
 	"github.com/weaveworks/common/user"
 
 	"github.com/cortexproject/cortex/pkg/tenant"
 	"github.com/cortexproject/cortex/pkg/util/concurrency"
+	"github.com/cortexproject/cortex/pkg/util/limiter"
 	"github.com/cortexproject/cortex/pkg/util/spanlogger"
+	"github.com/cortexproject/cortex/pkg/util/validation"
 )
 
 const (
@@ -36,15 +40,39 @@ const (
 // If the label "__tenant_id__" is already existing, its value is overwritten
 // by the tenant ID and the previous value is exposed through a new label
 // prefixed with "original_". This behaviour is not implemented recursively.
-func NewQueryable(upstream storage.Queryable, byPassWithSingleQuerier bool) storage.Queryable {
-	return NewMergeQueryable(defaultTenantLabel, tenantQuerierCallback(upstream), byPassWithSingleQuerier)
+func NewQueryable(upstream storage.Queryable, byPassWithSingleQuerier bool, maxTenants int, limits *validation.Overrides) storage.Queryable {
+	return NewMergeQueryable(defaultTenantLabel, tenantQuerierCallback(upstream, maxTenants, limits), byPassWithSingleQuerier)
 }
 
-func tenantQuerierCallback(queryable storage.Queryable) MergeQuerierCallback {
+func tenantQuerierCallback(queryable storage.Queryable, maxTenants int, limits *validation.Overrides) MergeQuerierCallback {
 	return func(ctx context.Context, mint int64, maxt int64) ([]string, []storage.Querier, error) {
 		tenantIDs, err := tenant.TenantIDs(ctx)
 		if err != nil {
 			return nil, nil, err
+		}
+
+		// Enforce a hard cap on the number of federated tenants so a single
+		// request cannot amplify into an unbounded fan-out across ingesters
+		// and the object store (CWE-770).
+		if maxTenants > 0 && len(tenantIDs) > maxTenants {
+			return nil, nil, httpgrpc.Errorf(http.StatusBadRequest,
+				"too many tenants in the query: %d (limit %d)", len(tenantIDs), maxTenants)
+		}
+
+		// Build a single, shared QueryLimiter for the whole federated query
+		// using the most restrictive non-zero limit across all involved
+		// tenants, and inject it into the context before creating the
+		// per-tenant queriers. This prevents per-query limits from being
+		// silently multiplied by the number of federated tenants.
+		if limits != nil && len(tenantIDs) > 0 {
+			if _, ok := ctx.Value(federatedLimiterCtxKey{}).(struct{}); !ok {
+				maxSeries := validation.SmallestPositiveNonZeroIntPerTenant(tenantIDs, limits.MaxFetchedSeriesPerQuery)
+				maxChunkBytes := validation.SmallestPositiveNonZeroIntPerTenant(tenantIDs, limits.MaxFetchedChunkBytesPerQuery)
+				maxChunks := validation.SmallestPositiveNonZeroIntPerTenant(tenantIDs, limits.MaxChunksPerQuery)
+				maxDataBytes := validation.SmallestPositiveNonZeroIntPerTenant(tenantIDs, limits.MaxFetchedDataBytesPerQuery)
+				ctx = limiter.AddQueryLimiterToContext(ctx, limiter.NewQueryLimiter(maxSeries, maxChunkBytes, maxChunks, maxDataBytes))
+				ctx = context.WithValue(ctx, federatedLimiterCtxKey{}, struct{}{})
+			}
 		}
 
 		var queriers = make([]storage.Querier, len(tenantIDs))
@@ -62,6 +90,20 @@ func tenantQuerierCallback(queryable storage.Queryable) MergeQuerierCallback {
 
 		return tenantIDs, queriers, nil
 	}
+}
+
+// federatedLimiterCtxKey is used to mark that a shared QueryLimiter has
+// already been installed on the context by the tenant-federation callback,
+// so downstream queryables (notably querier.NewQueryable) reuse it rather
+// than installing a fresh per-tenant one.
+type federatedLimiterCtxKey struct{}
+
+// IsFederatedQuery returns true if the context has been annotated by the
+// tenant-federation merge queryable, indicating a shared QueryLimiter is
+// already present and must not be replaced.
+func IsFederatedQuery(ctx context.Context) bool {
+	_, ok := ctx.Value(federatedLimiterCtxKey{}).(struct{})
+	return ok
 }
 
 // MergeQuerierCallback returns the underlying queriers and their IDs relevant
