@@ -5,6 +5,7 @@ import (
 	"time"
 
 	"github.com/go-kit/log"
+	"github.com/go-kit/log/level"
 	"github.com/oklog/ulid"
 	"github.com/pkg/errors"
 	"github.com/prometheus/client_golang/prometheus"
@@ -18,6 +19,11 @@ import (
 var (
 	errBucketIndexBlocksFinderNotRunning = errors.New("bucket index blocks finder is not running")
 	errBucketIndexTooOld                 = errors.New("bucket index is too old and the last time it was updated exceeds the allowed max staleness")
+	// errBucketIndexReadFailed is a sentinel error returned for any unexpected
+	// bucket-index read failure. It intentionally hides provider-specific details
+	// (bucket name, endpoint, key paths, access errors) from HTTP responses; the
+	// underlying error is logged server-side instead.
+	errBucketIndexReadFailed = errors.New("failed to read bucket index")
 )
 
 type BucketIndexBlocksFinderConfig struct {
@@ -33,6 +39,7 @@ type BucketIndexBlocksFinder struct {
 
 	cfg    BucketIndexBlocksFinderConfig
 	loader *bucketindex.Loader
+	logger log.Logger
 }
 
 func NewBucketIndexBlocksFinder(cfg BucketIndexBlocksFinderConfig, bkt objstore.Bucket, cfgProvider bucket.TenantConfigProvider, logger log.Logger, reg prometheus.Registerer) *BucketIndexBlocksFinder {
@@ -41,6 +48,7 @@ func NewBucketIndexBlocksFinder(cfg BucketIndexBlocksFinderConfig, bkt objstore.
 	return &BucketIndexBlocksFinder{
 		cfg:     cfg,
 		loader:  loader,
+		logger:  logger,
 		Service: loader,
 	}
 }
@@ -61,8 +69,16 @@ func (f *BucketIndexBlocksFinder) GetBlocks(ctx context.Context, userID string, 
 		// so the bucket index hasn't been created yet.
 		return nil, nil, nil
 	}
-	if err != nil {
+	if errors.Is(err, bucketindex.ErrIndexCorrupted) {
+		// This is a safe, non-leaky sentinel error; surface it as-is so operators
+		// (and tests) can distinguish it from generic storage failures.
 		return nil, nil, err
+	}
+	if err != nil {
+		// Do not surface provider-specific error text to the caller: it can leak
+		// bucket name, endpoint, access-mode details, or the `<tenant>/bucket-index.json.gz` key.
+		level.Warn(f.logger).Log("msg", "failed to read bucket index", "user", userID, "err", err)
+		return nil, nil, errBucketIndexReadFailed
 	}
 
 	// Ensure the bucket index is not too old.
