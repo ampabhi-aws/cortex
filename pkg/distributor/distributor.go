@@ -466,9 +466,14 @@ func shardByAllLabels(userID string, labels []cortexpb.LabelAdapter) uint32 {
 // Remove the label labelname from a slice of LabelPairs if it exists.
 func removeLabel(labelName string, labels *[]cortexpb.LabelAdapter) {
 	for i := 0; i < len(*labels); i++ {
-		pair := (*labels)[i]
-		if pair.Name == labelName {
-			*labels = append((*labels)[:i], (*labels)[i+1:]...)
+		if (*labels)[i].Name == labelName {
+			ls := *labels
+			copy(ls[i:], ls[i+1:])
+			// Drop the duplicated tail reference so the vacated slot in the
+			// (potentially pooled) backing array does not keep a zero-copy
+			// string alias into the original request buffer alive.
+			ls[len(ls)-1] = cortexpb.LabelAdapter{}
+			*labels = ls[:len(ls)-1]
 			return
 		}
 	}
