@@ -9,6 +9,7 @@ import (
 	"strings"
 	"sync"
 	"time"
+	"unicode/utf8"
 
 	"github.com/go-kit/log"
 	"github.com/go-kit/log/level"
@@ -226,6 +227,18 @@ func (c *haTracker) loop(ctx context.Context) error {
 
 		user := segments[0]
 		cluster := segments[1]
+
+		// Prometheus *Vec.WithLabelValues panics on label values that are not valid UTF-8
+		// (vendor/github.com/prometheus/client_golang/prometheus/labels.go). Because the KV
+		// store (etcd in particular) preserves raw key bytes end-to-end, a poisoned key
+		// previously persisted into the KV store would otherwise crash the haTracker.loop
+		// goroutine on every distributor replaying the watch. Skip such entries defensively;
+		// the admission path now validates cluster UTF-8 so no new poisoned keys can be
+		// created, and stale ones will be removed by cleanupOldReplicas.
+		if !utf8.ValidString(user) || !utf8.ValidString(cluster) {
+			level.Warn(c.logger).Log("msg", "ignoring HA tracker KV entry with invalid UTF-8 key", "key", key)
+			return true
+		}
 
 		c.electedLock.Lock()
 		defer c.electedLock.Unlock()
