@@ -136,6 +136,12 @@ type RulesLimits interface {
 	RulerTenantShardSize(userID string) int
 	RulerMaxRuleGroupsPerTenant(userID string) int
 	RulerMaxRulesPerRuleGroup(userID string) int
+	// RulerMinRuleEvaluationInterval returns the per-tenant minimum allowed
+	// evaluation interval for a rule group. Tenants that submit a rule group
+	// with a shorter interval are rejected at write time and clamped up to
+	// this value when existing groups are loaded from the rule store.
+	// A value of 0 disables the limit (preserving legacy behaviour).
+	RulerMinRuleEvaluationInterval(userID string) time.Duration
 }
 
 // EngineQueryFunc returns a new query function using the rules.EngineQueryFunc function
