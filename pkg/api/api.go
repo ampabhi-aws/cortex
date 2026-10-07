@@ -48,6 +48,13 @@ type Config struct {
 	AlertmanagerHTTPPrefix string `yaml:"alertmanager_http_prefix"`
 	PrometheusHTTPPrefix   string `yaml:"prometheus_http_prefix"`
 
+	// EnableConfigEndpoints controls whether the /config and /runtime_config
+	// endpoints are registered. When true, the endpoints are registered with the
+	// tenant-authentication middleware so that unauthenticated callers cannot
+	// retrieve the full process configuration, infrastructure credentials, or
+	// the full tenant inventory from the runtime config. Defaults to false.
+	EnableConfigEndpoints bool `yaml:"enable_config_endpoints"`
+
 	// The following configs are injected by the upstream caller.
 	ServerPrefix       string               `yaml:"-"`
 	LegacyHTTPPrefix   string               `yaml:"-"`
@@ -71,6 +78,7 @@ type Config struct {
 func (cfg *Config) RegisterFlags(f *flag.FlagSet) {
 	f.BoolVar(&cfg.ResponseCompression, "api.response-compression-enabled", false, "Use GZIP compression for API responses. Some endpoints serve large YAML or JSON blobs which can benefit from compression.")
 	f.Var(&cfg.HTTPRequestHeadersToLog, "api.http-request-headers-to-log", "Which HTTP Request headers to add to logs")
+	f.BoolVar(&cfg.EnableConfigEndpoints, "api.enable-config-endpoints", false, "Expose the /config and /runtime_config endpoints. When disabled (the default) the endpoints are not registered and are not advertised on the index page. When enabled the endpoints are gated by the tenant authentication middleware so that unauthenticated callers cannot read the live process configuration, infrastructure credentials, or the full tenant inventory.")
 	cfg.RegisterFlagsWithPrefix("", f)
 }
 
@@ -214,20 +222,28 @@ func (a *API) RegisterAlertmanager(am *alertmanager.MultitenantAlertmanager, tar
 
 // RegisterAPI registers the standard endpoints associated with a running Cortex.
 func (a *API) RegisterAPI(httpPathPrefix string, actualCfg interface{}, defaultCfg interface{}) {
-	a.indexPage.AddLink(SectionAdminEndpoints, "/config", "Current Config (including the default values)")
-	a.indexPage.AddLink(SectionAdminEndpoints, "/config?mode=diff", "Current Config (show only values that differ from the defaults)")
-
-	a.RegisterRoute("/config", a.cfg.configHandler(actualCfg, defaultCfg), false, "GET")
+	if a.cfg.EnableConfigEndpoints {
+		a.indexPage.AddLink(SectionAdminEndpoints, "/config", "Current Config (including the default values)")
+		a.indexPage.AddLink(SectionAdminEndpoints, "/config?mode=diff", "Current Config (show only values that differ from the defaults)")
+		// Registered with auth=true so that callers must at minimum present an
+		// X-Scope-OrgID tenant header; operators are expected to further protect
+		// this endpoint via an upstream admin proxy / deny-list. This closes
+		// the previous unauthenticated exposure of credentials and topology.
+		a.RegisterRoute("/config", a.cfg.configHandler(actualCfg, defaultCfg), true, "GET")
+	}
 	a.RegisterRoute("/", indexHandler(httpPathPrefix, a.indexPage), false, "GET")
 	a.RegisterRoute("/debug/fgprof", fgprof.Handler(), false, "GET")
 }
 
 // RegisterRuntimeConfig registers the endpoints associates with the runtime configuration
 func (a *API) RegisterRuntimeConfig(runtimeConfigHandler http.HandlerFunc) {
+	if !a.cfg.EnableConfigEndpoints {
+		return
+	}
 	a.indexPage.AddLink(SectionAdminEndpoints, "/runtime_config", "Current Runtime Config (incl. Overrides)")
 	a.indexPage.AddLink(SectionAdminEndpoints, "/runtime_config?mode=diff", "Current Runtime Config (show only values that differ from the defaults)")
 
-	a.RegisterRoute("/runtime_config", runtimeConfigHandler, false, "GET")
+	a.RegisterRoute("/runtime_config", runtimeConfigHandler, true, "GET")
 }
 
 // RegisterDistributor registers the endpoints associated with the distributor.
