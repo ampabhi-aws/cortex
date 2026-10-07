@@ -8,6 +8,7 @@ linters:
     - gofmt
     - misspell
     - depguard
+    - forbidigo
 
 linters-settings:
   staticcheck:
@@ -25,6 +26,17 @@ linters-settings:
     include-go-root: true
     packages-with-error-message:
       - github.com/go-kit/kit/log: "Use github.com/go-kit/log instead of github.com/go-kit/kit/log"
+
+  forbidigo:
+    # Ban the unsound `*((*[]byte)(unsafe.Pointer(&s)))` string->[]byte
+    # reinterpretation: it reads a 3-word slice header from a 2-word string
+    # header, so the resulting slice's capacity is indeterminate and the
+    # construct is undefined behaviour under Go's unsafe.Pointer rules.
+    # Use util.YoloBuf (which builds a correctly-sized header with
+    # cap == len) or, preferably, io.WriteString / xxhash.Digest.WriteString.
+    forbid:
+      - '\*\(\(\*\[\]byte\)\(unsafe\.Pointer\(&'
+    exclude_godoc_examples: false
 
 run:
   timeout: 5m
