@@ -2,6 +2,7 @@ package querier
 
 import (
 	"context"
+	"fmt"
 	"sort"
 	"time"
 
@@ -16,10 +17,12 @@ import (
 	"github.com/cortexproject/cortex/pkg/ingester/client"
 	"github.com/cortexproject/cortex/pkg/prom1/storage/metric"
 	"github.com/cortexproject/cortex/pkg/querier/series"
+	"github.com/cortexproject/cortex/pkg/tenant"
 	"github.com/cortexproject/cortex/pkg/util"
 	"github.com/cortexproject/cortex/pkg/util/chunkcompat"
 	"github.com/cortexproject/cortex/pkg/util/math"
 	"github.com/cortexproject/cortex/pkg/util/spanlogger"
+	"github.com/cortexproject/cortex/pkg/util/validation"
 )
 
 // Distributor is the read interface to the distributor, made an interface here
@@ -280,28 +283,78 @@ func (q *distributorQuerier) Close() error {
 
 type distributorExemplarQueryable struct {
 	distributor Distributor
+	cfg         Config
+	limits      *validation.Overrides
 }
 
-func newDistributorExemplarQueryable(d Distributor) storage.ExemplarQueryable {
+func newDistributorExemplarQueryable(d Distributor, cfg Config, limits *validation.Overrides) storage.ExemplarQueryable {
 	return &distributorExemplarQueryable{
 		distributor: d,
+		cfg:         cfg,
+		limits:      limits,
 	}
 }
 
 func (d distributorExemplarQueryable) ExemplarQuerier(ctx context.Context) (storage.ExemplarQuerier, error) {
 	return &distributorExemplarQuerier{
 		distributor: d.distributor,
+		cfg:         d.cfg,
+		limits:      d.limits,
 		ctx:         ctx,
 	}, nil
 }
 
 type distributorExemplarQuerier struct {
 	distributor Distributor
+	cfg         Config
+	limits      *validation.Overrides
 	ctx         context.Context
 }
 
 // Select querys for exemplars, prometheus' storage.ExemplarQuerier's Select function takes the time range as two int64 values.
 func (q *distributorExemplarQuerier) Select(start, end int64, matchers ...[]*labels.Matcher) ([]exemplar.QueryResult, error) {
+	// Fail fast if the request is already cancelled: the ingester-side
+	// exemplar Select loop holds a read lock and never checks the context,
+	// so there is no point in dispatching work that we know we cannot stop.
+	if err := q.ctx.Err(); err != nil {
+		return nil, err
+	}
+
+	// Apply the same per-tenant limits that other read paths get through
+	// NewQueryable / querier.Select. The exemplar queryable is created
+	// separately and does not go through the tripperware limits chain,
+	// so it needs its own validation to avoid an unbounded, uncancellable
+	// fan-out to every ingester.
+	if q.limits != nil {
+		userID, err := tenant.TenantID(q.ctx)
+		if err != nil {
+			return nil, err
+		}
+
+		// Cap the number of label-matcher sets a single exemplar query may
+		// carry. Prometheus' CircularExemplarStorage.Select walks the per
+		// tenant exemplar index once per entry and evaluates every matcher
+		// set under a read lock without any ctx.Err() check, so the cost
+		// grows as O(exemplar_index * matcher_sets). Reject obviously
+		// abusive requests before dispatching them to every ingester.
+		if maxSets := q.limits.MaxExemplarMatcherSetsPerQuery(userID); maxSets > 0 && len(matchers) > maxSets {
+			return nil, validation.LimitError(fmt.Sprintf("the query exceeds the maximum number of label-matcher sets allowed per exemplar query (limit: %d actual: %d)", maxSets, len(matchers)))
+		}
+
+		// Clamp the time range to [-max_query_lookback, now+max_query_into_future]
+		// in the same way as the sample read path, and enforce max_query_length.
+		startMs, endMs, err := validateQueryTimeRange(q.ctx, userID, start, end, q.limits, q.cfg.MaxQueryIntoFuture)
+		if err == errEmptyTimeRange {
+			return nil, nil
+		} else if err != nil {
+			return nil, err
+		}
+		if maxQueryLength := q.limits.MaxQueryLength(userID); maxQueryLength > 0 && time.Duration(endMs-startMs)*time.Millisecond > maxQueryLength {
+			return nil, validation.LimitError(fmt.Sprintf(validation.ErrQueryTooLong, time.Duration(endMs-startMs)*time.Millisecond, maxQueryLength))
+		}
+		start, end = startMs, endMs
+	}
+
 	allResults, err := q.distributor.QueryExemplars(q.ctx, model.Time(start), model.Time(end), matchers...)
 
 	if err != nil {
