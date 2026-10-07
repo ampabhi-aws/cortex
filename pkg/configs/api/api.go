@@ -1,6 +1,7 @@
 package api
 
 import (
+	"crypto/subtle"
 	"database/sql"
 	"encoding/json"
 	"errors"
@@ -35,6 +36,14 @@ var (
 // Config configures Configs API
 type Config struct {
 	Notifications NotificationsConfig `yaml:"notifications"`
+
+	// InternalBearerToken is the shared secret the ruler/alertmanager clients
+	// must send in the Authorization header when calling the /private/* bulk
+	// configuration endpoints. If empty, the /private/* endpoints are
+	// disabled (returns 403) because they would otherwise disclose every
+	// tenant's rules and raw Alertmanager configuration (including notifier
+	// secrets) to any caller able to reach the HTTP listener.
+	InternalBearerToken string `yaml:"internal_bearer_token"`
 }
 
 // NotificationsConfig configures Alertmanager notifications method.
@@ -47,6 +56,27 @@ type NotificationsConfig struct {
 func (cfg *Config) RegisterFlags(f *flag.FlagSet) {
 	f.BoolVar(&cfg.Notifications.DisableEmail, "configs.notifications.disable-email", false, "Disable Email notifications for Alertmanager.")
 	f.BoolVar(&cfg.Notifications.DisableWebHook, "configs.notifications.disable-webhook", false, "Disable WebHook notifications for Alertmanager.")
+	f.StringVar(&cfg.InternalBearerToken, "configs.internal-bearer-token", "", "Shared bearer token required in the Authorization header on the /private/* bulk configs endpoints used by the ruler/alertmanager configdb backends. If empty, those endpoints are disabled (return 403).")
+}
+
+// allowInternalCaller returns true if the request is permitted to call one
+// of the all-tenant /private/* endpoints. It requires an
+// `Authorization: Bearer <token>` header matching the configured
+// InternalBearerToken using a constant-time comparison. When no token is
+// configured, the endpoints are closed by default to prevent unauthenticated
+// cross-tenant disclosure of rules and Alertmanager secrets.
+func (cfg *Config) allowInternalCaller(r *http.Request) bool {
+	expected := cfg.InternalBearerToken
+	if expected == "" {
+		return false
+	}
+	auth := r.Header.Get("Authorization")
+	const prefix = "bearer "
+	if len(auth) <= len(prefix) || !strings.EqualFold(auth[:len(prefix)], prefix) {
+		return false
+	}
+	provided := auth[len(prefix):]
+	return subtle.ConstantTimeCompare([]byte(provided), []byte(expected)) == 1
 }
 
 // API implements the configs api.
@@ -264,9 +294,14 @@ type ConfigsView struct {
 }
 
 func (a *API) getConfigs(w http.ResponseWriter, r *http.Request) {
+	logger := util_log.WithContext(r.Context(), util_log.Logger)
+	if !a.cfg.allowInternalCaller(r) {
+		level.Warn(logger).Log("msg", "rejected unauthenticated call to /private/api/prom/configs/*", "path", r.URL.Path, "remote", r.RemoteAddr)
+		http.Error(w, "forbidden", http.StatusForbidden)
+		return
+	}
 	var cfgs map[string]userconfig.View
 	var cfgErr error
-	logger := util_log.WithContext(r.Context(), util_log.Logger)
 	rawSince := r.FormValue("since")
 	if rawSince == "" {
 		cfgs, cfgErr = a.db.GetAllConfigs(r.Context())

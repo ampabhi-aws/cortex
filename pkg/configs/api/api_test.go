@@ -4,11 +4,13 @@ import (
 	"encoding/json"
 	"fmt"
 	"net/http"
+	"net/http/httptest"
 	"os"
 	"path"
 	"strings"
 	"testing"
 
+	"github.com/cortexproject/cortex/pkg/configs/db/dbtest"
 	"github.com/cortexproject/cortex/pkg/configs/userconfig"
 
 	"github.com/stretchr/testify/assert"
@@ -65,6 +67,54 @@ func Test_GetConfig_Anonymous(t *testing.T) {
 	for _, c := range allClients {
 		w := request(t, "GET", c.Endpoint, nil)
 		assert.Equal(t, http.StatusUnauthorized, w.Code)
+	}
+}
+
+// The /private/* bulk-sync endpoints must reject unauthenticated callers
+// to prevent cross-tenant disclosure of rules and raw Alertmanager configs
+// (which carry Slack/SMTP/PagerDuty/OpsGenie/VictorOps secrets).
+func Test_GetAllConfigs_Anonymous_Forbidden(t *testing.T) {
+	setup(t)
+	defer cleanup(t)
+
+	for _, c := range allClients {
+		w := request(t, "GET", c.PrivateEndpoint, nil)
+		assert.Equal(t, http.StatusForbidden, w.Code, "expected /private/* to require the internal bearer token for %s", c.PrivateEndpoint)
+		w = request(t, "GET", fmt.Sprintf("%s?since=0", c.PrivateEndpoint), nil)
+		assert.Equal(t, http.StatusForbidden, w.Code, "since= cursor must not bypass auth for %s", c.PrivateEndpoint)
+	}
+}
+
+// A wrong bearer token must also be rejected.
+func Test_GetAllConfigs_WrongToken_Forbidden(t *testing.T) {
+	setup(t)
+	defer cleanup(t)
+
+	for _, c := range allClients {
+		w := httptest.NewRecorder()
+		r, err := http.NewRequest("GET", c.PrivateEndpoint, nil)
+		require.NoError(t, err)
+		r.Header.Set("Authorization", "Bearer not-the-right-token")
+		app.ServeHTTP(w, r)
+		assert.Equal(t, http.StatusForbidden, w.Code)
+	}
+}
+
+// When no internal bearer token is configured, the /private/* endpoints
+// must be closed by default — a missing shared secret must not degrade to
+// unauthenticated access.
+func Test_GetAllConfigs_NoConfiguredToken_Forbidden(t *testing.T) {
+	database = dbtest.Setup(t)
+	defer dbtest.Cleanup(t, database)
+	local := New(database, Config{})
+	for _, c := range allClients {
+		w := httptest.NewRecorder()
+		r, err := http.NewRequest("GET", c.PrivateEndpoint, nil)
+		require.NoError(t, err)
+		// Even with a Bearer header, the server has no token configured.
+		r.Header.Set("Authorization", "Bearer anything")
+		local.ServeHTTP(w, r)
+		assert.Equal(t, http.StatusForbidden, w.Code)
 	}
 }
 
@@ -149,7 +199,7 @@ func Test_GetAllConfigs_Empty(t *testing.T) {
 	defer cleanup(t)
 
 	for _, c := range allClients {
-		w := request(t, "GET", c.PrivateEndpoint, nil)
+		w := internalRequest(t, "GET", c.PrivateEndpoint, nil)
 		assert.Equal(t, http.StatusOK, w.Code)
 		var found ConfigsView
 		err := json.Unmarshal(w.Body.Bytes(), &found)
@@ -168,7 +218,7 @@ func Test_GetAllConfigs(t *testing.T) {
 
 	for _, c := range allClients {
 		view := c.post(t, userID, config)
-		w := request(t, "GET", c.PrivateEndpoint, nil)
+		w := internalRequest(t, "GET", c.PrivateEndpoint, nil)
 		assert.Equal(t, http.StatusOK, w.Code)
 		var found ConfigsView
 		err := json.Unmarshal(w.Body.Bytes(), &found)
@@ -191,7 +241,7 @@ func Test_GetAllConfigs_Newest(t *testing.T) {
 		c.post(t, userID, makeConfig())
 		lastCreated := c.post(t, userID, makeConfig())
 
-		w := request(t, "GET", c.PrivateEndpoint, nil)
+		w := internalRequest(t, "GET", c.PrivateEndpoint, nil)
 		assert.Equal(t, http.StatusOK, w.Code)
 		var found ConfigsView
 		err := json.Unmarshal(w.Body.Bytes(), &found)
@@ -212,7 +262,7 @@ func Test_GetConfigs_IncludesNewerConfigsAndExcludesOlder(t *testing.T) {
 		userID3 := makeUserID()
 		config3 := c.post(t, userID3, makeConfig())
 
-		w := request(t, "GET", fmt.Sprintf("%s?since=%d", c.PrivateEndpoint, config2.ID), nil)
+		w := internalRequest(t, "GET", fmt.Sprintf("%s?since=%d", c.PrivateEndpoint, config2.ID), nil)
 		assert.Equal(t, http.StatusOK, w.Code)
 		var found ConfigsView
 		err := json.Unmarshal(w.Body.Bytes(), &found)
