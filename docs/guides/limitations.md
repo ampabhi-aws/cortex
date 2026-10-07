@@ -25,7 +25,6 @@ The following character sets are generally **safe for use in the tenant ID**:
   - Hyphen (`-`)
   - Underscore (`_`)
   - Single Period (`.`), but the tenant IDs `.` and `..` is considered invalid
-  - Asterisk (`*`)
   - Single quote (`'`)
   - Open parenthesis (`(`)
   - Close parenthesis (`)`)

@@ -16,11 +16,15 @@ func TestValidTenantIDs(t *testing.T) {
 			name: "tenant-a",
 		},
 		{
-			name: "ABCDEFGHIJKLMNOPQRSTUVWXYZ-abcdefghijklmnopqrstuvwxyz_0987654321!.*'()",
+			name: "ABCDEFGHIJKLMNOPQRSTUVWXYZ-abcdefghijklmnopqrstuvwxyz_0987654321!.'()",
 		},
 		{
 			name: "invalid|",
 			err:  strptr("tenant ID 'invalid|' contains unsupported character '|'"),
+		},
+		{
+			name: "invalid*",
+			err:  strptr("tenant ID 'invalid*' contains unsupported character '*'"),
 		},
 		{
 			name: strings.Repeat("a", 150),
