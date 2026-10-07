@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"html/template"
+	"net"
 	"net/http"
 	"sort"
 	"strconv"
@@ -13,6 +14,7 @@ import (
 	"time"
 
 	"github.com/go-kit/log"
+	"github.com/go-kit/log/level"
 	"github.com/hashicorp/memberlist"
 	"github.com/prometheus/client_golang/prometheus"
 	"go.uber.org/atomic"
@@ -111,12 +113,16 @@ func (kvs *KVInitService) ServeHTTP(w http.ResponseWriter, req *http.Request) {
 
 	if err := req.ParseForm(); err == nil {
 		if req.Form[downloadKeyParam] != nil {
-			downloadKey(w, kv, kv.storeCopy(), req.Form[downloadKeyParam][0]) // Use first value, ignore the rest.
+			key := req.Form[downloadKeyParam][0]
+			kvs.auditAccess(req, "downloadKey", key)
+			downloadKey(w, kv, kv.storeCopy(), key) // Use first value, ignore the rest.
 			return
 		}
 
 		if req.Form[viewKeyParam] != nil {
-			viewKey(w, kv.storeCopy(), req.Form[viewKeyParam][0], getFormat(req))
+			key := req.Form[viewKeyParam][0]
+			kvs.auditAccess(req, "viewKey", key)
+			viewKey(w, kv.storeCopy(), key, getFormat(req))
 			return
 		}
 
@@ -126,6 +132,8 @@ func (kvs *KVInitService) ServeHTTP(w http.ResponseWriter, req *http.Request) {
 				http.Error(w, err.Error(), http.StatusBadRequest)
 				return
 			}
+
+			kvs.auditAccess(req, "viewMsg", strconv.Itoa(msgID))
 
 			sent, received := kv.getSentAndReceivedMessages()
 
@@ -141,9 +149,19 @@ func (kvs *KVInitService) ServeHTTP(w http.ResponseWriter, req *http.Request) {
 		}
 
 		if len(req.Form[deleteMessagesParam]) > 0 && req.Form[deleteMessagesParam][0] == "true" {
+			// Mitigation: destructive action must not be reachable via GET.
+			// Requiring POST prevents CSRF/<img>/crawler-initiated deletions of the
+			// in-memory gossip troubleshooting buffers.
+			if req.Method != http.MethodPost {
+				w.Header().Set("Allow", http.MethodPost)
+				http.Error(w, "deleteMessages requires POST", http.StatusMethodNotAllowed)
+				return
+			}
+
+			kvs.auditAccess(req, "deleteMessages", "")
 			kv.deleteSentReceivedMessages()
 
-			// Redirect back.
+			// Redirect back to the status page (GET).
 			w.Header().Set("Location", "?"+deleteMessagesParam+"=false")
 			w.WriteHeader(http.StatusFound)
 			return
@@ -187,6 +205,36 @@ func (kvs *KVInitService) ServeHTTP(w http.ResponseWriter, req *http.Request) {
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 	}
+}
+
+// auditAccess emits a structured log line for every access to a sensitive branch
+// of the memberlist status endpoint (viewKey/downloadKey/viewMsg/deleteMessages).
+// Because this route is not authenticated inside Cortex (external reverse proxy is
+// expected to gate it, per docs/guides/authentication-and-authorisation.md), we log
+// the request method, remote address and the X-Forwarded-For header so operators
+// can forensically trace who exercised these admin branches.
+func (kvs *KVInitService) auditAccess(req *http.Request, action, target string) {
+	if kvs == nil || kvs.logger == nil {
+		return
+	}
+	remote := req.RemoteAddr
+	if host, _, err := net.SplitHostPort(remote); err == nil {
+		remote = host
+	}
+	principal := req.Header.Get("X-Scope-OrgID")
+	if principal == "" {
+		principal = "anonymous"
+	}
+	_ = level.Info(kvs.logger).Log(
+		"msg", "memberlist status: sensitive access",
+		"action", action,
+		"target", target,
+		"method", req.Method,
+		"remote", remote,
+		"forwarded_for", req.Header.Get("X-Forwarded-For"),
+		"user_agent", req.Header.Get("User-Agent"),
+		"principal", principal,
+	)
 }
 
 func getFormat(req *http.Request) string {
@@ -360,7 +408,7 @@ const pageContent = `
 
 		<h2>Received Messages</h2>
 
-		<a href="?deleteMessages=true">Delete All Messages (received and sent)</a>
+		<form method="POST" action="?" style="display:inline"><input type="hidden" name="deleteMessages" value="true"><button type="submit">Delete All Messages (received and sent)</button></form>
 
 		<table width="100%" border="1">
 			<thead>
@@ -396,7 +444,7 @@ const pageContent = `
 
 		<h2>Sent Messages</h2>
 
-		<a href="?deleteMessages=true">Delete All Messages (received and sent)</a>
+		<form method="POST" action="?" style="display:inline"><input type="hidden" name="deleteMessages" value="true"><button type="submit">Delete All Messages (received and sent)</button></form>
 
 		<table width="100%" border="1">
 			<thead>
