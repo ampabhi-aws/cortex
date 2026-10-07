@@ -681,7 +681,19 @@ receivers:
 
 	router := mux.NewRouter()
 	router.Path("/multitenant_alertmanager/configs").Methods(http.MethodGet).HandlerFunc(am.ListAllConfigs)
+
+	// Without a tenant on the context the handler must reject the request so that
+	// anonymous callers cannot enumerate other tenants' configs.
+	{
+		req := httptest.NewRequest("GET", "https://localhost:8080/multitenant_alertmanager/configs", nil)
+		w := httptest.NewRecorder()
+		router.ServeHTTP(w, req)
+		require.Equal(t, http.StatusUnauthorized, w.Result().StatusCode)
+	}
+
+	// With a tenant on the context the handler must only return that tenant's config.
 	req := httptest.NewRequest("GET", "https://localhost:8080/multitenant_alertmanager/configs", nil)
+	req = req.WithContext(user.InjectOrgID(req.Context(), "user1"))
 	w := httptest.NewRecorder()
 	router.ServeHTTP(w, req)
 
@@ -690,7 +702,7 @@ receivers:
 	require.Equal(t, "application/yaml", resp.Header.Get("Content-Type"))
 	body, err := io.ReadAll(resp.Body)
 	require.NoError(t, err)
-	old, err := yaml.Marshal(testCases)
+	old, err := yaml.Marshal(map[string]*UserConfig{"user1": testCases["user1"]})
 	require.NoError(t, err)
 	require.YAMLEq(t, string(old), string(body))
 }
