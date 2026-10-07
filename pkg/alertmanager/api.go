@@ -261,6 +261,19 @@ func validateUserConfig(logger log.Logger, cfg alertspb.AlertConfigDesc, limits 
 
 func (am *MultitenantAlertmanager) ListAllConfigs(w http.ResponseWriter, r *http.Request) {
 	logger := util_log.WithContext(r.Context(), am.logger)
+
+	// Require the request to carry an authenticated tenant identity. The
+	// route is only registered when the operator has explicitly opted in
+	// (-api.alertmanager-admin-configs-dump-enabled) and is wrapped by the
+	// authentication middleware; refuse the request if no tenant has been
+	// established on the context, so operator-side auth cannot be bypassed
+	// by callers that forgot to assert an X-Scope-OrgID header.
+	if _, err := tenant.TenantID(r.Context()); err != nil {
+		level.Error(logger).Log("msg", errNoOrgID, "err", err.Error())
+		http.Error(w, fmt.Sprintf("%s: %s", errNoOrgID, err.Error()), http.StatusUnauthorized)
+		return
+	}
+
 	userIDs, err := am.store.ListAllUsers(r.Context())
 	if err != nil {
 		level.Error(logger).Log("msg", "failed to list users of alertmanager", "err", err)
@@ -285,8 +298,12 @@ func (am *MultitenantAlertmanager) ListAllConfigs(w http.ResponseWriter, r *http
 		}
 		data := map[string]*UserConfig{
 			userID: {
-				TemplateFiles:      alertspb.ParseTemplates(cfg),
-				AlertmanagerConfig: cfg.RawConfig,
+				// Deliberately omit template_files: operators debugging
+				// sharding and config distribution only need the tenant list
+				// and the config body, not notification templates, which can
+				// embed credentials or PII.
+				TemplateFiles:      nil,
+				AlertmanagerConfig: redactAlertmanagerConfig(cfg.RawConfig, userID, logger),
 			},
 		}
 
@@ -302,6 +319,35 @@ func (am *MultitenantAlertmanager) ListAllConfigs(w http.ResponseWriter, r *http
 	}
 	close(iter)
 	<-done
+}
+
+// redactAlertmanagerConfig re-marshals the raw Alertmanager YAML through the
+// upstream config.Config type whose Secret/SecretURL fields marshal as
+// "<secret>", scrubbing third-party notification credentials (Slack webhook
+// URLs, PagerDuty/OpsGenie/VictorOps keys, SMTP passwords, webhook basic-auth
+// / bearer / authorization credentials). If parsing fails (e.g. the stored
+// config is malformed or uses features unknown to this version of the
+// alertmanager library), we fall back to an opaque "<unparseable>" marker
+// rather than leaking the raw credentials, since the caller of this bulk
+// endpoint is an operator debugging sharding and does not need the verbatim
+// uploaded YAML.
+func redactAlertmanagerConfig(raw string, userID string, logger log.Logger) string {
+	if raw == "" {
+		return ""
+	}
+	parsed, err := config.Load(raw)
+	if err != nil || parsed == nil {
+		if err != nil {
+			level.Warn(logger).Log("msg", "failed to parse alertmanager config while redacting for bulk dump", "user", userID, "err", err)
+		}
+		return "<unparseable>\n"
+	}
+	out, err := yaml.Marshal(parsed)
+	if err != nil {
+		level.Warn(logger).Log("msg", "failed to marshal alertmanager config while redacting for bulk dump", "user", userID, "err", err)
+		return "<redacted>\n"
+	}
+	return string(out)
 }
 
 // validateAlertmanagerConfig recursively scans the input config looking for data types for which

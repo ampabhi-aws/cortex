@@ -86,6 +86,16 @@ api:
   # CLI flag: -api.http-request-headers-to-log
   [http_request_headers_to_log: <list of string> | default = []]
 
+  # Expose the admin GET /multitenant_alertmanager/configs endpoint. When
+  # enabled, the endpoint is registered behind the authentication middleware
+  # (an upstream identity-aware proxy that pins the X-Scope-OrgID is required
+  # to prevent anonymous access). Secrets in the returned per-tenant
+  # configurations are redacted and notification template files are omitted.
+  # Disabled by default because the endpoint can leak cross-tenant data if not
+  # properly fronted.
+  # CLI flag: -api.alertmanager-admin-configs-dump-enabled
+  [enable_admin_alertmanager_configs_dump: <boolean> | default = false]
+
 # The server_config configures the HTTP and gRPC server of the launched
 # service(s).
 [server: <server_config>]
