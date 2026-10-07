@@ -222,13 +222,20 @@ func (l *Limiter) maxByLocalAndGlobal(userID string, localLimitFn, globalLimitFn
 	// can't take a "local decision" without any centralized coordination.
 	if l.shardByAllLabels {
 		// We can assume that series/metadata are evenly distributed across ingesters
-		// so we do convert the global limit into a local limit
-		globalLimit := globalLimitFn(userID)
-		localLimit = minNonZero(localLimit, l.convertGlobalToLocalLimit(userID, globalLimit))
+		// so we do convert the global limit into a local limit. Only apply the
+		// conversion when the global limit is actually configured (> 0), so that
+		// a "could not compute" result from convertGlobalToLocalLimit can never
+		// be conflated with the "configured as unlimited" sentinel (0) below
+		// and silently widen the effective limit to math.MaxInt32.
+		if globalLimit := globalLimitFn(userID); globalLimit > 0 {
+			localLimit = minNonZero(localLimit, l.convertGlobalToLocalLimit(userID, globalLimit))
+		}
 	}
 
 	// If both the local and global limits are disabled, we just
-	// use the largest int value
+	// use the largest int value. Thanks to the guard above, this branch is
+	// only reached when every limit is 0 by configuration -- a degraded ring
+	// topology can no longer convert a configured limit into math.MaxInt32.
 	if localLimit == 0 {
 		localLimit = math.MaxInt32
 	}
@@ -247,10 +254,16 @@ func (l *Limiter) convertGlobalToLocalLimit(userID string, globalLimit int) int 
 	// (global limit / number of ingesters) * replication factor
 	numIngesters := l.ring.HealthyInstancesCount()
 
-	// May happen because the number of ingesters is asynchronously updated.
-	// If happens, we just temporarily ignore the global limit.
-	if numIngesters == 0 {
-		return 0
+	// May happen when the ring view is unusable (e.g. the ingester hasn't
+	// finished joining yet, the KV store is unreachable, or all instances
+	// have been forgotten). Previously we returned 0 here, which callers
+	// interpret as "limit disabled" and silently convert into math.MaxInt32,
+	// turning a transient topology problem into an unbounded fail-open.
+	// Fail closed instead: assume the most conservative topology (this
+	// ingester alone, no replication) so the configured global limit still
+	// applies locally until the ring recovers.
+	if numIngesters <= 0 {
+		return globalLimit
 	}
 
 	// If the number of available ingesters is greater than the tenant's shard
