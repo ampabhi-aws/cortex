@@ -3,6 +3,9 @@ Description=Horizontally scalable, highly available, multi-tenant, long term Pro
 Documentation=https://cortexmetrics.io/docs
 Wants=network-online.target
 After=network-online.target
+# Refuse to start until an operator-provided config exists.
+# See /usr/share/doc/cortex/README.md for the required review steps.
+ConditionPathExists=/etc/cortex/cortex.yaml
 
 [Service]
 Restart=always
@@ -13,6 +16,19 @@ ExecReload=/bin/kill -HUP $MAINPID
 TimeoutStopSec=20s
 SendSIGKILL=no
 WorkingDirectory=/var/lib/cortex
+
+# Defence in depth: uncomment to restrict network traffic to localhost
+# regardless of the config file. Must be removed once an authenticating
+# reverse proxy routes external traffic to this host.
+# IPAddressDeny=any
+# IPAddressAllow=localhost
+
+# Additional sandboxing recommended by systemd.exec(5).
+NoNewPrivileges=true
+ProtectSystem=full
+ProtectHome=true
+PrivateTmp=true
+PrivateDevices=true
 
 [Install]
 WantedBy=multi-user.target

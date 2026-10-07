@@ -362,7 +362,9 @@ dist/$(UPTODATE)-packages: dist $(wildcard packaging/deb/**) $(wildcard packagin
 			--before-remove packaging/deb/control/prerm \
 			--package dist/cortex-$(VERSION)_$$arch.deb \
 			dist/cortex-linux-$$arch=/usr/local/bin/cortex \
-			docs/configuration/single-process-config-blocks.yaml=/etc/cortex/single-process-config.yaml \
+			packaging/config/cortex.yaml=/etc/cortex/cortex.yaml \
+			docs/configuration/single-process-config-blocks.yaml=/usr/share/doc/cortex/examples/single-process-config.yaml \
+			packaging/README.md=/usr/share/doc/cortex/README.md \
 			packaging/deb/default/cortex=/etc/default/cortex \
 			packaging/deb/systemd/cortex.service=/etc/systemd/system/cortex.service; \
 		$(FPM_OPTS) -t rpm  \
@@ -371,7 +373,9 @@ dist/$(UPTODATE)-packages: dist $(wildcard packaging/deb/**) $(wildcard packagin
 			--before-remove packaging/rpm/control/preun \
 			--package dist/cortex-$(VERSION)_$$arch.rpm \
 			dist/cortex-linux-$$arch=/usr/local/bin/cortex \
-			docs/configuration/single-process-config-blocks.yaml=/etc/cortex/single-process-config.yaml \
+			packaging/config/cortex.yaml=/etc/cortex/cortex.yaml \
+			docs/configuration/single-process-config-blocks.yaml=/usr/share/doc/cortex/examples/single-process-config.yaml \
+			packaging/README.md=/usr/share/doc/cortex/README.md \
 			packaging/rpm/sysconfig/cortex=/etc/sysconfig/cortex \
 			packaging/rpm/systemd/cortex.service=/etc/systemd/system/cortex.service; \
 	done
