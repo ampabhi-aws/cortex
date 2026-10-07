@@ -42,6 +42,8 @@ const (
 var (
 	errPasswordFileNotAllowed        = errors.New("setting password_file, bearer_token_file and credentials_file is not allowed")
 	errOAuth2SecretFileNotAllowed    = errors.New("setting OAuth2 client_secret_file is not allowed")
+	errOAuth2ProxyURLNotAllowed      = errors.New("setting OAuth2 proxy_url is not allowed")
+	errOAuth2TokenURLNotAllowed      = errors.New("setting OAuth2 token_url is not allowed")
 	errTLSFileNotAllowed             = errors.New("setting TLS ca_file, cert_file and key_file is not allowed")
 	errSlackAPIURLFileNotAllowed     = errors.New("setting Slack api_url_file and global slack_api_url_file is not allowed")
 	errVictorOpsAPIKeyFileNotAllowed = errors.New("setting VictorOps api_key_file is not allowed")
@@ -408,8 +410,23 @@ func validateReceiverHTTPConfig(cfg commoncfg.HTTPClientConfig) error {
 	if cfg.BearerTokenFile != "" {
 		return errPasswordFileNotAllowed
 	}
-	if cfg.OAuth2 != nil && cfg.OAuth2.ClientSecretFile != "" {
-		return errOAuth2SecretFileNotAllowed
+	if cfg.OAuth2 != nil {
+		if cfg.OAuth2.ClientSecretFile != "" {
+			return errOAuth2SecretFileNotAllowed
+		}
+		// The OAuth2 round tripper builds its own HTTP transport for the token
+		// fetch and does not inherit the receivers-firewall DialContext, so a
+		// tenant-supplied proxy_url or token_url would bypass
+		// -alertmanager.receivers-firewall-block-private-addresses /
+		// -alertmanager.receivers-firewall-block-cidr-networks and could be used
+		// to SSRF arbitrary internal hosts. Reject these fields outright until
+		// the upstream prometheus/common transport honours the caller's dialer.
+		if cfg.OAuth2.ProxyURL.URL != nil {
+			return errOAuth2ProxyURLNotAllowed
+		}
+		if cfg.OAuth2.TokenURL != "" {
+			return errOAuth2TokenURLNotAllowed
+		}
 	}
 	return validateReceiverTLSConfig(cfg.TLSConfig)
 }
