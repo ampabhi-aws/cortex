@@ -4,7 +4,9 @@ import (
 	"context"
 	"flag"
 	"io"
+	"net"
 	"net/http"
+	"strings"
 	"sync"
 	"time"
 
@@ -19,6 +21,7 @@ import (
 	"github.com/weaveworks/common/middleware"
 	"github.com/weaveworks/common/user"
 	"google.golang.org/grpc"
+	"google.golang.org/grpc/peer"
 
 	"github.com/cortexproject/cortex/pkg/frontend/v2/frontendv2pb"
 	"github.com/cortexproject/cortex/pkg/scheduler/queue"
@@ -235,6 +238,22 @@ func (s *Scheduler) frontendConnected(frontend schedulerpb.SchedulerForFrontend_
 	if msg.Type != schedulerpb.INIT || msg.FrontendAddress == "" {
 		return "", nil, errors.New("no frontend address")
 	}
+	if err := validateFrontendAddress(msg.FrontendAddress); err != nil {
+		level.Warn(s.log).Log("msg", "rejecting frontend INIT with invalid address", "addr", msg.FrontendAddress, "err", err)
+		return "", nil, err
+	}
+	// Defence in depth: ensure the advertised FrontendAddress is at least
+	// plausibly reachable to the stream peer. We do not require an exact
+	// match (NAT / service discovery can legitimately rewrite host:port) but
+	// we reject obvious host-spoofing where the advertised host is a
+	// different concrete IP than the peer's connecting address. Unresolved
+	// hostnames and loopback/unknown peers are allowed through.
+	if p, ok := peer.FromContext(frontend.Context()); ok && p != nil && p.Addr != nil {
+		if err := checkFrontendAddressMatchesPeer(msg.FrontendAddress, p.Addr.String()); err != nil {
+			level.Warn(s.log).Log("msg", "rejecting frontend INIT with address not matching peer", "addr", msg.FrontendAddress, "peer", p.Addr.String(), "err", err)
+			return "", nil, err
+		}
+	}
 
 	s.connectedFrontendsMu.Lock()
 	defer s.connectedFrontendsMu.Unlock()
@@ -250,6 +269,96 @@ func (s *Scheduler) frontendConnected(frontend schedulerpb.SchedulerForFrontend_
 
 	cf.connections++
 	return msg.FrontendAddress, cf.ctx, nil
+}
+
+// validateFrontendAddress rejects FrontendAddress strings that could be used
+// to coerce the scheduler or querier into dialing an arbitrary gRPC target
+// scheme (e.g. "unix:/path", "dns:///...", "passthrough:///...") or that
+// contain obviously malformed characters. Legitimate frontend addresses are
+// bare host:port strings; opaque labels used in unit tests ("frontend-12345")
+// are also permitted.
+func validateFrontendAddress(addr string) error {
+	if addr == "" {
+		return errors.New("empty frontend address")
+	}
+	if len(addr) > 253 { // generous upper bound; longest DNS name is 253
+		return errors.New("frontend address too long")
+	}
+	if strings.ContainsAny(addr, "\x00\n\r\t ") {
+		return errors.New("frontend address contains invalid characters")
+	}
+	// Reject gRPC name-resolver schemes and absolute paths which could
+	// otherwise be used to coerce an outbound dial to a unix socket or an
+	// attacker-controlled resolver target.
+	if strings.HasPrefix(addr, "/") || strings.HasPrefix(addr, "//") {
+		return errors.New("frontend address must not be an absolute path")
+	}
+	if i := strings.Index(addr, ":"); i > 0 {
+		head := addr[:i]
+		rest := addr[i+1:]
+		// Any gRPC resolver scheme is of the form "<scheme>://..." (two
+		// slashes), while a legitimate host:port after the first colon is
+		// a plain port number (digits only).
+		if strings.HasPrefix(rest, "//") {
+			return errors.New("frontend address must not include a URI scheme")
+		}
+		// If head looks like a scheme (letters only, non-numeric) and rest
+		// is not a numeric port, it may be a resolver target such as
+		// "unix:/var/run/x" or "dns:example". Reject those.
+		if head != "" && isAlpha(head) && !isNumericPort(rest) && strings.ContainsAny(rest, "/\\") {
+			return errors.New("frontend address must not be a gRPC resolver target")
+		}
+	}
+	return nil
+}
+
+func isAlpha(s string) bool {
+	for _, r := range s {
+		if !((r >= 'a' && r <= 'z') || (r >= 'A' && r <= 'Z')) {
+			return false
+		}
+	}
+	return len(s) > 0
+}
+
+func isNumericPort(s string) bool {
+	if s == "" {
+		return false
+	}
+	for _, r := range s {
+		if r < '0' || r > '9' {
+			return false
+		}
+	}
+	return true
+}
+
+// checkFrontendAddressMatchesPeer returns nil when the advertised address
+// cannot be shown to disagree with the peer's connecting address. It only
+// errors when both resolve to concrete, incompatible IP literals.
+func checkFrontendAddressMatchesPeer(advertised, peerAddr string) error {
+	advHost, _, err := net.SplitHostPort(advertised)
+	if err != nil {
+		// Not host:port (could be an opaque label or hostname-only). Nothing
+		// to compare; allow it through.
+		return nil
+	}
+	peerHost, _, err := net.SplitHostPort(peerAddr)
+	if err != nil {
+		return nil
+	}
+	advIP := net.ParseIP(advHost)
+	peerIP := net.ParseIP(peerHost)
+	if advIP == nil || peerIP == nil {
+		return nil
+	}
+	if peerIP.IsLoopback() || peerIP.IsUnspecified() {
+		return nil
+	}
+	if !advIP.Equal(peerIP) {
+		return errors.New("advertised frontend address does not match stream peer")
+	}
+	return nil
 }
 
 func (s *Scheduler) frontendDisconnected(frontendAddress string) {
@@ -283,6 +392,27 @@ func (s *Scheduler) enqueueRequest(frontendContext context.Context, frontendAddr
 	}
 
 	userID := msg.GetUserID()
+
+	// Validate the tenant ID carried in the message body. The scheduler's
+	// gRPC interface is reachable without authentication in the default
+	// Cortex deployment and the UserID is attacker-controlled, so we apply
+	// the documented tenant-ID charset and length limits before it is used
+	// as a queue key or metric label. For multi-tenant requests, each
+	// component is validated independently.
+	for _, part := range strings.Split(userID, "|") {
+		if err := tenant.ValidTenantID(part); err != nil {
+			return err
+		}
+	}
+
+	// Defence in depth: refuse to enqueue a request whose inner
+	// X-Scope-OrgID header disagrees with the UserID field. A legitimate
+	// query-frontend derives both from the same authenticated tenant;
+	// a mismatch is a strong signal of a forged ENQUEUE attempting
+	// cross-tenant access against the querier's internal API.
+	if hdr := orgIDHeader(msg.HttpRequest); hdr != "" && hdr != userID {
+		return errors.New("tenant mismatch between HTTP X-Scope-OrgID header and UserID")
+	}
 
 	req := &schedulerRequest{
 		frontendAddress: frontendAddr,
@@ -441,7 +571,32 @@ func (s *Scheduler) forwardRequestToQuerier(querier schedulerpb.SchedulerForQuer
 	}
 }
 
+// orgIDHeader returns the first X-Scope-OrgID value found in an HTTPRequest's
+// headers (case-insensitive), or "" if the header is absent.
+func orgIDHeader(req *httpgrpc.HTTPRequest) string {
+	if req == nil {
+		return ""
+	}
+	for _, h := range req.Headers {
+		if h == nil {
+			continue
+		}
+		if strings.EqualFold(h.Key, user.OrgIDHeaderName) && len(h.Values) > 0 {
+			return h.Values[0]
+		}
+	}
+	return ""
+}
+
 func (s *Scheduler) forwardErrorToFrontend(ctx context.Context, req *schedulerRequest, requestErr error) {
+	// Defence in depth: refuse to open an outbound gRPC connection to an
+	// address we would never have accepted at INIT time. This closes the
+	// window where a buggy caller (or test harness) stored an unsafe
+	// address past validation.
+	if err := validateFrontendAddress(req.frontendAddress); err != nil {
+		level.Warn(s.log).Log("msg", "refusing to forward error to invalid frontend address", "frontend", req.frontendAddress, "err", err, "requestErr", requestErr)
+		return
+	}
 	opts, err := s.cfg.GRPCClientConfig.DialOption([]grpc.UnaryClientInterceptor{
 		otgrpc.OpenTracingClientInterceptor(opentracing.GlobalTracer()),
 		middleware.ClientUserHeaderInterceptor},
