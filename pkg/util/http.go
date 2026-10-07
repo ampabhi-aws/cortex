@@ -193,6 +193,12 @@ func decompressRequest(reader io.Reader, expectedSize, maxSize int, compression 
 	return
 }
 
+// initialAllocCap bounds the up-front allocation performed by
+// decompressFromReader when a client declares a large Content-Length. Without
+// this clamp, a trickled request can cause the server to reserve
+// Content-Length bytes of heap per connection before any body byte is read.
+const initialAllocCap = 1 << 20 // 1 MiB
+
 func decompressFromReader(reader io.Reader, expectedSize, maxSize int, compression CompressionType, sp opentracing.Span) ([]byte, error) {
 	var (
 		buf  bytes.Buffer
@@ -200,7 +206,13 @@ func decompressFromReader(reader io.Reader, expectedSize, maxSize int, compressi
 		err  error
 	)
 	if expectedSize > 0 {
-		buf.Grow(expectedSize + bytes.MinRead) // extra space guarantees no reallocation
+		// Clamp the up-front allocation so an attacker-controlled
+		// Content-Length cannot pin arbitrary heap per connection.
+		hint := expectedSize
+		if hint > initialAllocCap {
+			hint = initialAllocCap
+		}
+		buf.Grow(hint + bytes.MinRead)
 	}
 	// Read from LimitReader with limit max+1. So if the underlying
 	// reader is over limit, the result will be bigger than max.

@@ -1,6 +1,7 @@
 package cortexpb
 
 import (
+	"errors"
 	"flag"
 	"fmt"
 	"io"
@@ -11,11 +12,33 @@ import (
 	"github.com/prometheus/prometheus/model/labels"
 )
 
+// ErrTooManyTimeseries is returned by PreallocWriteRequest.Unmarshal when a
+// remote-write request contains more timeseries than the configured cap. It is
+// used to abort decoding of a parse-bomb request before the amplified objects
+// are retained and before downstream validation runs.
+var ErrTooManyTimeseries = errors.New("too many timeseries in write request")
+
+// ErrTooManyMetadata is the companion of ErrTooManyTimeseries for the
+// metric-metadata field of a WriteRequest.
+var ErrTooManyMetadata = errors.New("too many metric metadata in write request")
+
 var (
 	expectedTimeseries         = 100
 	expectedLabels             = 20
 	expectedSamplesPerSeries   = 10
 	expectedExemplarsPerSeries = 1
+
+	// maxTimeseriesPerRequest caps the number of TimeSeries decoded from a
+	// single remote-write WriteRequest, independent of the raw-byte limit.
+	// It defends against protobuf parse bombs where a tiny snappy-compressed
+	// body expands into tens of millions of pooled TimeSeries structs
+	// (~928 B each) and OOM-kills the distributor. 0 = unlimited (legacy
+	// behaviour).
+	maxTimeseriesPerRequest = 0
+
+	// maxMetadataPerRequest is the metadata-field counterpart of
+	// maxTimeseriesPerRequest. 0 = unlimited.
+	maxMetadataPerRequest = 0
 
 	/*
 		We cannot pool these as pointer-to-slice because the place we use them is in WriteRequest which is generated from Protobuf
@@ -48,6 +71,25 @@ func (PreallocConfig) RegisterFlags(f *flag.FlagSet) {
 	f.IntVar(&expectedTimeseries, "ingester-client.expected-timeseries", expectedTimeseries, "Expected number of timeseries per request, used for preallocations.")
 	f.IntVar(&expectedLabels, "ingester-client.expected-labels", expectedLabels, "Expected number of labels per timeseries, used for preallocations.")
 	f.IntVar(&expectedSamplesPerSeries, "ingester-client.expected-samples-per-series", expectedSamplesPerSeries, "Expected number of samples per timeseries, used for preallocations.")
+	f.IntVar(&maxTimeseriesPerRequest, "ingester-client.max-timeseries-per-request", maxTimeseriesPerRequest, "Hard cap on the number of timeseries that may be decoded from a single remote-write request. Enforced inside the WriteRequest unmarshaller before any validation or rate-limiting, to defend against protobuf parse bombs that otherwise amplify a small compressed body into millions of pooled TimeSeries allocations. 0 = unlimited.")
+	f.IntVar(&maxMetadataPerRequest, "ingester-client.max-metadata-per-request", maxMetadataPerRequest, "Hard cap on the number of metric metadata entries that may be decoded from a single remote-write request. Enforced inside the WriteRequest unmarshaller before any validation. 0 = unlimited.")
+}
+
+// SetMaxTimeseriesPerRequest overrides the per-request timeseries cap at
+// runtime. It is intended for tests and for callers that configure the limit
+// outside of the flag set (e.g. YAML-only wiring). A non-positive value
+// disables the cap.
+func SetMaxTimeseriesPerRequest(n int) {
+	if n < 0 {
+		n = 0
+	}
+	maxTimeseriesPerRequest = n
+}
+
+// MaxTimeseriesPerRequest returns the currently configured cap. 0 means
+// unlimited.
+func MaxTimeseriesPerRequest() int {
+	return maxTimeseriesPerRequest
 }
 
 // PreallocWriteRequest is a WriteRequest which preallocs slices on Unmarshal.
@@ -56,9 +98,29 @@ type PreallocWriteRequest struct {
 }
 
 // Unmarshal implements proto.Message.
+//
+// After the generated unmarshaller completes we enforce
+// maxTimeseriesPerRequest / maxMetadataPerRequest as a backstop against
+// protobuf parse-bomb requests. If the cap is exceeded the pooled
+// TimeSeries objects are returned to the pool and an error is reported
+// before the request can propagate into the distributor pipeline.
 func (p *PreallocWriteRequest) Unmarshal(dAtA []byte) error {
 	p.Timeseries = PreallocTimeseriesSliceFromPool()
-	return p.WriteRequest.Unmarshal(dAtA)
+	if err := p.WriteRequest.Unmarshal(dAtA); err != nil {
+		return err
+	}
+	if maxTimeseriesPerRequest > 0 && len(p.Timeseries) > maxTimeseriesPerRequest {
+		ReuseSlice(p.Timeseries)
+		p.Timeseries = nil
+		return ErrTooManyTimeseries
+	}
+	if maxMetadataPerRequest > 0 && len(p.Metadata) > maxMetadataPerRequest {
+		ReuseSlice(p.Timeseries)
+		p.Timeseries = nil
+		p.Metadata = nil
+		return ErrTooManyMetadata
+	}
+	return nil
 }
 
 // PreallocTimeseries is a TimeSeries which preallocs slices on Unmarshal.
