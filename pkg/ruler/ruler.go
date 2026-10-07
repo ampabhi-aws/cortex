@@ -197,7 +197,7 @@ type MultiTenantManager interface {
 	// Stop stops all Manager components.
 	Stop()
 	// ValidateRuleGroup validates a rulegroup
-	ValidateRuleGroup(rulefmt.RuleGroup) []error
+	ValidateRuleGroup(userID string, g rulefmt.RuleGroup) []error
 }
 
 // Ruler evaluates rules.

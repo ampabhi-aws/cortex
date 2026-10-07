@@ -464,7 +464,7 @@ func (a *API) CreateRuleGroup(w http.ResponseWriter, req *http.Request) {
 		return
 	}
 
-	errs := a.ruler.manager.ValidateRuleGroup(rg)
+	errs := a.ruler.manager.ValidateRuleGroup(userID, rg)
 	if len(errs) > 0 {
 		e := []string{}
 		for _, err := range errs {
