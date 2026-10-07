@@ -681,18 +681,43 @@ receivers:
 
 	router := mux.NewRouter()
 	router.Path("/multitenant_alertmanager/configs").Methods(http.MethodGet).HandlerFunc(am.ListAllConfigs)
+
+	// Verify that an unauthenticated request (no X-Scope-OrgID / no tenant in
+	// context) is rejected. Previously this handler streamed every tenant's
+	// raw alertmanager_config to anonymous callers, which is a cross-tenant
+	// disclosure of embedded notification secrets (CWE-1212 / CWE-552).
 	req := httptest.NewRequest("GET", "https://localhost:8080/multitenant_alertmanager/configs", nil)
 	w := httptest.NewRecorder()
 	router.ServeHTTP(w, req)
-
 	resp := w.Result()
-	require.Equal(t, http.StatusOK, resp.StatusCode)
-	require.Equal(t, "application/yaml", resp.Header.Get("Content-Type"))
-	body, err := io.ReadAll(resp.Body)
-	require.NoError(t, err)
-	old, err := yaml.Marshal(testCases)
-	require.NoError(t, err)
-	require.YAMLEq(t, string(old), string(body))
+	require.Equal(t, http.StatusUnauthorized, resp.StatusCode)
+
+	// With a tenant resolved in the request context, the handler must only
+	// return the configuration belonging to that tenant, never any other
+	// tenant's config.
+	for userID, want := range testCases {
+		ctx := user.InjectOrgID(context.Background(), userID)
+		req := httptest.NewRequest("GET", "https://localhost:8080/multitenant_alertmanager/configs", nil).WithContext(ctx)
+		w := httptest.NewRecorder()
+		router.ServeHTTP(w, req)
+
+		resp := w.Result()
+		require.Equal(t, http.StatusOK, resp.StatusCode)
+		require.Equal(t, "application/yaml", resp.Header.Get("Content-Type"))
+		body, err := io.ReadAll(resp.Body)
+		require.NoError(t, err)
+		expected, err := yaml.Marshal(map[string]*UserConfig{userID: want})
+		require.NoError(t, err)
+		require.YAMLEq(t, string(expected), string(body))
+		// Explicitly assert cross-tenant isolation: no other tenant's config
+		// may appear in the response body.
+		for otherID := range testCases {
+			if otherID == userID {
+				continue
+			}
+			require.NotContains(t, string(body), otherID)
+		}
+	}
 }
 
 func TestValidateAlertmanagerConfig(t *testing.T) {

@@ -259,12 +259,30 @@ func validateUserConfig(logger log.Logger, cfg alertspb.AlertConfigDesc, limits 
 	return nil
 }
 
+// ListAllConfigs serves the Alertmanager configuration for the authenticated
+// tenant. Historically this endpoint streamed every tenant's raw
+// `alertmanager_config` (including embedded notification credentials such as
+// Slack webhook URLs, PagerDuty routing keys, SMTP passwords and bearer
+// tokens) with no tenant scoping or authentication, so any party able to
+// reach the HTTP listener — or any tenant whose request was forwarded by an
+// authenticating gateway that did not deny-list this admin path — could
+// retrieve all tenants' alerting configuration via a single unauthenticated
+// GET (CWE-1212 / CWE-552). The handler now requires a tenant to be resolved
+// from the request context and only returns the config belonging to that
+// tenant, preventing cross-tenant disclosure even when a caller reaches the
+// endpoint through the shared data-plane listener. The route is also
+// registered with `auth=true` so the auth middleware runs before this handler
+// is invoked.
 func (am *MultitenantAlertmanager) ListAllConfigs(w http.ResponseWriter, r *http.Request) {
 	logger := util_log.WithContext(r.Context(), am.logger)
-	userIDs, err := am.store.ListAllUsers(r.Context())
+
+	// Require an authenticated tenant. Without this, the handler would be
+	// vulnerable to anonymous cross-tenant disclosure of all tenants' raw
+	// Alertmanager configurations and embedded notification secrets.
+	userID, err := tenant.TenantID(r.Context())
 	if err != nil {
-		level.Error(logger).Log("msg", "failed to list users of alertmanager", "err", err)
-		http.Error(w, fmt.Sprintf("%s: %s", errListAllUser, err.Error()), http.StatusInternalServerError)
+		level.Error(logger).Log("msg", errNoOrgID, "err", err.Error())
+		http.Error(w, fmt.Sprintf("%s: %s", errNoOrgID, err.Error()), http.StatusUnauthorized)
 		return
 	}
 
@@ -276,7 +294,7 @@ func (am *MultitenantAlertmanager) ListAllConfigs(w http.ResponseWriter, r *http
 		close(done)
 	}()
 
-	err = concurrency.ForEachUser(r.Context(), userIDs, fetchConcurrency, func(ctx context.Context, userID string) error {
+	err = concurrency.ForEachUser(r.Context(), []string{userID}, fetchConcurrency, func(ctx context.Context, userID string) error {
 		cfg, err := am.store.GetAlertConfig(ctx, userID)
 		if errors.Is(err, alertspb.ErrNotFound) {
 			return nil
@@ -298,7 +316,7 @@ func (am *MultitenantAlertmanager) ListAllConfigs(w http.ResponseWriter, r *http
 		return nil
 	})
 	if err != nil {
-		level.Error(logger).Log("msg", "failed to list all alertmanager configs", "err", err)
+		level.Error(logger).Log("msg", "failed to list alertmanager config", "user", userID, "err", err)
 	}
 	close(iter)
 	<-done
