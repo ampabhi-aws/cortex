@@ -672,8 +672,28 @@ func (t *Cortex) initMemberlistKV() (services.Service, error) {
 }
 
 func (t *Cortex) initTenantDeletionAPI() (services.Service, error) {
-	// t.RulerStorage can be nil when running in single-binary mode, and rule storage is not configured.
-	tenantDeletionAPI, err := purger.NewTenantDeletionAPI(t.Cfg.BlocksStorage, t.Overrides, util_log.Logger, prometheus.DefaultRegisterer)
+	// Build the per-store clients the purger uses to actually erase tenant data.
+	//
+	// RulerStorage is initialised by its own module and will be nil when the
+	// ruler is not configured in this deployment (e.g. single-binary with no
+	// ruler storage). In that case the purger simply skips the ruler step.
+	rulerStore := t.RulerStorage
+
+	// The Alertmanager store is normally constructed inside initAlertManager,
+	// but the tenant-deletion API has to be able to erase per-tenant Alertmanager
+	// configuration (including notifier secrets such as Slack/PagerDuty/OpsGenie
+	// keys, SMTP passwords and webhook URLs) even when the Alertmanager module
+	// itself is not running in this process. Build a dedicated client here from
+	// the same configuration; if construction fails we log and continue without
+	// it rather than failing the whole module start.
+	var alertStore alertstore.AlertStore
+	if as, err := alertstore.NewAlertStore(context.Background(), t.Cfg.AlertmanagerStorage, t.Overrides, util_log.Logger, prometheus.DefaultRegisterer); err == nil {
+		alertStore = as
+	} else {
+		level.Warn(util_log.Logger).Log("msg", "tenant deletion API: alertmanager store not available; alertmanager tenant configuration will not be purged", "err", err)
+	}
+
+	tenantDeletionAPI, err := purger.NewTenantDeletionAPI(t.Cfg.BlocksStorage, rulerStore, alertStore, t.Overrides, util_log.Logger, prometheus.DefaultRegisterer)
 	if err != nil {
 		return nil, err
 	}
@@ -752,7 +772,7 @@ func (t *Cortex) setupModuleManager() error {
 		AlertManager:             {API, MemberlistKV, Overrides},
 		Compactor:                {API, MemberlistKV, Overrides},
 		StoreGateway:             {API, Overrides, MemberlistKV},
-		TenantDeletion:           {API, Overrides, DeleteRequestsStore},
+		TenantDeletion:           {API, Overrides, DeleteRequestsStore, RulerStorage},
 		Purger:                   {TenantDeletion},
 		TenantFederation:         {Queryable},
 		All:                      {QueryFrontend, Querier, Ingester, Distributor, Purger, StoreGateway, Ruler},
