@@ -350,6 +350,11 @@ func validateAlertmanagerConfig(cfg interface{}) error {
 		if err := validateVictorOpsConfig(v.Interface().(config.VictorOpsConfig)); err != nil {
 			return err
 		}
+
+	case reflect.TypeOf(config.EmailConfig{}):
+		if err := validateEmailConfig(v.Interface().(config.EmailConfig)); err != nil {
+			return err
+		}
 	}
 
 	// If the input config is a struct, recursively iterate on all fields.
@@ -446,6 +451,25 @@ func validateSlackConfig(cfg config.SlackConfig) error {
 func validateVictorOpsConfig(cfg config.VictorOpsConfig) error {
 	if cfg.APIKeyFile != "" {
 		return errVictorOpsAPIKeyFileNotAllowed
+	}
+	return nil
+}
+
+// validateEmailConfig performs the static (tenant-independent) validation of an
+// EmailConfig entry. The runtime firewall (if configured) performs the actual
+// IP-level isPrivate / isLocal / blockCIDRNetworks checks against the resolved
+// smarthost; here we only reject the obviously malformed shapes (empty host,
+// empty port) so that config upload fails fast instead of silently accepting a
+// receiver that will never be able to send mail.
+func validateEmailConfig(cfg config.EmailConfig) error {
+	// An EmailConfig with no smarthost at all is only valid if the global
+	// smtp_smarthost is set; we cannot see that from here, so leave it alone
+	// (Alertmanager's own Config.UnmarshalYAML already enforces that).
+	if cfg.Smarthost.Host == "" && cfg.Smarthost.Port == "" {
+		return nil
+	}
+	if cfg.Smarthost.Host == "" || cfg.Smarthost.Port == "" {
+		return errors.Errorf("email receiver smarthost %q is invalid: both host and port must be set", cfg.Smarthost.String())
 	}
 	return nil
 }

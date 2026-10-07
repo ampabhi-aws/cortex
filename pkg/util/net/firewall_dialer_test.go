@@ -146,3 +146,70 @@ func (p firewallCfgProvider) BlockCIDRNetworks() []flagext.CIDR {
 func (p firewallCfgProvider) BlockPrivateAddresses() bool {
 	return p.blockPrivateAddresses
 }
+
+func TestFirewallDialer_ValidateHostPort(t *testing.T) {
+	blockedCIDR := flagext.CIDR{}
+	require.NoError(t, blockedCIDR.Set("172.217.168.64/28"))
+
+	type testCase struct {
+		host          string
+		port          string
+		expectBlocked bool
+		expectInvalid bool
+	}
+
+	tests := map[string]struct {
+		cfg   FirewallDialerConfigProvider
+		cases []testCase
+	}{
+		"should not validate when no firewall is configured": {
+			cfg: firewallCfgProvider{},
+			cases: []testCase{
+				{host: "127.0.0.1", port: "25", expectBlocked: false},
+				{host: "", port: "", expectBlocked: false},
+			},
+		},
+		"should block private and local addresses": {
+			cfg: firewallCfgProvider{blockPrivateAddresses: true},
+			cases: []testCase{
+				{host: "127.0.0.1", port: "25", expectBlocked: true},
+				{host: "10.0.0.1", port: "25", expectBlocked: true},
+				{host: "192.168.1.1", port: "25", expectBlocked: true},
+				{host: "169.254.169.254", port: "80", expectBlocked: true},
+				{host: "localhost", port: "25", expectBlocked: true},
+				{host: "8.8.8.8", port: "53", expectBlocked: false},
+				{host: "", port: "25", expectInvalid: true},
+				{host: "127.0.0.1", port: "", expectInvalid: true},
+			},
+		},
+		"should block custom CIDRs": {
+			cfg: firewallCfgProvider{blockCIDRNetworks: []flagext.CIDR{blockedCIDR}},
+			cases: []testCase{
+				{host: "172.217.168.78", port: "443", expectBlocked: true},
+				{host: "8.8.8.8", port: "53", expectBlocked: false},
+			},
+		},
+	}
+
+	for name, testData := range tests {
+		t.Run(name, func(t *testing.T) {
+			d := NewFirewallDialer(testData.cfg)
+			for _, tc := range testData.cases {
+				t.Run(fmt.Sprintf("%s:%s", tc.host, tc.port), func(t *testing.T) {
+					err := d.ValidateHostPort(tc.host, tc.port)
+					switch {
+					case tc.expectBlocked:
+						require.Error(t, err)
+						assert.Contains(t, err.Error(), errBlockedAddress.Error())
+					case tc.expectInvalid:
+						require.Error(t, err)
+						assert.Contains(t, err.Error(), errInvalidAddress.Error())
+					default:
+						assert.True(t, err == nil || !strings.Contains(err.Error(), errBlockedAddress.Error()),
+							"unexpected block for %s:%s: %v", tc.host, tc.port, err)
+					}
+				})
+			}
+		})
+	}
+}

@@ -1,6 +1,7 @@
 package alertmanager
 
 import (
+	"context"
 	"fmt"
 	"net/url"
 	"strings"
@@ -16,6 +17,8 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
+	"github.com/cortexproject/cortex/pkg/util/flagext"
+	util_net "github.com/cortexproject/cortex/pkg/util/net"
 	"github.com/cortexproject/cortex/pkg/util/test"
 )
 
@@ -235,3 +238,71 @@ func testLimiter(t *testing.T, limits Limits, ops []callbackOp) {
 		assert.Equal(t, op.expectedTotalSize, totalSize, "wrong total size, op %d", ix)
 	}
 }
+
+// TestFirewalledEmailNotifier_BlocksPrivateSmarthost is the regression test for
+// the SSRF via tenant-controlled SMTP smarthost finding: the email receiver
+// previously built the vendored notifier with no firewall hook, so a tenant
+// could point smarthost at loopback / RFC1918 / 169.254.169.254 / blocked
+// CIDRs and bypass -alertmanager.receivers-firewall-block-private-addresses /
+// -alertmanager.receivers-firewall-block-cidr-networks. The wrapped notifier
+// must now return an error containing "blocked address" before dialing.
+func TestFirewalledEmailNotifier_BlocksPrivateSmarthost(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+
+	cases := map[string]struct {
+		smarthost     config.HostPort
+		expectBlocked bool
+	}{
+		"loopback":    {smarthost: config.HostPort{Host: "127.0.0.1", Port: "2525"}, expectBlocked: true},
+		"rfc1918":     {smarthost: config.HostPort{Host: "10.0.0.5", Port: "25"}, expectBlocked: true},
+		"link-local":  {smarthost: config.HostPort{Host: "169.254.169.254", Port: "80"}, expectBlocked: true},
+		"localhost":   {smarthost: config.HostPort{Host: "localhost", Port: "25"}, expectBlocked: true},
+		"public ipv4": {smarthost: config.HostPort{Host: "8.8.8.8", Port: "25"}, expectBlocked: false},
+	}
+
+	fd := util_net.NewFirewallDialer(firewallCfgProviderStub{blockPrivate: true})
+
+	for name, tc := range cases {
+		tc := tc
+		t.Run(name, func(t *testing.T) {
+			conf := &config.EmailConfig{Smarthost: tc.smarthost}
+			sentinel := fmt.Errorf("delegated-to-inner")
+			inner := &stubNotifier{err: sentinel}
+			n := newFirewalledEmailNotifier(fd, conf, inner)
+			_, err := n.Notify(ctx, &types.Alert{})
+			if tc.expectBlocked {
+				require.Error(t, err)
+				assert.Contains(t, err.Error(), "blocked address")
+				assert.False(t, inner.called, "inner notifier must not be invoked for blocked smarthost")
+			} else {
+				// If not blocked by the firewall, our wrapper must delegate to the inner notifier.
+				require.Error(t, err)
+				assert.Contains(t, err.Error(), sentinel.Error())
+				assert.True(t, inner.called, "inner notifier must be invoked for allowed smarthost")
+			}
+		})
+	}
+}
+
+// stubNotifier records whether Notify was invoked and returns a configured
+// error. Used by TestFirewalledEmailNotifier_BlocksPrivateSmarthost to assert
+// that the firewalled wrapper short-circuits before delegating when the
+// smarthost is blocked.
+type stubNotifier struct {
+	called bool
+	err    error
+}
+
+func (s *stubNotifier) Notify(context.Context, ...*types.Alert) (bool, error) {
+	s.called = true
+	return false, s.err
+}
+
+type firewallCfgProviderStub struct {
+	blockPrivate bool
+	blockCIDRs   []flagext.CIDR
+}
+
+func (p firewallCfgProviderStub) BlockPrivateAddresses() bool    { return p.blockPrivate }
+func (p firewallCfgProviderStub) BlockCIDRNetworks() []flagext.CIDR { return p.blockCIDRs }
