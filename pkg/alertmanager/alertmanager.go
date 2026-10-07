@@ -101,6 +101,13 @@ type Alertmanager struct {
 	mux             *http.ServeMux
 	registry        *prometheus.Registry
 
+	// inUse guards against racing a request against teardown. Request handlers
+	// RLock it while serving; StopAndWait Locks it (so it waits for in-flight
+	// requests) and flips `stopped` to true. ServeHTTPIfRunning returns false
+	// once stopped, so callers can fail closed instead of touching freed state.
+	inUse   sync.RWMutex
+	stopped bool
+
 	// Pipeline created during last ApplyConfig call. Used for testing only.
 	lastPipeline notify.Stage
 
@@ -401,6 +408,21 @@ func (am *Alertmanager) ApplyConfig(userID string, conf *config.Config, rawCfg s
 	return nil
 }
 
+// ServeHTTPIfRunning serves req on the tenant mux unless the Alertmanager has
+// already been stopped. Returns true when it served the request, false when
+// the caller should treat the tenant as unavailable (e.g. respond 503).
+// Holding inUse for the duration of ServeHTTP prevents StopAndWait from
+// closing underlying resources while a request is still touching them.
+func (am *Alertmanager) ServeHTTPIfRunning(w http.ResponseWriter, req *http.Request) bool {
+	am.inUse.RLock()
+	defer am.inUse.RUnlock()
+	if am.stopped || am.mux == nil {
+		return false
+	}
+	am.mux.ServeHTTP(w, req)
+	return true
+}
+
 // Stop stops the Alertmanager.
 func (am *Alertmanager) Stop() {
 	if am.inhibitor != nil {
@@ -424,6 +446,12 @@ func (am *Alertmanager) Stop() {
 }
 
 func (am *Alertmanager) StopAndWait() {
+	// Mark as stopped under the write lock so any in-flight request completes
+	// before Stop() tears down shared state, and no new request starts after.
+	am.inUse.Lock()
+	am.stopped = true
+	am.inUse.Unlock()
+
 	am.Stop()
 
 	if am.persister != nil {
