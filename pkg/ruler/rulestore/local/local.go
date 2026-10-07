@@ -5,6 +5,7 @@ import (
 	"flag"
 	"os"
 	"path/filepath"
+	"strings"
 
 	"github.com/pkg/errors"
 	promRules "github.com/prometheus/prometheus/rules"
@@ -168,11 +169,29 @@ func (l *Client) loadAllRulesGroupsForUser(ctx context.Context, userID string) (
 }
 
 func (l *Client) loadAllRulesGroupsForUserAndNamespace(_ context.Context, userID string, namespace string) (rulespb.RuleGroupList, error) {
-	filename := filepath.Join(l.cfg.Directory, userID, namespace)
+	// Defence in depth: even if callers forget to sanitise the namespace,
+	// ensure the resulting file path stays inside the tenant's rule
+	// directory. filepath.Join cleans ".." segments, so without this check
+	// a crafted namespace (e.g. "../otherTenant/rules.yaml") would escape
+	// the per-tenant directory and expose cross-tenant or arbitrary files.
+	userRoot, err := filepath.Abs(filepath.Join(l.cfg.Directory, userID))
+	if err != nil {
+		return nil, errors.Wrap(err, "unable to resolve user rule directory")
+	}
+	filename, err := filepath.Abs(filepath.Join(userRoot, namespace))
+	if err != nil {
+		return nil, errors.New("invalid namespace")
+	}
+	if filename != userRoot && !strings.HasPrefix(filename, userRoot+string(os.PathSeparator)) {
+		return nil, errors.New("invalid namespace")
+	}
 
 	rulegroups, allErrors := l.loader.Load(filename)
 	if len(allErrors) > 0 {
-		return nil, errors.Wrapf(allErrors[0], "error parsing %s", filename)
+		// Do not echo the raw path or parse error back to the caller: it
+		// can be used as an existence/partial-read oracle. The caller
+		// (API handler) is responsible for logging a more detailed error.
+		return nil, errors.New("error parsing rule group")
 	}
 
 	var list rulespb.RuleGroupList
