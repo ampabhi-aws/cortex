@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"net/http"
 	"os"
+	"strings"
 
 	"github.com/go-kit/log"
 	kitlog "github.com/go-kit/log"
@@ -149,22 +150,84 @@ func ContextWithHeaderMap(ctx context.Context, headerMap map[string]string) cont
 	return context.WithValue(ctx, headerMapContextKey, headerMap)
 }
 
+// maxForwardedHeaderValueLen bounds the size of a single forwarded header
+// value that can land in the request-logging map received over gRPC. The
+// map eventually fans out to every structured log line emitted under the
+// request's context, so untrusted values are truncated to keep log volume
+// (and log-vendor cost) bounded.
+const maxForwardedHeaderValueLen = 256
+
 // InjectHeadersIntoHTTPRequest injects the logging header map from the context into the request headers.
-func InjectHeadersIntoHTTPRequest(headerMap map[string]string, request *http.Request) {
+//
+// Only entries whose names appear (case-insensitively) in `allowed` are
+// re-emitted as real HTTP headers; the caller must therefore pass the same
+// allowlist as the HTTP ingress middleware (`-api.http-request-headers-to-log`).
+// If `allowed` is nil the whole map is written through, preserving the
+// pre-existing behaviour for intra-process callers that have already applied
+// the allowlist themselves.
+func InjectHeadersIntoHTTPRequest(headerMap map[string]string, request *http.Request, allowed ...string) {
+	var allow map[string]struct{}
+	if len(allowed) > 0 {
+		allow = make(map[string]struct{}, len(allowed))
+		for _, a := range allowed {
+			allow[strings.ToLower(a)] = struct{}{}
+		}
+	}
 	for header, contents := range headerMap {
+		if allow != nil {
+			if _, ok := allow[strings.ToLower(header)]; !ok {
+				continue
+			}
+		}
 		request.Header.Add(header, contents)
 	}
 }
 
-func ContextWithHeaderMapFromMetadata(ctx context.Context, md metadata.MD) context.Context {
+// ContextWithHeaderMapFromMetadata rebuilds the request-logging header map
+// from a caller-supplied gRPC metadata slice. Because the metadata arrives
+// from the wire, keys that are not in `allowed` (which must mirror the HTTP
+// middleware's configured `TargetHeaders`) are dropped, credential-bearing
+// names are redacted, each value is truncated to `maxForwardedHeaderValueLen`,
+// and the total number of pairs is bounded by `len(allowed)` to prevent an
+// unauthenticated gRPC caller from arbitrarily inflating log volume or
+// injecting structured-log fields that could shadow genuine key/value pairs
+// such as `org_id`, `msg`, or `level`.
+//
+// Callers must pass the same allowlist as the HTTP middleware; the gRPC
+// interceptor in pkg/util/grpcutil threads it through as a closure.
+func ContextWithHeaderMapFromMetadata(ctx context.Context, md metadata.MD, allowed ...string) context.Context {
 	headersSlice, ok := md[HeaderPropagationStringForRequestLogging]
 	if !ok || len(headersSlice)%2 == 1 {
 		return ctx
 	}
 
+	// When an allowlist is provided, bound the number of pairs we accept
+	// off the wire by its size. This prevents log-volume inflation.
+	if len(allowed) > 0 && len(headersSlice) > 2*len(allowed) {
+		return ctx
+	}
+
+	var allow map[string]struct{}
+	if len(allowed) > 0 {
+		allow = make(map[string]struct{}, len(allowed))
+		for _, a := range allowed {
+			allow[strings.ToLower(a)] = struct{}{}
+		}
+	}
+
 	headerMap := make(map[string]string)
-	for i := 0; i < len(headersSlice); i += 2 {
-		headerMap[headersSlice[i]] = headersSlice[i+1]
+	for i := 0; i+1 < len(headersSlice); i += 2 {
+		k := headersSlice[i]
+		if allow != nil {
+			if _, ok := allow[strings.ToLower(k)]; !ok {
+				continue
+			}
+		}
+		v := headersSlice[i+1]
+		if len(v) > maxForwardedHeaderValueLen {
+			v = v[:maxForwardedHeaderValueLen]
+		}
+		headerMap[k] = v
 	}
 
 	return ContextWithHeaderMap(ctx, headerMap)

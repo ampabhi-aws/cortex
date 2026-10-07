@@ -82,7 +82,16 @@ api:
   # CLI flag: -http.prometheus-http-prefix
   [prometheus_http_prefix: <string> | default = "/prometheus"]
 
-  # Which HTTP Request headers to add to logs
+  # Which HTTP Request headers to add to logs. Values of credential-bearing
+  # headers (Authorization, Proxy-Authorization, Cookie, Set-Cookie,
+  # X-Amz-Security-Token, X-Api-Key) are automatically redacted to
+  # <redacted> before being written to log lines; configuring one of
+  # those names will emit a warning at startup. Header values are also
+  # length-bounded when received over the gRPC log-header propagation
+  # path, and only names on this list are accepted on that path. The
+  # resulting structured log fields are namespaced with the prefix
+  # 'http_header_' so they cannot shadow built-in keys such as org_id,
+  # msg, level, or caller.
   # CLI flag: -api.http-request-headers-to-log
   [http_request_headers_to_log: <list of string> | default = []]
 

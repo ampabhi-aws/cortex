@@ -15,6 +15,7 @@ func TestHeaderMapFromMetadata(t *testing.T) {
 
 	ctx := context.Background()
 
+	// Without an allowlist (legacy behaviour) all pairs are accepted.
 	ctx = ContextWithHeaderMapFromMetadata(ctx, md)
 
 	headerMap := HeaderMapFromContext(ctx)
@@ -35,6 +36,56 @@ func TestHeaderMapFromMetadataWithImproperLength(t *testing.T) {
 
 	headerMap := HeaderMapFromContext(ctx)
 	require.Nil(t, headerMap)
+}
+
+func TestHeaderMapFromMetadataWithAllowlist(t *testing.T) {
+	md := metadata.New(nil)
+	md.Append(HeaderPropagationStringForRequestLogging,
+		"TestHeader1", "SomeInformation",
+		"InjectedHeader", "ShouldBeDropped",
+		"testheader2", "ContentsOfTestHeader2", // case-insensitive match
+	)
+
+	ctx := context.Background()
+	ctx = ContextWithHeaderMapFromMetadata(ctx, md, "TestHeader1", "TestHeader2")
+
+	headerMap := HeaderMapFromContext(ctx)
+	require.NotNil(t, headerMap)
+	require.Equal(t, "SomeInformation", headerMap["TestHeader1"])
+	require.Equal(t, "ContentsOfTestHeader2", headerMap["testheader2"])
+	_, present := headerMap["InjectedHeader"]
+	require.False(t, present, "non-allowlisted header name must be dropped")
+}
+
+func TestHeaderMapFromMetadataAllowlistBoundsSize(t *testing.T) {
+	md := metadata.New(nil)
+	// 3 pairs supplied, but allowlist has only 1 entry -> the whole payload is rejected.
+	md.Append(HeaderPropagationStringForRequestLogging,
+		"TestHeader1", "A",
+		"TestHeader1", "B",
+		"TestHeader1", "C",
+	)
+
+	ctx := context.Background()
+	ctx = ContextWithHeaderMapFromMetadata(ctx, md, "TestHeader1")
+
+	require.Nil(t, HeaderMapFromContext(ctx), "oversized payload must be rejected")
+}
+
+func TestHeaderMapFromMetadataTruncatesValues(t *testing.T) {
+	long := make([]byte, maxForwardedHeaderValueLen+100)
+	for i := range long {
+		long[i] = 'a'
+	}
+	md := metadata.New(nil)
+	md.Append(HeaderPropagationStringForRequestLogging, "TestHeader1", string(long))
+
+	ctx := context.Background()
+	ctx = ContextWithHeaderMapFromMetadata(ctx, md, "TestHeader1")
+
+	headerMap := HeaderMapFromContext(ctx)
+	require.NotNil(t, headerMap)
+	require.Equal(t, maxForwardedHeaderValueLen, len(headerMap["TestHeader1"]))
 }
 
 func TestInjectHeadersIntoHTTPRequest(t *testing.T) {
@@ -62,4 +113,22 @@ func TestInjectHeadersIntoHTTPRequest(t *testing.T) {
 	require.Equal(t, "RequestID", header1[0])
 	require.Equal(t, "ContentsOfTestHeader2", header2[0])
 
+}
+
+func TestInjectHeadersIntoHTTPRequestWithAllowlist(t *testing.T) {
+	contentsMap := map[string]string{
+		"TestHeader1":    "RequestID",
+		"InjectedHeader": "ShouldBeDropped",
+	}
+
+	req := &http.Request{
+		Method:     "GET",
+		RequestURI: "/HTTPHeaderTest",
+		Body:       http.NoBody,
+		Header:     http.Header{},
+	}
+	InjectHeadersIntoHTTPRequest(contentsMap, req, "TestHeader1")
+
+	require.Equal(t, "RequestID", req.Header.Get("TestHeader1"))
+	require.Empty(t, req.Header.Get("InjectedHeader"))
 }

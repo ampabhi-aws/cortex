@@ -72,3 +72,40 @@ func TestExistingHeaderInContextIsNotOverridden(t *testing.T) {
 	require.Equal(t, contentsMap, util_log.HeaderMapFromContext(ctx))
 
 }
+
+func TestCredentialHeadersAreRedacted(t *testing.T) {
+	ctx := context.Background()
+
+	mw := HTTPHeaderMiddleware{TargetHeaders: []string{"Authorization", "Cookie", "X-Request-ID"}}
+
+	h := http.Header{}
+	h.Add("Authorization", "Bearer SUPER-SECRET")
+	h.Add("Cookie", "session=abc")
+	h.Add("X-Request-ID", "req-123")
+
+	req := (&http.Request{
+		Method:     "GET",
+		RequestURI: "/",
+		Body:       http.NoBody,
+		Header:     h,
+	}).WithContext(ctx)
+
+	ctx = mw.InjectTargetHeadersIntoHTTPRequest(req)
+	hm := util_log.HeaderMapFromContext(ctx)
+
+	require.Equal(t, "<redacted>", hm["Authorization"])
+	require.Equal(t, "<redacted>", hm["Cookie"])
+	require.Equal(t, "req-123", hm["X-Request-ID"])
+}
+
+func TestIsCredentialHeader(t *testing.T) {
+	require.True(t, IsCredentialHeader("Authorization"))
+	require.True(t, IsCredentialHeader("authorization"))
+	require.True(t, IsCredentialHeader("Cookie"))
+	require.True(t, IsCredentialHeader("Set-Cookie"))
+	require.True(t, IsCredentialHeader("X-Api-Key"))
+	require.True(t, IsCredentialHeader("x-amz-security-token"))
+	require.True(t, IsCredentialHeader("Proxy-Authorization"))
+	require.False(t, IsCredentialHeader("X-Request-ID"))
+	require.False(t, IsCredentialHeader(""))
+}
