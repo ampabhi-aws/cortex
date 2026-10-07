@@ -81,13 +81,21 @@ func (a *API) admin(w http.ResponseWriter, r *http.Request) {
 `)
 }
 
-// RegisterRoutes registers the configs API HTTP routes with the provided Router.
-func (a *API) RegisterRoutes(r *mux.Router) {
-	for _, route := range []struct {
-		name, method, path string
-		handler            http.HandlerFunc
-	}{
-		{"root", "GET", "/", a.admin},
+// Route describes a single configs API HTTP route.
+type Route struct {
+	Name    string
+	Method  string
+	Path    string
+	Handler http.HandlerFunc
+}
+
+// Routes returns the configs API routes so callers (e.g. pkg/api) can
+// register them with the shared authentication middleware. Admin and the
+// private tenant-dump endpoints are listed separately via AdminRoute and
+// PrivateRoutes so callers can decide whether to attach auth or expose them
+// on an internal listener.
+func (a *API) Routes() []Route {
+	return []Route{
 		// Dedicated APIs for updating rules config. In the future, these *must*
 		// be used.
 		{"get_rules", "GET", "/api/prom/configs/rules", a.getConfig},
@@ -99,17 +107,43 @@ func (a *API) RegisterRoutes(r *mux.Router) {
 		{"validate_alertmanager_config", "POST", "/api/prom/configs/alertmanager/validate", a.validateAlertmanagerConfig},
 		{"deactivate_config", "DELETE", "/api/prom/configs/deactivate", a.deactivateConfig},
 		{"restore_config", "POST", "/api/prom/configs/restore", a.restoreConfig},
-		// Internal APIs.
+	}
+}
+
+// AdminRoute returns the unauthenticated admin landing page route.
+func (a *API) AdminRoute() Route {
+	return Route{"root", "GET", "/", a.admin}
+}
+
+// PrivateRoutes returns the cross-tenant "private" dump endpoints. These must
+// be mounted behind authentication (treated as internal callers) or on a
+// separate listener; they are not safe to expose on the public router raw.
+func (a *API) PrivateRoutes() []Route {
+	return []Route{
 		{"private_get_rules", "GET", "/private/api/prom/configs/rules", a.getConfigs},
 		{"private_get_alertmanager_config", "GET", "/private/api/prom/configs/alertmanager", a.getConfigs},
-	} {
-		r.Handle(route.path, route.handler).Methods(route.method).Name(route.name)
+	}
+}
+
+// RegisterRoutes registers the configs API HTTP routes with the provided Router.
+//
+// This helper does NOT wrap handlers with the Cortex authentication
+// middleware. Production code must mount the API through
+// pkg/api.(*API).RegisterConfigsAPI so each handler is wrapped with the
+// configured auth middleware. RegisterRoutes is retained for the embedded
+// in-process router used by tests, where handlers derive the tenant from the
+// request context directly.
+func (a *API) RegisterRoutes(r *mux.Router) {
+	routes := append([]Route{a.AdminRoute()}, a.Routes()...)
+	routes = append(routes, a.PrivateRoutes()...)
+	for _, route := range routes {
+		r.Handle(route.Path, route.Handler).Methods(route.Method).Name(route.Name)
 	}
 }
 
 // getConfig returns the request configuration.
 func (a *API) getConfig(w http.ResponseWriter, r *http.Request) {
-	userID, _, err := tenant.ExtractTenantIDFromHTTPRequest(r)
+	userID, err := tenant.TenantID(r.Context())
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusUnauthorized)
 		return
@@ -147,7 +181,7 @@ func (a *API) getConfig(w http.ResponseWriter, r *http.Request) {
 }
 
 func (a *API) setConfig(w http.ResponseWriter, r *http.Request) {
-	userID, _, err := tenant.ExtractTenantIDFromHTTPRequest(r)
+	userID, err := tenant.TenantID(r.Context())
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusUnauthorized)
 		return
@@ -201,12 +235,22 @@ func (a *API) setConfig(w http.ResponseWriter, r *http.Request) {
 	w.WriteHeader(http.StatusNoContent)
 }
 
+// maxConfigSize caps the request body accepted by validateAlertmanagerConfig
+// to prevent unbounded memory allocation from a single HTTP request.
+const maxConfigSize = 1 << 20 // 1 MiB
+
 func (a *API) validateAlertmanagerConfig(w http.ResponseWriter, r *http.Request) {
 	logger := util_log.WithContext(r.Context(), util_log.Logger)
-	cfg, err := io.ReadAll(r.Body)
+	// Require an authenticated tenant so this endpoint cannot be probed
+	// anonymously (and so request logs attribute the call to a tenant).
+	if _, err := tenant.TenantID(r.Context()); err != nil {
+		http.Error(w, err.Error(), http.StatusUnauthorized)
+		return
+	}
+	cfg, err := io.ReadAll(http.MaxBytesReader(w, r.Body, maxConfigSize))
 	if err != nil {
 		level.Error(logger).Log("msg", "error reading request body", "err", err)
-		http.Error(w, err.Error(), http.StatusInternalServerError)
+		http.Error(w, err.Error(), http.StatusBadRequest)
 		return
 	}
 
@@ -297,7 +341,7 @@ func (a *API) getConfigs(w http.ResponseWriter, r *http.Request) {
 }
 
 func (a *API) deactivateConfig(w http.ResponseWriter, r *http.Request) {
-	userID, _, err := tenant.ExtractTenantIDFromHTTPRequest(r)
+	userID, err := tenant.TenantID(r.Context())
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusUnauthorized)
 		return
@@ -319,7 +363,7 @@ func (a *API) deactivateConfig(w http.ResponseWriter, r *http.Request) {
 }
 
 func (a *API) restoreConfig(w http.ResponseWriter, r *http.Request) {
-	userID, _, err := tenant.ExtractTenantIDFromHTTPRequest(r)
+	userID, err := tenant.TenantID(r.Context())
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusUnauthorized)
 		return

@@ -18,6 +18,7 @@ import (
 	"github.com/cortexproject/cortex/pkg/alertmanager"
 	"github.com/cortexproject/cortex/pkg/alertmanager/alertmanagerpb"
 	"github.com/cortexproject/cortex/pkg/compactor"
+	configAPI "github.com/cortexproject/cortex/pkg/configs/api"
 	"github.com/cortexproject/cortex/pkg/cortexpb"
 	"github.com/cortexproject/cortex/pkg/distributor"
 	"github.com/cortexproject/cortex/pkg/distributor/distributorpb"
@@ -322,6 +323,30 @@ func (a *API) RegisterRulerAPI(r *ruler.API) {
 	a.RegisterRoute(path.Join(a.cfg.LegacyHTTPPrefix, "/rules/{namespace}"), http.HandlerFunc(r.CreateRuleGroup), true, "POST")
 	a.RegisterRoute(path.Join(a.cfg.LegacyHTTPPrefix, "/rules/{namespace}/{groupName}"), http.HandlerFunc(r.DeleteRuleGroup), true, "DELETE")
 	a.RegisterRoute(path.Join(a.cfg.LegacyHTTPPrefix, "/rules/{namespace}"), http.HandlerFunc(r.DeleteNamespace), true, "DELETE")
+}
+
+// RegisterConfigsAPI registers routes associated with the (legacy) configs
+// service through the API package so each handler is wrapped with the
+// configured HTTP authentication middleware. The per-tenant and cross-tenant
+// private routes both require an authenticated caller (the handlers then
+// resolve the tenant from the request context the middleware established).
+//
+// The admin landing page ("GET /") is intentionally not re-registered here
+// because the shared index page is already mounted on "/" via RegisterAPI.
+func (a *API) RegisterConfigsAPI(c *configAPI.API) {
+	for _, r := range c.Routes() {
+		a.RegisterRoute(r.Path, r.Handler, true, r.Method)
+	}
+
+	// The /private/... dumps return every tenant's configuration and must be
+	// authenticated as internal callers (or moved to a dedicated listener).
+	// Attaching the standard auth middleware ensures the public listener does
+	// not expose them anonymously; operators who need stricter isolation
+	// should additionally block these paths at the gateway or move the
+	// configs target to a non-public port.
+	for _, r := range c.PrivateRoutes() {
+		a.RegisterRoute(r.Path, r.Handler, true, r.Method)
+	}
 }
 
 // RegisterRing registers the ring UI page associated with the distributor for writes.
