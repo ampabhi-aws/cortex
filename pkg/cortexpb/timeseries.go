@@ -290,19 +290,28 @@ func TimeseriesFromPool() *TimeSeries {
 
 // ReuseTimeseries puts the timeseries back into a sync.Pool for reuse.
 func ReuseTimeseries(ts *TimeSeries) {
-	// Name and Value may point into a large gRPC buffer, so clear the reference to allow GC
-	for i := 0; i < len(ts.Labels); i++ {
-		ts.Labels[i].Name = ""
-		ts.Labels[i].Value = ""
+	// Name and Value may point into a large gRPC/HTTP request buffer, so clear
+	// *every* slot up to cap: code such as distributor.removeLabel() shrinks len
+	// and would otherwise leave live aliases behind in the pooled array, keeping
+	// the entire decompressed request body reachable via a zero-copy string.
+	lbls := ts.Labels[:cap(ts.Labels)]
+	for i := range lbls {
+		lbls[i].Name = ""
+		lbls[i].Value = ""
 	}
 	ts.Labels = ts.Labels[:0]
 	ts.Samples = ts.Samples[:0]
-	// Name and Value may point into a large gRPC buffer, so clear the reference in each exemplar to allow GC
-	for i := range ts.Exemplars {
-		for j := range ts.Exemplars[i].Labels {
-			ts.Exemplars[i].Labels[j].Name = ""
-			ts.Exemplars[i].Labels[j].Value = ""
+	// Name and Value may point into a large gRPC buffer, so clear the reference
+	// in each exemplar — again covering the full capacity of each slice — to
+	// allow GC and to prevent cross-request residue in the pooled struct.
+	ex := ts.Exemplars[:cap(ts.Exemplars)]
+	for i := range ex {
+		exLbls := ex[i].Labels[:cap(ex[i].Labels)]
+		for j := range exLbls {
+			exLbls[j].Name = ""
+			exLbls[j].Value = ""
 		}
+		ex[i].Labels = nil
 	}
 	ts.Exemplars = ts.Exemplars[:0]
 	timeSeriesPool.Put(ts)
