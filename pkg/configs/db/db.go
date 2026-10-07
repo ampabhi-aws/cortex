@@ -24,7 +24,7 @@ type Config struct {
 
 // RegisterFlags adds the flags required to configure this to the given FlagSet.
 func (cfg *Config) RegisterFlags(f *flag.FlagSet) {
-	f.StringVar(&cfg.URI, "configs.database.uri", "postgres://postgres@configs-db.weave.local/configs?sslmode=disable", "URI where the database can be found (for dev you can use memory://)")
+	f.StringVar(&cfg.URI, "configs.database.uri", "postgres://postgres@configs-db.weave.local/configs?sslmode=verify-full", "URI where the database can be found (for dev you can use memory://). For postgres:// URIs, sslmode must be one of require, verify-ca, or verify-full; plaintext connections are rejected because they would expose tenant Alertmanager secrets.")
 	f.StringVar(&cfg.MigrationsDir, "configs.database.migrations-dir", "", "Path where the database migration files can be found")
 	f.StringVar(&cfg.PasswordFile, "configs.database.password-file", "", "File containing password (username goes in URI)")
 }
@@ -67,6 +67,19 @@ func New(cfg Config) (DB, error) {
 	u, err := url.Parse(cfg.URI)
 	if err != nil {
 		return nil, err
+	}
+
+	// Fail closed on plaintext Postgres connections: the configs service
+	// transports per-tenant Alertmanager secrets (SMTP/Slack/PagerDuty
+	// credentials) and rule files over this link, so TLS with server
+	// certificate validation is required. See CWE-319.
+	if u.Scheme == "postgres" {
+		switch u.Query().Get("sslmode") {
+		case "require", "verify-ca", "verify-full":
+		default:
+			return nil, fmt.Errorf("configs.database.uri must use sslmode=require|verify-ca|verify-full; " +
+				"plaintext connections would expose tenant Alertmanager secrets")
+		}
 	}
 
 	if len(cfg.PasswordFile) != 0 {
