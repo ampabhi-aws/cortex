@@ -288,6 +288,16 @@ func (u *userTSDB) Close() error {
 }
 
 func (u *userTSDB) Compact() error {
+	// Enter the same state machine as compactHead / shipping / idle-close so that
+	// a regular (unforced) compaction cannot race closeAndDeleteUserTSDBIfIdle,
+	// which would otherwise tear down the head while this compaction's head GC
+	// is still calling PostDeletion and would double-decrement the instance
+	// series counter.
+	if !u.casState(active, forceCompacting) {
+		return errors.New("TSDB cannot be compacted because it is not in active state (possibly being closed or blocks shipping in progress)")
+	}
+	defer u.casState(forceCompacting, active)
+
 	return u.db.Compact()
 }
 
@@ -2182,9 +2192,11 @@ func (i *Ingester) compactionLoop(ctx context.Context) error {
 		select {
 		case <-ticker.C:
 			i.compactBlocks(ctx, false, nil)
+			i.auditInstanceSeriesCount()
 
 		case req := <-i.TSDBState.forceCompactTrigger:
 			i.compactBlocks(ctx, true, req.users)
+			i.auditInstanceSeriesCount()
 			close(req.callback) // Notify back.
 
 		case <-ctx.Done():
@@ -2192,6 +2204,19 @@ func (i *Ingester) compactionLoop(ctx context.Context) error {
 		}
 	}
 	return nil
+}
+
+// auditInstanceSeriesCount clamps the process-wide series counter at zero and
+// logs an error if it has gone negative. The counter is a plain atomic.Int64
+// that is never recomputed from ground truth; letting it drift negative would
+// silently disable the -ingester.instance-limits.max-series guard, which is
+// the ingester's last line of defence against a single tenant's cardinality
+// exhausting memory for all tenants sharing the process.
+func (i *Ingester) auditInstanceSeriesCount() {
+	if v := i.TSDBState.seriesCount.Load(); v < 0 {
+		i.TSDBState.seriesCount.Store(0)
+		level.Error(i.logger).Log("msg", "instance series count went negative; clamping to 0 to keep -ingester.instance-limits.max-series effective", "previous_value", v)
+	}
 }
 
 // Compacts all compactable blocks. Force flag will force compaction even if head is not compactable yet.
@@ -2277,7 +2302,9 @@ func (i *Ingester) closeAndDeleteUserTSDBIfIdle(userID string) tsdbCloseCheckRes
 		return result
 	}
 
-	// This disables pushes and force-compactions. Not allowed to close while shipping is in progress.
+	// This disables pushes, force-compactions and regular compactions. Not allowed to close while
+	// shipping or a compaction is in progress: all of those operations transition the userTSDB
+	// state machine out of 'active', so this casState will fail and we will retry on the next tick.
 	if !userDB.casState(active, closing) {
 		return tsdbNotActive
 	}
@@ -2297,10 +2324,14 @@ func (i *Ingester) closeAndDeleteUserTSDBIfIdle(userID string) tsdbCloseCheckRes
 		tenantDeleted = true
 	}
 
-	// At this point there are no more pushes to TSDB, and no possible compaction. Normally TSDB is empty,
-	// but if we're closing TSDB because of tenant deletion mark, then it may still contain some series.
-	// We need to remove these series from series count.
-	i.TSDBState.seriesCount.Sub(int64(userDB.Head().NumSeries()))
+	// At this point there are no more pushes to TSDB, and no possible compaction (regular,
+	// forced or idle), because the casState(active, closing) above locks out all three.
+	// Normally TSDB is empty, but if we're closing TSDB because of tenant deletion mark, then
+	// it may still contain some series. We need to remove these series from the series count,
+	// but only after a successful Close(): if Close() fails the TSDB is returned to active state
+	// by the deferred casState and will keep serving pushes, so the counter must be left intact
+	// to avoid a permanent drift that would silently weaken -ingester.instance-limits.max-series.
+	numSeries := int64(userDB.Head().NumSeries())
 
 	dir := userDB.db.Dir()
 
@@ -2308,6 +2339,8 @@ func (i *Ingester) closeAndDeleteUserTSDBIfIdle(userID string) tsdbCloseCheckRes
 		level.Error(i.logger).Log("msg", "failed to close idle TSDB", "user", userID, "err", err)
 		return tsdbCloseFailed
 	}
+
+	i.TSDBState.seriesCount.Sub(numSeries)
 
 	level.Info(i.logger).Log("msg", "closed idle TSDB", "user", userID)
 
