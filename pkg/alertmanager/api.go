@@ -40,11 +40,14 @@ const (
 )
 
 var (
-	errPasswordFileNotAllowed        = errors.New("setting password_file, bearer_token_file and credentials_file is not allowed")
-	errOAuth2SecretFileNotAllowed    = errors.New("setting OAuth2 client_secret_file is not allowed")
-	errTLSFileNotAllowed             = errors.New("setting TLS ca_file, cert_file and key_file is not allowed")
-	errSlackAPIURLFileNotAllowed     = errors.New("setting Slack api_url_file and global slack_api_url_file is not allowed")
-	errVictorOpsAPIKeyFileNotAllowed = errors.New("setting VictorOps api_key_file is not allowed")
+	errPasswordFileNotAllowed         = errors.New("setting password_file, bearer_token_file and credentials_file is not allowed")
+	errOAuth2SecretFileNotAllowed     = errors.New("setting OAuth2 client_secret_file is not allowed")
+	errTLSFileNotAllowed              = errors.New("setting TLS ca_file, cert_file and key_file is not allowed")
+	errSlackAPIURLFileNotAllowed      = errors.New("setting Slack api_url_file and global slack_api_url_file is not allowed")
+	errVictorOpsAPIKeyFileNotAllowed  = errors.New("setting VictorOps api_key_file is not allowed")
+	errSNSAmbientCredentialsNotAllowed = errors.New("sns_configs must specify sigv4 access_key and secret_key; using the Alertmanager's own AWS credentials is not allowed")
+	errSNSProfileNotAllowed            = errors.New("setting sns sigv4 profile is not allowed")
+	errSNSRoleARNNotAllowed            = errors.New("setting sns sigv4 role_arn is not allowed")
 )
 
 // UserConfig is used to communicate a users alertmanager configs
@@ -350,6 +353,11 @@ func validateAlertmanagerConfig(cfg interface{}) error {
 		if err := validateVictorOpsConfig(v.Interface().(config.VictorOpsConfig)); err != nil {
 			return err
 		}
+
+	case reflect.TypeOf(config.SNSConfig{}):
+		if err := validateSNSConfig(v.Interface().(config.SNSConfig)); err != nil {
+			return err
+		}
 	}
 
 	// If the input config is a struct, recursively iterate on all fields.
@@ -446,6 +454,29 @@ func validateSlackConfig(cfg config.SlackConfig) error {
 func validateVictorOpsConfig(cfg config.VictorOpsConfig) error {
 	if cfg.APIKeyFile != "" {
 		return errVictorOpsAPIKeyFileNotAllowed
+	}
+	return nil
+}
+
+// validateSNSConfig validates the SNS config and returns an error if it contains
+// settings not allowed by Cortex. In particular, tenant SNS configurations are
+// not permitted to rely on the Alertmanager process's ambient AWS credentials:
+// if sigv4 access_key / secret_key are omitted, the AWS SDK would fall back to
+// the default credential chain (env vars, IRSA web identity, instance profile,
+// or a shared-credentials profile), causing the server to sign requests with
+// its own identity to a tenant-controlled api_url. The sigv4 profile and
+// role_arn fields are rejected for the same reason: both let a tenant make the
+// server authenticate as itself (shared-credentials profile selection, or an
+// sts:AssumeRole pivot using the process identity as caller).
+func validateSNSConfig(cfg config.SNSConfig) error {
+	if cfg.Sigv4.Profile != "" {
+		return errSNSProfileNotAllowed
+	}
+	if cfg.Sigv4.RoleARN != "" {
+		return errSNSRoleARNNotAllowed
+	}
+	if cfg.Sigv4.AccessKey == "" || cfg.Sigv4.SecretKey == "" {
+		return errSNSAmbientCredentialsNotAllowed
 	}
 	return nil
 }
