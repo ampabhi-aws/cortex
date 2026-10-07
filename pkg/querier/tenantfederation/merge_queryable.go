@@ -47,6 +47,13 @@ func tenantQuerierCallback(queryable storage.Queryable) MergeQuerierCallback {
 			return nil, nil, err
 		}
 
+		// Defense-in-depth: even though MultiResolver enforces the same cap,
+		// re-check here before allocating per-tenant queriers so that no code
+		// path (custom resolver, future caller) can trigger unbounded fan-out.
+		if maxN := tenant.MaxTenantIDs(); maxN > 0 && len(tenantIDs) > maxN {
+			return nil, nil, fmt.Errorf("too many tenant IDs: %d (max %d)", len(tenantIDs), maxN)
+		}
+
 		var queriers = make([]storage.Querier, len(tenantIDs))
 		for pos, tenantID := range tenantIDs {
 			q, err := queryable.Querier(
