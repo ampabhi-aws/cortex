@@ -185,6 +185,15 @@ func validateUserConfig(logger log.Logger, cfg alertspb.AlertConfigDesc, limits 
 		return err
 	}
 
+	// Reject configurations which explicitly set the global HTTP config (or any
+	// per-receiver HTTP config) to YAML null. yaml.v2 zeroes the pointer rather
+	// than running UnmarshalYAML, which bypasses the default HTTPConfig and
+	// causes downstream notifier constructors (e.g. webhook.New) to dereference
+	// a nil *HTTPClientConfig and crash the whole Alertmanager process.
+	if err := validateAlertmanagerHTTPConfigs(amCfg); err != nil {
+		return err
+	}
+
 	// Validate the config recursively scanning it.
 	if err := validateAlertmanagerConfig(amCfg); err != nil {
 		return err
@@ -302,6 +311,74 @@ func (am *MultitenantAlertmanager) ListAllConfigs(w http.ResponseWriter, r *http
 	}
 	close(iter)
 	<-done
+}
+
+// validateAlertmanagerHTTPConfigs rejects configurations that would leave a
+// receiver integration with a nil *HTTPClientConfig. This can happen when a
+// tenant uploads YAML such as `global: {http_config: null}`: yaml.v2 zeroes
+// the pointer instead of invoking the custom UnmarshalYAML that installs the
+// default HTTPConfig, and the nil global value is then copied into every
+// receiver integration by alertmanager's own Config.UnmarshalYAML. Downstream
+// notifier constructors (webhook.New and siblings) dereference the pointer
+// unconditionally, which would otherwise panic the Alertmanager goroutine.
+func validateAlertmanagerHTTPConfigs(cfg *config.Config) error {
+	if cfg == nil {
+		return nil
+	}
+	if cfg.Global == nil || cfg.Global.HTTPConfig == nil {
+		return errors.New("setting global http_config to null is not allowed")
+	}
+	for _, rcv := range cfg.Receivers {
+		if rcv == nil {
+			continue
+		}
+		for i, c := range rcv.WebhookConfigs {
+			if c == nil || c.HTTPConfig == nil {
+				return fmt.Errorf("receiver %q: webhook_configs[%d] http_config must not be null", rcv.Name, i)
+			}
+		}
+		for i, c := range rcv.SlackConfigs {
+			if c == nil || c.HTTPConfig == nil {
+				return fmt.Errorf("receiver %q: slack_configs[%d] http_config must not be null", rcv.Name, i)
+			}
+		}
+		for i, c := range rcv.PagerdutyConfigs {
+			if c == nil || c.HTTPConfig == nil {
+				return fmt.Errorf("receiver %q: pagerduty_configs[%d] http_config must not be null", rcv.Name, i)
+			}
+		}
+		for i, c := range rcv.OpsGenieConfigs {
+			if c == nil || c.HTTPConfig == nil {
+				return fmt.Errorf("receiver %q: opsgenie_configs[%d] http_config must not be null", rcv.Name, i)
+			}
+		}
+		for i, c := range rcv.WechatConfigs {
+			if c == nil || c.HTTPConfig == nil {
+				return fmt.Errorf("receiver %q: wechat_configs[%d] http_config must not be null", rcv.Name, i)
+			}
+		}
+		for i, c := range rcv.PushoverConfigs {
+			if c == nil || c.HTTPConfig == nil {
+				return fmt.Errorf("receiver %q: pushover_configs[%d] http_config must not be null", rcv.Name, i)
+			}
+		}
+		for i, c := range rcv.VictorOpsConfigs {
+			if c == nil || c.HTTPConfig == nil {
+				return fmt.Errorf("receiver %q: victorops_configs[%d] http_config must not be null", rcv.Name, i)
+			}
+		}
+		for i, c := range rcv.SNSConfigs {
+			if c == nil || c.HTTPConfig == nil {
+				return fmt.Errorf("receiver %q: sns_configs[%d] http_config must not be null", rcv.Name, i)
+			}
+		}
+		for i, c := range rcv.TelegramConfigs {
+			if c == nil || c.HTTPConfig == nil {
+				return fmt.Errorf("receiver %q: telegram_configs[%d] http_config must not be null", rcv.Name, i)
+			}
+		}
+	}
+	return nil
 }
 
 // validateAlertmanagerConfig recursively scans the input config looking for data types for which
