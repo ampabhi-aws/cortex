@@ -681,7 +681,23 @@ receivers:
 
 	router := mux.NewRouter()
 	router.Path("/multitenant_alertmanager/configs").Methods(http.MethodGet).HandlerFunc(am.ListAllConfigs)
+
+	// Without an org on the request context the handler must refuse the
+	// request: the admin bulk-dump endpoint is now behind authentication.
+	{
+		req := httptest.NewRequest("GET", "https://localhost:8080/multitenant_alertmanager/configs", nil)
+		w := httptest.NewRecorder()
+		router.ServeHTTP(w, req)
+		require.Equal(t, http.StatusUnauthorized, w.Result().StatusCode)
+	}
+
+	// With an org on the request context the handler returns a sanitised
+	// view of every tenant's config: template_files is omitted and the
+	// Alertmanager config body is re-marshaled through the upstream
+	// config.Config type, which masks Secret / SecretURL fields as
+	// "<secret>". The response is still a YAML map keyed by tenant ID.
 	req := httptest.NewRequest("GET", "https://localhost:8080/multitenant_alertmanager/configs", nil)
+	req = req.WithContext(user.InjectOrgID(req.Context(), "test_admin"))
 	w := httptest.NewRecorder()
 	router.ServeHTTP(w, req)
 
@@ -690,9 +706,25 @@ receivers:
 	require.Equal(t, "application/yaml", resp.Header.Get("Content-Type"))
 	body, err := io.ReadAll(resp.Body)
 	require.NoError(t, err)
-	old, err := yaml.Marshal(testCases)
-	require.NoError(t, err)
-	require.YAMLEq(t, string(old), string(body))
+
+	var got map[string]*UserConfig
+	require.NoError(t, yaml.Unmarshal(body, &got))
+	require.ElementsMatch(t, []string{"user1", "user2"}, keysOfUserConfigs(got))
+	for u, uc := range got {
+		require.Nil(t, uc.TemplateFiles, "template_files must be omitted for %s", u)
+		// The redacted body must be parseable by the upstream
+		// Alertmanager config loader.
+		_, parseErr := config.Load(uc.AlertmanagerConfig)
+		require.NoError(t, parseErr, "redacted config for %s must still be parseable: %s", u, uc.AlertmanagerConfig)
+	}
+}
+
+func keysOfUserConfigs(m map[string]*UserConfig) []string {
+	out := make([]string, 0, len(m))
+	for k := range m {
+		out = append(out, k)
+	}
+	return out
 }
 
 func TestValidateAlertmanagerConfig(t *testing.T) {

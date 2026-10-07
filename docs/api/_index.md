@@ -684,7 +684,7 @@ Displays a web page with the current status of the Alertmanager, including the A
 GET /multitenant_alertmanager/configs
 ```
 
-List all Alertmanager configurations. This endpoint is not part of alertmanager-API and is always available regardless of whether alertmanager-API is enabled or not. It should not be exposed to end users. This endpoint returns a YAML dictionary with all the Alertmanager configurations and `200` status code on success.
+List all Alertmanager configurations. This endpoint is not part of alertmanager-API and should not be exposed to end users. It is **disabled by default** and must be explicitly enabled by the operator by setting `-api.alertmanager-admin-configs-dump-enabled=true`. When enabled, the endpoint is served behind the authentication middleware (an upstream identity-aware proxy that pins the `X-Scope-OrgID` header is required), per-tenant notification secrets (`slack_api_url`, `opsgenie_api_key`, `victorops_api_key`, PagerDuty `routing_key`/`service_key`, `smtp_auth_password`, HTTP basic-auth / bearer / authorization credentials) are masked as `<secret>`, and notification `template_files` are omitted. This endpoint returns a YAML dictionary of Alertmanager configurations keyed by tenant ID with a `200` status code on success.
 
 ### Alertmanager ring status
 

@@ -48,6 +48,13 @@ type Config struct {
 	AlertmanagerHTTPPrefix string `yaml:"alertmanager_http_prefix"`
 	PrometheusHTTPPrefix   string `yaml:"prometheus_http_prefix"`
 
+	// EnableAdminAlertmanagerConfigsDump controls whether the
+	// GET /multitenant_alertmanager/configs endpoint is exposed. When false
+	// (the default), the endpoint is not registered. When true, it is
+	// registered behind the authentication middleware so an upstream
+	// identity-aware proxy must be in front of Cortex.
+	EnableAdminAlertmanagerConfigsDump bool `yaml:"enable_admin_alertmanager_configs_dump"`
+
 	// The following configs are injected by the upstream caller.
 	ServerPrefix       string               `yaml:"-"`
 	LegacyHTTPPrefix   string               `yaml:"-"`
@@ -71,6 +78,7 @@ type Config struct {
 func (cfg *Config) RegisterFlags(f *flag.FlagSet) {
 	f.BoolVar(&cfg.ResponseCompression, "api.response-compression-enabled", false, "Use GZIP compression for API responses. Some endpoints serve large YAML or JSON blobs which can benefit from compression.")
 	f.Var(&cfg.HTTPRequestHeadersToLog, "api.http-request-headers-to-log", "Which HTTP Request headers to add to logs")
+	f.BoolVar(&cfg.EnableAdminAlertmanagerConfigsDump, "api.alertmanager-admin-configs-dump-enabled", false, "Expose the admin GET /multitenant_alertmanager/configs endpoint. When enabled, the endpoint is registered behind the authentication middleware (an upstream identity-aware proxy that pins the X-Scope-OrgID is required to prevent anonymous access). Secrets in the returned per-tenant configurations are redacted and notification template files are omitted. Disabled by default because the endpoint can leak cross-tenant data if not properly fronted.")
 	cfg.RegisterFlagsWithPrefix("", f)
 }
 
@@ -187,7 +195,16 @@ func (a *API) RegisterAlertmanager(am *alertmanager.MultitenantAlertmanager, tar
 	a.indexPage.AddLink(SectionAdminEndpoints, "/multitenant_alertmanager/ring", "Alertmanager Ring Status")
 	// Ensure this route is registered before the prefixed AM route
 	a.RegisterRoute("/multitenant_alertmanager/status", am.GetStatusHandler(), false, "GET")
-	a.RegisterRoute("/multitenant_alertmanager/configs", http.HandlerFunc(am.ListAllConfigs), false, "GET")
+	// The /multitenant_alertmanager/configs endpoint returns the
+	// Alertmanager configuration of every tenant. Historically it was
+	// registered without authentication and without any opt-in gate, which
+	// made it a cross-tenant secret-disclosure sink when the Cortex HTTP
+	// port was reachable by anything other than a hardened operator proxy.
+	// It is now opt-in via -api.alertmanager-admin-configs-dump-enabled
+	// and, when enabled, registered behind the authentication middleware.
+	if a.cfg.EnableAdminAlertmanagerConfigsDump {
+		a.RegisterRoute("/multitenant_alertmanager/configs", http.HandlerFunc(am.ListAllConfigs), true, "GET")
+	}
 	a.RegisterRoute("/multitenant_alertmanager/ring", http.HandlerFunc(am.RingHandler), false, "GET", "POST")
 	a.RegisterRoute("/multitenant_alertmanager/delete_tenant_config", http.HandlerFunc(am.DeleteUserConfig), true, "POST")
 
