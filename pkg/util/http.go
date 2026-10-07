@@ -19,7 +19,17 @@ import (
 	otlog "github.com/opentracing/opentracing-go/log"
 	yaml "gopkg.in/yaml.v2"
 	yamlv3 "gopkg.in/yaml.v3"
+
+	util_math "github.com/cortexproject/cortex/pkg/util/math"
 )
+
+// maxDecompressPreallocation caps how much heap we are willing to reserve up
+// front for a push/remote-write body based on the client-supplied
+// Content-Length header. The header is attacker-controlled and may vastly
+// overstate the real payload size, so we never size the buffer directly from
+// it: we clamp the preallocation here and let the buffer grow as data
+// actually arrives, which is bounded by the LimitReader below.
+const maxDecompressPreallocation = 1 << 20 // 1 MiB
 
 const messageSizeLargerErrFmt = "received message larger than max (%d vs %d)"
 
@@ -199,8 +209,14 @@ func decompressFromReader(reader io.Reader, expectedSize, maxSize int, compressi
 		body []byte
 		err  error
 	)
+	// Only pre-grow by a small, bounded amount. expectedSize is derived from
+	// the client-supplied Content-Length header and is untrusted: the real
+	// body may be arbitrarily smaller (or empty) than the declared size, so
+	// sizing the backing array directly from it enables an unbounded heap
+	// pre-allocation DoS. The buffer will still grow organically as bytes
+	// are actually read, capped by the LimitReader below.
 	if expectedSize > 0 {
-		buf.Grow(expectedSize + bytes.MinRead) // extra space guarantees no reallocation
+		buf.Grow(util_math.Min(expectedSize, maxDecompressPreallocation) + bytes.MinRead)
 	}
 	// Read from LimitReader with limit max+1. So if the underlying
 	// reader is over limit, the result will be bigger than max.
