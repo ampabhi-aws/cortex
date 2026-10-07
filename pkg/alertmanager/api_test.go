@@ -419,6 +419,77 @@ alertmanager_config: |
 			err: errors.Wrap(errVictorOpsAPIKeyFileNotAllowed, "error validating Alertmanager config"),
 		},
 		{
+			name: "SNS without sigv4 creds is rejected",
+			cfg: `
+alertmanager_config: |
+  receivers:
+    - name: default-receiver
+      sns_configs:
+        - topic_arn: topicA
+          sigv4:
+            region: us-east-1
+          message: 'test'
+  route:
+    receiver: 'default-receiver'
+`,
+			err: errors.Wrap(errSNSAmbientCredsNotAllowed, "error validating Alertmanager config"),
+		},
+		{
+			name: "SNS with sigv4 profile is rejected",
+			cfg: `
+alertmanager_config: |
+  receivers:
+    - name: default-receiver
+      sns_configs:
+        - topic_arn: topicA
+          sigv4:
+            region: us-east-1
+            access_key: foo
+            secret_key: bar
+            profile: tenant-profile
+          message: 'test'
+  route:
+    receiver: 'default-receiver'
+`,
+			err: errors.Wrap(errSNSAmbientCredsNotAllowed, "error validating Alertmanager config"),
+		},
+		{
+			name: "SNS with sigv4 role_arn is rejected",
+			cfg: `
+alertmanager_config: |
+  receivers:
+    - name: default-receiver
+      sns_configs:
+        - topic_arn: topicA
+          sigv4:
+            region: us-east-1
+            access_key: foo
+            secret_key: bar
+            role_arn: some-role
+          message: 'test'
+  route:
+    receiver: 'default-receiver'
+`,
+			err: errors.Wrap(errSNSAmbientCredsNotAllowed, "error validating Alertmanager config"),
+		},
+		{
+			name: "SNS with explicit static sigv4 credentials is accepted",
+			cfg: `
+alertmanager_config: |
+  receivers:
+    - name: default-receiver
+      sns_configs:
+        - topic_arn: topicA
+          sigv4:
+            region: us-east-1
+            access_key: foo
+            secret_key: bar
+          message: 'test'
+  route:
+    receiver: 'default-receiver'
+`,
+		},
+		{
 			name: "should return error if template is wrong",
 			cfg: `
 alertmanager_config: |
