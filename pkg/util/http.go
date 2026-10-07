@@ -193,6 +193,14 @@ func decompressRequest(reader io.Reader, expectedSize, maxSize int, compression 
 	return
 }
 
+// maxDecompressPrealloc caps how much we pre-allocate from the caller-supplied
+// expectedSize hint. The hint is derived from the client-controlled
+// Content-Length header; using it as the allocation authority allows a tiny
+// request with a large declared length to force the server to commit the full
+// buffer before any body byte is read. We therefore treat it only as a small
+// optimisation and let the buffer grow from actually-received bytes.
+const maxDecompressPrealloc = 1 << 20 // 1 MiB
+
 func decompressFromReader(reader io.Reader, expectedSize, maxSize int, compression CompressionType, sp opentracing.Span) ([]byte, error) {
 	var (
 		buf  bytes.Buffer
@@ -200,7 +208,15 @@ func decompressFromReader(reader io.Reader, expectedSize, maxSize int, compressi
 		err  error
 	)
 	if expectedSize > 0 {
-		buf.Grow(expectedSize + bytes.MinRead) // extra space guarantees no reallocation
+		// Only use the client-supplied hint as a small optimisation, never as
+		// an allocation authority: cap the pre-allocation at maxDecompressPrealloc
+		// so the memory footprint is driven by bytes actually received, not by
+		// an unvalidated Content-Length value.
+		prealloc := expectedSize
+		if prealloc > maxDecompressPrealloc {
+			prealloc = maxDecompressPrealloc
+		}
+		buf.Grow(prealloc + bytes.MinRead)
 	}
 	// Read from LimitReader with limit max+1. So if the underlying
 	// reader is over limit, the result will be bigger than max.
