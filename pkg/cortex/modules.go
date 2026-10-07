@@ -591,7 +591,12 @@ func (t *Cortex) initConfig() (serv services.Service, err error) {
 	}
 
 	t.ConfigAPI = configAPI.New(t.ConfigDB, t.Cfg.Configs.API)
-	t.ConfigAPI.RegisterRoutes(t.Server.HTTP)
+	// Register the configs routes via the shared API so that authentication middleware
+	// is applied to tenant-facing endpoints (previously the router was mounted directly
+	// on the raw mux, trusting a raw X-Scope-OrgID header for cross-tenant writes).
+	for _, route := range t.ConfigAPI.Routes() {
+		t.API.RegisterRoute(route.Path, route.Handler, route.Auth, route.Method)
+	}
 	return services.NewIdleService(nil, func(_ error) error {
 		t.ConfigDB.Close()
 		return nil
