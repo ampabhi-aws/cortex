@@ -82,7 +82,12 @@ api:
   # CLI flag: -http.prometheus-http-prefix
   [prometheus_http_prefix: <string> | default = "/prometheus"]
 
-  # Which HTTP Request headers to add to logs
+  # Comma-separated list of HTTP request headers to add to log lines for every
+  # request. Credential-bearing headers (Authorization, Proxy-Authorization,
+  # Cookie, Set-Cookie, X-Amz-Security-Token, X-Api-Key, X-Auth-Token) are
+  # rejected at startup because logging them would expose tenant secrets in
+  # component logs (and forward them to downstream components via gRPC
+  # metadata).
   # CLI flag: -api.http-request-headers-to-log
   [http_request_headers_to_log: <list of string> | default = []]
 

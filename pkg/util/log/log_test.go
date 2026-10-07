@@ -15,7 +15,7 @@ func TestHeaderMapFromMetadata(t *testing.T) {
 
 	ctx := context.Background()
 
-	ctx = ContextWithHeaderMapFromMetadata(ctx, md)
+	ctx = ContextWithHeaderMapFromMetadata(ctx, md, "TestHeader1", "TestHeader2")
 
 	headerMap := HeaderMapFromContext(ctx)
 
@@ -25,13 +25,55 @@ func TestHeaderMapFromMetadata(t *testing.T) {
 	require.Equal(t, "ContentsOfTestHeader2", headerMap["TestHeader2"])
 }
 
+func TestHeaderMapFromMetadataFiltersUntargetedKeys(t *testing.T) {
+	md := metadata.New(nil)
+	md.Append(HeaderPropagationStringForRequestLogging,
+		"TestHeader1", "SomeInformation",
+		"Forged", "ShouldBeDropped")
+
+	ctx := context.Background()
+	ctx = ContextWithHeaderMapFromMetadata(ctx, md, "TestHeader1")
+
+	headerMap := HeaderMapFromContext(ctx)
+	require.NotNil(t, headerMap)
+	require.Contains(t, headerMap, "TestHeader1")
+	require.NotContains(t, headerMap, "Forged")
+}
+
+func TestHeaderMapFromMetadataDropsAllWhenNoTargets(t *testing.T) {
+	md := metadata.New(nil)
+	md.Append(HeaderPropagationStringForRequestLogging, "TestHeader1", "SomeInformation")
+
+	ctx := context.Background()
+	ctx = ContextWithHeaderMapFromMetadata(ctx, md)
+
+	headerMap := HeaderMapFromContext(ctx)
+	require.NotNil(t, headerMap)
+	require.Empty(t, headerMap)
+}
+
+func TestHeaderMapFromMetadataTruncatesLongValues(t *testing.T) {
+	long := make([]byte, maxForwardedLogHeaderValueLen+500)
+	for i := range long {
+		long[i] = 'a'
+	}
+	md := metadata.New(nil)
+	md.Append(HeaderPropagationStringForRequestLogging, "TestHeader1", string(long))
+
+	ctx := context.Background()
+	ctx = ContextWithHeaderMapFromMetadata(ctx, md, "TestHeader1")
+
+	headerMap := HeaderMapFromContext(ctx)
+	require.Equal(t, maxForwardedLogHeaderValueLen, len(headerMap["TestHeader1"]))
+}
+
 func TestHeaderMapFromMetadataWithImproperLength(t *testing.T) {
 	md := metadata.New(nil)
 	md.Append(HeaderPropagationStringForRequestLogging, "TestHeader1", "SomeInformation", "TestHeader2", "ContentsOfTestHeader2", "Test3")
 
 	ctx := context.Background()
 
-	ctx = ContextWithHeaderMapFromMetadata(ctx, md)
+	ctx = ContextWithHeaderMapFromMetadata(ctx, md, "TestHeader1", "TestHeader2", "Test3")
 
 	headerMap := HeaderMapFromContext(ctx)
 	require.Nil(t, headerMap)

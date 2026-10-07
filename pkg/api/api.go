@@ -3,6 +3,7 @@ package api
 import (
 	"context"
 	"flag"
+	"fmt"
 	"net/http"
 	"path"
 	"strings"
@@ -70,8 +71,22 @@ type Config struct {
 // RegisterFlags adds the flags required to config this to the given FlagSet.
 func (cfg *Config) RegisterFlags(f *flag.FlagSet) {
 	f.BoolVar(&cfg.ResponseCompression, "api.response-compression-enabled", false, "Use GZIP compression for API responses. Some endpoints serve large YAML or JSON blobs which can benefit from compression.")
-	f.Var(&cfg.HTTPRequestHeadersToLog, "api.http-request-headers-to-log", "Which HTTP Request headers to add to logs")
+	f.Var(&cfg.HTTPRequestHeadersToLog, "api.http-request-headers-to-log", "Comma-separated list of HTTP request headers to add to log lines for every request. Credential-bearing headers (Authorization, Proxy-Authorization, Cookie, Set-Cookie, X-Amz-Security-Token, X-Api-Key, X-Auth-Token) are rejected at startup because logging them would expose tenant secrets in component logs (and forward them to downstream components via gRPC metadata).")
 	cfg.RegisterFlagsWithPrefix("", f)
+}
+
+// Validate rejects configurations that would knowingly leak credentials into
+// component logs via the -api.http-request-headers-to-log feature. Credential
+// headers are refused even if the operator names them explicitly: this is a
+// configuration error that must stop the process from starting instead of
+// silently writing bearer tokens to every log line.
+func (cfg *Config) Validate() error {
+	for _, h := range cfg.HTTPRequestHeadersToLog {
+		if IsDeniedLogHeader(h) {
+			return fmt.Errorf("api.http-request-headers-to-log: header %q is credential-bearing and must not be logged", h)
+		}
+	}
+	return nil
 }
 
 // RegisterFlagsWithPrefix adds the flags required to config this to the given FlagSet with the set prefix.
