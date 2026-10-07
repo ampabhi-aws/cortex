@@ -55,11 +55,19 @@ func WithSourceIPs(sourceIPs string, l log.Logger) log.Logger {
 	return log.With(l, "sourceIPs", sourceIPs)
 }
 
+// loggedHeaderFieldPrefix is prepended to every header-derived structured
+// log field so that the field names cannot collide with (and thereby
+// shadow or spoof) first-class log keys such as `org_id`, `traceID`,
+// `msg`, `level`, or `caller`. Combined with the allowlist on both the
+// HTTP and gRPC ingress paths this ensures that nothing on the request
+// surface can forge an otherwise-authoritative structured log field.
+const loggedHeaderFieldPrefix = "http_header_"
+
 // HeadersFromContext enables the logging of specified HTTP Headers that have been added to a context
 func headersFromContext(ctx context.Context, l log.Logger) log.Logger {
 	headerContentsMap := HeaderMapFromContext(ctx)
 	for header, contents := range headerContentsMap {
-		l = kitlog.With(l, header, contents)
+		l = kitlog.With(l, loggedHeaderFieldPrefix+header, contents)
 	}
 	return l
 }

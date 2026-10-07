@@ -80,6 +80,26 @@ func (cfg *Config) RegisterFlagsWithPrefix(prefix string, f *flag.FlagSet) {
 	f.StringVar(&cfg.PrometheusHTTPPrefix, prefix+"http.prometheus-http-prefix", "/prometheus", "HTTP URL path under which the Prometheus api will be served.")
 }
 
+// Validate checks the API config for self-consistency and emits warnings via
+// the supplied logger when the configuration is likely to leak credentials
+// into logs. Specifically, it warns when `http_request_headers_to_log`
+// contains a header name that is known to carry replayable credentials
+// (Authorization, Cookie, X-Api-Key, etc.); the HTTP middleware will still
+// start, but values for those headers are redacted before being attached to
+// log lines (see pkg/api/middlewares.go).
+func (cfg *Config) Validate(logger log.Logger) error {
+	for _, h := range cfg.HTTPRequestHeadersToLog {
+		if IsCredentialHeader(h) {
+			level.Warn(logger).Log(
+				"msg", "http_request_headers_to_log contains a credential-bearing header; its value will be redacted before logging",
+				"header", h,
+				"flag", "-api.http-request-headers-to-log",
+			)
+		}
+	}
+	return nil
+}
+
 // Push either wraps the distributor push function as configured or returns the distributor push directly.
 func (cfg *Config) wrapDistributorPush(d *distributor.Distributor) push.Func {
 	if cfg.DistributorPushWrapper != nil {
