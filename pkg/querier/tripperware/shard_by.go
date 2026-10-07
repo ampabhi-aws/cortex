@@ -60,7 +60,12 @@ func (s shardBy) Do(ctx context.Context, r Request) (Response, error) {
 
 	reqs := s.shardQuery(logger, numShards, r, analysis)
 
-	reqResps, err := DoRequests(ctx, s.next, reqs, s.limits)
+	// Divide the per-request parallelism budget evenly across shards so that
+	// `MaxQueryParallelism` remains an upper bound on the total number of
+	// in-flight downstream requests per user request, even when the nested
+	// `DoRequests` inside each split sub-request would otherwise consume a
+	// fresh budget of MaxQueryParallelism per shard.
+	reqResps, err := DoRequests(ctx, s.next, reqs, scaledParallelismLimits{Limits: s.limits, divisor: numShards})
 	if err != nil {
 		return nil, err
 	}
@@ -91,4 +96,30 @@ func (s shardBy) shardQuery(l log.Logger, numShards int, r Request, analysis que
 	}
 
 	return reqs
+}
+
+// scaledParallelismLimits wraps a Limits so that MaxQueryParallelism is
+// divided by `divisor` (floored at 1). It is used by shardBy to split the
+// per-request parallelism budget evenly across its shards, so the configured
+// `-querier.max-query-parallelism` remains an actual upper bound on the
+// total number of in-flight downstream requests, instead of being multiplied
+// by the number of shards via the nested DoRequests call.
+type scaledParallelismLimits struct {
+	Limits
+	divisor int
+}
+
+func (l scaledParallelismLimits) MaxQueryParallelism(userID string) int {
+	p := l.Limits.MaxQueryParallelism(userID)
+	if l.divisor <= 1 {
+		return p
+	}
+	if p <= 0 {
+		return p
+	}
+	scaled := p / l.divisor
+	if scaled < 1 {
+		return 1
+	}
+	return scaled
 }

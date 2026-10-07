@@ -191,6 +191,7 @@ type mockLimits struct {
 	maxQueryLookback  time.Duration
 	maxQueryLength    time.Duration
 	maxCacheFreshness time.Duration
+	maxSplitsPerQuery int
 }
 
 func (m mockLimits) MaxQueryLookback(string) time.Duration {
@@ -203,6 +204,10 @@ func (m mockLimits) MaxQueryLength(string) time.Duration {
 
 func (mockLimits) MaxQueryParallelism(string) int {
 	return 14 // Flag default.
+}
+
+func (m mockLimits) MaxSplitsPerQuery(string) int {
+	return m.maxSplitsPerQuery
 }
 
 func (m mockLimits) MaxCacheFreshness(string) time.Duration {
