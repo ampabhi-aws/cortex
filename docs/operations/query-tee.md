@@ -84,6 +84,19 @@ Floating point sample values are compared with a small tolerance that can be con
 
 `query-tee` sends back to the client the first viable response as soon as available, without waiting to receive a response from all backends.
 
+### Error responses and logging of tenant query content
+
+`query-tee` never returns the raw upstream Go/transport error to the HTTP client. When a backend request fails at the transport layer (DNS, dial, TLS, redirect refusal, context deadline, etc.) the proxy writes a generic `upstream request failed` body with status `502 Bad Gateway` and logs the full error (including the internal backend URL) at `warn` level for the operator. This prevents an unauthenticated caller of the service port from using the error body to enumerate internal hostnames, ports and path prefixes.
+
+By default, log lines produced by `query-tee` identify a request only by:
+
+- The route name (e.g. `api_v1_query`)
+- A short SHA-256 prefix of the raw query string (`query_hash`)
+- The backend name, response status and request duration
+- A metric fingerprint on comparison-mismatch log lines (instead of the full customer label set)
+
+The raw tenant query string and the full customer metric label set / sample values are **not** emitted on `info`/`warn`/`error` log lines unless the operator opts in with the CLI flag `-log.query-content=true`. When that flag is enabled, `query-tee` logs must be treated at the same sensitivity level as tenant query logs: label matchers routinely contain customer identifiers (hostnames, pod names, user IDs, URLs), so the operator log sink should be scoped to parties already entitled to read the queried tenant data.
+
 ### Exported metrics
 
 `query-tee` exposes the following Prometheus metrics on the port configured via the CLI flag `-server.metrics-port`:
