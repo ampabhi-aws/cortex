@@ -177,10 +177,12 @@ func (a *API) setConfig(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	if err := validateAlertmanagerConfig(cfg.AlertmanagerConfig, a.cfg.Notifications); err != nil && cfg.AlertmanagerConfig != "" {
-		level.Error(logger).Log("msg", "invalid Alertmanager config", "err", err)
-		http.Error(w, fmt.Sprintf("Invalid Alertmanager config: %v", err), http.StatusBadRequest)
-		return
+	if cfg.AlertmanagerConfig != "" {
+		if err := validateAlertmanagerConfig(cfg.AlertmanagerConfig, a.cfg.Notifications); err != nil {
+			level.Error(logger).Log("msg", "invalid Alertmanager config", "err", err)
+			http.Error(w, fmt.Sprintf("Invalid Alertmanager config: %v", err), http.StatusBadRequest)
+			return
+		}
 	}
 	if err := validateRulesFiles(cfg); err != nil {
 		level.Error(logger).Log("msg", "invalid rules", "err", err)
@@ -227,6 +229,20 @@ func (a *API) validateAlertmanagerConfig(w http.ResponseWriter, r *http.Request)
 func validateAlertmanagerConfig(cfg string, noCfg NotificationsConfig) error {
 	amCfg, err := amconfig.Load(cfg)
 	if err != nil {
+		return err
+	}
+
+	// Reject references to local files inside the tenant-supplied
+	// Alertmanager configuration. Without this, an authenticated tenant
+	// could point e.g. basic_auth.password_file, bearer_token_file,
+	// authorization.credentials_file, oauth2.client_secret_file, TLS
+	// ca_file/cert_file/key_file, Slack api_url_file or VictorOps
+	// api_key_file at operator-owned files on disk and later cause the
+	// Alertmanager process to read them at notification time and send
+	// their contents to a tenant-controlled receiver URL. This matches
+	// the hardened validation already enforced on the
+	// POST /api/v1/alerts path (pkg/alertmanager/api.go).
+	if err := validateAlertmanagerConfigNoFileRefs(amCfg); err != nil {
 		return err
 	}
 
