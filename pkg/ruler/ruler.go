@@ -63,6 +63,7 @@ const (
 	// Limit errors
 	errMaxRuleGroupsPerUserLimitExceeded        = "per-user rule groups limit (limit: %d actual: %d) exceeded"
 	errMaxRulesPerRuleGroupPerUserLimitExceeded = "per-user rules per rule group limit (limit: %d actual: %d) exceeded"
+	errMinRuleEvaluationIntervalLimitExceeded   = "rule group evaluation interval (%s) is below the per-user minimum allowed (%s)"
 
 	// errors
 	errListAllUser = "unable to list the ruler users"
@@ -837,6 +838,28 @@ func (r *Ruler) AssertMaxRulesPerRuleGroup(userID string, rules int) error {
 		return nil
 	}
 	return fmt.Errorf(errMaxRulesPerRuleGroupPerUserLimitExceeded, limit, rules)
+}
+
+// AssertMinRuleEvaluationInterval returns an error if the rule-group evaluation
+// interval supplied by the tenant is non-zero and shorter than the per-user
+// configured minimum. A configured minimum of <= 0 disables the check and
+// preserves backwards-compatible behavior.
+func (r *Ruler) AssertMinRuleEvaluationInterval(userID string, interval time.Duration) error {
+	min := r.limits.RulerMinRuleEvaluationInterval(userID)
+	if min <= 0 {
+		return nil
+	}
+
+	// An interval of 0 means "use the server-side default" (-ruler.evaluation-interval),
+	// which is operator-controlled and therefore not subject to this check.
+	if interval <= 0 {
+		return nil
+	}
+
+	if interval < min {
+		return fmt.Errorf(errMinRuleEvaluationIntervalLimitExceeded, interval, min)
+	}
+	return nil
 }
 
 func (r *Ruler) DeleteTenantConfiguration(w http.ResponseWriter, req *http.Request) {
