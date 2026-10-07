@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"net/http"
+	"strings"
 	"time"
 
 	"github.com/go-kit/log"
@@ -22,6 +23,7 @@ import (
 	querier_stats "github.com/cortexproject/cortex/pkg/querier/stats"
 	"github.com/cortexproject/cortex/pkg/ring/client"
 	"github.com/cortexproject/cortex/pkg/scheduler/schedulerpb"
+	"github.com/cortexproject/cortex/pkg/tenant"
 	"github.com/cortexproject/cortex/pkg/util/backoff"
 	"github.com/cortexproject/cortex/pkg/util/grpcclient"
 	"github.com/cortexproject/cortex/pkg/util/httpgrpcutil"
@@ -127,6 +129,26 @@ func (sp *schedulerProcessor) querierLoop(c schedulerpb.SchedulerForQuerier_Quer
 		// here, as we're running in lock step with the server - each Recv is
 		// paired with a Send.
 		go func() {
+			// The scheduler's gRPC server is unauthenticated in the default
+			// Cortex deployment, so request.UserID and request.FrontendAddress
+			// are attacker-controlled on paths that reach the scheduler without
+			// a trusted reverse proxy. Validate / sanitize them before using
+			// them to execute a query or to dial a result-callback connection.
+			if err := validateSchedulerRequest(request); err != nil {
+				level.Warn(sp.log).Log("msg", "rejecting malformed scheduler request", "err", err, "addr", address)
+				if sendErr := c.Send(&schedulerpb.QuerierToScheduler{}); sendErr != nil {
+					level.Error(sp.log).Log("msg", "error notifying scheduler about rejected query", "err", sendErr, "addr", address)
+				}
+				return
+			}
+
+			// Overwrite any X-Scope-OrgID header in the inner HTTPRequest so the
+			// authoritative tenant used by the querier's internal AuthMiddleware
+			// always matches request.UserID. Without this a caller could set a
+			// different inner header to reach another tenant's data (the
+			// httpgrpc server rebuilds a real http.Request from these headers).
+			sanitizeOrgIDHeader(request.HttpRequest, request.UserID)
+
 			// We need to inject user into context for sending response back.
 			ctx := user.InjectOrgID(ctx, request.UserID)
 
@@ -195,6 +217,9 @@ func (sp *schedulerProcessor) runRequest(ctx context.Context, logger log.Logger,
 }
 
 func (sp *schedulerProcessor) createFrontendClient(addr string) (client.PoolClient, error) {
+	if err := validateFrontendCallbackAddress(addr); err != nil {
+		return nil, err
+	}
 	opts, err := sp.grpcConfig.DialOption([]grpc.UnaryClientInterceptor{
 		otgrpc.OpenTracingClientInterceptor(opentracing.GlobalTracer()),
 		middleware.ClientUserHeaderInterceptor,
@@ -225,4 +250,100 @@ type frontendClient struct {
 
 func (fc *frontendClient) Close() error {
 	return fc.conn.Close()
+}
+
+// validateSchedulerRequest applies the documented tenant-ID charset / length
+// limit to the externally-supplied UserID and rejects FrontendAddress values
+// that could be used to coerce an outbound dial to an attacker-selected gRPC
+// resolver target (unix sockets, dns:// targets, etc.).
+func validateSchedulerRequest(req *schedulerpb.SchedulerToQuerier) error {
+	if req == nil {
+		return fmt.Errorf("nil scheduler request")
+	}
+	for _, part := range strings.Split(req.UserID, "|") {
+		if err := tenant.ValidTenantID(part); err != nil {
+			return err
+		}
+	}
+	return validateFrontendCallbackAddress(req.FrontendAddress)
+}
+
+// validateFrontendCallbackAddress rejects gRPC target strings that would make
+// the querier dial an attacker-chosen scheme (unix:/path, dns:///..., etc.)
+// or an absolute filesystem path.
+func validateFrontendCallbackAddress(addr string) error {
+	if addr == "" {
+		return fmt.Errorf("empty frontend callback address")
+	}
+	if len(addr) > 253 {
+		return fmt.Errorf("frontend callback address too long")
+	}
+	if strings.ContainsAny(addr, "\x00\n\r\t ") {
+		return fmt.Errorf("frontend callback address contains invalid characters")
+	}
+	if strings.HasPrefix(addr, "/") {
+		return fmt.Errorf("frontend callback address must not be an absolute path")
+	}
+	if i := strings.Index(addr, ":"); i > 0 {
+		head := addr[:i]
+		rest := addr[i+1:]
+		if strings.HasPrefix(rest, "//") {
+			return fmt.Errorf("frontend callback address must not include a URI scheme")
+		}
+		if head != "" && isAlphaOnly(head) && !isDigitsOnly(rest) && strings.ContainsAny(rest, "/\\") {
+			return fmt.Errorf("frontend callback address must not be a gRPC resolver target")
+		}
+	}
+	return nil
+}
+
+func isAlphaOnly(s string) bool {
+	if s == "" {
+		return false
+	}
+	for _, r := range s {
+		if !((r >= 'a' && r <= 'z') || (r >= 'A' && r <= 'Z')) {
+			return false
+		}
+	}
+	return true
+}
+
+func isDigitsOnly(s string) bool {
+	if s == "" {
+		return false
+	}
+	for _, r := range s {
+		if r < '0' || r > '9' {
+			return false
+		}
+	}
+	return true
+}
+
+// sanitizeOrgIDHeader replaces (or inserts) the X-Scope-OrgID header on an
+// httpgrpc.HTTPRequest so that it unambiguously matches the authoritative
+// tenant the querier will execute the request under. This prevents a caller
+// that reaches the unauthenticated scheduler port from using a conflicting
+// inner header to pivot into another tenant's data via the querier's
+// internal AuthMiddleware.
+func sanitizeOrgIDHeader(req *httpgrpc.HTTPRequest, userID string) {
+	if req == nil {
+		return
+	}
+	filtered := make([]*httpgrpc.Header, 0, len(req.Headers)+1)
+	for _, h := range req.Headers {
+		if h == nil {
+			continue
+		}
+		if strings.EqualFold(h.Key, user.OrgIDHeaderName) {
+			continue
+		}
+		filtered = append(filtered, h)
+	}
+	filtered = append(filtered, &httpgrpc.Header{
+		Key:    user.OrgIDHeaderName,
+		Values: []string{userID},
+	})
+	req.Headers = filtered
 }
