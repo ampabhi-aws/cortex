@@ -143,16 +143,26 @@ func (s *state) AddState(key string, cs cluster.State, _ prometheus.Registerer) 
 }
 
 // MergePartialState merges a received partial message with an internal state.
+//
+// The caller-supplied p.Key is used as a Prometheus label value, so it MUST be
+// validated against the set of keys registered via AddState (which is
+// closed/finite per tenant, e.g. "nfl:<user>" and "sil:<user>") before being
+// used with WithLabelValues. Otherwise an attacker able to reach this path
+// could grow the CounterVec cardinality without bound by submitting random
+// keys. See CWE-770.
 func (s *state) MergePartialState(p *clusterpb.Part) error {
-	s.partialStateMergesTotal.WithLabelValues(p.Key).Inc()
-
 	s.mtx.Lock()
-	defer s.mtx.Unlock()
 	st, ok := s.states[p.Key]
+	s.mtx.Unlock()
 	if !ok {
-		s.partialStateMergesFailed.WithLabelValues(p.Key).Inc()
+		// Do NOT touch the CounterVec here: p.Key is attacker-controlled and
+		// would permanently add a child series for every distinct bogus key.
 		return fmt.Errorf("key not found while merging")
 	}
+
+	// p.Key is now known-good (registered via AddState), so it is safe to
+	// use as a label value.
+	s.partialStateMergesTotal.WithLabelValues(p.Key).Inc()
 
 	if err := st.Merge(p.Data); err != nil {
 		s.partialStateMergesFailed.WithLabelValues(p.Key).Inc()
