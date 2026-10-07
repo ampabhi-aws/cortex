@@ -48,6 +48,15 @@ type Config struct {
 	AlertmanagerHTTPPrefix string `yaml:"alertmanager_http_prefix"`
 	PrometheusHTTPPrefix   string `yaml:"prometheus_http_prefix"`
 
+	// IngesterPushDebugEndpointsEnabled gates the registration of the
+	// debug-only HTTP push routes (`/ingester/push` and the legacy `/push`)
+	// that call `Ingester.Push` directly. These routes bypass the
+	// distributor's per-tenant ingestion rate limiter, label/sample
+	// validation, HA de-duplication, relabeling and replication, so they
+	// must only be enabled by operators who understand the implications
+	// (for example, in a controlled testing or debugging environment).
+	IngesterPushDebugEndpointsEnabled bool `yaml:"ingester_push_debug_endpoints_enabled"`
+
 	// The following configs are injected by the upstream caller.
 	ServerPrefix       string               `yaml:"-"`
 	LegacyHTTPPrefix   string               `yaml:"-"`
@@ -71,6 +80,7 @@ type Config struct {
 func (cfg *Config) RegisterFlags(f *flag.FlagSet) {
 	f.BoolVar(&cfg.ResponseCompression, "api.response-compression-enabled", false, "Use GZIP compression for API responses. Some endpoints serve large YAML or JSON blobs which can benefit from compression.")
 	f.Var(&cfg.HTTPRequestHeadersToLog, "api.http-request-headers-to-log", "Which HTTP Request headers to add to logs")
+	f.BoolVar(&cfg.IngesterPushDebugEndpointsEnabled, "api.ingester-push-debug-endpoints-enabled", false, "Enable the debug-only HTTP push routes (POST /ingester/push and the legacy POST /push) that call Ingester.Push directly. These endpoints bypass the distributor and therefore skip the per-tenant ingestion rate limit, label/sample validation, HA de-duplication, relabeling and replication. Disabled by default; only enable in controlled testing environments.")
 	cfg.RegisterFlagsWithPrefix("", f)
 }
 
@@ -267,12 +277,22 @@ func (a *API) RegisterIngester(i Ingester, pushConfig distributor.Config) {
 	a.indexPage.AddLink(SectionDangerous, "/ingester/shutdown", "Trigger Ingester Shutdown (Dangerous)")
 	a.RegisterRoute("/ingester/flush", http.HandlerFunc(i.FlushHandler), false, "GET", "POST")
 	a.RegisterRoute("/ingester/shutdown", http.HandlerFunc(i.ShutdownHandler), false, "GET", "POST")
-	a.RegisterRoute("/ingester/push", push.Handler(pushConfig.MaxRecvMsgSize, a.sourceIPs, i.Push), true, "POST") // For testing and debugging.
 
 	// Legacy Routes
 	a.RegisterRoute("/flush", http.HandlerFunc(i.FlushHandler), false, "GET", "POST")
 	a.RegisterRoute("/shutdown", http.HandlerFunc(i.ShutdownHandler), false, "GET", "POST")
-	a.RegisterRoute("/push", push.Handler(pushConfig.MaxRecvMsgSize, a.sourceIPs, i.Push), true, "POST") // For testing and debugging.
+
+	// The debug-only /ingester/push and legacy /push endpoints bypass the
+	// distributor (and therefore the per-tenant ingestion rate limiter,
+	// validation.ValidateLabels/ValidateSample, HA de-duplication,
+	// relabeling and replication). Only register them when explicitly
+	// opted in by the operator; the default-off posture closes the
+	// debug-code attack surface described in CWE-489.
+	if a.cfg.IngesterPushDebugEndpointsEnabled {
+		level.Warn(a.logger).Log("msg", "api: registering debug-only ingester push endpoints that bypass distributor validation and per-tenant rate limits; do not enable in production", "paths", "/ingester/push,/push")
+		a.RegisterRoute("/ingester/push", push.Handler(pushConfig.MaxRecvMsgSize, a.sourceIPs, i.Push), true, "POST") // For testing and debugging.
+		a.RegisterRoute("/push", push.Handler(pushConfig.MaxRecvMsgSize, a.sourceIPs, i.Push), true, "POST")          // For testing and debugging.
+	}
 }
 
 func (a *API) RegisterTenantDeletion(api *purger.TenantDeletionAPI) {

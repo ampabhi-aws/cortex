@@ -2,6 +2,8 @@
 
 ## master / unreleased
 
+* [CHANGE] API: The debug-only HTTP push routes `POST /ingester/push` and the legacy `POST /push` (which call `Ingester.Push` directly and therefore bypass the distributor's per-tenant ingestion rate limiter, `validation.ValidateLabels`/`ValidateSample`, HA de-duplication, relabeling and replication) are now disabled by default. Set `-api.ingester-push-debug-endpoints-enabled=true` (or `api.ingester_push_debug_endpoints_enabled: true` in YAML) to re-enable them in controlled testing environments.
+
   **This release removes support for chunks storage. See below for more.**
 * [CHANGE] Remove support for chunks storage entirely. If you are using chunks storage on a previous version, you must [migrate your data](https://github.com/cortexproject/cortex/blob/v1.11.1/docs/blocks-storage/migrate-from-chunks-to-blocks.md) on version 1.12 or earlier. Before upgrading to this release, you should also remove any deprecated chunks-related configuration, as this release will no longer accept that. The following flags are gone:
   - `-dynamodb.*`
