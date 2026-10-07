@@ -54,11 +54,6 @@ var commonResolverTestCases = []resolverTestCase{
 		errTenantIDs: user.ErrNoOrgID,
 	},
 	{
-		name:        "empty",
-		headerValue: strptr(""),
-		tenantIDs:   []string{""},
-	},
-	{
 		name:        "single-tenant",
 		headerValue: strptr("tenant-a"),
 		tenantID:    "tenant-a",
@@ -82,10 +77,70 @@ func TestSingleResolver(t *testing.T) {
 	r := NewSingleResolver()
 	for _, tc := range append(commonResolverTestCases, []resolverTestCase{
 		{
+			name:         "empty",
+			headerValue:  strptr(""),
+			errTenantID:  user.ErrNoOrgID,
+			errTenantIDs: user.ErrNoOrgID,
+		},
+		{
+			name:         "multi-tenant",
+			headerValue:  strptr("tenant-a|tenant-b"),
+			errTenantID:  &errTenantIDUnsupportedCharacter{pos: 8, tenantID: "tenant-a|tenant-b"},
+			errTenantIDs: &errTenantIDUnsupportedCharacter{pos: 8, tenantID: "tenant-a|tenant-b"},
+		},
+		{
+			name:         "containing-forward-slash",
+			headerValue:  strptr("forward/slash"),
+			errTenantID:  &errTenantIDUnsupportedCharacter{pos: 7, tenantID: "forward/slash"},
+			errTenantIDs: &errTenantIDUnsupportedCharacter{pos: 7, tenantID: "forward/slash"},
+		},
+		{
+			name:         "containing-backward-slash",
+			headerValue:  strptr(`backward\slash`),
+			errTenantID:  &errTenantIDUnsupportedCharacter{pos: 8, tenantID: "backward\\slash"},
+			errTenantIDs: &errTenantIDUnsupportedCharacter{pos: 8, tenantID: "backward\\slash"},
+		},
+		{
+			name:         "containing-colon",
+			headerValue:  strptr("acme:node"),
+			errTenantID:  &errTenantIDUnsupportedCharacter{pos: 4, tenantID: "acme:node"},
+			errTenantIDs: &errTenantIDUnsupportedCharacter{pos: 4, tenantID: "acme:node"},
+		},
+	}...) {
+		t.Run(tc.name, tc.test(r))
+	}
+}
+
+func TestSingleResolverAllowUnsafeTenantIDs(t *testing.T) {
+	// When operators explicitly opt out of strict validation (e.g. via a
+	// `-tenant.allow-unsafe-ids` flag), legacy behaviour is preserved: only
+	// path-segment-unsafe IDs are rejected. The results-cache key is
+	// independently length-prefixed so the cross-tenant collision is still
+	// prevented.
+	prev := AllowUnsafeTenantIDs
+	AllowUnsafeTenantIDs = true
+	t.Cleanup(func() { AllowUnsafeTenantIDs = prev })
+
+	r := NewSingleResolver()
+	cases := []resolverTestCase{
+		{
 			name:        "multi-tenant",
 			headerValue: strptr("tenant-a|tenant-b"),
 			tenantID:    "tenant-a|tenant-b",
 			tenantIDs:   []string{"tenant-a|tenant-b"},
+		},
+		{
+			name:        "empty",
+			headerValue: strptr(""),
+			// Empty is still rejected via the user library invariant.
+			errTenantID:  user.ErrNoOrgID,
+			errTenantIDs: user.ErrNoOrgID,
+		},
+		{
+			name:        "containing-colon",
+			headerValue: strptr("acme:node"),
+			tenantID:    "acme:node",
+			tenantIDs:   []string{"acme:node"},
 		},
 		{
 			name:         "containing-forward-slash",
@@ -93,13 +148,8 @@ func TestSingleResolver(t *testing.T) {
 			errTenantID:  errInvalidTenantID,
 			errTenantIDs: errInvalidTenantID,
 		},
-		{
-			name:         "containing-backward-slash",
-			headerValue:  strptr(`backward\slash`),
-			errTenantID:  errInvalidTenantID,
-			errTenantIDs: errInvalidTenantID,
-		},
-	}...) {
+	}
+	for _, tc := range cases {
 		t.Run(tc.name, tc.test(r))
 	}
 }
@@ -107,6 +157,11 @@ func TestSingleResolver(t *testing.T) {
 func TestMultiResolver(t *testing.T) {
 	r := NewMultiResolver()
 	for _, tc := range append(commonResolverTestCases, []resolverTestCase{
+		{
+			name:        "empty",
+			headerValue: strptr(""),
+			tenantIDs:   []string{""},
+		},
 		{
 			name:        "multi-tenant",
 			headerValue: strptr("tenant-a|tenant-b"),

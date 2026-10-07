@@ -2,6 +2,8 @@
 
 ## master / unreleased
 
+* [SECURITY] query-frontend/tenant: fix cross-tenant results-cache key collision caused by tenant IDs containing characters that could forge the cache-key delimiter. The results-cache key is now length-prefixed on the tenant ID and query, so `(tenant, query) -> key` is injective regardless of tenant-ID bytes. The single-tenant resolver (`SingleResolver`) also now enforces the documented tenant-ID allow-list (letters, digits and `!-_.*'()`, 150 char limit) in addition to the existing path-segment check, rejecting IDs containing `:`, `|`, whitespace and other characters that are documented as unsafe. Operators that need to preserve the previous permissive behaviour for existing tenants can opt out explicitly with `-tenant.allow-unsafe-ids=true`, but should ensure their auth proxy validates tenant IDs.
+
   **This release removes support for chunks storage. See below for more.**
 * [CHANGE] Remove support for chunks storage entirely. If you are using chunks storage on a previous version, you must [migrate your data](https://github.com/cortexproject/cortex/blob/v1.11.1/docs/blocks-storage/migrate-from-chunks-to-blocks.md) on version 1.12 or earlier. Before upgrading to this release, you should also remove any deprecated chunks-related configuration, as this release will no longer accept that. The following flags are gone:
   - `-dynamodb.*`

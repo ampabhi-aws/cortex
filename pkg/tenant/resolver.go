@@ -74,6 +74,23 @@ func containsUnsafePathSegments(id string) bool {
 	return strings.ContainsAny(id, "\\/")
 }
 
+// AllowUnsafeTenantIDs, when set to true, relaxes tenant ID validation in
+// SingleResolver to preserve behaviour for deployments that historically
+// relied on characters outside the documented allow-list (see
+// https://cortexmetrics.io/docs/guides/limitations/#tenant-id-naming).
+//
+// When false (the default), SingleResolver enforces the documented allow-list
+// and length limit via ValidTenantID in addition to the existing path-segment
+// check. Operators that need the legacy permissive behaviour must opt out
+// explicitly (for example via a `-tenant.allow-unsafe-ids` CLI flag wired to
+// this variable), and should ensure their auth proxy validates tenant IDs
+// before they reach Cortex.
+//
+// This is a package-level variable rather than a resolver field so that
+// existing callers that construct SingleResolver directly (including tests)
+// pick up the stricter default without API changes.
+var AllowUnsafeTenantIDs = false
+
 var errInvalidTenantID = errors.New("invalid tenant ID")
 
 func (t *SingleResolver) TenantID(ctx context.Context) (string, error) {
@@ -81,6 +98,21 @@ func (t *SingleResolver) TenantID(ctx context.Context) (string, error) {
 	id, err := user.ExtractOrgID(ctx)
 	if err != nil {
 		return "", err
+	}
+
+	if id == "" {
+		return "", user.ErrNoOrgID
+	}
+
+	if !AllowUnsafeTenantIDs {
+		// Enforce the documented allow-list (charset + 150 char limit) so
+		// that the tenant ID is a safe opaque token for downstream
+		// string-concatenation key schemes (e.g. the query-frontend results
+		// cache). Without this, bytes such as ':' can forge cache-key
+		// delimiters and collide across tenants.
+		if err := ValidTenantID(id); err != nil {
+			return "", err
+		}
 	}
 
 	if containsUnsafePathSegments(id) {

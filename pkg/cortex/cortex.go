@@ -112,6 +112,15 @@ type Config struct {
 	StoreGateway     storegateway.Config             `yaml:"store_gateway"`
 	TenantFederation tenantfederation.Config         `yaml:"tenant_federation"`
 
+	// AllowUnsafeTenantIDs opts out of enforcing the documented tenant-ID
+	// allow-list (charset + length limit) in the single-tenant resolver,
+	// preserving the pre-fix permissive behaviour. Only enable this when an
+	// upstream auth proxy validates tenant IDs and you cannot migrate
+	// existing tenants that use characters outside the allow-list. The
+	// query-frontend results cache key is independently length-prefixed so
+	// enabling this flag does not reintroduce the cross-tenant collision.
+	AllowUnsafeTenantIDs bool `yaml:"-"`
+
 	Ruler               ruler.Config                               `yaml:"ruler"`
 	RulerStorage        rulestore.Config                           `yaml:"ruler_storage"`
 	Configs             configs.Config                             `yaml:"configs"`
@@ -139,6 +148,7 @@ func (c *Config) RegisterFlags(f *flag.FlagSet) {
 	f.BoolVar(&c.AuthEnabled, "auth.enabled", true, "Set to false to disable auth.")
 	f.BoolVar(&c.PrintConfig, "print.config", false, "Print the config and exit.")
 	f.StringVar(&c.HTTPPrefix, "http.prefix", "/api/prom", "HTTP path prefix for Cortex API.")
+	f.BoolVar(&c.AllowUnsafeTenantIDs, "tenant.allow-unsafe-ids", false, "Allow tenant IDs that contain characters outside the documented allow-list (letters, digits and `!-_.*'()`). When false (default), the single-tenant resolver rejects such IDs because they can forge delimiters in downstream cache/storage keys.")
 
 	c.API.RegisterFlags(f)
 	c.registerServerFlagsWithChangedDefaultValues(f)
@@ -334,6 +344,11 @@ func New(cfg Config) (*Cortex, error) {
 		util_log.WarnExperimentalUse("tenant-federation")
 		tenant.WithDefaultResolver(tenant.NewMultiResolver())
 	}
+
+	// Propagate the operator-level opt-out for strict tenant-ID validation
+	// to the tenant package. Default (false) enforces the documented
+	// allow-list on the single-tenant resolver.
+	tenant.AllowUnsafeTenantIDs = cfg.AllowUnsafeTenantIDs
 
 	// Don't check auth header on TransferChunks, as we weren't originally
 	// sending it and this could cause transfers to fail on update.
