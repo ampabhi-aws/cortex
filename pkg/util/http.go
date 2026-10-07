@@ -103,10 +103,17 @@ func RenderHTTPResponse(w http.ResponseWriter, v interface{}, t *template.Templa
 		return
 	}
 
-	err := t.Execute(w, v)
-	if err != nil {
+	// Buffer the rendered template so we can substitute the CSRF token
+	// placeholder (if present) and set an HttpOnly SameSite=Strict cookie
+	// before writing to the client. See pkg/util/csrf.go.
+	var buf bytes.Buffer
+	if err := t.Execute(&buf, v); err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
 	}
+	body := InjectCSRFToken(w, r, buf.Bytes())
+	w.Header().Set("Content-Type", "text/html; charset=utf-8")
+	_, _ = w.Write(body)
 }
 
 // StreamWriteYAMLResponseCommon stream writes data as http response
