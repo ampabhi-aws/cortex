@@ -571,6 +571,16 @@ func (d *Distributor) Push(ctx context.Context, req *cortexpb.WriteRequest) (*co
 	now := time.Now()
 	d.activeUsers.UpdateUserTimestamp(userID, now)
 
+	// SkipLabelNameValidation is an operator-only switch. The HTTP push handler
+	// zeroes the wire field before invoking the push func (see pkg/util/push),
+	// but Distributor.Push is also exposed over gRPC where there is no such
+	// edge sanitisation. Clear it defensively so an untrusted client cannot
+	// bypass label-name validation (and so the flag cannot leak onward to the
+	// ingester via the forwarded request).
+	if req.SkipLabelNameValidation {
+		req.SkipLabelNameValidation = false
+	}
+
 	source := util.GetSourceIPsFromOutgoingCtx(ctx)
 
 	var firstPartialErr error
@@ -687,7 +697,10 @@ func (d *Distributor) Push(ctx context.Context, req *cortexpb.WriteRequest) (*co
 			return nil, err
 		}
 
-		skipLabelNameValidation := d.cfg.SkipLabelNameValidation || req.GetSkipLabelNameValidation()
+		// The flag is an operator-only switch; never trust the client-supplied
+		// protobuf field. req.SkipLabelNameValidation has already been cleared
+		// at the top of Distributor.Push for defence in depth.
+		skipLabelNameValidation := d.cfg.SkipLabelNameValidation
 		validatedSeries, validationErr := d.validateSeries(ts, userID, skipLabelNameValidation)
 
 		// Errors in validation are considered non-fatal, as one series in a request may contain
