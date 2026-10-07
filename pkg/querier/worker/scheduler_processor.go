@@ -3,6 +3,7 @@ package worker
 import (
 	"context"
 	"fmt"
+	"net"
 	"net/http"
 	"time"
 
@@ -180,6 +181,11 @@ func (sp *schedulerProcessor) runRequest(ctx context.Context, logger log.Logger,
 		}
 	}
 
+	if err := isValidFrontendAddress(frontendAddress); err != nil {
+		level.Error(logger).Log("msg", "refusing to deliver query result to invalid frontend address", "frontend", frontendAddress, "err", err)
+		return
+	}
+
 	c, err := sp.frontendPool.GetClientFor(frontendAddress)
 	if err == nil {
 		// Response is empty and uninteresting.
@@ -225,4 +231,25 @@ type frontendClient struct {
 
 func (fc *frontendClient) Close() error {
 	return fc.conn.Close()
+}
+
+// isValidFrontendAddress performs a defensive sanity check on the
+// scheduler-provided frontend delivery address before the querier opens a
+// gRPC connection to it. The scheduler is responsible for authenticating
+// its frontends (see pkg/scheduler/scheduler.go:validateFrontendAddress),
+// but we also refuse to dial obviously malformed values here so a
+// compromised or buggy control-plane peer cannot coerce the querier into
+// dialing an arbitrary string.
+func isValidFrontendAddress(addr string) error {
+	if addr == "" {
+		return fmt.Errorf("empty frontend address")
+	}
+	host, port, err := net.SplitHostPort(addr)
+	if err != nil {
+		return fmt.Errorf("frontend address %q is not host:port: %w", addr, err)
+	}
+	if host == "" || port == "" {
+		return fmt.Errorf("frontend address %q is missing host or port", addr)
+	}
+	return nil
 }
