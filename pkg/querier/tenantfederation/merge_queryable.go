@@ -3,6 +3,7 @@ package tenantfederation
 import (
 	"context"
 	"fmt"
+	"net/http"
 	"sort"
 	"strings"
 
@@ -11,6 +12,7 @@ import (
 	"github.com/prometheus/prometheus/storage"
 	"github.com/prometheus/prometheus/tsdb/chunkenc"
 	tsdb_errors "github.com/prometheus/prometheus/tsdb/errors"
+	"github.com/weaveworks/common/httpgrpc"
 	"github.com/weaveworks/common/user"
 
 	"github.com/cortexproject/cortex/pkg/tenant"
@@ -31,20 +33,32 @@ const (
 // and results for request with a single querier will not contain the
 // "__tenant_id__" label. This allows a smoother transition, when enabling
 // tenant federation in a cluster.
+// The maxTenants argument bounds the number of federated tenants a single
+// query may address, rejecting over-long lists with HTTP 400 before any
+// sub-querier is allocated. A value of 0 disables the limit.
 // The result contains a label "__tenant_id__" to identify the tenant ID that
 // it originally resulted from.
 // If the label "__tenant_id__" is already existing, its value is overwritten
 // by the tenant ID and the previous value is exposed through a new label
 // prefixed with "original_". This behaviour is not implemented recursively.
-func NewQueryable(upstream storage.Queryable, byPassWithSingleQuerier bool) storage.Queryable {
-	return NewMergeQueryable(defaultTenantLabel, tenantQuerierCallback(upstream), byPassWithSingleQuerier)
+func NewQueryable(upstream storage.Queryable, byPassWithSingleQuerier bool, maxTenants int) storage.Queryable {
+	return NewMergeQueryable(defaultTenantLabel, tenantQuerierCallback(upstream, maxTenants), byPassWithSingleQuerier)
 }
 
-func tenantQuerierCallback(queryable storage.Queryable) MergeQuerierCallback {
+func tenantQuerierCallback(queryable storage.Queryable, maxTenants int) MergeQuerierCallback {
 	return func(ctx context.Context, mint int64, maxt int64) ([]string, []storage.Querier, error) {
 		tenantIDs, err := tenant.TenantIDs(ctx)
 		if err != nil {
 			return nil, nil, err
+		}
+
+		// Reject over-long tenant lists before allocating any querier or
+		// issuing any sub-query. Without this bound, a single request with
+		// an attacker-controlled X-Scope-OrgID header can amplify into
+		// thousands of ingester / store-gateway RPCs (CWE-770).
+		if maxTenants > 0 && len(tenantIDs) > maxTenants {
+			return nil, nil, httpgrpc.Errorf(http.StatusBadRequest,
+				"too many tenants in request: %d (limit %d)", len(tenantIDs), maxTenants)
 		}
 
 		var queriers = make([]storage.Querier, len(tenantIDs))
