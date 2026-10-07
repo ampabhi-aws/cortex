@@ -2,6 +2,7 @@ package querier
 
 import (
 	"context"
+	"fmt"
 	"sort"
 	"time"
 
@@ -16,10 +17,12 @@ import (
 	"github.com/cortexproject/cortex/pkg/ingester/client"
 	"github.com/cortexproject/cortex/pkg/prom1/storage/metric"
 	"github.com/cortexproject/cortex/pkg/querier/series"
+	"github.com/cortexproject/cortex/pkg/tenant"
 	"github.com/cortexproject/cortex/pkg/util"
 	"github.com/cortexproject/cortex/pkg/util/chunkcompat"
 	"github.com/cortexproject/cortex/pkg/util/math"
 	"github.com/cortexproject/cortex/pkg/util/spanlogger"
+	"github.com/cortexproject/cortex/pkg/util/validation"
 )
 
 // Distributor is the read interface to the distributor, made an interface here
@@ -279,29 +282,78 @@ func (q *distributorQuerier) Close() error {
 }
 
 type distributorExemplarQueryable struct {
-	distributor Distributor
+	distributor        Distributor
+	limits             *validation.Overrides
+	maxQueryIntoFuture time.Duration
 }
 
-func newDistributorExemplarQueryable(d Distributor) storage.ExemplarQueryable {
+func newDistributorExemplarQueryable(d Distributor, limits *validation.Overrides, maxQueryIntoFuture time.Duration) storage.ExemplarQueryable {
 	return &distributorExemplarQueryable{
-		distributor: d,
+		distributor:        d,
+		limits:             limits,
+		maxQueryIntoFuture: maxQueryIntoFuture,
 	}
 }
 
 func (d distributorExemplarQueryable) ExemplarQuerier(ctx context.Context) (storage.ExemplarQuerier, error) {
 	return &distributorExemplarQuerier{
-		distributor: d.distributor,
-		ctx:         ctx,
+		distributor:        d.distributor,
+		ctx:                ctx,
+		limits:             d.limits,
+		maxQueryIntoFuture: d.maxQueryIntoFuture,
 	}, nil
 }
 
 type distributorExemplarQuerier struct {
-	distributor Distributor
-	ctx         context.Context
+	distributor        Distributor
+	ctx                context.Context
+	limits             *validation.Overrides
+	maxQueryIntoFuture time.Duration
 }
 
 // Select querys for exemplars, prometheus' storage.ExemplarQuerier's Select function takes the time range as two int64 values.
 func (q *distributorExemplarQuerier) Select(start, end int64, matchers ...[]*labels.Matcher) ([]exemplar.QueryResult, error) {
+	// Resolve the tenant for the request so that per-tenant limits can be enforced.
+	// If limits are not configured (e.g. legacy callers), skip tenant-scoped enforcement.
+	if q.limits != nil {
+		userID, err := tenant.TenantID(q.ctx)
+		if err != nil {
+			return nil, err
+		}
+
+		// Cap the number of matcher sets accepted from the caller. The number of matcher
+		// sets equals the number of PromQL VectorSelectors in the submitted expression and
+		// is attacker-controlled. Without this cap, a single authenticated request can
+		// amplify work (regexp compilation and index scanning) onto every ingester in the
+		// tenant's shard. 0 disables the cap.
+		if maxMatchers := q.limits.MaxExemplarsMatchersPerQuery(userID); maxMatchers > 0 && len(matchers) > maxMatchers {
+			return nil, validation.LimitError(fmt.Sprintf(
+				"the query would use too many matcher sets for exemplars (%d), limit is %d; reduce the number of selectors in the query_exemplars expression",
+				len(matchers), maxMatchers))
+		}
+
+		// Clamp the time range using max_query_lookback / max_query_into_future, matching
+		// the sample path (see NewQueryable / querier.Select).
+		newStart, newEnd, err := validateQueryTimeRange(q.ctx, userID, start, end, q.limits, q.maxQueryIntoFuture)
+		if err == errEmptyTimeRange {
+			return nil, nil
+		} else if err != nil {
+			return nil, err
+		}
+		start = newStart
+		end = newEnd
+
+		// Enforce the per-tenant max_query_length on the (possibly clamped) exemplar query
+		// range, mirroring querier.Select.
+		if maxQueryLength := q.limits.MaxQueryLength(userID); maxQueryLength > 0 {
+			startTime := model.Time(start)
+			endTime := model.Time(end)
+			if endTime.Sub(startTime) > maxQueryLength {
+				return nil, validation.LimitError(fmt.Sprintf(validation.ErrQueryTooLong, endTime.Sub(startTime), maxQueryLength))
+			}
+		}
+	}
+
 	allResults, err := q.distributor.QueryExemplars(q.ctx, model.Time(start), model.Time(end), matchers...)
 
 	if err != nil {
