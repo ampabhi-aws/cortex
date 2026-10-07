@@ -524,8 +524,11 @@ func (am *MultitenantAlertmanager) migrateStateFilesToPerTenantDirectories() err
 	}
 
 	for userID, files := range st {
-		tenantDir := am.getTenantDirectory(userID)
-		err := os.MkdirAll(tenantDir, 0777)
+		tenantDir, err := am.getTenantDirectory(userID)
+		if err != nil {
+			return errors.Wrapf(err, "failed to resolve per-tenant directory for user %q", userID)
+		}
+		err = os.MkdirAll(tenantDir, 0777)
 		if err != nil {
 			return errors.Wrapf(err, "failed to create per-tenant directory %v", tenantDir)
 		}
@@ -811,7 +814,11 @@ func (am *MultitenantAlertmanager) setConfig(cfg alertspb.AlertConfigDesc) error
 	var userAmConfig *amconfig.Config
 	var err error
 	var hasTemplateChanges bool
-	var userTemplateDir = filepath.Join(am.getTenantDirectory(cfg.User), templatesDir)
+	userTenantDir, err := am.getTenantDirectory(cfg.User)
+	if err != nil {
+		return err
+	}
+	var userTemplateDir = filepath.Join(userTenantDir, templatesDir)
 	var pathsToRemove = make(map[string]struct{})
 
 	// List existing files to keep track the ones to be removed
@@ -919,15 +926,21 @@ func (am *MultitenantAlertmanager) setConfig(cfg alertspb.AlertConfigDesc) error
 	return nil
 }
 
-func (am *MultitenantAlertmanager) getTenantDirectory(userID string) string {
-	return filepath.Join(am.cfg.DataDir, userID)
+func (am *MultitenantAlertmanager) getTenantDirectory(userID string) (string, error) {
+	if userID == "" {
+		return "", errors.New("empty tenant ID for alertmanager tenant directory")
+	}
+	return filepath.Join(am.cfg.DataDir, userID), nil
 }
 
 func (am *MultitenantAlertmanager) newAlertmanager(userID string, amConfig *amconfig.Config, rawCfg string) (*Alertmanager, error) {
 	reg := prometheus.NewRegistry()
 
-	tenantDir := am.getTenantDirectory(userID)
-	err := os.MkdirAll(tenantDir, 0777)
+	tenantDir, err := am.getTenantDirectory(userID)
+	if err != nil {
+		return nil, err
+	}
+	err = os.MkdirAll(tenantDir, 0777)
 	if err != nil {
 		return nil, errors.Wrapf(err, "failed to create per-tenant directory %v", tenantDir)
 	}

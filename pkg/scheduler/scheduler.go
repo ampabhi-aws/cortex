@@ -283,6 +283,14 @@ func (s *Scheduler) enqueueRequest(frontendContext context.Context, frontendAddr
 	}
 
 	userID := msg.GetUserID()
+	// Validate the tenant ID (or federated tenant IDs) before injecting it into the
+	// context. This fails closed for an empty or syntactically invalid tenant ID,
+	// which would otherwise collapse per-tenant paths onto the shared data root in
+	// downstream components. The FrontendLoop RPC is auth-exempt, so the scheduler
+	// must not trust msg.UserID blindly.
+	if _, err := tenant.TenantIDsFromOrgID(userID); err != nil {
+		return err
+	}
 
 	req := &schedulerRequest{
 		frontendAddress: frontendAddr,

@@ -392,8 +392,11 @@ func isEmptyBucketStore(bs *store.BucketStore) bool {
 	return min == math.MaxInt64 && max == math.MinInt64
 }
 
-func (u *BucketStores) syncDirForUser(userID string) string {
-	return filepath.Join(u.cfg.BucketStore.SyncDir, userID)
+func (u *BucketStores) syncDirForUser(userID string) (string, error) {
+	if userID == "" {
+		return "", fmt.Errorf("empty tenant ID for bucket store sync directory")
+	}
+	return filepath.Join(u.cfg.BucketStore.SyncDir, userID), nil
 }
 
 func (u *BucketStores) getOrCreateStore(userID string) (*store.BucketStore, error) {
@@ -415,6 +418,11 @@ func (u *BucketStores) getOrCreateStore(userID string) (*store.BucketStore, erro
 	userLogger := util_log.WithUserID(userID, u.logger)
 
 	level.Info(userLogger).Log("msg", "creating user bucket store")
+
+	userSyncDir, err := u.syncDirForUser(userID)
+	if err != nil {
+		return nil, err
+	}
 
 	userBkt := bucket.NewUserBucketClient(userID, u.bucket, u.limits)
 	fetcherReg := prometheus.NewRegistry()
@@ -460,7 +468,7 @@ func (u *BucketStores) getOrCreateStore(userID string) (*store.BucketStore, erro
 			userLogger,
 			u.cfg.BucketStore.MetaSyncConcurrency,
 			fetcherBkt,
-			u.syncDirForUser(userID), // The fetcher stores cached metas in the "meta-syncer/" sub directory
+			userSyncDir, // The fetcher stores cached metas in the "meta-syncer/" sub directory
 			fetcherReg,
 			filters,
 		)
@@ -484,7 +492,7 @@ func (u *BucketStores) getOrCreateStore(userID string) (*store.BucketStore, erro
 	bs, err := store.NewBucketStore(
 		userBkt,
 		fetcher,
-		u.syncDirForUser(userID),
+		userSyncDir,
 		newChunksLimiterFactory(u.limits, userID),
 		newSeriesLimiterFactory(u.limits, userID),
 		u.partitioner,
@@ -538,7 +546,11 @@ func (u *BucketStores) deleteLocalFilesForExcludedTenants(includeUserIDs map[str
 			level.Warn(u.logger).Log("msg", "failed to close bucket store for user", "user", userID, "err", err)
 		}
 
-		userSyncDir := u.syncDirForUser(userID)
+		userSyncDir, err := u.syncDirForUser(userID)
+		if err != nil {
+			level.Warn(u.logger).Log("msg", "failed to resolve user sync directory", "user", userID, "err", err)
+			continue
+		}
 		err = os.RemoveAll(userSyncDir)
 		if err == nil {
 			level.Info(u.logger).Log("msg", "deleted user sync directory", "dir", userSyncDir)
