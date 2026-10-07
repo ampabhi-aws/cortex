@@ -143,13 +143,25 @@ func Test_PostConfig_MultipleUsers(t *testing.T) {
 	}
 }
 
+// GetAllConfigs returns 401 to unauthenticated callers (the /private endpoints
+// are operator-only and must not be reachable without an identity).
+func Test_GetAllConfigs_Anonymous(t *testing.T) {
+	setup(t)
+	defer cleanup(t)
+
+	for _, c := range allClients {
+		w := request(t, "GET", c.PrivateEndpoint, nil)
+		assert.Equal(t, http.StatusUnauthorized, w.Code)
+	}
+}
+
 // GetAllConfigs returns an empty list of configs if there aren't any.
 func Test_GetAllConfigs_Empty(t *testing.T) {
 	setup(t)
 	defer cleanup(t)
 
 	for _, c := range allClients {
-		w := request(t, "GET", c.PrivateEndpoint, nil)
+		w := requestAsUser(t, "operator", "GET", c.PrivateEndpoint, "", nil)
 		assert.Equal(t, http.StatusOK, w.Code)
 		var found ConfigsView
 		err := json.Unmarshal(w.Body.Bytes(), &found)
@@ -168,13 +180,14 @@ func Test_GetAllConfigs(t *testing.T) {
 
 	for _, c := range allClients {
 		view := c.post(t, userID, config)
-		w := request(t, "GET", c.PrivateEndpoint, nil)
+		w := requestAsUser(t, "operator", "GET", c.PrivateEndpoint, "", nil)
 		assert.Equal(t, http.StatusOK, w.Code)
 		var found ConfigsView
 		err := json.Unmarshal(w.Body.Bytes(), &found)
 		assert.NoError(t, err, "Could not unmarshal JSON")
+		expected := redactViewForTest(t, view)
 		assert.Equal(t, ConfigsView{Configs: map[string]userconfig.View{
-			userID: view,
+			userID: expected,
 		}}, found)
 	}
 }
@@ -191,13 +204,14 @@ func Test_GetAllConfigs_Newest(t *testing.T) {
 		c.post(t, userID, makeConfig())
 		lastCreated := c.post(t, userID, makeConfig())
 
-		w := request(t, "GET", c.PrivateEndpoint, nil)
+		w := requestAsUser(t, "operator", "GET", c.PrivateEndpoint, "", nil)
 		assert.Equal(t, http.StatusOK, w.Code)
 		var found ConfigsView
 		err := json.Unmarshal(w.Body.Bytes(), &found)
 		assert.NoError(t, err, "Could not unmarshal JSON")
+		expected := redactViewForTest(t, lastCreated)
 		assert.Equal(t, ConfigsView{Configs: map[string]userconfig.View{
-			userID: lastCreated,
+			userID: expected,
 		}}, found)
 	}
 }
@@ -212,13 +226,14 @@ func Test_GetConfigs_IncludesNewerConfigsAndExcludesOlder(t *testing.T) {
 		userID3 := makeUserID()
 		config3 := c.post(t, userID3, makeConfig())
 
-		w := request(t, "GET", fmt.Sprintf("%s?since=%d", c.PrivateEndpoint, config2.ID), nil)
+		w := requestAsUser(t, "operator", "GET", fmt.Sprintf("%s?since=%d", c.PrivateEndpoint, config2.ID), "", nil)
 		assert.Equal(t, http.StatusOK, w.Code)
 		var found ConfigsView
 		err := json.Unmarshal(w.Body.Bytes(), &found)
 		assert.NoError(t, err, "Could not unmarshal JSON")
+		expected := redactViewForTest(t, config3)
 		assert.Equal(t, ConfigsView{Configs: map[string]userconfig.View{
-			userID3: config3,
+			userID3: expected,
 		}}, found)
 	}
 }
