@@ -24,6 +24,13 @@ const (
 	defaultSettleReadTimeout = 15 * time.Second
 	defaultStoreReadTimeout  = 15 * time.Second
 
+	// replicationQueueSize is the capacity of the per-tenant msgc channel used to
+	// queue state updates for asynchronous replication. The channel is buffered so
+	// that broadcast() never blocks the Alertmanager silence/nflog mutexes that
+	// its callers hold; if the queue fills up (e.g. the receiver is slow or has
+	// already exited) broadcast() drops the update rather than parking.
+	replicationQueueSize = 1000
+
 	// Initial sync outcome label values.
 	syncFromReplica  = "from-replica"
 	syncFromStorage  = "from-storage"
@@ -53,13 +60,21 @@ type state struct {
 	partialStateMergesFailed *prometheus.CounterVec
 	stateReplicationTotal    *prometheus.CounterVec
 	stateReplicationFailed   *prometheus.CounterVec
+	stateReplicationDropped  *prometheus.CounterVec
 	fetchReplicaStateTotal   prometheus.Counter
 	fetchReplicaStateFailed  prometheus.Counter
 	initialSyncTotal         prometheus.Counter
 	initialSyncCompleted     *prometheus.CounterVec
 	initialSyncDuration      prometheus.Histogram
 
+	// msgc is the buffered queue of state parts to replicate. broadcast() uses
+	// a non-blocking send so a wedged or exited receiver can never deadlock the
+	// callers (which hold Alertmanager silence/nflog mutexes).
 	msgc chan *clusterpb.Part
+	// stopc is closed by the stopping function once the running() receiver has
+	// exited, so any sender racing the shutdown unblocks instead of parking on
+	// the (possibly full) channel.
+	stopc chan struct{}
 }
 
 // newReplicatedStates creates a new state struct, which manages state to be replicated between alertmanagers.
@@ -72,7 +87,8 @@ func newReplicatedStates(userID string, rf int, re Replicator, st alertstore.Ale
 		replicator:        re,
 		store:             st,
 		states:            make(map[string]cluster.State, 2), // we use two, one for the notifications and one for silences.
-		msgc:              make(chan *clusterpb.Part),
+		msgc:              make(chan *clusterpb.Part, replicationQueueSize),
+		stopc:             make(chan struct{}),
 		reg:               r,
 		settleReadTimeout: defaultSettleReadTimeout,
 		storeReadTimeout:  defaultStoreReadTimeout,
@@ -91,6 +107,10 @@ func newReplicatedStates(userID string, rf int, re Replicator, st alertstore.Ale
 		stateReplicationFailed: promauto.With(r).NewCounterVec(prometheus.CounterOpts{
 			Name: "alertmanager_state_replication_failed_total",
 			Help: "Number of times we have failed to replicate a state to other alertmanagers.",
+		}, []string{"key"}),
+		stateReplicationDropped: promauto.With(r).NewCounterVec(prometheus.CounterOpts{
+			Name: "alertmanager_state_replication_dropped_total",
+			Help: "Number of state updates dropped because the replication queue was full or the replicator was shutting down.",
 		}, []string{"key"}),
 		fetchReplicaStateTotal: promauto.With(r).NewCounter(prometheus.CounterOpts{
 			Name: "alertmanager_state_fetch_replica_state_total",
@@ -119,7 +139,7 @@ func newReplicatedStates(userID string, rf int, re Replicator, st alertstore.Ale
 	s.initialSyncCompleted.WithLabelValues(syncUserNotFound)
 	s.initialSyncCompleted.WithLabelValues(syncFailed)
 
-	s.Service = services.NewBasicService(s.starting, s.running, nil)
+	s.Service = services.NewBasicService(s.starting, s.running, s.stopping)
 
 	return s
 }
@@ -135,6 +155,7 @@ func (s *state) AddState(key string, cs cluster.State, _ prometheus.Registerer) 
 	s.partialStateMergesFailed.WithLabelValues(key)
 	s.stateReplicationTotal.WithLabelValues(key)
 	s.stateReplicationFailed.WithLabelValues(key)
+	s.stateReplicationDropped.WithLabelValues(key)
 
 	return &stateChannel{
 		s:   s,
@@ -280,9 +301,13 @@ func (s *state) running(ctx context.Context) error {
 	for {
 		select {
 		case p := <-s.msgc:
-			// If the replication factor is <= 1, we don't need to replicate any state anywhere else.
+			// If the replication factor is <= 1, there is nowhere to replicate to,
+			// but we must keep draining the channel so that senders (which hold
+			// foreign Alertmanager mutexes) never block on a full queue and so
+			// that the running goroutine remains available for the entire
+			// lifetime of the service.
 			if s.replicationFactor <= 1 {
-				return nil
+				continue
 			}
 
 			s.stateReplicationTotal.WithLabelValues(p.Key).Inc()
@@ -296,10 +321,50 @@ func (s *state) running(ctx context.Context) error {
 	}
 }
 
+// stopping is invoked by the basic-service framework once running() has
+// returned. It closes stopc to unblock any sender that is racing the
+// shutdown, and drains msgc so queued updates can be discarded rather than
+// leaking goroutines parked on a non-existent receiver.
+func (s *state) stopping(_ error) error {
+	close(s.stopc)
+	for {
+		select {
+		case p := <-s.msgc:
+			if s.stateReplicationDropped != nil {
+				s.stateReplicationDropped.WithLabelValues(p.Key).Inc()
+			}
+		default:
+			return nil
+		}
+	}
+}
+
+// broadcast queues a state update for asynchronous replication. It must never
+// block the caller because callers (silence.Set, nflog.Log, nflog.Merge, ...)
+// hold Alertmanager mutexes while invoking it; blocking here would freeze the
+// tenant's silences/nflog and, via Alertmanager.StopAndWait, the whole
+// MultitenantAlertmanager config-sync loop. The send therefore uses a select
+// with:
+//   - a cancellation path on stopc, which is closed by stopping() once the
+//     running() receiver has exited, defeating the TOCTOU between Ready() and
+//     the send;
+//   - a default branch that drops the update (and bumps a counter) when the
+//     buffered queue is full, rather than parking the sender.
 func (s *state) broadcast(key string, b []byte) {
 	// We should ignore the Merges into the initial state during settling.
-	if s.Ready() {
-		s.msgc <- &clusterpb.Part{Key: key, Data: b}
+	if !s.Ready() {
+		return
+	}
+	part := &clusterpb.Part{Key: key, Data: b}
+	select {
+	case s.msgc <- part:
+	case <-s.stopc:
+		// The service is going away; drop the update instead of blocking
+		// the caller (which holds a silences/nflog mutex).
+		s.stateReplicationDropped.WithLabelValues(key).Inc()
+	default:
+		// Queue is full - never block the HTTP/dispatcher path.
+		s.stateReplicationDropped.WithLabelValues(key).Inc()
 	}
 }
 
