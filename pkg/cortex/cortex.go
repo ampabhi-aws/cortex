@@ -343,10 +343,12 @@ func New(cfg Config) (*Cortex, error) {
 			"/grpc.health.v1.Health/Check",
 			"/cortex.Ingester/TransferChunks",
 			"/frontend.Frontend/Process",
-			"/frontend.Frontend/NotifyClientShutdown",
 			"/schedulerpb.SchedulerForFrontend/FrontendLoop",
 			"/schedulerpb.SchedulerForQuerier/QuerierLoop",
-			"/schedulerpb.SchedulerForQuerier/NotifyQuerierShutdown",
+			// NotifyQuerierShutdown and NotifyClientShutdown intentionally
+			// require the tenant/worker header: their handlers bind the
+			// request to the authenticated peer so an unauthenticated
+			// network client cannot evict somebody else's querier.
 		})
 
 	cortex := &Cortex{

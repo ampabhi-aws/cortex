@@ -76,6 +76,15 @@ type schedulerProcessor struct {
 func (sp *schedulerProcessor) notifyShutdown(ctx context.Context, conn *grpc.ClientConn, address string) {
 	client := schedulerpb.NewSchedulerForQuerierClient(conn)
 
+	// Bind the shutdown call to our own querier identity so the scheduler can
+	// enforce that only the owning querier may trigger its own shutdown.
+	ctx = user.InjectOrgID(ctx, sp.querierID)
+	ctx, err := user.InjectIntoGRPCRequest(ctx)
+	if err != nil {
+		level.Warn(sp.log).Log("msg", "failed to inject querier ID into shutdown notification", "err", err)
+		return
+	}
+
 	req := &schedulerpb.NotifyQuerierShutdownRequest{QuerierID: sp.querierID}
 	if _, err := client.NotifyQuerierShutdown(ctx, req); err != nil {
 		// Since we're shutting down there's nothing we can do except logging it.

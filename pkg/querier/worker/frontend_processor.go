@@ -9,6 +9,7 @@ import (
 	"github.com/go-kit/log"
 	"github.com/go-kit/log/level"
 	"github.com/weaveworks/common/httpgrpc"
+	"github.com/weaveworks/common/user"
 	"google.golang.org/grpc"
 
 	"github.com/cortexproject/cortex/pkg/frontend/v1/frontendv1pb"
@@ -45,6 +46,15 @@ type frontendProcessor struct {
 // notifyShutdown implements processor.
 func (fp *frontendProcessor) notifyShutdown(ctx context.Context, conn *grpc.ClientConn, address string) {
 	client := frontendv1pb.NewFrontendClient(conn)
+
+	// Bind the shutdown call to our own querier identity so the frontend can
+	// enforce that only the owning querier may trigger its own shutdown.
+	ctx = user.InjectOrgID(ctx, fp.querierID)
+	ctx, err := user.InjectIntoGRPCRequest(ctx)
+	if err != nil {
+		level.Warn(fp.log).Log("msg", "failed to inject querier ID into shutdown notification", "err", err)
+		return
+	}
 
 	req := &frontendv1pb.NotifyClientShutdownRequest{ClientID: fp.querierID}
 	if _, err := client.NotifyClientShutdown(ctx, req); err != nil {

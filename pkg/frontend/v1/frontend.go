@@ -14,6 +14,8 @@ import (
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/promauto"
 	"github.com/weaveworks/common/httpgrpc"
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/status"
 
 	"github.com/cortexproject/cortex/pkg/frontend/v1/frontendv1pb"
 	"github.com/cortexproject/cortex/pkg/querier/stats"
@@ -23,6 +25,7 @@ import (
 	"github.com/cortexproject/cortex/pkg/util/httpgrpcutil"
 	"github.com/cortexproject/cortex/pkg/util/services"
 	"github.com/cortexproject/cortex/pkg/util/validation"
+	"github.com/cortexproject/cortex/pkg/util/workerauth"
 )
 
 var (
@@ -285,9 +288,19 @@ func (f *Frontend) Process(server frontendv1pb.Frontend_ProcessServer) error {
 	}
 }
 
-func (f *Frontend) NotifyClientShutdown(_ context.Context, req *frontendv1pb.NotifyClientShutdownRequest) (*frontendv1pb.NotifyClientShutdownResponse, error) {
-	level.Info(f.log).Log("msg", "received shutdown notification from querier", "querier", req.GetClientID())
-	f.requestQueue.NotifyQuerierShutdown(req.GetClientID())
+func (f *Frontend) NotifyClientShutdown(ctx context.Context, req *frontendv1pb.NotifyClientShutdownRequest) (*frontendv1pb.NotifyClientShutdownResponse, error) {
+	peerID, err := workerauth.AuthenticatedPeerID(ctx)
+	if err != nil {
+		level.Warn(f.log).Log("msg", "rejecting unauthenticated querier shutdown notification", "err", err, "querier", req.GetClientID())
+		return nil, status.Error(codes.Unauthenticated, "caller is not an authorized querier")
+	}
+	if req.GetClientID() != peerID {
+		level.Warn(f.log).Log("msg", "rejecting querier shutdown notification: client ID does not match authenticated peer", "peer", peerID, "querier", req.GetClientID())
+		return nil, status.Error(codes.PermissionDenied, "cannot notify shutdown for another querier")
+	}
+
+	level.Info(f.log).Log("msg", "received shutdown notification from querier", "querier", peerID)
+	f.requestQueue.NotifyQuerierShutdown(peerID)
 
 	return &frontendv1pb.NotifyClientShutdownResponse{}, nil
 }

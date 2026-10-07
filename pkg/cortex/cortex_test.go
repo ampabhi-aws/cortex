@@ -20,6 +20,7 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	"github.com/weaveworks/common/server"
+	"github.com/weaveworks/common/user"
 	"go.uber.org/atomic"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/credentials/insecure"
@@ -197,19 +198,43 @@ func TestGrpcAuthMiddleware(t *testing.T) {
 	}()
 
 	{
-		// Verify that we can call frontendClient.NotifyClientShutdown without user in the context, and we don't get any error.
+		// Verify that we can call frontendClient.NotifyClientShutdown when the
+		// caller injects its querier ID via X-Scope-OrgID metadata; the auth
+		// interceptor no longer exempts this method.
 		require.False(t, msch.clientShutdownCalled.Load())
 		frontendClient := frontendv1pb.NewFrontendClient(conn)
+
+		// Without identity: the auth interceptor must reject the call.
 		_, err = frontendClient.NotifyClientShutdown(ctx, &frontendv1pb.NotifyClientShutdownRequest{ClientID: "random-client-id"})
+		require.Error(t, err)
+		require.False(t, msch.clientShutdownCalled.Load())
+
+		// With identity: the call reaches the handler.
+		authCtx := user.InjectOrgID(ctx, "random-client-id")
+		authCtx, err = user.InjectIntoGRPCRequest(authCtx)
+		require.NoError(t, err)
+		_, err = frontendClient.NotifyClientShutdown(authCtx, &frontendv1pb.NotifyClientShutdownRequest{ClientID: "random-client-id"})
 		require.NoError(t, err)
 		require.True(t, msch.clientShutdownCalled.Load())
 	}
 
 	{
-		// Verify that we can call schedulerClient.NotifyQuerierShutdown without user in the context, and we don't get any error.
+		// Verify that we can call schedulerClient.NotifyQuerierShutdown when
+		// the caller injects its querier ID via X-Scope-OrgID metadata; the
+		// auth interceptor no longer exempts this method.
 		require.False(t, msch.querierShutdownCalled.Load())
 		schedulerClient := schedulerpb.NewSchedulerForQuerierClient(conn)
+
+		// Without identity: the auth interceptor must reject the call.
 		_, err = schedulerClient.NotifyQuerierShutdown(ctx, &schedulerpb.NotifyQuerierShutdownRequest{QuerierID: "random-querier-id"})
+		require.Error(t, err)
+		require.False(t, msch.querierShutdownCalled.Load())
+
+		// With identity: the call reaches the handler.
+		authCtx := user.InjectOrgID(ctx, "random-querier-id")
+		authCtx, err = user.InjectIntoGRPCRequest(authCtx)
+		require.NoError(t, err)
+		_, err = schedulerClient.NotifyQuerierShutdown(authCtx, &schedulerpb.NotifyQuerierShutdownRequest{QuerierID: "random-querier-id"})
 		require.NoError(t, err)
 		require.True(t, msch.querierShutdownCalled.Load())
 	}
