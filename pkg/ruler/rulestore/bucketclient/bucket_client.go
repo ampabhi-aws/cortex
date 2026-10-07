@@ -180,13 +180,24 @@ func (b *BucketRuleStore) LoadRuleGroups(ctx context.Context, groupsToLoad map[s
 					return fmt.Errorf("invalid rule group: user=%q, namespace=%q, group=%q", user, namespace, group)
 				}
 
-				gr, err := b.getRuleGroup(gCtx, user, namespace, group, gr) // reuse group pointer from the map.
+				gr2, err := b.getRuleGroup(gCtx, user, namespace, group, gr) // reuse group pointer from the map.
+				if errors.Is(err, rulestore.ErrGroupNotFound) {
+					// The rule group was deleted between listing and loading (benign race, or
+					// object-storage eventual-consistency hiccup). Treat it as non-fatal so one
+					// vanished group cannot abort the whole batch (which would freeze rule
+					// propagation for every tenant owned by this ruler). Reset the desc to a
+					// zero value so the caller can filter it out.
+					level.Warn(b.logger).Log("msg", "rule group disappeared while loading, skipping",
+						"user", user, "namespace", namespace, "group", group)
+					gr.Reset()
+					continue
+				}
 				if err != nil {
 					return errors.Wrapf(err, "get rule group user=%q, namespace=%q, name=%q", user, namespace, group)
 				}
 
-				if user != gr.User || namespace != gr.Namespace || group != gr.Name {
-					return fmt.Errorf("mismatch between requested rule group and loaded rule group, requested: user=%q, namespace=%q, group=%q, loaded: user=%q, namespace=%q, group=%q", user, namespace, group, gr.User, gr.Namespace, gr.Name)
+				if user != gr2.User || namespace != gr2.Namespace || group != gr2.Name {
+					return fmt.Errorf("mismatch between requested rule group and loaded rule group, requested: user=%q, namespace=%q, group=%q, loaded: user=%q, namespace=%q, group=%q", user, namespace, group, gr2.User, gr2.Namespace, gr2.Name)
 				}
 			}
 
