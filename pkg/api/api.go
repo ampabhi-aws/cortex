@@ -18,6 +18,7 @@ import (
 	"github.com/cortexproject/cortex/pkg/alertmanager"
 	"github.com/cortexproject/cortex/pkg/alertmanager/alertmanagerpb"
 	"github.com/cortexproject/cortex/pkg/compactor"
+	configAPI "github.com/cortexproject/cortex/pkg/configs/api"
 	"github.com/cortexproject/cortex/pkg/cortexpb"
 	"github.com/cortexproject/cortex/pkg/distributor"
 	"github.com/cortexproject/cortex/pkg/distributor/distributorpb"
@@ -322,6 +323,25 @@ func (a *API) RegisterRulerAPI(r *ruler.API) {
 	a.RegisterRoute(path.Join(a.cfg.LegacyHTTPPrefix, "/rules/{namespace}"), http.HandlerFunc(r.CreateRuleGroup), true, "POST")
 	a.RegisterRoute(path.Join(a.cfg.LegacyHTTPPrefix, "/rules/{namespace}/{groupName}"), http.HandlerFunc(r.DeleteRuleGroup), true, "DELETE")
 	a.RegisterRoute(path.Join(a.cfg.LegacyHTTPPrefix, "/rules/{namespace}"), http.HandlerFunc(r.DeleteNamespace), true, "DELETE")
+}
+
+// RegisterConfigAPI registers the legacy configs service HTTP routes through
+// the API wrapper so that the configured auth middleware chain (per-tenant
+// AuthMiddleware + optional HTTPHeaderMiddleware) is applied uniformly, the
+// same way every other HTTP surface is wired up. Each handler is expected to
+// resolve the tenant from the request context (populated by AuthMiddleware)
+// rather than from the raw X-Scope-OrgID header, so that fakeauth / any custom
+// auth middleware cannot be bypassed by a client-supplied header value.
+func (a *API) RegisterConfigAPI(c *configAPI.API) {
+	for _, route := range c.Routes() {
+		// Skip the configs root page: Cortex already serves "/" via its own
+		// index handler (RegisterAPI), and the two would conflict on the
+		// shared HTTP mux.
+		if route.Path == "/" {
+			continue
+		}
+		a.RegisterRoute(route.Path, route.Handler, route.Auth, route.Method)
+	}
 }
 
 // RegisterRing registers the ring UI page associated with the distributor for writes.

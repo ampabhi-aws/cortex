@@ -591,7 +591,12 @@ func (t *Cortex) initConfig() (serv services.Service, err error) {
 	}
 
 	t.ConfigAPI = configAPI.New(t.ConfigDB, t.Cfg.Configs.API)
-	t.ConfigAPI.RegisterRoutes(t.Server.HTTP)
+	// Register configs routes through the API wrapper so that the configured
+	// AuthMiddleware (and HTTPHeaderMiddleware, when enabled) are applied,
+	// matching every other HTTP surface. Previously the raw mux router was
+	// attached directly to t.Server.HTTP, which bypassed the middleware chain
+	// and let clients choose any tenant via the X-Scope-OrgID header.
+	t.API.RegisterConfigAPI(t.ConfigAPI)
 	return services.NewIdleService(nil, func(_ error) error {
 		t.ConfigDB.Close()
 		return nil
