@@ -47,10 +47,35 @@ type Email struct {
 	tmpl     *template.Template
 	logger   log.Logger
 	hostname string
+	dialer   ContextDialer
+}
+
+// ContextDialer is the subset of *net.Dialer we need to dial SMTP connections.
+// Any dialer implementing DialContext may be injected via WithDialer to
+// enforce an egress policy (e.g. Cortex's FirewallDialer) on SMTP
+// connections, mirroring commoncfg.WithDialContextFunc for the other
+// Alertmanager integrations. This is a Cortex vendor-local extension; the
+// zero-value behaviour is unchanged (plain net.Dialer{}).
+type ContextDialer interface {
+	DialContext(ctx context.Context, network, address string) (net.Conn, error)
+}
+
+// Option customises the Email notifier.
+type Option func(*Email)
+
+// WithDialer wires a custom ContextDialer into the Email notifier so that both
+// the plaintext/STARTTLS and the implicit-TLS (port 465) branches honour the
+// caller's egress policy at dial time. If d is nil the option is a no-op.
+func WithDialer(d ContextDialer) Option {
+	return func(n *Email) {
+		if d != nil {
+			n.dialer = d
+		}
+	}
 }
 
 // New returns a new Email notifier.
-func New(c *config.EmailConfig, t *template.Template, l log.Logger) *Email {
+func New(c *config.EmailConfig, t *template.Template, l log.Logger, opts ...Option) *Email {
 	if _, ok := c.Headers["Subject"]; !ok {
 		c.Headers["Subject"] = config.DefaultEmailSubject
 	}
@@ -66,7 +91,11 @@ func New(c *config.EmailConfig, t *template.Template, l log.Logger) *Email {
 	if err != nil {
 		h = "localhost.localdomain"
 	}
-	return &Email{conf: c, tmpl: t, logger: l, hostname: h}
+	n := &Email{conf: c, tmpl: t, logger: l, hostname: h}
+	for _, opt := range opts {
+		opt(n)
+	}
+	return n
 }
 
 // auth resolves a string of authentication mechanisms.
@@ -122,6 +151,15 @@ func (n *Email) Notify(ctx context.Context, as ...*types.Alert) (bool, error) {
 		err     error
 		success = false
 	)
+	// Pick the dialer used to establish the raw TCP connection. If a custom
+	// dialer has been injected via WithDialer (e.g. Cortex's FirewallDialer)
+	// use it for both branches so that any egress policy is enforced at dial
+	// time regardless of whether implicit TLS (port 465) or
+	// plaintext/STARTTLS is in use.
+	var dialer ContextDialer = n.dialer
+	if dialer == nil {
+		dialer = &net.Dialer{}
+	}
 	if n.conf.Smarthost.Port == "465" {
 		tlsConfig, err := commoncfg.NewTLSConfig(&n.conf.TLSConfig)
 		if err != nil {
@@ -131,16 +169,18 @@ func (n *Email) Notify(ctx context.Context, as ...*types.Alert) (bool, error) {
 			tlsConfig.ServerName = n.conf.Smarthost.Host
 		}
 
-		conn, err = tls.Dial("tcp", n.conf.Smarthost.String(), tlsConfig)
+		rawConn, err := dialer.DialContext(ctx, "tcp", n.conf.Smarthost.String())
 		if err != nil {
+			return true, errors.Wrap(err, "establish connection to server")
+		}
+		tlsConn := tls.Client(rawConn, tlsConfig)
+		if err := tlsConn.HandshakeContext(ctx); err != nil {
+			rawConn.Close()
 			return true, errors.Wrap(err, "establish TLS connection to server")
 		}
+		conn = tlsConn
 	} else {
-		var (
-			d   = net.Dialer{}
-			err error
-		)
-		conn, err = d.DialContext(ctx, "tcp", n.conf.Smarthost.String())
+		conn, err = dialer.DialContext(ctx, "tcp", n.conf.Smarthost.String())
 		if err != nil {
 			return true, errors.Wrap(err, "establish connection to server")
 		}
