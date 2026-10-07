@@ -282,6 +282,10 @@ func (a *API) PrometheusAlerts(w http.ResponseWriter, req *http.Request) {
 var (
 	// ErrNoNamespace signals that no namespace was specified in the request
 	ErrNoNamespace = errors.New("a namespace must be provided in the request")
+	// ErrInvalidNamespace signals that the namespace in the request is not
+	// a valid single filename (empty, `.`, `..`, or contains a path
+	// separator), and therefore cannot be safely materialised on disk.
+	ErrInvalidNamespace = errors.New("invalid namespace: must not be empty, '.', '..', or contain path separators")
 	// ErrNoGroupName signals a group name url parameter was not found
 	ErrNoGroupName = errors.New("a matching group name must be provided in the request")
 	// ErrNoRuleGroups signals the rule group requested does not exist
@@ -334,6 +338,18 @@ func parseNamespace(params map[string]string) (string, error) {
 	namespace, err := url.PathUnescape(namespace)
 	if err != nil {
 		return "", err
+	}
+
+	// Reject namespaces that are not valid single filenames. These values
+	// are later written to disk as `<rule-path>/<tenant>/<url.PathEscape(namespace)>`
+	// in pkg/ruler/mapper.go; `.` and `..` collapse onto an existing
+	// directory (silently breaking the tenant's rule sync) and path
+	// separators would escape the per-tenant directory. Validate once at
+	// the API boundary so an invalid namespace can never be persisted in
+	// the rule store.
+	if namespace == "" || namespace == "." || namespace == ".." ||
+		strings.ContainsAny(namespace, "/\\") {
+		return "", ErrInvalidNamespace
 	}
 
 	return namespace, nil
