@@ -48,6 +48,13 @@ type Config struct {
 	AlertmanagerHTTPPrefix string `yaml:"alertmanager_http_prefix"`
 	PrometheusHTTPPrefix   string `yaml:"prometheus_http_prefix"`
 
+	// EnableAdminAPI gates administrative/cross-tenant HTTP endpoints (for
+	// example /ruler/rule_groups) that would otherwise be reachable without
+	// authentication on the same listener as the tenant-facing API. It
+	// defaults to false so these endpoints are not exposed unless the
+	// operator explicitly opts in.
+	EnableAdminAPI bool `yaml:"enable_admin_api"`
+
 	// The following configs are injected by the upstream caller.
 	ServerPrefix       string               `yaml:"-"`
 	LegacyHTTPPrefix   string               `yaml:"-"`
@@ -71,6 +78,7 @@ type Config struct {
 func (cfg *Config) RegisterFlags(f *flag.FlagSet) {
 	f.BoolVar(&cfg.ResponseCompression, "api.response-compression-enabled", false, "Use GZIP compression for API responses. Some endpoints serve large YAML or JSON blobs which can benefit from compression.")
 	f.Var(&cfg.HTTPRequestHeadersToLog, "api.http-request-headers-to-log", "Which HTTP Request headers to add to logs")
+	f.BoolVar(&cfg.EnableAdminAPI, "api.enable-admin-api", false, "Enable administrative HTTP endpoints that expose cross-tenant data (for example /ruler/rule_groups). Disabled by default; when enabled, these endpoints are also wrapped by the auth middleware and require an X-Scope-OrgID header.")
 	cfg.RegisterFlagsWithPrefix("", f)
 }
 
@@ -291,8 +299,14 @@ func (a *API) RegisterRuler(r *ruler.Ruler) {
 	// Legacy Ring Route
 	a.RegisterRoute("/ruler_ring", r, false, "GET", "POST")
 
-	// List all user rule groups
-	a.RegisterRoute("/ruler/rule_groups", http.HandlerFunc(r.ListAllRules), false, "GET")
+	// List all user rule groups. This endpoint exposes every tenant's
+	// ruler configuration, so it is only registered when the administrative
+	// API is explicitly enabled and is placed behind the auth middleware so
+	// an X-Scope-OrgID (or equivalent control enforced by an upstream proxy)
+	// is required.
+	if a.cfg.EnableAdminAPI {
+		a.RegisterRoute("/ruler/rule_groups", http.HandlerFunc(r.ListAllRules), true, "GET")
+	}
 
 	ruler.RegisterRulerServer(a.server.GRPC, r)
 }

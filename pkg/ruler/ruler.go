@@ -863,6 +863,20 @@ func (r *Ruler) DeleteTenantConfiguration(w http.ResponseWriter, req *http.Reque
 func (r *Ruler) ListAllRules(w http.ResponseWriter, req *http.Request) {
 	logger := util_log.WithContext(req.Context(), r.logger)
 
+	// Defence in depth: this handler returns cross-tenant data, so even if a
+	// misconfigured route accidentally exposes it we require that the caller
+	// present a tenant identity (mirroring the pattern used by every other
+	// ruler handler). The route itself is additionally gated by an
+	// administrative API flag at registration time; see RegisterRuler in
+	// pkg/api/api.go.
+	if _, err := tenant.TenantID(req.Context()); err != nil {
+		// When Cortex is running, the auth middleware injects the tenant and
+		// returns http.StatusUnauthorized when X-Scope-OrgID is missing. We
+		// do the same here for consistency.
+		http.Error(w, err.Error(), http.StatusUnauthorized)
+		return
+	}
+
 	userIDs, err := r.store.ListAllUsers(req.Context())
 	if err != nil {
 		level.Error(logger).Log("msg", errListAllUser, "err", err)

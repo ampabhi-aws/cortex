@@ -1108,8 +1108,15 @@ func TestRuler_ListAllRules(t *testing.T) {
 	router := mux.NewRouter()
 	router.Path("/ruler/rule_groups").Methods(http.MethodGet).HandlerFunc(r.ListAllRules)
 
+	// Without a tenant identity the admin handler must reject the request
+	// with 401, mirroring the auth middleware behaviour used in production.
 	req := requestFor(t, http.MethodGet, "https://localhost:8080/ruler/rule_groups", nil, "")
 	w := httptest.NewRecorder()
+	router.ServeHTTP(w, req)
+	require.Equal(t, http.StatusUnauthorized, w.Result().StatusCode)
+
+	req = requestFor(t, http.MethodGet, "https://localhost:8080/ruler/rule_groups", nil, "admin")
+	w = httptest.NewRecorder()
 	router.ServeHTTP(w, req)
 
 	resp := w.Result()
