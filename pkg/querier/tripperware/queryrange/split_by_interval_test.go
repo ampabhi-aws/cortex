@@ -341,6 +341,16 @@ func Test_evaluateAtModifier(t *testing.T) {
 			expected: "http_requests_total[1h] @ 10.001",
 		},
 		{
+			// subquery with @ start() must be resolved.
+			in:       "sum_over_time(up[10m:1m] @ start())",
+			expected: "sum_over_time(up[10m:1m] @ 1546300.800)",
+		},
+		{
+			// subquery with @ end() must be resolved.
+			in:       "sum_over_time(up[10m:1m] @ end())",
+			expected: "sum_over_time(up[10m:1m] @ 1646300.800)",
+		},
+		{
 			in: `min_over_time(
 				sum by(cluster) (
 					rate(http_requests_total[5m] @ end())
