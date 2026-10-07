@@ -16,6 +16,26 @@ import (
 // Func defines the type of the push. It is similar to http.HandlerFunc.
 type Func func(context.Context, *cortexpb.WriteRequest) (*cortexpb.WriteResponse, error)
 
+// maxLoggedErrorBytes bounds how many bytes of an error are written to the log line
+// emitted by Handler. Validation errors in the push pipeline are formatted from
+// attacker-controlled label data, so an unbounded log write can flood the shared
+// logging pipeline on the distributor.
+const maxLoggedErrorBytes = 1024
+
+// truncateErrorForLog returns a string representation of err suitable for logging,
+// bounded to maxLoggedErrorBytes. It avoids materializing more than that many bytes
+// in the final log line even if err.Error() is very large.
+func truncateErrorForLog(err error) string {
+	if err == nil {
+		return ""
+	}
+	s := err.Error()
+	if len(s) <= maxLoggedErrorBytes {
+		return s
+	}
+	return s[:maxLoggedErrorBytes] + "... (truncated)"
+}
+
 // Handler is a http.Handler which accepts WriteRequests.
 func Handler(maxRecvMsgSize int, sourceIPs *middleware.SourceIPExtractor, push Func) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -48,7 +68,10 @@ func Handler(maxRecvMsgSize int, sourceIPs *middleware.SourceIPExtractor, push F
 				return
 			}
 			if resp.GetCode() != 202 {
-				level.Error(logger).Log("msg", "push error", "err", err)
+				// Cap the error message that is written to the log line. Validation errors
+				// are built from attacker-controlled series/label data; without a cap one
+				// malformed request can flood the shared logging pipeline.
+				level.Error(logger).Log("msg", "push error", "err", truncateErrorForLog(err))
 			}
 			http.Error(w, string(resp.Body), int(resp.Code))
 		}

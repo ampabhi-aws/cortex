@@ -129,8 +129,8 @@ func newTooManyLabelsError(series []cortexpb.LabelAdapter, limit int) Validation
 
 func (e *tooManyLabelsError) Error() string {
 	return fmt.Sprintf(
-		"series has too many labels (actual: %d, limit: %d) series: '%s'",
-		len(e.series), e.limit, cortexpb.FromLabelAdaptersToMetric(e.series).String())
+		"series has too many labels (actual: %d, limit: %d) series: %.200q",
+		len(e.series), e.limit, formatLabelSet(e.series))
 }
 
 type noMetricNameError struct{}
@@ -225,28 +225,52 @@ func newExemplarLabelLengthError(seriesLabels []cortexpb.LabelAdapter, exemplarL
 	}
 }
 
+// maxFormattedLabelSetBytes caps how many bytes of label pairs formatLabelSet will
+// materialize. Callers typically truncate the result with %.200q, so a cap a few times
+// larger than that is sufficient to produce the final truncated message while making
+// sure a maliciously large label set does not force O(N) allocations before truncation.
+const maxFormattedLabelSetBytes = 1024
+
 // formatLabelSet formats label adapters as a metric name with labels, while preserving
 // label order, and keeping duplicates. If there are multiple "__name__" labels, only
 // first one is used as metric name, other ones will be included as regular labels.
+//
+// The returned string is bounded by construction (see maxFormattedLabelSetBytes) so
+// that an attacker-controlled series with millions of labels cannot force the process
+// to allocate / copy a multi-hundred-megabyte string before callers truncate it with
+// %.200q.
 func formatLabelSet(ls []cortexpb.LabelAdapter) string {
 	metricName, hasMetricName := "", false
 
-	labelStrings := make([]string, 0, len(ls))
+	var b strings.Builder
+	first := true
+	truncated := false
 	for _, l := range ls {
 		if l.Name == model.MetricNameLabel && !hasMetricName && l.Value != "" {
 			metricName = l.Value
 			hasMetricName = true
-		} else {
-			labelStrings = append(labelStrings, fmt.Sprintf("%s=%q", l.Name, l.Value))
+			continue
 		}
+		if b.Len() >= maxFormattedLabelSetBytes {
+			truncated = true
+			break
+		}
+		if !first {
+			b.WriteString(", ")
+		}
+		first = false
+		fmt.Fprintf(&b, "%s=%q", l.Name, l.Value)
 	}
 
-	if len(labelStrings) == 0 {
+	if b.Len() == 0 {
 		if hasMetricName {
 			return metricName
 		}
 		return "{}"
 	}
 
-	return fmt.Sprintf("%s{%s}", metricName, strings.Join(labelStrings, ", "))
+	if truncated {
+		b.WriteString(", …")
+	}
+	return fmt.Sprintf("%s{%s}", metricName, b.String())
 }
