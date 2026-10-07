@@ -5,12 +5,14 @@ import (
 
 	"github.com/go-kit/log"
 	"github.com/go-kit/log/level"
+	pkgerrors "github.com/pkg/errors"
 	"github.com/prometheus/prometheus/storage"
 
 	"github.com/cortexproject/cortex/pkg/cortexpb"
 	"github.com/cortexproject/cortex/pkg/ingester/client"
 	"github.com/cortexproject/cortex/pkg/util"
 	util_log "github.com/cortexproject/cortex/pkg/util/log"
+	"github.com/cortexproject/cortex/pkg/util/validation"
 )
 
 // Queries are a set of matchers with time ranges - should not get into megabytes
@@ -65,7 +67,17 @@ func RemoteReadHandler(q storage.Queryable, logger log.Logger) http.Handler {
 			}
 		}
 		if lastErr != nil {
-			http.Error(w, lastErr.Error(), http.StatusBadRequest)
+			// Full error detail is kept server-side only; the response body must not
+			// leak internal infrastructure identifiers (store-gateway addresses,
+			// block ULIDs, bucket/key names, etc.) to tenants.
+			level.Warn(logger).Log("msg", "remote read failed", "err", lastErr)
+			translatedErr := TranslateToPromqlAPIError(lastErr)
+			if limitErr, ok := pkgerrors.Cause(translatedErr).(validation.LimitError); ok {
+				// Limit errors are safe, user-facing text and have a dedicated status code.
+				http.Error(w, limitErr.Error(), http.StatusUnprocessableEntity)
+				return
+			}
+			http.Error(w, "internal error while executing remote read", http.StatusInternalServerError)
 			return
 		}
 		w.Header().Add("Content-Type", "application/x-protobuf")
