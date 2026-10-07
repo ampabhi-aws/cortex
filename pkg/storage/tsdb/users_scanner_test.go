@@ -49,3 +49,43 @@ func TestUsersScanner_ScanUsers_ShouldReturnUsersForWhichOwnerCheckOrTenantDelet
 	assert.Equal(t, expected, actual)
 	assert.Empty(t, deleted)
 }
+
+// Strict (fail-closed) ownership mode: tenants are skipped when the
+// ownership check returns an error. This is the mode used by the
+// destructive BlocksCleaner path.
+func TestUsersScanner_ScanUsers_StrictMode_ShouldSkipUsersWhenOwnerCheckFails(t *testing.T) {
+	bucketClient := &bucket.ClientMock{}
+	bucketClient.MockIter("", []string{"user-1", "user-2"}, nil)
+
+	isOwned := func(userID string) (bool, error) {
+		return false, errors.New("failed to check if user is owned")
+	}
+
+	s := NewUsersScannerStrict(bucketClient, isOwned, log.NewNopLogger())
+	actual, deleted, err := s.ScanUsers(context.Background())
+	require.NoError(t, err)
+	assert.Empty(t, actual)
+	assert.Empty(t, deleted)
+}
+
+// Strict mode should still return owned users and still fail-open on the
+// tenant-deletion-mark check (unchanged lenient behaviour for that step).
+func TestUsersScanner_ScanUsers_StrictMode_ShouldReturnOwnedUsers(t *testing.T) {
+	bucketClient := &bucket.ClientMock{}
+	bucketClient.MockIter("", []string{"user-1", "user-2", "user-3"}, nil)
+	bucketClient.MockExists(path.Join("user-1", TenantDeletionMarkPath), false, nil)
+	bucketClient.MockExists(path.Join("user-3", TenantDeletionMarkPath), true, nil)
+
+	isOwned := func(userID string) (bool, error) {
+		if userID == "user-2" {
+			return false, errors.New("ring error")
+		}
+		return userID == "user-1" || userID == "user-3", nil
+	}
+
+	s := NewUsersScannerStrict(bucketClient, isOwned, log.NewNopLogger())
+	actual, deleted, err := s.ScanUsers(context.Background())
+	require.NoError(t, err)
+	assert.Equal(t, []string{"user-1"}, actual)
+	assert.Equal(t, []string{"user-3"}, deleted)
+}
