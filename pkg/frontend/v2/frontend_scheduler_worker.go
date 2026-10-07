@@ -198,6 +198,14 @@ func (w *frontendSchedulerWorker) stop() {
 }
 
 func (w *frontendSchedulerWorker) runOne(ctx context.Context, client schedulerpb.SchedulerForFrontendClient) {
+	// Recover from any panic in the scheduler loop so that a single misbehaving
+	// response from a scheduler cannot bring down the whole query-frontend process.
+	defer func() {
+		if r := recover(); r != nil {
+			level.Error(w.log).Log("msg", "recovered panic in scheduler loop", "panic", r)
+		}
+	}()
+
 	backoffConfig := backoff.Config{
 		MinBackoff: 50 * time.Millisecond,
 		MaxBackoff: 1 * time.Second,
@@ -291,7 +299,12 @@ func (w *frontendSchedulerWorker) schedulerLoop(loop schedulerpb.SchedulerForFro
 				req.response <- &frontendv2pb.QueryResultRequest{
 					HttpResponse: &httpgrpc.HTTPResponse{
 						Code: http.StatusInternalServerError,
-						Body: []byte(err.Error()),
+						// Use the scheduler-provided error message from the response
+						// (resp.Error). The local `err` variable is guaranteed to be nil
+						// here because the preceding `if err != nil { return err }` guard
+						// would have returned otherwise, so calling err.Error() would
+						// panic on a nil error interface.
+						Body: []byte(resp.Error),
 					},
 				}
 
