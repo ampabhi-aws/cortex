@@ -320,6 +320,52 @@ func TestSplitByDay(t *testing.T) {
 	}
 }
 
+func TestSplitByInterval_MaxSplitsPerQuery(t *testing.T) {
+	req := &PrometheusRequest{
+		Start: 0,
+		// 5 days -> 5 sub-requests at 24h split interval.
+		End:   5 * 24 * 3600 * seconds,
+		Step:  15 * seconds,
+		Query: "foo",
+	}
+
+	downstream := tripperware.HandlerFunc(func(ctx context.Context, r tripperware.Request) (tripperware.Response, error) {
+		return NewEmptyPrometheusResponse(), nil
+	})
+
+	ctx := user.InjectOrgID(context.Background(), "1")
+
+	// Below the limit: request succeeds.
+	mw := SplitByIntervalMiddleware(
+		func(_ tripperware.Request) time.Duration { return day },
+		mockLimits{maxSplitsPerQuery: 10},
+		PrometheusCodec, nil,
+	)
+	_, err := mw.Wrap(downstream).Do(ctx, req)
+	require.NoError(t, err)
+
+	// Above the limit: request is rejected with HTTP 400.
+	mw = SplitByIntervalMiddleware(
+		func(_ tripperware.Request) time.Duration { return day },
+		mockLimits{maxSplitsPerQuery: 2},
+		PrometheusCodec, nil,
+	)
+	_, err = mw.Wrap(downstream).Do(ctx, req)
+	require.Error(t, err)
+	resp, ok := httpgrpc.HTTPResponseFromError(err)
+	require.True(t, ok)
+	require.Equal(t, int32(http.StatusBadRequest), resp.Code)
+
+	// Zero (disabled): request succeeds even for many splits.
+	mw = SplitByIntervalMiddleware(
+		func(_ tripperware.Request) time.Duration { return day },
+		mockLimits{maxSplitsPerQuery: 0},
+		PrometheusCodec, nil,
+	)
+	_, err = mw.Wrap(downstream).Do(ctx, req)
+	require.NoError(t, err)
+}
+
 func Test_evaluateAtModifier(t *testing.T) {
 	const (
 		start, end = int64(1546300800), int64(1646300800)
