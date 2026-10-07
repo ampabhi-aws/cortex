@@ -4,12 +4,14 @@ import (
 	"bytes"
 	"context"
 	"crypto/rand"
+	"encoding/base64"
 	"encoding/binary"
 	"errors"
 	"flag"
 	"fmt"
 	"math"
 	mathrand "math/rand"
+	"os"
 	"strings"
 	"sync"
 	"time"
@@ -28,6 +30,17 @@ import (
 const (
 	maxCasRetries              = 10          // max retries in CAS operation
 	noChangeDetectedRetrySleep = time.Second // how long to sleep after no change was detected in CAS
+
+	// maxMergeRemoteStateBytes caps the total size of a single push/pull remote-state
+	// payload we are willing to process. The memberlist stream handler calls
+	// MergeRemoteState with an attacker-controllable buffer; without an upper bound a
+	// hostile peer could force the delegate to allocate and merge an unbounded number
+	// of KV pairs.
+	maxMergeRemoteStateBytes = 64 * 1024 * 1024
+
+	// maxMergeRemoteStateKVPairs caps the number of KV pairs we are willing to merge
+	// from a single remote-state payload.
+	maxMergeRemoteStateKVPairs = 1024
 )
 
 // Client implements kv.Client interface, by using memberlist.KV
@@ -154,6 +167,14 @@ type KVConfig struct {
 	// Timeout used when leaving the memberlist cluster.
 	LeaveTimeout time.Duration `yaml:"leave_timeout"`
 
+	// Shared secret used by hashicorp/memberlist's built-in gossip authentication/encryption.
+	// When non-empty, SecretKey (16/24/32 raw bytes) or SecretKeyPath (file containing raw bytes
+	// or a base64-encoded key) is loaded; packets and streams from peers that do not share the
+	// key are dropped. Enabling this is strongly recommended in addition to TLS, so the gossip
+	// plane is authenticated at the application level even if a peer is on-network.
+	SecretKey     flagext.Secret `yaml:"secret_key"`
+	SecretKeyPath string         `yaml:"secret_key_path"`
+
 	// How much space to use to keep received and sent messages in memory (for troubleshooting).
 	MessageHistoryBufferBytes int `yaml:"message_history_buffer_bytes"`
 
@@ -184,6 +205,8 @@ func (cfg *KVConfig) RegisterFlagsWithPrefix(f *flag.FlagSet, prefix string) {
 	f.DurationVar(&cfg.RejoinInterval, prefix+"memberlist.rejoin-interval", 0, "If not 0, how often to rejoin the cluster. Occasional rejoin can help to fix the cluster split issue, and is harmless otherwise. For example when using only few components as a seed nodes (via -memberlist.join), then it's recommended to use rejoin. If -memberlist.join points to dynamic service that resolves to all gossiping nodes (eg. Kubernetes headless service), then rejoin is not needed.")
 	f.DurationVar(&cfg.LeftIngestersTimeout, prefix+"memberlist.left-ingesters-timeout", 5*time.Minute, "How long to keep LEFT ingesters in the ring.")
 	f.DurationVar(&cfg.LeaveTimeout, prefix+"memberlist.leave-timeout", 5*time.Second, "Timeout for leaving memberlist cluster.")
+	f.Var(&cfg.SecretKey, prefix+"memberlist.secret-key", "Shared secret for authenticated and encrypted gossip (16, 24 or 32 raw bytes, or base64-encoded). When set, packets/streams from peers that do not share the key are dropped. Strongly recommended in addition to -memberlist.tls-enabled, because TLS alone does not authenticate peers unless client certificates are also configured.")
+	f.StringVar(&cfg.SecretKeyPath, prefix+"memberlist.secret-key-path", "", "Path to a file containing the shared gossip secret (raw bytes or base64). Mutually exclusive with -memberlist.secret-key.")
 	f.DurationVar(&cfg.GossipInterval, prefix+"memberlist.gossip-interval", mlDefaults.GossipInterval, "How often to gossip.")
 	f.IntVar(&cfg.GossipNodes, prefix+"memberlist.gossip-nodes", mlDefaults.GossipNodes, "How many nodes to gossip to.")
 	f.DurationVar(&cfg.PushPullInterval, prefix+"memberlist.pullpush-interval", mlDefaults.PushPullInterval, "How often to use pull/push sync.")
@@ -199,6 +222,49 @@ func (cfg *KVConfig) RegisterFlagsWithPrefix(f *flag.FlagSet, prefix string) {
 
 func (cfg *KVConfig) RegisterFlags(f *flag.FlagSet) {
 	cfg.RegisterFlagsWithPrefix(f, "")
+}
+
+// loadGossipSecretKey returns the shared gossip secret key, read either from the inline
+// -memberlist.secret-key flag or from the file referenced by -memberlist.secret-key-path.
+// Both forms accept either raw 16/24/32-byte keys or a base64/base64-url encoded key.
+// Returns a nil slice (not an error) when no key is configured.
+func (cfg *KVConfig) loadGossipSecretKey() ([]byte, error) {
+	inline := cfg.SecretKey.Value
+	path := cfg.SecretKeyPath
+	if inline == "" && path == "" {
+		return nil, nil
+	}
+	if inline != "" && path != "" {
+		return nil, errors.New("-memberlist.secret-key and -memberlist.secret-key-path are mutually exclusive")
+	}
+
+	var raw []byte
+	if path != "" {
+		b, err := os.ReadFile(path)
+		if err != nil {
+			return nil, fmt.Errorf("reading gossip secret key file %q: %w", path, err)
+		}
+		raw = bytes.TrimSpace(b)
+	} else {
+		raw = []byte(inline)
+	}
+
+	key := raw
+	// Accept base64 (std or url) for operator convenience.
+	if l := len(raw); l != 16 && l != 24 && l != 32 {
+		if decoded, err := base64.StdEncoding.DecodeString(string(raw)); err == nil {
+			key = decoded
+		} else if decoded, err := base64.URLEncoding.DecodeString(string(raw)); err == nil {
+			key = decoded
+		} else if decoded, err := base64.RawStdEncoding.DecodeString(string(raw)); err == nil {
+			key = decoded
+		}
+	}
+
+	if l := len(key); l != 16 && l != 24 && l != 32 {
+		return nil, fmt.Errorf("gossip secret key must be 16, 24 or 32 bytes (got %d bytes after optional base64 decode)", l)
+	}
+	return key, nil
 }
 
 func generateRandomSuffix(logger log.Logger) string {
@@ -374,6 +440,20 @@ func (m *KV) buildMemberlistConfig() (*memberlist.Config, error) {
 
 	mlCfg := defaultMemberlistConfig()
 	mlCfg.Delegate = m
+
+	// Wire hashicorp/memberlist's built-in gossip authentication/encryption. When a shared key is
+	// configured, packets without a matching key are dropped by memberlist's ingestPacket (see
+	// vendor/github.com/hashicorp/memberlist/net.go). Both verify flags are set so inbound AND
+	// outbound traffic require the key.
+	secret, err := m.cfg.loadGossipSecretKey()
+	if err != nil {
+		return nil, fmt.Errorf("failed to load gossip secret key: %v", err)
+	}
+	if len(secret) > 0 {
+		mlCfg.SecretKey = secret
+		mlCfg.GossipVerifyIncoming = true
+		mlCfg.GossipVerifyOutgoing = true
+	}
 
 	mlCfg.TCPTimeout = m.cfg.StreamTimeout
 	mlCfg.RetransmitMult = m.cfg.RetransmitMult
@@ -1122,9 +1202,19 @@ func (m *KV) MergeRemoteState(data []byte, join bool) {
 	m.numberOfPushes.Inc()
 	m.totalSizeOfPushes.Add(float64(len(data)))
 
+	// Defense in depth: refuse to merge unreasonably large payloads. See
+	// maxMergeRemoteStateBytes. Without this a hostile peer could force
+	// unbounded work in the delegate before any key-level filtering runs.
+	if len(data) > maxMergeRemoteStateBytes {
+		m.numberOfInvalidReceivedMessages.Inc()
+		level.Warn(m.logger).Log("msg", "rejecting oversized remote state", "size", len(data), "limit", maxMergeRemoteStateBytes)
+		return
+	}
+
 	kvPair := KeyValuePair{}
 
 	var err error
+	var pairCount int
 	// Data contains individual KV pairs (encoded as protobuf messages), each prefixed with 4 bytes length of KV pair:
 	// [4-bytes length of marshalled KV pair] [marshalled KV pair] [4-bytes length] [KV pair]...
 	for len(data) > 0 {
@@ -1150,6 +1240,12 @@ func (m *KV) MergeRemoteState(data []byte, join bool) {
 		}
 
 		data = data[kvPairLength:]
+
+		pairCount++
+		if pairCount > maxMergeRemoteStateKVPairs {
+			err = fmt.Errorf("too many KV pairs in remote state (limit %d)", maxMergeRemoteStateKVPairs)
+			break
+		}
 
 		codec := m.GetCodec(kvPair.GetCodec())
 		if codec == nil {
