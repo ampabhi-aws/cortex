@@ -162,9 +162,16 @@ func TestLoadRules(t *testing.T) {
 		require.NoError(t, rs.SetRuleGroup(context.Background(), "user1", "hello", &rulespb.RuleGroupDesc{User: "user2", Namespace: "world", Name: "first testGroup"}))
 		require.EqualError(t, rs.LoadRuleGroups(context.Background(), allGroupsMap), "mismatch between requested rule group and loaded rule group, requested: user=\"user1\", namespace=\"hello\", group=\"first testGroup\", loaded: user=\"user2\", namespace=\"world\", group=\"first testGroup\"")
 
-		// Load with missing rule groups fails.
+		// Load tolerates missing rule groups (deleted between list and load) by
+		// skipping them instead of failing the whole batch. The vanished entry is
+		// reset to a zero value so the caller can filter it out.
 		require.NoError(t, rs.DeleteRuleGroup(context.Background(), "user1", "hello", "first testGroup"))
-		require.EqualError(t, rs.LoadRuleGroups(context.Background(), allGroupsMap), "get rule group user=\"user2\", namespace=\"world\", name=\"first testGroup\": group does not exist")
+		require.NoError(t, rs.LoadRuleGroups(context.Background(), allGroupsMap))
+		for _, g := range allGroupsMap["user1"] {
+			if g != nil && g.GetUser() == "user2" && g.GetNamespace() == "world" && g.GetName() == "first testGroup" {
+				require.Equal(t, &rulespb.RuleGroupDesc{}, g, "vanished rule group should be reset to a zero value so callers can filter it out")
+			}
+		}
 	})
 }
 

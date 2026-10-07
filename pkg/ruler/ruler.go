@@ -243,8 +243,15 @@ type Ruler struct {
 	// Pool of clients used to connect to other ruler replicas.
 	clientsPool ClientsPool
 
-	ringCheckErrors prometheus.Counter
-	rulerSync       *prometheus.CounterVec
+	ringCheckErrors   prometheus.Counter
+	rulerSync         *prometheus.CounterVec
+	rulerSyncFailures *prometheus.CounterVec
+
+	// lastGoodConfigs holds the most recently successfully loaded rule groups per tenant,
+	// so a tenant whose load fails transiently is not dropped from the manager (which would
+	// stop evaluating its already-loaded rules).
+	lastGoodConfigsMtx sync.Mutex
+	lastGoodConfigs    map[string]rulespb.RuleGroupList
 
 	allowedTenants *util.AllowedTenants
 
@@ -277,6 +284,13 @@ func newRuler(cfg Config, manager MultiTenantManager, reg prometheus.Registerer,
 			Name: "cortex_ruler_sync_rules_total",
 			Help: "Total number of times the ruler sync operation triggered.",
 		}, []string{"reason"}),
+
+		rulerSyncFailures: promauto.With(reg).NewCounterVec(prometheus.CounterOpts{
+			Name: "cortex_ruler_sync_rules_failures_total",
+			Help: "Total number of times the ruler failed to load rule groups for a tenant during a sync cycle.",
+		}, []string{"user"}),
+
+		lastGoodConfigs: map[string]rulespb.RuleGroupList{},
 	}
 
 	if len(cfg.EnabledTenants) > 0 {
@@ -491,14 +505,69 @@ func (r *Ruler) syncRules(ctx context.Context, reason string) {
 		return
 	}
 
-	err = r.store.LoadRuleGroups(ctx, configs)
-	if err != nil {
-		level.Error(r.logger).Log("msg", "unable to load rules owned by this ruler", "err", err)
-		return
+	// Load per tenant so one tenant's failure (e.g. a rule group deleted between list
+	// and load, yielding ErrGroupNotFound) cannot abort the sync for every other
+	// tenant owned by this ruler.
+	for userID, groups := range configs {
+		perUser := map[string]rulespb.RuleGroupList{userID: groups}
+		if err := r.store.LoadRuleGroups(ctx, perUser); err != nil {
+			level.Error(r.logger).Log("msg", "unable to load rules for user, skipping", "user", userID, "err", err)
+			r.rulerSyncFailures.WithLabelValues(userID).Inc()
+			// Carry the tenant's last known good groups forward so SyncRuleGroups does
+			// not tear down its manager (which would stop evaluating already-loaded
+			// rules). If we have no previous snapshot, drop the entry so a half-loaded
+			// state is not pushed to the manager.
+			if prev, ok := r.getLastGoodConfig(userID); ok {
+				configs[userID] = prev
+			} else {
+				delete(configs, userID)
+			}
+			continue
+		}
+
+		// Drop zero-valued descs that LoadRuleGroups reset because the underlying
+		// object vanished between list and load.
+		filtered := groups[:0]
+		for _, g := range groups {
+			if g == nil || (g.GetUser() == "" && g.GetNamespace() == "" && g.GetName() == "") {
+				continue
+			}
+			filtered = append(filtered, g)
+		}
+		configs[userID] = filtered
+		r.setLastGoodConfig(userID, filtered)
 	}
+
+	// Forget last-good snapshots for tenants no longer owned by this ruler so we do
+	// not leak memory across ring changes.
+	r.pruneLastGoodConfigs(configs)
 
 	// This will also delete local group files for users that are no longer in 'configs' map.
 	r.manager.SyncRuleGroups(ctx, configs)
+}
+
+func (r *Ruler) getLastGoodConfig(userID string) (rulespb.RuleGroupList, bool) {
+	r.lastGoodConfigsMtx.Lock()
+	defer r.lastGoodConfigsMtx.Unlock()
+	g, ok := r.lastGoodConfigs[userID]
+	return g, ok
+}
+
+func (r *Ruler) setLastGoodConfig(userID string, groups rulespb.RuleGroupList) {
+	r.lastGoodConfigsMtx.Lock()
+	defer r.lastGoodConfigsMtx.Unlock()
+	r.lastGoodConfigs[userID] = groups
+}
+
+func (r *Ruler) pruneLastGoodConfigs(current map[string]rulespb.RuleGroupList) {
+	r.lastGoodConfigsMtx.Lock()
+	defer r.lastGoodConfigsMtx.Unlock()
+	for userID := range r.lastGoodConfigs {
+		if _, ok := current[userID]; !ok {
+			delete(r.lastGoodConfigs, userID)
+			r.rulerSyncFailures.DeleteLabelValues(userID)
+		}
+	}
 }
 
 func (r *Ruler) listRules(ctx context.Context) (result map[string]rulespb.RuleGroupList, err error) {
@@ -887,7 +956,17 @@ func (r *Ruler) ListAllRules(w http.ResponseWriter, req *http.Request) {
 		if err := r.store.LoadRuleGroups(ctx, userRules); err != nil {
 			return errors.Wrapf(err, "failed to load ruler config for user %s", userID)
 		}
-		data := map[string]map[string][]rulefmt.RuleGroup{userID: userRules[userID].Formatted()}
+		// Drop any groups that LoadRuleGroups reset because they vanished between
+		// list and load (benign race / eventual consistency).
+		loaded := userRules[userID]
+		filtered := loaded[:0]
+		for _, g := range loaded {
+			if g == nil || (g.GetUser() == "" && g.GetNamespace() == "" && g.GetName() == "") {
+				continue
+			}
+			filtered = append(filtered, g)
+		}
+		data := map[string]map[string][]rulefmt.RuleGroup{userID: filtered.Formatted()}
 
 		select {
 		case iter <- data:

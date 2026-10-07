@@ -411,6 +411,24 @@ func (a *API) ListRules(w http.ResponseWriter, req *http.Request) {
 		return
 	}
 
+	// Drop any groups that LoadRuleGroups reset because they vanished between list
+	// and load (benign race / eventual consistency). Prevents an empty-namespace
+	// entry leaking into the response.
+	filtered := rgs[:0]
+	for _, g := range rgs {
+		if g == nil || (g.GetUser() == "" && g.GetNamespace() == "" && g.GetName() == "") {
+			continue
+		}
+		filtered = append(filtered, g)
+	}
+	rgs = filtered
+
+	if len(rgs) == 0 {
+		level.Info(logger).Log("msg", "no rule groups found", "userID", userID)
+		http.Error(w, ErrNoRuleGroups.Error(), http.StatusNotFound)
+		return
+	}
+
 	level.Debug(logger).Log("msg", "retrieved rule groups from rule store", "userID", userID, "num_namespaces", len(rgs))
 
 	formatted := rgs.Formatted()
