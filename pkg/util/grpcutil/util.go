@@ -32,29 +32,60 @@ func IsGRPCContextCanceled(err error) bool {
 }
 
 // HTTPHeaderPropagationServerInterceptor allows for propagation of HTTP Request headers across gRPC calls - works
-// alongside HTTPHeaderPropagationClientInterceptor
+// alongside HTTPHeaderPropagationClientInterceptor.
+//
+// Deprecated: this unary interceptor trusts every key/value pair in the
+// caller-supplied gRPC metadata and does not enforce the operator-configured
+// allow-list. Use HTTPHeaderPropagationServerInterceptorForHeaders instead.
+// Kept for backwards compatibility with external callers; internal callers
+// should build the closure-based variant.
 func HTTPHeaderPropagationServerInterceptor(ctx context.Context, req interface{}, _ *grpc.UnaryServerInfo, handler grpc.UnaryHandler) (resp interface{}, err error) {
-	ctx = extractForwardedHeadersFromMetadata(ctx)
+	ctx = extractForwardedHeadersFromMetadata(ctx, nil)
 	h, err := handler(ctx, req)
 	return h, err
 }
 
-// HTTPHeaderPropagationStreamServerInterceptor does the same as HTTPHeaderPropagationServerInterceptor but for streams
+// HTTPHeaderPropagationStreamServerInterceptor does the same as HTTPHeaderPropagationServerInterceptor but for streams.
+//
+// Deprecated: see HTTPHeaderPropagationServerInterceptor.
 func HTTPHeaderPropagationStreamServerInterceptor(srv interface{}, ss grpc.ServerStream, _ *grpc.StreamServerInfo, handler grpc.StreamHandler) error {
 	return handler(srv, wrappedServerStream{
-		ctx:          extractForwardedHeadersFromMetadata(ss.Context()),
+		ctx:          extractForwardedHeadersFromMetadata(ss.Context(), nil),
 		ServerStream: ss,
 	})
 }
 
+// HTTPHeaderPropagationServerInterceptorForHeaders returns a unary server
+// interceptor that only copies caller-supplied gRPC metadata entries whose
+// name is contained in `allowed` into the request context. This mirrors the
+// HTTP ingress behaviour in pkg/api/middlewares.go and prevents arbitrary
+// field injection into structured logs.
+func HTTPHeaderPropagationServerInterceptorForHeaders(allowed []string) grpc.UnaryServerInterceptor {
+	return func(ctx context.Context, req interface{}, _ *grpc.UnaryServerInfo, handler grpc.UnaryHandler) (resp interface{}, err error) {
+		ctx = extractForwardedHeadersFromMetadata(ctx, allowed)
+		return handler(ctx, req)
+	}
+}
+
+// HTTPHeaderPropagationStreamServerInterceptorForHeaders is the stream variant
+// of HTTPHeaderPropagationServerInterceptorForHeaders.
+func HTTPHeaderPropagationStreamServerInterceptorForHeaders(allowed []string) grpc.StreamServerInterceptor {
+	return func(srv interface{}, ss grpc.ServerStream, _ *grpc.StreamServerInfo, handler grpc.StreamHandler) error {
+		return handler(srv, wrappedServerStream{
+			ctx:          extractForwardedHeadersFromMetadata(ss.Context(), allowed),
+			ServerStream: ss,
+		})
+	}
+}
+
 // extractForwardedHeadersFromMetadata implements HTTPHeaderPropagationServerInterceptor by placing forwarded
-// headers into incoming context
-func extractForwardedHeadersFromMetadata(ctx context.Context) context.Context {
+// headers into incoming context. Only header names in `allowed` are retained.
+func extractForwardedHeadersFromMetadata(ctx context.Context, allowed []string) context.Context {
 	md, ok := metadata.FromIncomingContext(ctx)
 	if !ok {
 		return ctx
 	}
-	return util_log.ContextWithHeaderMapFromMetadata(ctx, md)
+	return util_log.ContextWithHeaderMapFromMetadata(ctx, md, allowed)
 }
 
 // HTTPHeaderPropagationClientInterceptor allows for propagation of HTTP Request headers across gRPC calls - works
