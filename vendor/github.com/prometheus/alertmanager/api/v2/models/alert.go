@@ -20,6 +20,8 @@ package models
 // Editing this file might prove futile when you re-run the swagger generate command
 
 import (
+	"strings"
+
 	"github.com/go-openapi/errors"
 	"github.com/go-openapi/strfmt"
 	"github.com/go-openapi/swag"
@@ -66,6 +68,22 @@ func (m *Alert) validateGeneratorURL(formats strfmt.Registry) error {
 
 	if err := validate.FormatOf("generatorURL", "body", "uri", m.GeneratorURL.String(), formats); err != nil {
 		return err
+	}
+
+	// Mitigation for CVE-2023-40577 (stored XSS in Alertmanager UI, fixed
+	// upstream in v0.25.1). The "uri" format validation accepts arbitrary
+	// schemes including "javascript:" / "data:" / "vbscript:", which are
+	// rendered as clickable links in the UI the Cortex Alertmanager tenant
+	// mounts. Reject non-http(s) schemes at ingestion time.
+	if raw := m.GeneratorURL.String(); raw != "" {
+		trimmed := strings.TrimLeft(raw, " \t\r\n\f\v")
+		lower := strings.ToLower(trimmed)
+		if strings.HasPrefix(lower, "javascript:") ||
+			strings.HasPrefix(lower, "data:") ||
+			strings.HasPrefix(lower, "vbscript:") ||
+			strings.HasPrefix(lower, "file:") {
+			return errors.New(422, "generatorURL in body must use an http or https scheme")
+		}
 	}
 
 	return nil

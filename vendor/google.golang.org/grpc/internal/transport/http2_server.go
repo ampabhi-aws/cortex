@@ -127,6 +127,13 @@ type http2Server struct {
 	// This lock may not be taken if mu is already held.
 	maxStreamMu sync.Mutex
 	maxStreamID uint32 // max stream ID ever seen
+
+	// Fields below mitigate HTTP/2 rapid reset (CVE-2023-44487): backport
+	// of the per-connection RST_STREAM accounting added in grpc-go
+	// 1.56.3/1.57.1/1.58.3. Access guarded by resetMu.
+	resetMu          sync.Mutex
+	resetStreamCount uint32    // RST_STREAM frames received since resetStreamTS
+	resetStreamTS    time.Time // start of current accounting window
 }
 
 // NewServerTransport creates a http2 transport with conn and configuration
@@ -789,6 +796,40 @@ func (t *http2Server) handleData(f *http2.DataFrame) {
 }
 
 func (t *http2Server) handleRSTStream(f *http2.RSTStreamFrame) {
+	// Mitigation for CVE-2023-44487 (HTTP/2 "Rapid Reset"): track the rate
+	// of RST_STREAM frames per connection. If a peer resets more streams
+	// than roughly twice MaxConcurrentStreams within a one-minute window,
+	// treat it as abusive and drop the connection with ENHANCE_YOUR_CALM.
+	// Backport of the fix added upstream in grpc-go 1.56.3/1.57.1/1.58.3.
+	t.resetMu.Lock()
+	now := time.Now()
+	if t.resetStreamTS.IsZero() || now.Sub(t.resetStreamTS) > time.Minute {
+		t.resetStreamTS = now
+		t.resetStreamCount = 0
+	}
+	t.resetStreamCount++
+	// Allow 2*maxStreams resets per minute as a conservative threshold;
+	// legitimate clients rarely approach this rate. maxStreams may be
+	// math.MaxUint32 when uncapped; guard against overflow by capping.
+	threshold := uint32(1 << 10) // 1024 by default
+	if t.maxStreams < uint32(1<<30) {
+		if t.maxStreams*2 > threshold {
+			threshold = t.maxStreams * 2
+		}
+	}
+	overshoot := t.resetStreamCount > threshold
+	t.resetMu.Unlock()
+	if overshoot {
+		if logger.V(logLevel) {
+			logger.Warningf("transport: http2Server received too many RST_STREAM frames (%d in <1m); closing connection to mitigate rapid-reset (CVE-2023-44487)", t.resetStreamCount)
+		}
+		t.controlBuf.put(&goAway{
+			code:      http2.ErrCodeEnhanceYourCalm,
+			debugData: []byte("too_many_rststreams"),
+			closeConn: true,
+		})
+		// Fall through so the current stream is still cleaned up.
+	}
 	// If the stream is not deleted from the transport's active streams map, then do a regular close stream.
 	if s, ok := t.getStream(f); ok {
 		t.closeStream(s, false, 0, false)
