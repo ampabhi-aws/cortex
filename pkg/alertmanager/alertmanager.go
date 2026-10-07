@@ -496,7 +496,22 @@ func buildReceiverIntegrations(nc *config.Receiver, tmpl *template.Template, fir
 		add("webhook", i, c, func(l log.Logger) (notify.Notifier, error) { return webhook.New(c, tmpl, l, httpOps...) })
 	}
 	for i, c := range nc.EmailConfigs {
-		add("email", i, c, func(l log.Logger) (notify.Notifier, error) { return email.New(c, tmpl, l), nil })
+		c := c
+		add("email", i, c, func(l log.Logger) (notify.Notifier, error) {
+			// The vendored email notifier dials the SMTP smarthost with a bare
+			// net.Dialer{} / tls.Dial and does not expose a DialContextFunc hook,
+			// so the FirewallDialer.control hook that enforces
+			// -alertmanager.receivers-firewall-block-private-addresses and
+			// -alertmanager.receivers-firewall-block-cidr-networks is never
+			// reached. Reject smarthosts that the firewall would block before any
+			// dial, and wrap the notifier so the check is re-run on every notify
+			// call (so the firewall is still consulted when the host resolves to
+			// different IPs between validation and dial).
+			if err := firewallDialer.ValidateHostPort(c.Smarthost.Host, c.Smarthost.Port); err != nil {
+				return nil, errors.Wrapf(err, "invalid email smarthost %q", c.Smarthost.String())
+			}
+			return newFirewalledEmailNotifier(firewallDialer, c, email.New(c, tmpl, l)), nil
+		})
 	}
 	for i, c := range nc.PagerdutyConfigs {
 		add("pagerduty", i, c, func(l log.Logger) (notify.Notifier, error) { return pagerduty.New(c, tmpl, l, httpOps...) })
@@ -524,6 +539,34 @@ func buildReceiverIntegrations(nc *config.Receiver, tmpl *template.Template, fir
 		return nil, &errs
 	}
 	return integrations, nil
+}
+
+// firewalledEmailNotifier wraps a notify.Notifier (the vendored SMTP email
+// notifier) and re-checks the smarthost against the firewall policy on every
+// Notify call. The vendored email notifier dials the smarthost with a bare
+// net.Dialer{} / tls.Dial that does not consult FirewallDialer.control, so
+// without this wrapper -alertmanager.receivers-firewall-block-private-addresses
+// / -alertmanager.receivers-firewall-block-cidr-networks are silently bypassed
+// for email receivers (CVE: SSRF via tenant-controlled SMTP smarthost).
+type firewalledEmailNotifier struct {
+	firewallDialer *util_net.FirewallDialer
+	conf           *config.EmailConfig
+	inner          notify.Notifier
+}
+
+func newFirewalledEmailNotifier(fd *util_net.FirewallDialer, conf *config.EmailConfig, inner notify.Notifier) notify.Notifier {
+	return &firewalledEmailNotifier{firewallDialer: fd, conf: conf, inner: inner}
+}
+
+// Notify validates the configured smarthost against the firewall policy and,
+// if allowed, delegates to the wrapped email notifier. A blocked address is
+// returned as a non-retryable error whose message contains "blocked address"
+// so operators can grep for it in Alertmanager logs.
+func (n *firewalledEmailNotifier) Notify(ctx context.Context, as ...*types.Alert) (bool, error) {
+	if err := n.firewallDialer.ValidateHostPort(n.conf.Smarthost.Host, n.conf.Smarthost.Port); err != nil {
+		return false, errors.Wrapf(err, "email smarthost %q", n.conf.Smarthost.String())
+	}
+	return n.inner.Notify(ctx, as...)
 }
 
 func md5HashAsMetricValue(data []byte) float64 {

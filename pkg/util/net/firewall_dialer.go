@@ -34,6 +34,51 @@ func (d *FirewallDialer) DialContext(ctx context.Context, network, address strin
 	return d.parent.DialContext(ctx, network, address)
 }
 
+// ValidateHostPort resolves host and checks every resolved IP against the
+// firewall's isPrivate/isLocal/blockCIDRNetworks policy. It returns
+// errBlockedAddress when any resolved IP is denied, errInvalidAddress for an
+// unparseable input, or nil when the firewall is not configured or every
+// resolved IP is permitted.
+//
+// Note: because DNS can be rebound between validation and the actual dial, this
+// is a best-effort pre-flight check. The authoritative enforcement remains the
+// Control hook installed on the dialer (invoked after DNS resolution, with the
+// final IP). ValidateHostPort is intended for integrations (such as the SMTP
+// email notifier) whose underlying library does not expose a DialContextFunc
+// hook, so that at least the obvious loopback / RFC1918 / link-local / blocked
+// CIDR cases are rejected before a connection is opened.
+func (d *FirewallDialer) ValidateHostPort(host, port string) error {
+	blockPrivateAddresses := d.cfgProvider.BlockPrivateAddresses()
+	blockCIDRNetworks := d.cfgProvider.BlockCIDRNetworks()
+
+	// Skip any control if no firewall has been configured.
+	if !blockPrivateAddresses && len(blockCIDRNetworks) == 0 {
+		return nil
+	}
+
+	if host == "" || port == "" {
+		return errInvalidAddress
+	}
+
+	ips, err := net.LookupIP(host)
+	if err != nil || len(ips) == 0 {
+		return errBlockedAddress
+	}
+
+	for _, ip := range ips {
+		if blockPrivateAddresses && (isPrivate(ip) || isLocal(ip)) {
+			return errBlockedAddress
+		}
+		for _, cidr := range blockCIDRNetworks {
+			if cidr.Value.Contains(ip) {
+				return errBlockedAddress
+			}
+		}
+	}
+
+	return nil
+}
+
 func (d *FirewallDialer) control(_, address string, _ syscall.RawConn) error {
 	blockPrivateAddresses := d.cfgProvider.BlockPrivateAddresses()
 	blockCIDRNetworks := d.cfgProvider.BlockCIDRNetworks()
