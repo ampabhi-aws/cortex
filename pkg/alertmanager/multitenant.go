@@ -822,6 +822,14 @@ func (am *MultitenantAlertmanager) setConfig(cfg alertspb.AlertConfigDesc) error
 	}
 
 	for _, tmpl := range cfg.Templates {
+		// Enforce base-name only template filenames regardless of the alert
+		// store backend, so configs arriving from the configdb and local
+		// stores are subject to the same rule as the experimental per-tenant
+		// API's validateUserConfig.
+		if err := validateTemplateFilename(tmpl.Filename); err != nil {
+			return err
+		}
+
 		templateFilePath, err := safeTemplateFilepath(userTemplateDir, tmpl.Filename)
 		if err != nil {
 			return err
@@ -1325,8 +1333,15 @@ func safeTemplateFilepath(dir, templateName string) (string, error) {
 
 	// Ensure the actual path of the template is within the expected directory.
 	// This check is a counter-measure to make sure the tenant is not trying to
-	// escape its own directory on disk.
-	if !strings.HasPrefix(actualPath, containerDir) {
+	// escape its own directory on disk. We use filepath.Rel so that the check
+	// is separator-aware (a bare strings.HasPrefix test wrongly accepts sibling
+	// directories whose name extends the container directory name, e.g.
+	// "../templates-x/evil.tmpl"). We additionally require that the resolved
+	// name is a base name (no path separators), matching validateTemplateFilename.
+	rel, err := filepath.Rel(containerDir, actualPath)
+	if err != nil || rel == "." || rel == ".." ||
+		strings.HasPrefix(rel, ".."+string(os.PathSeparator)) ||
+		strings.ContainsRune(rel, os.PathSeparator) {
 		return "", fmt.Errorf("invalid template name %q: the template filepath is escaping the per-tenant local directory", templateName)
 	}
 
