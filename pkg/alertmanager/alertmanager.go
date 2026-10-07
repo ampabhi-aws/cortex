@@ -302,9 +302,15 @@ func (am *Alertmanager) WaitInitialStateSync(ctx context.Context) error {
 
 // clusterWait returns a function that inspects the current peer state and returns
 // a duration of one base timeout for each peer with a higher ID than ourselves.
+// Negative positions (reported by replicators to signal non-membership) are
+// treated as position zero so the overall timeout is never negative.
 func clusterWait(position func() int, timeout time.Duration) func() time.Duration {
 	return func() time.Duration {
-		return time.Duration(position()) * timeout
+		p := position()
+		if p < 0 {
+			p = 0
+		}
+		return time.Duration(p) * timeout
 	}
 }
 

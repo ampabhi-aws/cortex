@@ -259,6 +259,11 @@ type MultitenantAlertmanager struct {
 	// Stores the current set of configurations we're running in each tenant's Alertmanager.
 	// Used for comparing configurations as we synchronize them.
 	cfgs map[string]alertspb.AlertConfigDesc
+	// Tracks tenants for which we started a tenant Alertmanager purely from the fallback
+	// configuration (no configuration exists in the alert store). Protected by alertmanagersMtx.
+	// These entries are only kept in memory and are never written to the alert store, so a
+	// read request on a non-owning / pre-poll instance can never destroy a tenant's config.
+	fallbackStarted map[string]struct{}
 
 	logger              log.Logger
 	alertmanagerMetrics *alertmanagerMetrics
@@ -352,6 +357,7 @@ func createMultitenantAlertmanager(cfg *MultitenantAlertmanagerConfig, fallbackC
 		fallbackConfig:      string(fallbackConfig),
 		cfgs:                map[string]alertspb.AlertConfigDesc{},
 		alertmanagers:       map[string]*Alertmanager{},
+		fallbackStarted:     map[string]struct{}{},
 		alertmanagerMetrics: newAlertmanagerMetrics(),
 		multitenantMetrics:  newMultitenantAlertmanagerMetrics(registerer),
 		peer:                peer,
@@ -786,14 +792,29 @@ func (am *MultitenantAlertmanager) syncConfigs(cfgs map[string]alertspb.AlertCon
 
 	am.alertmanagersMtx.Lock()
 	for userID, userAM := range am.alertmanagers {
-		if _, exists := cfgs[userID]; !exists {
-			userAlertmanagersToStop[userID] = userAM
-			delete(am.alertmanagers, userID)
-			delete(am.cfgs, userID)
-			am.multitenantMetrics.lastReloadSuccessful.DeleteLabelValues(userID)
-			am.multitenantMetrics.lastReloadSuccessfulTimestamp.DeleteLabelValues(userID)
-			am.alertmanagerMetrics.removeUserRegistry(userID)
+		if _, exists := cfgs[userID]; exists {
+			// A stored configuration now exists for this tenant; it supersedes any
+			// fallback-only state we were holding in memory.
+			delete(am.fallbackStarted, userID)
+			continue
 		}
+		// Keep tenant Alertmanagers that were started purely from the fallback
+		// configuration (never written to the alert store) around until the tenant
+		// is no longer served by this instance for some other reason (e.g. the
+		// shard moves away). This matches the historical behaviour where a
+		// fallback-started tenant was persisted as an empty-config object, without
+		// the destructive side effect of clobbering a real configuration that
+		// lives on another replica.
+		if _, started := am.fallbackStarted[userID]; started && am.isUserOwned(userID) {
+			continue
+		}
+		delete(am.fallbackStarted, userID)
+		userAlertmanagersToStop[userID] = userAM
+		delete(am.alertmanagers, userID)
+		delete(am.cfgs, userID)
+		am.multitenantMetrics.lastReloadSuccessful.DeleteLabelValues(userID)
+		am.multitenantMetrics.lastReloadSuccessfulTimestamp.DeleteLabelValues(userID)
+		am.alertmanagerMetrics.removeUserRegistry(userID)
 	}
 	am.alertmanagersMtx.Unlock()
 
@@ -960,6 +981,9 @@ func (am *MultitenantAlertmanager) newAlertmanager(userID string, amConfig *amco
 }
 
 // GetPositionForUser returns the position this Alertmanager instance holds in the ring related to its other replicas for an specific user.
+// It returns -1 when this instance is not part of the tenant's replica set, so
+// callers (notably the statePersister "position == 0" guard and clusterWait)
+// can distinguish non-membership from being replica 0.
 func (am *MultitenantAlertmanager) GetPositionForUser(userID string) int {
 	// If we have a replication factor of 1 or less we don't need to do any work and can immediately return.
 	if am.ring == nil || am.ring.ReplicationFactor() <= 1 {
@@ -974,15 +998,17 @@ func (am *MultitenantAlertmanager) GetPositionForUser(userID string) int {
 		return 0
 	}
 
-	var position int
+	selfAddr := am.ringLifecycler.GetInstanceAddr()
 	for i, instance := range set.Instances {
-		if instance.Addr == am.ringLifecycler.GetInstanceAddr() {
-			position = i
-			break
+		if instance.Addr == selfAddr {
+			return i
 		}
 	}
 
-	return position
+	// This instance is not part of the tenant's replica set. Return a sentinel
+	// so the caller does not mistake us for replica 0 and overwrite the tenant's
+	// persisted silence/nflog state.
+	return -1
 }
 
 // ServeHTTP serves the Alertmanager's web UI and API.
@@ -1023,8 +1049,25 @@ func (am *MultitenantAlertmanager) serveRequest(w http.ResponseWriter, req *http
 		return
 	}
 
+	// In sharded mode, requests for tenants this instance does not own must never
+	// instantiate a tenant Alertmanager locally. Paths listed in
+	// Distributor.IsPathSupported are proxied through the ring in ServeHTTP, but
+	// any other path (the UI root, static assets, trailing-slash variants, unknown
+	// paths) is served locally. Without this check, a request for a non-owned
+	// tenant that hit the fallback branch below would overwrite the tenant's
+	// stored configuration with an empty one.
+	if am.cfg.ShardingEnabled && !am.isUserOwned(userID) {
+		http.Error(w, "the Alertmanager for this tenant is not served by this instance", http.StatusNotFound)
+		return
+	}
+
 	if am.fallbackConfig != "" {
-		userAM, err = am.alertmanagerFromFallbackConfig(userID)
+		userAM, err = am.alertmanagerFromFallbackConfig(req.Context(), userID)
+		if err == errNotUploadingFallback {
+			level.Warn(am.logger).Log("msg", "not initializing Alertmanager", "user", userID, "err", err)
+			http.Error(w, "Not initializing the Alertmanager", http.StatusInternalServerError)
+			return
+		}
 		if err != nil {
 			level.Error(am.logger).Log("msg", "unable to initialize the Alertmanager with a fallback configuration", "user", userID, "err", err)
 			http.Error(w, "Failed to initialize the Alertmanager", http.StatusInternalServerError)
@@ -1039,22 +1082,51 @@ func (am *MultitenantAlertmanager) serveRequest(w http.ResponseWriter, req *http
 	http.Error(w, "the Alertmanager is not configured", http.StatusNotFound)
 }
 
-func (am *MultitenantAlertmanager) alertmanagerFromFallbackConfig(userID string) (*Alertmanager, error) {
-	// Upload an empty config so that the Alertmanager is no de-activated in the next poll
-	cfgDesc := alertspb.ToProto("", nil, userID)
-	err := am.store.SetAlertConfig(context.Background(), cfgDesc)
-	if err != nil {
+// errNotUploadingFallback is returned when the fallback path refuses to start a
+// tenant Alertmanager because a real configuration already exists in the alert
+// store. Callers must not treat this as a hard failure other than refusing the
+// request.
+var errNotUploadingFallback = errors.New("not initializing fallback Alertmanager: tenant configuration already exists")
+
+// alertmanagerFromFallbackConfig starts a tenant Alertmanager using the
+// operator-provided fallback configuration. It never writes to the alert store:
+// the fallback is kept purely in memory and the tenant is tracked in
+// am.fallbackStarted so syncConfigs does not reap it on the next poll.
+//
+// Before starting the Alertmanager it reads from the store (not the local,
+// ownership-filtered cache) to make sure the tenant genuinely has no
+// configuration. This closes the window in which a request landing on a
+// non-owning or pre-poll instance could cause the tenant's real configuration
+// to be lost.
+func (am *MultitenantAlertmanager) alertmanagerFromFallbackConfig(ctx context.Context, userID string) (*Alertmanager, error) {
+	// Read directly from the alert store to avoid relying on the local, poll-lagged,
+	// ownership-filtered map as the predicate for "tenant has no configuration".
+	storedCfg, err := am.store.GetAlertConfig(ctx, userID)
+	if err == nil {
+		if storedCfg.RawConfig != "" {
+			// A configuration already exists for this tenant. Never clobber it, and
+			// never start a tenant Alertmanager here either (that would race with the
+			// owning replica). Refuse the request so the caller falls back to an
+			// error response.
+			return nil, errNotUploadingFallback
+		}
+		// An empty-config object exists but no real configuration; fall through and
+		// start the Alertmanager with the fallback.
+	} else if !errors.Is(err, alertspb.ErrNotFound) {
 		return nil, err
 	}
 
+	// Build the fallback descriptor in memory only; do NOT write it to the store.
+	cfgDesc := alertspb.ToProto("", nil, userID)
+
 	// Calling setConfig with an empty configuration will use the fallback config.
-	err = am.setConfig(cfgDesc)
-	if err != nil {
+	if err := am.setConfig(cfgDesc); err != nil {
 		return nil, err
 	}
 
 	am.alertmanagersMtx.Lock()
 	defer am.alertmanagersMtx.Unlock()
+	am.fallbackStarted[userID] = struct{}{}
 	return am.alertmanagers[userID], nil
 }
 
