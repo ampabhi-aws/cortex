@@ -83,6 +83,15 @@ func (t *SingleResolver) TenantID(ctx context.Context) (string, error) {
 		return "", err
 	}
 
+	// Enforce the documented tenant-ID contract (charset and 150-byte limit).
+	// Previously only `containsUnsafePathSegments` was applied, which allowed
+	// characters such as ':' and '|' that are used as field separators in
+	// composed cache/queue keys, enabling cross-tenant key collisions in the
+	// results cache.
+	if err := ValidTenantID(id); err != nil {
+		return "", err
+	}
+
 	if containsUnsafePathSegments(id) {
 		return "", errInvalidTenantID
 	}
