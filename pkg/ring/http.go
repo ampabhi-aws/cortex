@@ -1,6 +1,7 @@
 package ring
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"fmt"
@@ -12,6 +13,8 @@ import (
 	"time"
 
 	"github.com/go-kit/log/level"
+
+	"github.com/cortexproject/cortex/pkg/util"
 )
 
 const pageContent = `
@@ -97,6 +100,17 @@ func (r *Ring) forget(ctx context.Context, id string) error {
 		}
 
 		ringDesc := in.(*Desc)
+
+		// Safety guard: refuse to remove an instance whose heartbeat is still
+		// fresh. The "forget" admin action is intended to garbage-collect
+		// stopped/LEAVING/unhealthy entries that can no longer re-register
+		// themselves; evicting a currently healthy instance from the ring is
+		// disruptive (it triggers resharding across the cluster) and the
+		// instance would re-register on its next heartbeat anyway.
+		if ing, ok := ringDesc.Ingesters[id]; ok && r.IsHealthy(&ing, Reporting, time.Now()) {
+			return nil, false, fmt.Errorf("instance %s is healthy and cannot be forgotten; stop it first", id)
+		}
+
 		ringDesc.RemoveIngester(id)
 		return ringDesc, true, nil
 	}
@@ -123,9 +137,21 @@ type httpResponse struct {
 
 func (r *Ring) ServeHTTP(w http.ResponseWriter, req *http.Request) {
 	if req.Method == http.MethodPost {
+		// Reject cross-site browser POSTs and POSTs without a matching
+		// double-submit CSRF token. On rejection ValidateCSRF has already
+		// written a 403 response, so we just return.
+		if !util.ValidateCSRF(w, req) {
+			return
+		}
+
 		ingesterID := req.FormValue("forget")
+		principal := req.Header.Get("X-Scope-OrgID")
+		if principal == "" {
+			principal = "<anonymous>"
+		}
+		level.Info(r.logger).Log("msg", "ring forget requested", "instance", ingesterID, "principal", principal, "remote_addr", req.RemoteAddr)
 		if err := r.forget(req.Context(), ingesterID); err != nil {
-			level.Error(r.logger).Log("msg", "error forgetting instance", "err", err)
+			level.Error(r.logger).Log("msg", "error forgetting instance", "err", err, "instance", ingesterID, "principal", principal)
 		}
 
 		// Implement PRG pattern to prevent double-POST and work with CSRF middleware.
@@ -197,10 +223,17 @@ func renderHTTPResponse(w http.ResponseWriter, v httpResponse, t *template.Templ
 		return
 	}
 
-	err := t.Execute(w, v)
-	if err != nil {
+	// Render into a buffer so we can substitute the CSRF token placeholder
+	// before writing to the client. The CSRF cookie is set during rendering
+	// and consumed by subsequent POSTs; see pkg/util/csrf.go.
+	var buf bytes.Buffer
+	if err := t.Execute(&buf, v); err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
 	}
+	body := util.InjectCSRFToken(w, r, buf.Bytes())
+	w.Header().Set("Content-Type", "text/html; charset=utf-8")
+	_, _ = w.Write(body)
 }
 
 // WriteJSONResponse writes some JSON as a HTTP response.

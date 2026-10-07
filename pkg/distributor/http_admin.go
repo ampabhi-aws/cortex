@@ -69,6 +69,9 @@ func (s userStatsByTimeseries) Less(i, j int) bool {
 
 // AllUserStatsHandler shows stats for all users.
 func (d *Distributor) AllUserStatsHandler(w http.ResponseWriter, r *http.Request) {
+	if r.Method == http.MethodPost && !util.ValidateCSRF(w, r) {
+		return
+	}
 	stats, err := d.AllUserStats(r.Context())
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
