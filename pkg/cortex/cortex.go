@@ -67,6 +67,29 @@ var (
 	errInvalidHTTPPrefix = errors.New("HTTP prefix should be empty or start with /")
 )
 
+// GRPCAuthExemptedMethods lists gRPC methods that bypass the tenant-header
+// (X-Scope-OrgID) propagation interceptor. The interceptor is NOT a peer
+// authentication control — it only copies a caller-supplied tenant string
+// into the request context (see pkg/util/fakeauth and
+// docs/guides/authentication-and-authorisation.md). Methods are listed here
+// because a single stream multiplexes requests for many tenants (or carries
+// no tenant, like the health check). Component-to-component gRPC must be
+// authenticated out-of-band (mTLS / network policy).
+//
+// WARNING: adding a method here widens the set of RPCs that accept any
+// caller on the gRPC listener. The pinning test in
+// grpc_auth_exemptions_test.go must be updated in the same change, which
+// forces reviewers to confirm an out-of-band peer-authentication control
+// is in place for the new method.
+var GRPCAuthExemptedMethods = []string{
+	"/grpc.health.v1.Health/Check",
+	"/frontend.Frontend/Process",
+	"/frontend.Frontend/NotifyClientShutdown",
+	"/schedulerpb.SchedulerForFrontend/FrontendLoop",
+	"/schedulerpb.SchedulerForQuerier/QuerierLoop",
+	"/schedulerpb.SchedulerForQuerier/NotifyQuerierShutdown",
+}
+
 // The design pattern for Cortex is a series of config objects, which are
 // registered for command line flags, and then a series of components that
 // are instantiated and composed.  Some rules of thumb:
@@ -335,19 +358,18 @@ func New(cfg Config) (*Cortex, error) {
 		tenant.WithDefaultResolver(tenant.NewMultiResolver())
 	}
 
-	// Don't check auth header on TransferChunks, as we weren't originally
-	// sending it and this could cause transfers to fail on update.
+	// These gRPC methods are exempted from the X-Scope-OrgID (tenant) header
+	// interceptor because a single stream multiplexes requests for many tenants
+	// (or is tenant-less, like the health check). This is NOT a security control:
+	// the interceptor only propagates a caller-supplied tenant header into the
+	// context, it does not authenticate the peer. Operators are expected to
+	// authenticate component-to-component gRPC externally (e.g. via
+	// -server.grpc-tls-client-auth and network policy); see
+	// docs/guides/authentication-and-authorisation.md. If you add a method here
+	// you MUST update grpc_auth_exemptions_test.go (which pins the list) and
+	// confirm an out-of-band peer-authentication control covers the method.
 	cfg.API.HTTPAuthMiddleware = fakeauth.SetupAuthMiddleware(&cfg.Server, cfg.AuthEnabled,
-		// Also don't check auth for these gRPC methods, since single call is used for multiple users (or no user like health check).
-		[]string{
-			"/grpc.health.v1.Health/Check",
-			"/cortex.Ingester/TransferChunks",
-			"/frontend.Frontend/Process",
-			"/frontend.Frontend/NotifyClientShutdown",
-			"/schedulerpb.SchedulerForFrontend/FrontendLoop",
-			"/schedulerpb.SchedulerForQuerier/QuerierLoop",
-			"/schedulerpb.SchedulerForQuerier/NotifyQuerierShutdown",
-		})
+		GRPCAuthExemptedMethods)
 
 	cortex := &Cortex{
 		Cfg: cfg,
