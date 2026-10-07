@@ -2987,9 +2987,12 @@ The `configs_config` configures the Cortex Configs DB and API.
 
 ```yaml
 database:
-  # URI where the database can be found (for dev you can use memory://)
+  # URI where the database can be found (for dev you can use memory://). For
+  # postgres:// URIs, sslmode must be one of require, verify-ca, or
+  # verify-full; plaintext connections are rejected because they would expose
+  # tenant Alertmanager secrets.
   # CLI flag: -configs.database.uri
-  [uri: <string> | default = "postgres://postgres@configs-db.weave.local/configs?sslmode=disable"]
+  [uri: <string> | default = "postgres://postgres@configs-db.weave.local/configs?sslmode=verify-full"]
 
   # Path where the database migration files can be found
   # CLI flag: -configs.database.migrations-dir
