@@ -78,6 +78,16 @@ const (
 
 	// Period at which to attempt purging metadata from memory.
 	metadataPurgePeriod = 5 * time.Minute
+
+	// defaultSafeMaxInMemoryTenants is the conservative ceiling applied to the
+	// number of in-memory per-tenant TSDBs when the operator has not configured
+	// -ingester.instance-limits.max-tenants (i.e. the limit is 0 or no
+	// InstanceLimits are supplied). It prevents an authenticated-but-untrusted
+	// caller that can pick X-Scope-OrgID from fabricating an unbounded number
+	// of tenants and exhausting heap, inodes and file descriptors by driving
+	// per-tenant TSDB creation. Operators who need more tenants per ingester
+	// should set -ingester.instance-limits.max-tenants explicitly.
+	defaultSafeMaxInMemoryTenants = 10000
 )
 
 var (
@@ -1781,11 +1791,17 @@ func (i *Ingester) getOrCreateTSDB(userID string, force bool) (*userTSDB, error)
 		return nil, fmt.Errorf(errTSDBCreateIncompatibleState, ingesterState)
 	}
 
-	gl := i.getInstanceLimits()
-	if gl != nil && gl.MaxInMemoryTenants > 0 {
-		if users := int64(len(i.TSDBState.dbs)); users >= gl.MaxInMemoryTenants {
-			return nil, errMaxUsersLimitReached
-		}
+	// Enforce a bound on the number of per-tenant TSDBs. If the operator did not
+	// configure an explicit MaxInMemoryTenants, we still apply a conservative
+	// default so that a caller that can choose X-Scope-OrgID cannot drive
+	// unbounded per-tenant allocations (TSDB head stripes, directories, file
+	// descriptors, metric cardinality) by fabricating distinct tenant IDs.
+	maxTenants := int64(defaultSafeMaxInMemoryTenants)
+	if gl := i.getInstanceLimits(); gl != nil && gl.MaxInMemoryTenants > 0 {
+		maxTenants = gl.MaxInMemoryTenants
+	}
+	if users := int64(len(i.TSDBState.dbs)); users >= maxTenants {
+		return nil, errMaxUsersLimitReached
 	}
 
 	// Create the database and a shipper for a user

@@ -76,11 +76,24 @@ func containsUnsafePathSegments(id string) bool {
 
 var errInvalidTenantID = errors.New("invalid tenant ID")
 
+// maxTenantIDLength bounds the number of bytes a single tenant ID may contain
+// before it is rejected by SingleResolver. The limit matches the one enforced
+// by ValidTenantID (which SingleResolver intentionally does not run in full
+// because it has historically accepted a wider character set, including the
+// '|' separator). Enforcing the length cap here still prevents arbitrarily
+// large tenant IDs from being used as directory names, metric label values
+// and in-memory keys on the single-tenant path.
+const maxTenantIDLength = 150
+
 func (t *SingleResolver) TenantID(ctx context.Context) (string, error) {
 	//lint:ignore faillint wrapper around upstream method
 	id, err := user.ExtractOrgID(ctx)
 	if err != nil {
 		return "", err
+	}
+
+	if len(id) > maxTenantIDLength {
+		return "", errTenantIDTooLong
 	}
 
 	if containsUnsafePathSegments(id) {
