@@ -24,13 +24,37 @@ import (
 	"github.com/cortexproject/cortex/pkg/configs/userconfig"
 	"github.com/cortexproject/cortex/pkg/tenant"
 	"github.com/cortexproject/cortex/pkg/util"
+	"github.com/cortexproject/cortex/pkg/util/flagext"
 	util_log "github.com/cortexproject/cortex/pkg/util/log"
 )
+
+// knownIntegrations is the set of Alertmanager receiver integration types
+// recognized by validateAlertmanagerConfig. It is used both as the
+// default allow-list and to enumerate upstream receiver fields so new
+// (unlisted) integrations fail closed on validation.
+var knownIntegrations = []string{
+	"email",
+	"webhook",
+	"slack",
+	"opsgenie",
+	"wechat",
+	"victorops",
+	"pagerduty",
+	"pushover",
+	"sns",
+	"telegram",
+}
 
 var (
 	ErrEmailNotificationsAreDisabled   = errors.New("email notifications are disabled")
 	ErrWebhookNotificationsAreDisabled = errors.New("webhook notifications are disabled")
 )
+
+// ErrNotificationIntegrationNotAllowed is returned when a receiver uses an
+// integration type that is not in the configured allow-list.
+func errNotificationIntegrationNotAllowed(name string) error {
+	return fmt.Errorf("%s notifications are not allowed", name)
+}
 
 // Config configures Configs API
 type Config struct {
@@ -41,12 +65,61 @@ type Config struct {
 type NotificationsConfig struct {
 	DisableEmail   bool `yaml:"disable_email"`
 	DisableWebHook bool `yaml:"disable_webhook"`
+
+	// AllowedIntegrations is an explicit allow-list of Alertmanager receiver
+	// integration types tenants are permitted to configure. Any receiver that
+	// uses an integration type outside this list (including types newly added
+	// by upstream Alertmanager) is rejected, so the control fails closed.
+	// If empty, all known integrations are allowed by default (preserving
+	// backward-compatible behaviour); DisableEmail / DisableWebHook are then
+	// additionally honoured to remove the corresponding types from the
+	// effective allow-list.
+	AllowedIntegrations flagext.StringSliceCSV `yaml:"allowed_integrations"`
 }
 
 // RegisterFlags adds the flags required to configure this to the given FlagSet.
 func (cfg *Config) RegisterFlags(f *flag.FlagSet) {
 	f.BoolVar(&cfg.Notifications.DisableEmail, "configs.notifications.disable-email", false, "Disable Email notifications for Alertmanager.")
 	f.BoolVar(&cfg.Notifications.DisableWebHook, "configs.notifications.disable-webhook", false, "Disable WebHook notifications for Alertmanager.")
+	f.Var(&cfg.Notifications.AllowedIntegrations, "configs.notifications.allowed-integrations", "Comma-separated allow-list of Alertmanager receiver integration types tenants may configure (e.g. email,webhook,slack,opsgenie,wechat,victorops,pagerduty,pushover,sns,telegram). Any receiver using an integration type not in this list is rejected. When empty (default), all known integrations are allowed; disable-email / disable-webhook still further restrict the allow-list for backward compatibility.")
+}
+
+// effectiveAllowedIntegrations returns the set of integration names that are
+// permitted by this NotificationsConfig. The allow-list is applied strictly:
+// unknown integration names in the configured allow-list are ignored, and any
+// integration not present in the resulting set must be rejected.
+func (noCfg NotificationsConfig) effectiveAllowedIntegrations() map[string]bool {
+	allowed := map[string]bool{}
+	if len(noCfg.AllowedIntegrations) == 0 {
+		// Backward-compatible default: allow every known integration, and let
+		// the legacy DisableEmail / DisableWebHook toggles subtract from it.
+		for _, name := range knownIntegrations {
+			allowed[name] = true
+		}
+		if noCfg.DisableEmail {
+			delete(allowed, "email")
+		}
+		if noCfg.DisableWebHook {
+			delete(allowed, "webhook")
+		}
+		return allowed
+	}
+	for _, name := range noCfg.AllowedIntegrations {
+		name = strings.TrimSpace(name)
+		if name == "" {
+			continue
+		}
+		allowed[strings.ToLower(name)] = true
+	}
+	// The explicit allow-list still honours the legacy per-method kill
+	// switches so operators who set both see the stricter of the two.
+	if noCfg.DisableEmail {
+		delete(allowed, "email")
+	}
+	if noCfg.DisableWebHook {
+		delete(allowed, "webhook")
+	}
+	return allowed
 }
 
 // API implements the configs api.
@@ -224,18 +297,55 @@ func (a *API) validateAlertmanagerConfig(w http.ResponseWriter, r *http.Request)
 	})
 }
 
+// receiverIntegrations returns the number of integrations of each known
+// type configured on an Alertmanager receiver. It is the single source of
+// truth for the integration slices on config.Receiver, so adding a new
+// upstream integration here is sufficient to make the allow-list cover it.
+func receiverIntegrations(r *amconfig.Receiver) map[string]int {
+	return map[string]int{
+		"email":     len(r.EmailConfigs),
+		"webhook":   len(r.WebhookConfigs),
+		"slack":     len(r.SlackConfigs),
+		"opsgenie":  len(r.OpsGenieConfigs),
+		"wechat":    len(r.WechatConfigs),
+		"victorops": len(r.VictorOpsConfigs),
+		"pagerduty": len(r.PagerdutyConfigs),
+		"pushover":  len(r.PushoverConfigs),
+		"sns":       len(r.SNSConfigs),
+		"telegram":  len(r.TelegramConfigs),
+	}
+}
+
 func validateAlertmanagerConfig(cfg string, noCfg NotificationsConfig) error {
 	amCfg, err := amconfig.Load(cfg)
 	if err != nil {
 		return err
 	}
 
+	allowed := noCfg.effectiveAllowedIntegrations()
+
 	for _, recv := range amCfg.Receivers {
-		if noCfg.DisableEmail && len(recv.EmailConfigs) > 0 {
-			return ErrEmailNotificationsAreDisabled
-		}
-		if noCfg.DisableWebHook && len(recv.WebhookConfigs) > 0 {
-			return ErrWebhookNotificationsAreDisabled
+		for name, n := range receiverIntegrations(recv) {
+			if n == 0 {
+				continue
+			}
+			if allowed[name] {
+				continue
+			}
+			// Preserve the stable error values for the two legacy
+			// per-method kill-switches so existing callers / tests
+			// (and operator-facing messages) do not regress.
+			switch name {
+			case "email":
+				if noCfg.DisableEmail {
+					return ErrEmailNotificationsAreDisabled
+				}
+			case "webhook":
+				if noCfg.DisableWebHook {
+					return ErrWebhookNotificationsAreDisabled
+				}
+			}
+			return errNotificationIntegrationNotAllowed(name)
 		}
 	}
 
