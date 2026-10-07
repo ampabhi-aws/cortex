@@ -304,9 +304,16 @@ func (am *MultitenantAlertmanager) ListAllConfigs(w http.ResponseWriter, r *http
 	<-done
 }
 
-// validateAlertmanagerConfig recursively scans the input config looking for data types for which
+// ValidateAlertmanagerConfig recursively scans the input config looking for data types for which
 // we have a specific validation and, whenever encountered, it runs their validation. Returns the
-// first error or nil if validation succeeds.
+// first error or nil if validation succeeds. It rejects local-file secret references (e.g.
+// bearer_token_file, basic_auth.password_file, authorization.credentials_file,
+// oauth2.client_secret_file, tls_config.{ca,cert,key}_file, slack api_url_file, VictorOps
+// api_key_file) which would otherwise let a tenant exfiltrate local files.
+func ValidateAlertmanagerConfig(cfg interface{}) error {
+	return validateAlertmanagerConfig(cfg)
+}
+
 func validateAlertmanagerConfig(cfg interface{}) error {
 	v := reflect.ValueOf(cfg)
 	t := v.Type()
