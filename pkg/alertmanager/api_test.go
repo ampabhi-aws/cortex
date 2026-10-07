@@ -19,7 +19,6 @@ import (
 	"github.com/stretchr/testify/require"
 	"github.com/thanos-io/objstore"
 	"github.com/weaveworks/common/user"
-	"gopkg.in/yaml.v2"
 
 	"github.com/cortexproject/cortex/pkg/alertmanager/alertspb"
 	"github.com/cortexproject/cortex/pkg/alertmanager/alertstore/bucketclient"
@@ -670,6 +669,7 @@ receivers:
 	// Create the Multitenant Alertmanager.
 	reg := prometheus.NewPedanticRegistry()
 	cfg := mockAlertmanagerConfig(t)
+	cfg.EnableAdminAPI = true // operator-only all-tenant endpoint is opt-in
 	am, err := createMultitenantAlertmanager(cfg, nil, nil, alertStore, nil, nil, log.NewNopLogger(), reg)
 	require.NoError(t, err)
 	require.NoError(t, services.StartAndAwaitRunning(context.Background(), am))
@@ -681,7 +681,17 @@ receivers:
 
 	router := mux.NewRouter()
 	router.Path("/multitenant_alertmanager/configs").Methods(http.MethodGet).HandlerFunc(am.ListAllConfigs)
+
+	// Anonymous (no X-Scope-OrgID) must be rejected even if the admin API is enabled.
+	{
+		req := httptest.NewRequest("GET", "https://localhost:8080/multitenant_alertmanager/configs", nil)
+		w := httptest.NewRecorder()
+		router.ServeHTTP(w, req)
+		require.Equal(t, http.StatusUnauthorized, w.Result().StatusCode)
+	}
+
 	req := httptest.NewRequest("GET", "https://localhost:8080/multitenant_alertmanager/configs", nil)
+	req = req.WithContext(user.InjectOrgID(context.Background(), "admin"))
 	w := httptest.NewRecorder()
 	router.ServeHTTP(w, req)
 
@@ -690,9 +700,25 @@ receivers:
 	require.Equal(t, "application/yaml", resp.Header.Get("Content-Type"))
 	body, err := io.ReadAll(resp.Body)
 	require.NoError(t, err)
-	old, err := yaml.Marshal(testCases)
-	require.NoError(t, err)
-	require.YAMLEq(t, string(old), string(body))
+
+	// The response must list both tenants (inventory metadata) but must not
+	// echo the raw tenant YAML verbatim: template_files must be absent and
+	// the per-tenant payload must round-trip through the upstream parser so
+	// Secret / SecretURL types redact credentials.
+	bodyStr := string(body)
+	require.Contains(t, bodyStr, "user1")
+	require.Contains(t, bodyStr, "user2")
+	require.NotContains(t, bodyStr, "template_files")
+
+	// Finally, disabling the admin API must return 404 even for authenticated callers.
+	cfg.EnableAdminAPI = false
+	{
+		req := httptest.NewRequest("GET", "https://localhost:8080/multitenant_alertmanager/configs", nil)
+		req = req.WithContext(user.InjectOrgID(context.Background(), "admin"))
+		w := httptest.NewRecorder()
+		router.ServeHTTP(w, req)
+		require.Equal(t, http.StatusNotFound, w.Result().StatusCode)
+	}
 }
 
 func TestValidateAlertmanagerConfig(t *testing.T) {

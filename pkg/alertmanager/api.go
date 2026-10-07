@@ -261,6 +261,28 @@ func validateUserConfig(logger log.Logger, cfg alertspb.AlertConfigDesc, limits 
 
 func (am *MultitenantAlertmanager) ListAllConfigs(w http.ResponseWriter, r *http.Request) {
 	logger := util_log.WithContext(r.Context(), am.logger)
+
+	// Operator-only admin endpoint: gated off by default so a route-table edit
+	// that re-enables unauthenticated access to this handler cannot silently
+	// expose every tenant's Alertmanager configuration. Operators must opt in
+	// via -alertmanager.enable-admin-api and ensure the endpoint is only
+	// reachable from a trusted administrative network path.
+	if !am.cfg.EnableAdminAPI {
+		http.Error(w, "not found", http.StatusNotFound)
+		return
+	}
+
+	// Require a tenant/org identity on the request. Cortex has no built-in
+	// credential verification, but refusing anonymous (header-less) callers
+	// at least forces operators to put this endpoint behind the same
+	// authenticated path as the per-tenant APIs, and prevents a casual
+	// unauthenticated GET from dumping every tenant.
+	if _, err := tenant.TenantID(r.Context()); err != nil {
+		level.Error(logger).Log("msg", errNoOrgID, "err", err.Error())
+		http.Error(w, fmt.Sprintf("%s: %s", errNoOrgID, err.Error()), http.StatusUnauthorized)
+		return
+	}
+
 	userIDs, err := am.store.ListAllUsers(r.Context())
 	if err != nil {
 		level.Error(logger).Log("msg", "failed to list users of alertmanager", "err", err)
@@ -283,10 +305,25 @@ func (am *MultitenantAlertmanager) ListAllConfigs(w http.ResponseWriter, r *http
 		} else if err != nil {
 			return errors.Wrapf(err, "failed to fetch alertmanager config for user %s", userID)
 		}
-		data := map[string]*UserConfig{
+
+		// Never emit cfg.RawConfig verbatim on an all-tenant endpoint: it
+		// contains notifier credentials (Slack webhook URLs,
+		// smtp_auth_password, PagerDuty/OpsGenie/VictorOps keys,
+		// basic_auth.password, bearer_token, ...). Round-trip through
+		// config.Load + yaml.Marshal so that Secret/SecretURL redact via
+		// their MarshalYAML implementations (<secret>). Also drop
+		// template_files from the listing: operators that need the
+		// template bodies can read them scoped to a single tenant via
+		// GET /api/v1/alerts with X-Scope-OrgID.
+		redacted, rerr := redactAlertmanagerConfig(cfg.RawConfig)
+		if rerr != nil {
+			level.Warn(logger).Log("msg", "failed to parse alertmanager config for redaction; omitting raw config in listing", "user", userID, "err", rerr)
+			redacted = ""
+		}
+
+		data := map[string]*listedUserConfig{
 			userID: {
-				TemplateFiles:      alertspb.ParseTemplates(cfg),
-				AlertmanagerConfig: cfg.RawConfig,
+				AlertmanagerConfig: redacted,
 			},
 		}
 
@@ -302,6 +339,32 @@ func (am *MultitenantAlertmanager) ListAllConfigs(w http.ResponseWriter, r *http
 	}
 	close(iter)
 	<-done
+}
+
+// listedUserConfig is the per-tenant payload shape emitted by ListAllConfigs.
+// It intentionally omits template_files (they can leak notifier template
+// contents) and only exposes a redacted alertmanager_config.
+type listedUserConfig struct {
+	AlertmanagerConfig string `yaml:"alertmanager_config"`
+}
+
+// redactAlertmanagerConfig round-trips a raw Alertmanager YAML through the
+// upstream config parser so Secret / SecretURL types replace credentials with
+// "<secret>" on marshal. An empty input returns an empty string. On parse
+// failure the caller is expected to omit the raw config from the response.
+func redactAlertmanagerConfig(raw string) (string, error) {
+	if raw == "" {
+		return "", nil
+	}
+	amCfg, err := config.Load(raw)
+	if err != nil {
+		return "", err
+	}
+	out, err := yaml.Marshal(amCfg)
+	if err != nil {
+		return "", err
+	}
+	return string(out), nil
 }
 
 // validateAlertmanagerConfig recursively scans the input config looking for data types for which

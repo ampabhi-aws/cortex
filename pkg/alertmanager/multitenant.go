@@ -80,6 +80,12 @@ type MultitenantAlertmanagerConfig struct {
 
 	EnableAPI bool `yaml:"enable_api"`
 
+	// EnableAdminAPI controls whether the operator-only all-tenant
+	// endpoints (currently /multitenant_alertmanager/configs) are served.
+	// It defaults to false so that even if the route is reachable the
+	// handler refuses to serve a cross-tenant dump.
+	EnableAdminAPI bool `yaml:"enable_admin_api"`
+
 	// For distributor.
 	AlertmanagerClient ClientConfig `yaml:"alertmanager_client"`
 
@@ -114,6 +120,7 @@ func (cfg *MultitenantAlertmanagerConfig) RegisterFlags(f *flag.FlagSet) {
 	f.DurationVar(&cfg.PollInterval, "alertmanager.configs.poll-interval", 15*time.Second, "How frequently to poll Cortex configs")
 
 	f.BoolVar(&cfg.EnableAPI, "experimental.alertmanager.enable-api", false, "Enable the experimental alertmanager config api.")
+	f.BoolVar(&cfg.EnableAdminAPI, "alertmanager.enable-admin-api", false, "Enable the operator-only all-tenant admin endpoints (currently GET /multitenant_alertmanager/configs). Off by default; when enabled, the endpoint still requires an authenticated/tenant-scoped caller and redacts notifier secrets.")
 
 	f.BoolVar(&cfg.ShardingEnabled, "alertmanager.sharding-enabled", false, "Shard tenants across multiple alertmanager instances.")
 
