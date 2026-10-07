@@ -690,9 +690,91 @@ receivers:
 	require.Equal(t, "application/yaml", resp.Header.Get("Content-Type"))
 	body, err := io.ReadAll(resp.Body)
 	require.NoError(t, err)
-	old, err := yaml.Marshal(testCases)
+
+	// The handler re-marshals each tenant's config via Alertmanager's own
+	// types so that config.Secret / SecretURL redaction applies. Compare each
+	// tenant's returned YAML against the expected re-marshalled form rather
+	// than against the raw input YAML.
+	got := map[string]*UserConfig{}
+	require.NoError(t, yaml.Unmarshal(body, &got))
+	require.Len(t, got, len(testCases))
+	for user, cfg := range testCases {
+		returned, ok := got[user]
+		require.True(t, ok, "missing user %q in response", user)
+		expectedCfg, err := config.Load(cfg.AlertmanagerConfig)
+		require.NoError(t, err)
+		expectedYAML, err := yaml.Marshal(expectedCfg)
+		require.NoError(t, err)
+		require.YAMLEq(t, string(expectedYAML), returned.AlertmanagerConfig)
+		// Template bodies are intentionally dropped.
+		require.Empty(t, returned.TemplateFiles)
+	}
+}
+
+// TestAMConfigListUserConfig_RedactsSecrets asserts that notification
+// credentials uploaded by one tenant are not returned in cleartext by the
+// cross-tenant /multitenant_alertmanager/configs admin endpoint.
+func TestAMConfigListUserConfig_RedactsSecrets(t *testing.T) {
+	const rawCfg = `global:
+  resolve_timeout: 5m
+  smtp_auth_password: 'CANARY-SMTP-PASSWORD'
+  slack_api_url: 'https://hooks.slack.com/services/T000/B000/CANARY-SLACK-URL'
+  opsgenie_api_key: 'CANARY-OPSGENIE-KEY'
+route:
+  receiver: route1
+receivers:
+- name: route1
+  pagerduty_configs:
+  - service_key: 'CANARY-PAGERDUTY-SERVICE-KEY'
+    routing_key: 'CANARY-PAGERDUTY-ROUTING-KEY'
+  webhook_configs:
+  - send_resolved: true
+    url: 'https://webhook.example.com/CANARY-WEBHOOK-URL'
+    http_config:
+      basic_auth:
+        username: user
+        password: 'CANARY-BASIC-AUTH-PASSWORD'
+`
+
+	storage := objstore.NewInMemBucket()
+	alertStore := bucketclient.NewBucketAlertStore(storage, nil, log.NewNopLogger())
+	require.NoError(t, alertStore.SetAlertConfig(context.Background(), alertspb.AlertConfigDesc{
+		User:      "tenant-a",
+		RawConfig: rawCfg,
+		Templates: []*alertspb.TemplateDesc{{Filename: "a.tmpl", Body: "CANARY-TEMPLATE-BODY"}},
+	}))
+
+	am := &MultitenantAlertmanager{
+		store:  alertStore,
+		logger: util_log.Logger,
+	}
+
+	router := mux.NewRouter()
+	router.Path("/multitenant_alertmanager/configs").Methods(http.MethodGet).HandlerFunc(am.ListAllConfigs)
+	req := httptest.NewRequest("GET", "https://localhost:8080/multitenant_alertmanager/configs", nil)
+	w := httptest.NewRecorder()
+	router.ServeHTTP(w, req)
+
+	resp := w.Result()
+	require.Equal(t, http.StatusOK, resp.StatusCode)
+	body, err := io.ReadAll(resp.Body)
 	require.NoError(t, err)
-	require.YAMLEq(t, string(old), string(body))
+
+	bodyStr := string(body)
+	// Secrets must not appear in cleartext.
+	for _, canary := range []string{
+		"CANARY-SMTP-PASSWORD",
+		"CANARY-SLACK-URL",
+		"CANARY-OPSGENIE-KEY",
+		"CANARY-PAGERDUTY-SERVICE-KEY",
+		"CANARY-PAGERDUTY-ROUTING-KEY",
+		"CANARY-BASIC-AUTH-PASSWORD",
+		// Template bodies are also stripped from the response.
+		"CANARY-TEMPLATE-BODY",
+	} {
+		require.NotContains(t, bodyStr, canary, "secret %q leaked in /multitenant_alertmanager/configs response", canary)
+	}
+	require.Contains(t, bodyStr, "<secret>", "expected redaction marker <secret> in response")
 }
 
 func TestValidateAlertmanagerConfig(t *testing.T) {

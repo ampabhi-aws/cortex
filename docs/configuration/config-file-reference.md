@@ -82,6 +82,13 @@ api:
   # CLI flag: -http.prometheus-http-prefix
   [prometheus_http_prefix: <string> | default = "/prometheus"]
 
+  # Enable the cross-tenant /multitenant_alertmanager/configs admin endpoint.
+  # This endpoint returns every tenant's Alertmanager configuration and must
+  # only be exposed to operators via an authenticating proxy or a dedicated
+  # admin listener. Disabled by default.
+  # CLI flag: -api.alertmanager-admin-api-enabled
+  [alertmanager_admin_api_enabled: <boolean> | default = false]
+
   # Which HTTP Request headers to add to logs
   # CLI flag: -api.http-request-headers-to-log
   [http_request_headers_to_log: <list of string> | default = []]

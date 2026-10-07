@@ -48,6 +48,11 @@ type Config struct {
 	AlertmanagerHTTPPrefix string `yaml:"alertmanager_http_prefix"`
 	PrometheusHTTPPrefix   string `yaml:"prometheus_http_prefix"`
 
+	// AlertmanagerAdminAPIEnabled gates the operator-only cross-tenant admin
+	// endpoint /multitenant_alertmanager/configs. Disabled by default so that
+	// the endpoint is not reachable on the tenant-facing HTTP router.
+	AlertmanagerAdminAPIEnabled bool `yaml:"alertmanager_admin_api_enabled"`
+
 	// The following configs are injected by the upstream caller.
 	ServerPrefix       string               `yaml:"-"`
 	LegacyHTTPPrefix   string               `yaml:"-"`
@@ -78,6 +83,7 @@ func (cfg *Config) RegisterFlags(f *flag.FlagSet) {
 func (cfg *Config) RegisterFlagsWithPrefix(prefix string, f *flag.FlagSet) {
 	f.StringVar(&cfg.AlertmanagerHTTPPrefix, prefix+"http.alertmanager-http-prefix", "/alertmanager", "HTTP URL path under which the Alertmanager ui and api will be served.")
 	f.StringVar(&cfg.PrometheusHTTPPrefix, prefix+"http.prometheus-http-prefix", "/prometheus", "HTTP URL path under which the Prometheus api will be served.")
+	f.BoolVar(&cfg.AlertmanagerAdminAPIEnabled, prefix+"api.alertmanager-admin-api-enabled", false, "Enable the cross-tenant /multitenant_alertmanager/configs admin endpoint. This endpoint returns every tenant's Alertmanager configuration and must only be exposed to operators via an authenticating proxy or a dedicated admin listener. Disabled by default.")
 }
 
 // Push either wraps the distributor push function as configured or returns the distributor push directly.
@@ -187,7 +193,15 @@ func (a *API) RegisterAlertmanager(am *alertmanager.MultitenantAlertmanager, tar
 	a.indexPage.AddLink(SectionAdminEndpoints, "/multitenant_alertmanager/ring", "Alertmanager Ring Status")
 	// Ensure this route is registered before the prefixed AM route
 	a.RegisterRoute("/multitenant_alertmanager/status", am.GetStatusHandler(), false, "GET")
-	a.RegisterRoute("/multitenant_alertmanager/configs", http.HandlerFunc(am.ListAllConfigs), false, "GET")
+	// /multitenant_alertmanager/configs returns every tenant's Alertmanager
+	// configuration (albeit with notification secrets redacted via
+	// config.Secret.MarshalYAML). It is intended for operator / debugging use,
+	// not for tenants. Gate it behind an explicit admin opt-in and require
+	// authentication so that it is not reachable by default on the
+	// tenant-facing HTTP router.
+	if a.cfg.AlertmanagerAdminAPIEnabled {
+		a.RegisterRoute("/multitenant_alertmanager/configs", http.HandlerFunc(am.ListAllConfigs), true, "GET")
+	}
 	a.RegisterRoute("/multitenant_alertmanager/ring", http.HandlerFunc(am.RingHandler), false, "GET", "POST")
 	a.RegisterRoute("/multitenant_alertmanager/delete_tenant_config", http.HandlerFunc(am.DeleteUserConfig), true, "POST")
 
