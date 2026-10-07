@@ -18,6 +18,7 @@ import (
 	"golang.org/x/time/rate"
 
 	"github.com/cortexproject/cortex/pkg/ring/kv/codec"
+	"github.com/cortexproject/cortex/pkg/util"
 	"github.com/cortexproject/cortex/pkg/util/backoff"
 	"github.com/cortexproject/cortex/pkg/util/flagext"
 )
@@ -143,6 +144,11 @@ func (c *Client) cas(ctx context.Context, key string, f func(in interface{}) (ou
 	}
 
 	index := uint64(0)
+	// Avoid logging/returning the raw key verbatim when it may be very long
+	// (e.g. attacker-controlled HA tracker keys). Truncating protects stderr
+	// (which is a single mutex-serialised writer in Cortex) and prevents
+	// multi-megabyte error strings from propagating back to callers.
+	safeKey := util.TruncateString(key, 128)
 	for i := 0; i < retries; i++ {
 		if i > 0 && sleepBeforeRetry > 0 {
 			time.Sleep(sleepBeforeRetry)
@@ -152,14 +158,14 @@ func (c *Client) cas(ctx context.Context, key string, f func(in interface{}) (ou
 		options := &consul.QueryOptions{}
 		kvp, _, err := c.kv.Get(key, options.WithContext(ctx))
 		if err != nil {
-			level.Error(c.logger).Log("msg", "error getting key", "key", key, "err", err)
+			level.Error(c.logger).Log("msg", "error getting key", "key", safeKey, "err", err)
 			continue
 		}
 		var intermediate interface{}
 		if kvp != nil {
 			out, err := c.codec.Decode(kvp.Value)
 			if err != nil {
-				level.Error(c.logger).Log("msg", "error decoding key", "key", key, "err", err)
+				level.Error(c.logger).Log("msg", "error decoding key", "key", safeKey, "err", err)
 				continue
 			}
 			// If key doesn't exist, index will be 0.
@@ -183,7 +189,7 @@ func (c *Client) cas(ctx context.Context, key string, f func(in interface{}) (ou
 
 		bytes, err := c.codec.Encode(intermediate)
 		if err != nil {
-			level.Error(c.logger).Log("msg", "error serialising value", "key", key, "err", err)
+			level.Error(c.logger).Log("msg", "error serialising value", "key", safeKey, "err", err)
 			continue
 		}
 		ok, _, err := c.kv.CAS(&consul.KVPair{
@@ -192,16 +198,16 @@ func (c *Client) cas(ctx context.Context, key string, f func(in interface{}) (ou
 			ModifyIndex: index,
 		}, writeOptions.WithContext(ctx))
 		if err != nil {
-			level.Error(c.logger).Log("msg", "error CASing", "key", key, "err", err)
+			level.Error(c.logger).Log("msg", "error CASing", "key", safeKey, "err", err)
 			continue
 		}
 		if !ok {
-			level.Debug(c.logger).Log("msg", "error CASing, trying again", "key", key, "index", index)
+			level.Debug(c.logger).Log("msg", "error CASing, trying again", "key", safeKey, "index", index)
 			continue
 		}
 		return nil
 	}
-	return fmt.Errorf("failed to CAS %s", key)
+	return fmt.Errorf("failed to CAS %s", safeKey)
 }
 
 // WatchKey will watch a given key in consul for changes. When the value
