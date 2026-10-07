@@ -32,12 +32,20 @@ type Config struct {
 	ConfigsAPIURL flagext.URLValue     `yaml:"configs_api_url"`
 	ClientTimeout time.Duration        `yaml:"client_timeout"` // HTTP timeout duration for requests made to the Weave Cloud configs service.
 	TLS           tls_cfg.ClientConfig `yaml:",inline"`
+	// PrivateAPIAuthToken is a shared secret that identifies this client as
+	// the internal configdb poller to the configs service. It is sent as
+	// `Authorization: Bearer <token>` on calls to
+	// /private/api/prom/configs/{rules,alertmanager}. The configs server
+	// (see -configs.private-api-auth-token) must be configured with the same
+	// value or those endpoints fail closed.
+	PrivateAPIAuthToken string `yaml:"private_api_auth_token"`
 }
 
 // RegisterFlagsWithPrefix adds the flags required to config this to the given FlagSet
 func (cfg *Config) RegisterFlagsWithPrefix(prefix string, f *flag.FlagSet) {
 	f.Var(&cfg.ConfigsAPIURL, prefix+"configs.url", "URL of configs API server.")
 	f.DurationVar(&cfg.ClientTimeout, prefix+"configs.client-timeout", 5*time.Second, "Timeout for requests to Weave Cloud configs service.")
+	f.StringVar(&cfg.PrivateAPIAuthToken, prefix+"configs.private-api-auth-token", "", "Shared secret sent as an Authorization: Bearer header when polling the configs service /private/api/prom/configs/{rules,alertmanager} endpoints. Must match -configs.private-api-auth-token on the configs server.")
 	cfg.TLS.RegisterFlagsWithPrefix(prefix+"configs", f)
 }
 
@@ -66,8 +74,9 @@ func New(cfg Config) (*ConfigDBClient, error) {
 	}
 
 	client := &ConfigDBClient{
-		URL:     cfg.ConfigsAPIURL.URL,
-		Timeout: cfg.ClientTimeout,
+		URL:       cfg.ConfigsAPIURL.URL,
+		Timeout:   cfg.ClientTimeout,
+		AuthToken: cfg.PrivateAPIAuthToken,
 	}
 
 	tlsConfig, err := cfg.TLS.GetTLSConfig()
@@ -86,6 +95,11 @@ type ConfigDBClient struct {
 	URL       *url.URL
 	Timeout   time.Duration
 	TLSConfig *tls.Config
+	// AuthToken, when non-empty, is sent to the configs server as
+	// `Authorization: Bearer <AuthToken>` so the server can distinguish the
+	// internal configdb poller from an unauthenticated external caller on the
+	// /private/api/prom/configs/* endpoints.
+	AuthToken string
 }
 
 // GetRules implements Client
@@ -98,7 +112,7 @@ func (c ConfigDBClient) GetRules(ctx context.Context, since userconfig.ID) (map[
 	var response *ConfigsResponse
 	err := instrument.CollectedRequest(ctx, "GetRules", configsRequestDuration, instrument.ErrorCode, func(ctx context.Context) error {
 		var err error
-		response, err = doRequest(endpoint, c.Timeout, c.TLSConfig, since)
+		response, err = doRequest(endpoint, c.Timeout, c.TLSConfig, c.AuthToken, since)
 		return err
 	})
 	if err != nil {
@@ -124,13 +138,13 @@ func (c ConfigDBClient) GetAlerts(ctx context.Context, since userconfig.ID) (*Co
 	var response *ConfigsResponse
 	err := instrument.CollectedRequest(ctx, "GetAlerts", configsRequestDuration, instrument.ErrorCode, func(ctx context.Context) error {
 		var err error
-		response, err = doRequest(endpoint, c.Timeout, c.TLSConfig, since)
+		response, err = doRequest(endpoint, c.Timeout, c.TLSConfig, c.AuthToken, since)
 		return err
 	})
 	return response, err
 }
 
-func doRequest(endpoint string, timeout time.Duration, tlsConfig *tls.Config, since userconfig.ID) (*ConfigsResponse, error) {
+func doRequest(endpoint string, timeout time.Duration, tlsConfig *tls.Config, authToken string, since userconfig.ID) (*ConfigsResponse, error) {
 	req, err := http.NewRequest("GET", endpoint, nil)
 	if err != nil {
 		return nil, err
@@ -142,6 +156,9 @@ func doRequest(endpoint string, timeout time.Duration, tlsConfig *tls.Config, si
 	}
 
 	req.Header.Set("User-Agent", fmt.Sprintf("Cortex/%s", version.Version))
+	if authToken != "" {
+		req.Header.Set("Authorization", "Bearer "+authToken)
+	}
 
 	resp, err := client.Do(req)
 	if err != nil {

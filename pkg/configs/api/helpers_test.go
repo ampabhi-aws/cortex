@@ -7,6 +7,7 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 
 	"github.com/cortexproject/cortex/pkg/configs/userconfig"
@@ -19,9 +20,10 @@ import (
 )
 
 var (
-	app      *API
-	database db.DB
-	counter  int
+	app       *API
+	database  db.DB
+	counter   int
+	testToken = "test-private-api-token"
 )
 
 // setup sets up the environment for the tests.
@@ -31,6 +33,7 @@ func setup(t *testing.T) {
 		Notifications: NotificationsConfig{
 			DisableEmail: true,
 		},
+		PrivateAPIAuthToken: testToken,
 	})
 	counter = 0
 }
@@ -42,6 +45,7 @@ func setupWithEmailEnabled(t *testing.T) {
 		Notifications: NotificationsConfig{
 			DisableEmail: false,
 		},
+		PrivateAPIAuthToken: testToken,
 	})
 	counter = 0
 }
@@ -51,8 +55,24 @@ func cleanup(t *testing.T) {
 	dbtest.Cleanup(t, database)
 }
 
-// request makes a request to the configs API.
+// request makes a request to the configs API. Requests to the
+// /private/api/prom/configs/* endpoints additionally carry the shared Bearer
+// token the server is configured with, mirroring the authenticated internal
+// caller (pkg/configs/client).
 func request(t *testing.T, method, urlStr string, body io.Reader) *httptest.ResponseRecorder {
+	w := httptest.NewRecorder()
+	r, err := http.NewRequest(method, urlStr, body)
+	require.NoError(t, err)
+	if strings.HasPrefix(urlStr, "/private/") {
+		r.Header.Set("Authorization", "Bearer "+testToken)
+	}
+	app.ServeHTTP(w, r)
+	return w
+}
+
+// requestUnauthenticated makes a request to the configs API without any
+// credentials. Used by tests that assert the private endpoints fail closed.
+func requestUnauthenticated(t *testing.T, method, urlStr string, body io.Reader) *httptest.ResponseRecorder {
 	w := httptest.NewRecorder()
 	r, err := http.NewRequest(method, urlStr, body)
 	require.NoError(t, err)
