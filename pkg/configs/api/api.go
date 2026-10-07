@@ -1,6 +1,7 @@
 package api
 
 import (
+	"crypto/subtle"
 	"database/sql"
 	"encoding/json"
 	"errors"
@@ -35,6 +36,15 @@ var (
 // Config configures Configs API
 type Config struct {
 	Notifications NotificationsConfig `yaml:"notifications"`
+
+	// PrivateAPIAuthToken is a shared secret required (as a Bearer token in the
+	// Authorization header) to call the /private/api/prom/configs/* endpoints.
+	// These endpoints return the configuration of every tenant and must only be
+	// reachable by trusted internal components (the ruler/alertmanager configdb
+	// client). The handler fails closed when this value is empty, so operators
+	// MUST configure the same secret here and on the configdb client. See
+	// pkg/configs/client/client.go.
+	PrivateAPIAuthToken string `yaml:"private_api_auth_token"`
 }
 
 // NotificationsConfig configures Alertmanager notifications method.
@@ -47,6 +57,7 @@ type NotificationsConfig struct {
 func (cfg *Config) RegisterFlags(f *flag.FlagSet) {
 	f.BoolVar(&cfg.Notifications.DisableEmail, "configs.notifications.disable-email", false, "Disable Email notifications for Alertmanager.")
 	f.BoolVar(&cfg.Notifications.DisableWebHook, "configs.notifications.disable-webhook", false, "Disable WebHook notifications for Alertmanager.")
+	f.StringVar(&cfg.PrivateAPIAuthToken, "configs.private-api-auth-token", "", "Shared secret that callers of the /private/api/prom/configs/{rules,alertmanager} endpoints must present in the Authorization: Bearer header. These endpoints return every tenant's raw configuration (including Alertmanager notification credentials) and MUST only be exposed to the ruler/alertmanager configdb client. When left empty the endpoints fail closed.")
 }
 
 // API implements the configs api.
@@ -264,9 +275,23 @@ type ConfigsView struct {
 }
 
 func (a *API) getConfigs(w http.ResponseWriter, r *http.Request) {
+	logger := util_log.WithContext(r.Context(), util_log.Logger)
+
+	// authorizePrivateCaller fails closed: the /private/api/prom/configs/*
+	// endpoints return every tenant's configuration (including raw
+	// Alertmanager YAML with notification credentials) and must be reachable
+	// only by an authenticated internal caller. The server must be configured
+	// with a shared Bearer token (-configs.private-api-auth-token) that the
+	// configdb client presents; when it is empty the handler refuses all
+	// requests. This is CWE-1220 (Insufficient Granularity of Access Control).
+	if !a.authorizePrivateCaller(r) {
+		level.Warn(logger).Log("msg", "rejected unauthenticated call to private configs endpoint", "path", r.URL.Path, "remote_addr", r.RemoteAddr)
+		http.Error(w, "forbidden", http.StatusForbidden)
+		return
+	}
+
 	var cfgs map[string]userconfig.View
 	var cfgErr error
-	logger := util_log.WithContext(r.Context(), util_log.Logger)
 	rawSince := r.FormValue("since")
 	if rawSince == "" {
 		cfgs, cfgErr = a.db.GetAllConfigs(r.Context())
@@ -281,9 +306,9 @@ func (a *API) getConfigs(w http.ResponseWriter, r *http.Request) {
 	}
 
 	if cfgErr != nil {
-		// XXX: Untested
+		// Do not leak raw DB error strings to the caller; the detail is logged.
 		level.Error(logger).Log("msg", "error getting configs", "err", cfgErr)
-		http.Error(w, cfgErr.Error(), http.StatusInternalServerError)
+		http.Error(w, "error retrieving configurations", http.StatusInternalServerError)
 		return
 	}
 
@@ -294,6 +319,24 @@ func (a *API) getConfigs(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
 	}
+}
+
+// authorizePrivateCaller verifies that the caller presented the shared Bearer
+// token configured for the /private/api/prom/configs/* endpoints. It fails
+// closed: if no token is configured on the server, every request is rejected.
+func (a *API) authorizePrivateCaller(r *http.Request) bool {
+	expected := a.cfg.PrivateAPIAuthToken
+	if expected == "" {
+		return false
+	}
+
+	authz := r.Header.Get("Authorization")
+	const prefix = "Bearer "
+	if !strings.HasPrefix(authz, prefix) {
+		return false
+	}
+	presented := authz[len(prefix):]
+	return subtle.ConstantTimeCompare([]byte(presented), []byte(expected)) == 1
 }
 
 func (a *API) deactivateConfig(w http.ResponseWriter, r *http.Request) {
