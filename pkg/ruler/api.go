@@ -8,6 +8,7 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/go-kit/log"
@@ -125,15 +126,41 @@ type API struct {
 	store rulestore.RuleStore
 
 	logger log.Logger
+
+	// tenantWriteLocks serializes rule-group write operations (create/update/delete)
+	// per tenant within this process. This narrows the TOCTOU window between the
+	// quota LIST/CHECK and the subsequent object-storage WRITE so that concurrent
+	// requests served by the same ruler replica cannot all observe the same
+	// pre-write count and bypass -ruler.max-rule-groups-per-tenant. Note: this is
+	// an in-process guard only; operators that run multiple ruler replicas behind
+	// a load balancer should also configure -ruler.max-rules-per-rule-group and
+	// consider routing writes through a single replica per tenant for strict
+	// enforcement across the fleet.
+	tenantWriteLocks   map[string]*sync.Mutex
+	tenantWriteLocksMu sync.Mutex
 }
 
 // NewAPI returns a new API struct with the provided ruler and rule store
 func NewAPI(r *Ruler, s rulestore.RuleStore, logger log.Logger) *API {
 	return &API{
-		ruler:  r,
-		store:  s,
-		logger: logger,
+		ruler:            r,
+		store:            s,
+		logger:           logger,
+		tenantWriteLocks: make(map[string]*sync.Mutex),
 	}
+}
+
+// tenantWriteLock returns a per-tenant mutex used to serialize rule-group
+// mutations originating from this ruler replica.
+func (a *API) tenantWriteLock(userID string) *sync.Mutex {
+	a.tenantWriteLocksMu.Lock()
+	defer a.tenantWriteLocksMu.Unlock()
+	mu, ok := a.tenantWriteLocks[userID]
+	if !ok {
+		mu = &sync.Mutex{}
+		a.tenantWriteLocks[userID] = mu
+	}
+	return mu
 }
 
 func (a *API) PrometheusRules(w http.ResponseWriter, req *http.Request) {
@@ -482,6 +509,13 @@ func (a *API) CreateRuleGroup(w http.ResponseWriter, req *http.Request) {
 		return
 	}
 
+	// Serialize LIST -> CHECK -> WRITE per tenant within this process so that
+	// concurrent requests cannot all observe the same pre-write count and
+	// bypass the per-tenant rule-group quota.
+	writeLock := a.tenantWriteLock(userID)
+	writeLock.Lock()
+	defer writeLock.Unlock()
+
 	rgs, err := a.store.ListRuleGroupsForUserAndNamespace(req.Context(), userID, "")
 	if err != nil {
 		level.Error(logger).Log("msg", "unable to fetch current rule groups for validation", "err", err.Error(), "user", userID)
@@ -489,7 +523,22 @@ func (a *API) CreateRuleGroup(w http.ResponseWriter, req *http.Request) {
 		return
 	}
 
-	if err := a.ruler.AssertMaxRuleGroups(userID, len(rgs)+1); err != nil {
+	// SetRuleGroup is an upsert against a deterministic (namespace, name) object
+	// key, so an update of an existing group must not consume additional quota.
+	// Only increment the count when this (namespace, name) pair is new.
+	count := len(rgs)
+	exists := false
+	for _, g := range rgs {
+		if g.Namespace == namespace && g.Name == rg.Name {
+			exists = true
+			break
+		}
+	}
+	if !exists {
+		count++
+	}
+
+	if err := a.ruler.AssertMaxRuleGroups(userID, count); err != nil {
 		level.Error(logger).Log("msg", "limit validation failure", "err", err.Error(), "user", userID)
 		http.Error(w, err.Error(), http.StatusBadRequest)
 		return
