@@ -35,6 +35,16 @@ var (
 // Config configures Configs API
 type Config struct {
 	Notifications NotificationsConfig `yaml:"notifications"`
+
+	// EnablePrivateEndpoints controls whether the all-tenant "private" HTTP
+	// endpoints (/private/api/prom/configs/{rules,alertmanager}) are
+	// registered. These endpoints are intended for use by the ruler and
+	// alertmanager components as part of the inter-component configdb
+	// protocol and must never be exposed to tenants. When Cortex is run
+	// behind a tenant-facing listener without an admin-only path, operators
+	// should disable these endpoints and run the configs module on a
+	// separate internal listener.
+	EnablePrivateEndpoints bool `yaml:"enable_private_endpoints"`
 }
 
 // NotificationsConfig configures Alertmanager notifications method.
@@ -47,6 +57,7 @@ type NotificationsConfig struct {
 func (cfg *Config) RegisterFlags(f *flag.FlagSet) {
 	f.BoolVar(&cfg.Notifications.DisableEmail, "configs.notifications.disable-email", false, "Disable Email notifications for Alertmanager.")
 	f.BoolVar(&cfg.Notifications.DisableWebHook, "configs.notifications.disable-webhook", false, "Disable WebHook notifications for Alertmanager.")
+	f.BoolVar(&cfg.EnablePrivateEndpoints, "configs.api.enable-private-endpoints", true, "Register the all-tenant /private/api/prom/configs/* HTTP endpoints used by the ruler and alertmanager configdb clients. These endpoints return every tenant's rules, templates and raw Alertmanager configuration (which may contain cleartext notifier credentials) and must never be served on a listener reachable by tenants. Disable this when the configs module is accessible only to internal clients that already have a dedicated listener, or when authorisation is enforced upstream.")
 }
 
 // API implements the configs api.
@@ -81,13 +92,28 @@ func (a *API) admin(w http.ResponseWriter, r *http.Request) {
 `)
 }
 
-// RegisterRoutes registers the configs API HTTP routes with the provided Router.
-func (a *API) RegisterRoutes(r *mux.Router) {
-	for _, route := range []struct {
-		name, method, path string
-		handler            http.HandlerFunc
-	}{
-		{"root", "GET", "/", a.admin},
+// Route describes a single configs-API HTTP route. It is exported so that the
+// top-level pkg/api wrapper can iterate the route table and register each
+// handler through API.RegisterRoute (which applies the configured auth
+// middleware). This keeps a single, auditable registration path for every
+// HTTP route in Cortex and prevents a repeat of the historical bypass where
+// configs routes were attached directly to the raw gorilla/mux router.
+type Route struct {
+	Name, Method, Path string
+	Handler            http.HandlerFunc
+}
+
+// TenantRoutes returns the per-tenant HTTP routes of the configs API. Every
+// handler in this table extracts the tenant ID from the request and rejects
+// anonymous callers with 401.
+//
+// The "root" admin landing page (GET /) is intentionally excluded from the
+// list because pkg/api.API.RegisterAPI already owns that path across the
+// Cortex HTTP listener; registering it twice from the configs module would
+// shadow the shared index page. The standalone *API handler built by
+// New() continues to serve the admin page via RegisterRoutes below.
+func (a *API) TenantRoutes() []Route {
+	return []Route{
 		// Dedicated APIs for updating rules config. In the future, these *must*
 		// be used.
 		{"get_rules", "GET", "/api/prom/configs/rules", a.getConfig},
@@ -99,11 +125,41 @@ func (a *API) RegisterRoutes(r *mux.Router) {
 		{"validate_alertmanager_config", "POST", "/api/prom/configs/alertmanager/validate", a.validateAlertmanagerConfig},
 		{"deactivate_config", "DELETE", "/api/prom/configs/deactivate", a.deactivateConfig},
 		{"restore_config", "POST", "/api/prom/configs/restore", a.restoreConfig},
-		// Internal APIs.
+	}
+}
+
+// PrivateRoutes returns the all-tenant "private" HTTP routes used by the
+// ruler and alertmanager configdb clients. These handlers return every
+// tenant's configuration unredacted and must only ever be exposed on an
+// internal listener. Callers are expected to apply the API-wide auth
+// middleware (and, where possible, additional admin/mTLS gating) on top of
+// them.
+func (a *API) PrivateRoutes() []Route {
+	return []Route{
 		{"private_get_rules", "GET", "/private/api/prom/configs/rules", a.getConfigs},
 		{"private_get_alertmanager_config", "GET", "/private/api/prom/configs/alertmanager", a.getConfigs},
-	} {
-		r.Handle(route.path, route.handler).Methods(route.method).Name(route.name)
+	}
+}
+
+// PrivateEndpointsEnabled reports whether the all-tenant private endpoints
+// should be registered on the HTTP listener for this instance.
+func (a *API) PrivateEndpointsEnabled() bool {
+	return a.cfg.EnablePrivateEndpoints
+}
+
+// RegisterRoutes registers the configs API HTTP routes with the provided
+// Router. It is used by API.New to build the standalone *API handler for
+// in-process tests and legacy embedders; the production Cortex binary
+// registers these routes through pkg/api.API.RegisterConfigAPI so that the
+// auth middleware is applied. The admin landing page is included here so
+// the standalone handler (used e.g. by http.Handler consumers in tests)
+// retains its historical GET / behaviour.
+func (a *API) RegisterRoutes(r *mux.Router) {
+	r.Handle("/", http.HandlerFunc(a.admin)).Methods("GET").Name("root")
+	routes := a.TenantRoutes()
+	routes = append(routes, a.PrivateRoutes()...)
+	for _, route := range routes {
+		r.Handle(route.Path, route.Handler).Methods(route.Method).Name(route.Name)
 	}
 }
 

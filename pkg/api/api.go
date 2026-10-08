@@ -18,6 +18,7 @@ import (
 	"github.com/cortexproject/cortex/pkg/alertmanager"
 	"github.com/cortexproject/cortex/pkg/alertmanager/alertmanagerpb"
 	"github.com/cortexproject/cortex/pkg/compactor"
+	configAPI "github.com/cortexproject/cortex/pkg/configs/api"
 	"github.com/cortexproject/cortex/pkg/cortexpb"
 	"github.com/cortexproject/cortex/pkg/distributor"
 	"github.com/cortexproject/cortex/pkg/distributor/distributorpb"
@@ -278,6 +279,29 @@ func (a *API) RegisterIngester(i Ingester, pushConfig distributor.Config) {
 func (a *API) RegisterTenantDeletion(api *purger.TenantDeletionAPI) {
 	a.RegisterRoute("/purger/delete_tenant", http.HandlerFunc(api.DeleteTenant), true, "POST")
 	a.RegisterRoute("/purger/delete_tenant_status", http.HandlerFunc(api.DeleteTenantStatus), true, "GET")
+}
+
+// RegisterConfigAPI registers routes associated with the (deprecated)
+// configs service. Every route — both the per-tenant handlers and the
+// all-tenant "private" configdb-protocol handlers — is attached through
+// RegisterRoute with auth=true so that the configured HTTPAuthMiddleware
+// (tenant extraction / external auth proxy) is applied. Previously
+// pkg/cortex/modules.go registered the configs API directly on the raw
+// server mux, which silently bypassed every middleware in pkg/api. The
+// all-tenant /private endpoints additionally honour
+// -configs.api.enable-private-endpoints so operators can keep them off a
+// tenant-facing listener entirely.
+func (a *API) RegisterConfigAPI(c *configAPI.API) {
+	for _, route := range c.TenantRoutes() {
+		a.RegisterRoute(route.Path, route.Handler, true, route.Method)
+	}
+	if c.PrivateEndpointsEnabled() {
+		for _, route := range c.PrivateRoutes() {
+			a.RegisterRoute(route.Path, route.Handler, true, route.Method)
+		}
+	} else {
+		level.Info(a.logger).Log("msg", "configs: private configdb-protocol endpoints are disabled (-configs.api.enable-private-endpoints=false); ruler/alertmanager configdb clients pointing at this instance will fail")
+	}
 }
 
 // RegisterRuler registers routes associated with the Ruler service.
