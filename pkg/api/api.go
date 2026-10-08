@@ -5,7 +5,10 @@ import (
 	"flag"
 	"net/http"
 	"path"
+	"strconv"
 	"strings"
+	"sync/atomic"
+	"time"
 
 	"github.com/NYTimes/gziphandler"
 	"github.com/felixge/fgprof"
@@ -219,7 +222,45 @@ func (a *API) RegisterAPI(httpPathPrefix string, actualCfg interface{}, defaultC
 
 	a.RegisterRoute("/config", a.cfg.configHandler(actualCfg, defaultCfg), false, "GET")
 	a.RegisterRoute("/", indexHandler(httpPathPrefix, a.indexPage), false, "GET")
-	a.RegisterRoute("/debug/fgprof", fgprof.Handler(), false, "GET")
+	a.RegisterRoute("/debug/fgprof", boundedFgprof(fgprof.Handler(), fgprofMaxDuration), false, "GET")
+}
+
+// fgprofMaxDuration is the maximum duration we allow a single fgprof profile
+// to run for. Callers can request shorter durations but any value above this
+// cap is silently clamped before the vendored handler sees it. This prevents
+// an unauthenticated caller from pinning a profiling goroutine (which samples
+// runtime.GoroutineProfile() at 99 Hz) for an arbitrary amount of time.
+const fgprofMaxDuration = 60 * time.Second
+
+// boundedFgprof wraps the fgprof handler so that:
+//   - at most one profile is collected at a time (concurrent callers get 429);
+//   - the attacker-controlled `seconds` query parameter is clamped to max.
+//
+// Note: the underlying route is still intentionally exposed without Cortex
+// authentication (Cortex relies on an operator-provided auth proxy, see
+// docs/guides/authentication-and-authorisation.md). Clamping + single-flight
+// here hardens the surface against accidental or malicious resource
+// exhaustion that was previously trivial because fgprof.Handler accepts any
+// positive `seconds` value and spawns an unlimited number of concurrent
+// stop-the-world sampling goroutines.
+func boundedFgprof(next http.Handler, max time.Duration) http.Handler {
+	var inFlight int32
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if !atomic.CompareAndSwapInt32(&inFlight, 0, 1) {
+			http.Error(w, "profiling already in progress", http.StatusTooManyRequests)
+			return
+		}
+		defer atomic.StoreInt32(&inFlight, 0)
+
+		q := r.URL.Query()
+		if raw := q.Get("seconds"); raw != "" {
+			if s, err := strconv.Atoi(raw); err == nil && time.Duration(s)*time.Second > max {
+				q.Set("seconds", strconv.Itoa(int(max.Seconds())))
+				r.URL.RawQuery = q.Encode()
+			}
+		}
+		next.ServeHTTP(w, r)
+	})
 }
 
 // RegisterRuntimeConfig registers the endpoints associates with the runtime configuration
