@@ -82,7 +82,11 @@ api:
   # CLI flag: -http.prometheus-http-prefix
   [prometheus_http_prefix: <string> | default = "/prometheus"]
 
-  # Which HTTP Request headers to add to logs
+  # Which HTTP Request headers to add to logs. Must not be used for
+  # credential-bearing headers (e.g. Authorization, Proxy-Authorization,
+  # Cookie, Set-Cookie, X-Api-Key, X-Auth-Token, X-Amz-Security-Token); such
+  # entries are dropped with a warning at startup, and captured values are
+  # truncated to 256 bytes.
   # CLI flag: -api.http-request-headers-to-log
   [http_request_headers_to_log: <list of string> | default = []]
 

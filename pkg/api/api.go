@@ -70,7 +70,7 @@ type Config struct {
 // RegisterFlags adds the flags required to config this to the given FlagSet.
 func (cfg *Config) RegisterFlags(f *flag.FlagSet) {
 	f.BoolVar(&cfg.ResponseCompression, "api.response-compression-enabled", false, "Use GZIP compression for API responses. Some endpoints serve large YAML or JSON blobs which can benefit from compression.")
-	f.Var(&cfg.HTTPRequestHeadersToLog, "api.http-request-headers-to-log", "Which HTTP Request headers to add to logs")
+	f.Var(&cfg.HTTPRequestHeadersToLog, "api.http-request-headers-to-log", "Which HTTP Request headers to add to logs. Must not be used for credential-bearing headers (e.g. Authorization, Proxy-Authorization, Cookie, Set-Cookie, X-Api-Key, X-Auth-Token, X-Amz-Security-Token); such entries are dropped with a warning at startup, and captured values are truncated to 256 bytes.")
 	cfg.RegisterFlagsWithPrefix("", f)
 }
 
@@ -127,7 +127,25 @@ func New(cfg Config, serverCfg server.Config, s *server.Server, logger log.Logge
 		api.AuthMiddleware = middleware.AuthenticateUser
 	}
 	if len(cfg.HTTPRequestHeadersToLog) > 0 {
-		api.HTTPHeaderMiddleware = &HTTPHeaderMiddleware{TargetHeaders: cfg.HTTPRequestHeadersToLog}
+		// Filter out well-known credential-bearing headers. Logging these would
+		// persist end-user credentials in plaintext logs and propagate them to
+		// other components, so the names are dropped here with a loud warning.
+		// Operators should not configure these; see docs for
+		// `-api.http-request-headers-to-log`.
+		filtered := make([]string, 0, len(cfg.HTTPRequestHeadersToLog))
+		for _, h := range cfg.HTTPRequestHeadersToLog {
+			if IsSensitiveHeader(h) {
+				level.Warn(logger).Log(
+					"msg", "ignoring credential-bearing header name in -api.http-request-headers-to-log; such headers must never be logged",
+					"header", h,
+				)
+				continue
+			}
+			filtered = append(filtered, h)
+		}
+		if len(filtered) > 0 {
+			api.HTTPHeaderMiddleware = &HTTPHeaderMiddleware{TargetHeaders: filtered}
+		}
 	}
 
 	return api, nil
