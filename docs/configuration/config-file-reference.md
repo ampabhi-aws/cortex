@@ -2999,6 +2999,12 @@ database:
   # CLI flag: -configs.database.password-file
   [password_file: <string> | default = ""]
 
+  # If true, wrap the configs database in a tracing decorator that emits a
+  # redacted debug log line per call. Disabled by default to avoid high-volume
+  # debug logging in production.
+  # CLI flag: -configs.database.trace
+  [trace: <boolean> | default = false]
+
 api:
   notifications:
     # Disable Email notifications for Alertmanager.

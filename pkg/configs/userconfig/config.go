@@ -106,6 +106,22 @@ type Config struct {
 	AlertmanagerConfig string
 }
 
+// String implements fmt.Stringer. The AlertmanagerConfig and template files
+// hold credential-grade material (Slack tokens, PagerDuty/OpsGenie/VictorOps
+// keys, webhook URLs, smtp_auth_password, …) and rule bodies may carry
+// sensitive query content, so the human-readable form of a Config is
+// deliberately redacted. JSON/YAML marshaling is unchanged.
+func (c Config) String() string {
+	return fmt.Sprintf("userconfig.Config{rules_files:%d, template_files:%d, am_config_bytes:%d}",
+		len(c.RulesConfig.Files), len(c.TemplateFiles), len(c.AlertmanagerConfig))
+}
+
+// GoString implements fmt.GoStringer so %#v cannot print the raw Alertmanager
+// YAML either.
+func (c Config) GoString() string {
+	return c.String()
+}
+
 // configCompat is a compatibility struct to support old JSON config blobs
 // saved in the config DB that didn't have a rule format version yet and
 // just had a top-level field for the rule files.
@@ -184,6 +200,19 @@ type View struct {
 	ID        ID        `json:"id"`
 	Config    Config    `json:"config"`
 	DeletedAt time.Time `json:"deleted_at"`
+}
+
+// String implements fmt.Stringer; see Config.String — the embedded Config
+// carries secret-bearing fields that must not be rendered in log output.
+func (v View) String() string {
+	return fmt.Sprintf("userconfig.View{id:%d, deleted:%t, config:%s}",
+		int(v.ID), !v.DeletedAt.IsZero(), v.Config.String())
+}
+
+// GoString implements fmt.GoStringer so %#v cannot print the raw Alertmanager
+// YAML either.
+func (v View) GoString() string {
+	return v.String()
 }
 
 // IsDeleted tells you if the config is deleted.

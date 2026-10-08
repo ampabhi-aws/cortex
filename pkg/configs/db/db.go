@@ -17,6 +17,12 @@ type Config struct {
 	URI           string `yaml:"uri"`
 	MigrationsDir string `yaml:"migrations_dir"`
 	PasswordFile  string `yaml:"password_file"`
+	// Trace enables the per-call debug logging decorator. Even with tracing
+	// enabled no secret-bearing fields (raw Alertmanager YAML, rule bodies,
+	// notification templates) are included in the log line — only sizes and
+	// identifiers are. The decorator is opt-in because its debug lines are
+	// still high-volume in multi-tenant deployments.
+	Trace bool `yaml:"trace"`
 
 	// Allow injection of mock DBs for unit testing.
 	Mock DB `yaml:"-"`
@@ -27,6 +33,7 @@ func (cfg *Config) RegisterFlags(f *flag.FlagSet) {
 	f.StringVar(&cfg.URI, "configs.database.uri", "postgres://postgres@configs-db.weave.local/configs?sslmode=disable", "URI where the database can be found (for dev you can use memory://)")
 	f.StringVar(&cfg.MigrationsDir, "configs.database.migrations-dir", "", "Path where the database migration files can be found")
 	f.StringVar(&cfg.PasswordFile, "configs.database.password-file", "", "File containing password (username goes in URI)")
+	f.BoolVar(&cfg.Trace, "configs.database.trace", false, "If true, wrap the configs database in a tracing decorator that emits a redacted debug log line per call. Disabled by default to avoid high-volume debug logging in production.")
 }
 
 // DB is the interface for the database.
@@ -92,5 +99,9 @@ func New(cfg Config) (DB, error) {
 	if err != nil {
 		return nil, err
 	}
-	return traced{timed{d}}, nil
+	var wrapped DB = timed{d}
+	if cfg.Trace {
+		wrapped = traced{wrapped}
+	}
+	return wrapped, nil
 }
