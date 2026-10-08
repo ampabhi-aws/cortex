@@ -291,8 +291,12 @@ func (a *API) RegisterRuler(r *ruler.Ruler) {
 	// Legacy Ring Route
 	a.RegisterRoute("/ruler_ring", r, false, "GET", "POST")
 
-	// List all user rule groups
-	a.RegisterRoute("/ruler/rule_groups", http.HandlerFunc(r.ListAllRules), false, "GET")
+	// List rule groups for the caller's tenant. The handler enforces that the request
+	// carries a tenant identity (X-Scope-OrgID) via tenant.TenantID and only returns
+	// rule groups owned by that tenant, preventing cross-tenant disclosure. We also
+	// register the route with auth=true so the HTTP auth middleware runs consistently
+	// with the other tenant-scoped ruler routes.
+	a.RegisterRoute("/ruler/rule_groups", http.HandlerFunc(r.ListAllRules), true, "GET")
 
 	ruler.RegisterRulerServer(a.server.GRPC, r)
 }

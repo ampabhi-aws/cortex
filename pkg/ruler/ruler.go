@@ -863,12 +863,19 @@ func (r *Ruler) DeleteTenantConfiguration(w http.ResponseWriter, req *http.Reque
 func (r *Ruler) ListAllRules(w http.ResponseWriter, req *http.Request) {
 	logger := util_log.WithContext(req.Context(), r.logger)
 
-	userIDs, err := r.store.ListAllUsers(req.Context())
+	// Require a tenant identity on the request. The route is registered with
+	// auth=true, so the HTTP auth middleware extracts X-Scope-OrgID into the
+	// request context; we then scope the listing to that tenant only so this
+	// endpoint cannot be used to enumerate rule groups across tenants.
+	userID, err := tenant.TenantID(req.Context())
 	if err != nil {
-		level.Error(logger).Log("msg", errListAllUser, "err", err)
-		http.Error(w, fmt.Sprintf("%s: %s", errListAllUser, err.Error()), http.StatusInternalServerError)
+		// When Cortex is running, it uses Auth Middleware for checking X-Scope-OrgID and injecting tenant into context.
+		// Auth Middleware sends http.StatusUnauthorized if X-Scope-OrgID is missing, so we do too here, for consistency.
+		http.Error(w, err.Error(), http.StatusUnauthorized)
 		return
 	}
+
+	userIDs := []string{userID}
 
 	done := make(chan struct{})
 	iter := make(chan interface{})
