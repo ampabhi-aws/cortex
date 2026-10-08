@@ -496,6 +496,16 @@ func buildReceiverIntegrations(nc *config.Receiver, tmpl *template.Template, fir
 		add("webhook", i, c, func(l log.Logger) (notify.Notifier, error) { return webhook.New(c, tmpl, l, httpOps...) })
 	}
 	for i, c := range nc.EmailConfigs {
+		// The vendored prometheus/alertmanager email notifier dials smtp_smarthost with a
+		// plain net.Dialer (and tls.Dial for port 465) that does NOT go through the
+		// FirewallDialer. If the operator has enabled the receivers firewall for this
+		// tenant, fail closed: refuse to build the email integration so a tenant-controlled
+		// smarthost cannot bypass -alertmanager.receivers-firewall-block-private-addresses
+		// or -alertmanager.receivers-firewall-block-cidr-networks. See CWE-918.
+		if firewallDialer.Enabled() {
+			errs.Add(errEmailReceiverNotAllowedWithFirewall)
+			continue
+		}
 		add("email", i, c, func(l log.Logger) (notify.Notifier, error) { return email.New(c, tmpl, l), nil })
 	}
 	for i, c := range nc.PagerdutyConfigs {

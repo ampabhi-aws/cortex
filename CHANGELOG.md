@@ -2,6 +2,8 @@
 
 ## master / unreleased
 
+* [BUGFIX] Alertmanager: fail closed when a tenant configures `email_configs` while the receivers firewall (`-alertmanager.receivers-firewall-block-private-addresses` / `-alertmanager.receivers-firewall-block-cidr-networks`) is enabled. The vendored prometheus/alertmanager email notifier dials `smtp_smarthost` with a plain `net.Dialer`/`tls.Dial` that bypasses `FirewallDialer`, which previously allowed a tenant with Alertmanager API access to open arbitrary TCP connections (loopback, RFC1918, link-local, operator-blocked CIDRs) and conduct an attacker-shaped SMTP conversation with them (CWE-918).
+
   **This release removes support for chunks storage. See below for more.**
 * [CHANGE] Remove support for chunks storage entirely. If you are using chunks storage on a previous version, you must [migrate your data](https://github.com/cortexproject/cortex/blob/v1.11.1/docs/blocks-storage/migrate-from-chunks-to-blocks.md) on version 1.12 or earlier. Before upgrading to this release, you should also remove any deprecated chunks-related configuration, as this release will no longer accept that. The following flags are gone:
   - `-dynamodb.*`

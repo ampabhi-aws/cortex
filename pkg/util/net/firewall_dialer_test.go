@@ -146,3 +146,29 @@ func (p firewallCfgProvider) BlockCIDRNetworks() []flagext.CIDR {
 func (p firewallCfgProvider) BlockPrivateAddresses() bool {
 	return p.blockPrivateAddresses
 }
+
+func TestFirewallDialer_Enabled(t *testing.T) {
+	blockedCIDR := flagext.CIDR{}
+	require.NoError(t, blockedCIDR.Set("10.0.0.0/8"))
+
+	tests := map[string]struct {
+		cfg      FirewallDialerConfigProvider
+		expected bool
+	}{
+		"no blocks":          {firewallCfgProvider{}, false},
+		"block private only": {firewallCfgProvider{blockPrivateAddresses: true}, true},
+		"block cidrs only":   {firewallCfgProvider{blockCIDRNetworks: []flagext.CIDR{blockedCIDR}}, true},
+		"block both":         {firewallCfgProvider{blockPrivateAddresses: true, blockCIDRNetworks: []flagext.CIDR{blockedCIDR}}, true},
+	}
+
+	for name, tc := range tests {
+		t.Run(name, func(t *testing.T) {
+			d := NewFirewallDialer(tc.cfg)
+			assert.Equal(t, tc.expected, d.Enabled())
+		})
+	}
+
+	// Nil-safe.
+	var nilDialer *FirewallDialer
+	assert.False(t, nilDialer.Enabled())
+}

@@ -34,6 +34,16 @@ func (d *FirewallDialer) DialContext(ctx context.Context, network, address strin
 	return d.parent.DialContext(ctx, network, address)
 }
 
+// Enabled reports whether this firewall dialer is configured to block any traffic
+// (either private addresses or CIDR networks). Callers can use this to fail-closed
+// for non-HTTP integrations that cannot be routed through DialContext.
+func (d *FirewallDialer) Enabled() bool {
+	if d == nil || d.cfgProvider == nil {
+		return false
+	}
+	return d.cfgProvider.BlockPrivateAddresses() || len(d.cfgProvider.BlockCIDRNetworks()) > 0
+}
+
 func (d *FirewallDialer) control(_, address string, _ syscall.RawConn) error {
 	blockPrivateAddresses := d.cfgProvider.BlockPrivateAddresses()
 	blockCIDRNetworks := d.cfgProvider.BlockCIDRNetworks()

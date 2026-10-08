@@ -40,11 +40,12 @@ const (
 )
 
 var (
-	errPasswordFileNotAllowed        = errors.New("setting password_file, bearer_token_file and credentials_file is not allowed")
-	errOAuth2SecretFileNotAllowed    = errors.New("setting OAuth2 client_secret_file is not allowed")
-	errTLSFileNotAllowed             = errors.New("setting TLS ca_file, cert_file and key_file is not allowed")
-	errSlackAPIURLFileNotAllowed     = errors.New("setting Slack api_url_file and global slack_api_url_file is not allowed")
-	errVictorOpsAPIKeyFileNotAllowed = errors.New("setting VictorOps api_key_file is not allowed")
+	errPasswordFileNotAllowed              = errors.New("setting password_file, bearer_token_file and credentials_file is not allowed")
+	errOAuth2SecretFileNotAllowed          = errors.New("setting OAuth2 client_secret_file is not allowed")
+	errTLSFileNotAllowed                   = errors.New("setting TLS ca_file, cert_file and key_file is not allowed")
+	errSlackAPIURLFileNotAllowed           = errors.New("setting Slack api_url_file and global slack_api_url_file is not allowed")
+	errVictorOpsAPIKeyFileNotAllowed       = errors.New("setting VictorOps api_key_file is not allowed")
+	errEmailReceiverNotAllowedWithFirewall = errors.New("email receiver is not allowed when the receivers firewall (-alertmanager.receivers-firewall-block-private-addresses or -alertmanager.receivers-firewall-block-cidr-networks) is configured for the tenant: the vendored email notifier dials smtp_smarthost with a plain dialer that bypasses the firewall")
 )
 
 // UserConfig is used to communicate a users alertmanager configs
@@ -186,7 +187,7 @@ func validateUserConfig(logger log.Logger, cfg alertspb.AlertConfigDesc, limits 
 	}
 
 	// Validate the config recursively scanning it.
-	if err := validateAlertmanagerConfig(amCfg); err != nil {
+	if err := validateAlertmanagerConfig(amCfg, limits, user); err != nil {
 		return err
 	}
 
@@ -307,7 +308,7 @@ func (am *MultitenantAlertmanager) ListAllConfigs(w http.ResponseWriter, r *http
 // validateAlertmanagerConfig recursively scans the input config looking for data types for which
 // we have a specific validation and, whenever encountered, it runs their validation. Returns the
 // first error or nil if validation succeeds.
-func validateAlertmanagerConfig(cfg interface{}) error {
+func validateAlertmanagerConfig(cfg interface{}, limits Limits, user string) error {
 	v := reflect.ValueOf(cfg)
 	t := v.Type()
 
@@ -350,6 +351,19 @@ func validateAlertmanagerConfig(cfg interface{}) error {
 		if err := validateVictorOpsConfig(v.Interface().(config.VictorOpsConfig)); err != nil {
 			return err
 		}
+
+	case reflect.TypeOf(config.EmailConfig{}):
+		// Fail closed: the vendored prometheus/alertmanager email notifier dials
+		// smtp_smarthost with a plain net.Dialer{} (and tls.Dial for port 465) that
+		// does not go through FirewallDialer. If the operator has configured the
+		// receivers firewall for this tenant, reject email receivers entirely so
+		// tenant-controlled smarthosts cannot bypass -alertmanager.receivers-firewall-*.
+		if limits != nil {
+			if limits.AlertmanagerReceiversBlockPrivateAddresses(user) ||
+				len(limits.AlertmanagerReceiversBlockCIDRNetworks(user)) > 0 {
+				return errEmailReceiverNotAllowedWithFirewall
+			}
+		}
 	}
 
 	// If the input config is a struct, recursively iterate on all fields.
@@ -360,7 +374,7 @@ func validateAlertmanagerConfig(cfg interface{}) error {
 
 			// Skip any field value which can't be converted to interface (eg. primitive types).
 			if fieldValue.CanInterface() {
-				if err := validateAlertmanagerConfig(fieldValue.Interface()); err != nil {
+				if err := validateAlertmanagerConfig(fieldValue.Interface(), limits, user); err != nil {
 					return err
 				}
 			}
@@ -373,7 +387,7 @@ func validateAlertmanagerConfig(cfg interface{}) error {
 
 			// Skip any field value which can't be converted to interface (eg. primitive types).
 			if fieldValue.CanInterface() {
-				if err := validateAlertmanagerConfig(fieldValue.Interface()); err != nil {
+				if err := validateAlertmanagerConfig(fieldValue.Interface(), limits, user); err != nil {
 					return err
 				}
 			}
@@ -386,7 +400,7 @@ func validateAlertmanagerConfig(cfg interface{}) error {
 
 			// Skip any field value which can't be converted to interface (eg. primitive types).
 			if fieldValue.CanInterface() {
-				if err := validateAlertmanagerConfig(fieldValue.Interface()); err != nil {
+				if err := validateAlertmanagerConfig(fieldValue.Interface(), limits, user); err != nil {
 					return err
 				}
 			}
