@@ -68,6 +68,16 @@ func (api *TenantDeletionAPI) DeleteTenant(w http.ResponseWriter, r *http.Reques
 type DeleteTenantStatusResponse struct {
 	TenantID      string `json:"tenant_id"`
 	BlocksDeleted bool   `json:"blocks_deleted"`
+	// DeletionMarkPresent reports whether the tenant deletion mark object still
+	// exists in object storage. Deletion is only truly complete once the mark has
+	// been removed by the compactor's blocks cleaner; while the mark is present
+	// the tenant ID MUST NOT be re-used, otherwise newly ingested data will be
+	// destroyed on the next cleanup cycle.
+	DeletionMarkPresent bool `json:"deletion_mark_present"`
+	// TenantReusable is true only when both the blocks have been deleted and the
+	// tenant deletion mark has been removed. Callers automating tenant
+	// re-provisioning should gate on this field rather than BlocksDeleted.
+	TenantReusable bool `json:"tenant_reusable"`
 }
 
 func (api *TenantDeletionAPI) DeleteTenantStatus(w http.ResponseWriter, r *http.Request) {
@@ -85,6 +95,16 @@ func (api *TenantDeletionAPI) DeleteTenantStatus(w http.ResponseWriter, r *http.
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
 	}
+
+	// Deletion is only complete once the mark itself has been cleaned up; until
+	// then the tenant ID MUST NOT be re-used.
+	mark, err := cortex_tsdb.ReadTenantDeletionMark(ctx, api.bucketClient, userID)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	result.DeletionMarkPresent = mark != nil
+	result.TenantReusable = result.BlocksDeleted && !result.DeletionMarkPresent
 
 	util.WriteJSONResponse(w, result)
 }

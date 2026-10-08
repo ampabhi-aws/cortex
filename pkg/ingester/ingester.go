@@ -2123,10 +2123,12 @@ func (i *Ingester) shipBlocks(ctx context.Context, allowed *util.AllowedTenants)
 			return nil
 		}
 
-		if userDB.deletionMarkFound.Load() {
-			return nil
-		}
-
+		// Re-check the tenant deletion mark periodically so that the latch is
+		// recoverable. The previous implementation only ever flipped
+		// deletionMarkFound from false->true and never back, which permanently
+		// prevented the ingester from shipping new blocks even after the mark
+		// was removed from object storage (e.g. after the compactor's terminal
+		// tenant cleanup). We now refresh the cached value both ways.
 		if time.Since(time.Unix(userDB.lastDeletionMarkCheck.Load(), 0)) > cortex_tsdb.DeletionMarkCheckInterval {
 			// Even if check fails with error, we don't want to repeat it too often.
 			userDB.lastDeletionMarkCheck.Store(time.Now().Unix())
@@ -2136,12 +2138,19 @@ func (i *Ingester) shipBlocks(ctx context.Context, allowed *util.AllowedTenants)
 				// If we cannot check for deletion mark, we continue anyway, even though in production shipper will likely fail too.
 				// This however simplifies unit tests, where tenant deletion check is enabled by default, but tests don't setup bucket.
 				level.Warn(logutil.WithContext(ctx, i.logger)).Log("msg", "failed to check for tenant deletion mark before shipping blocks", "user", userID, "err", err)
-			} else if deletionMarkExists {
-				userDB.deletionMarkFound.Store(true)
-
-				level.Info(logutil.WithContext(ctx, i.logger)).Log("msg", "tenant deletion mark exists, not shipping blocks", "user", userID)
-				return nil
+			} else {
+				wasFound := userDB.deletionMarkFound.Load()
+				userDB.deletionMarkFound.Store(deletionMarkExists)
+				if deletionMarkExists && !wasFound {
+					level.Info(logutil.WithContext(ctx, i.logger)).Log("msg", "tenant deletion mark exists, not shipping blocks", "user", userID)
+				} else if !deletionMarkExists && wasFound {
+					level.Info(logutil.WithContext(ctx, i.logger)).Log("msg", "tenant deletion mark no longer present, resuming block shipping", "user", userID)
+				}
 			}
+		}
+
+		if userDB.deletionMarkFound.Load() {
+			return nil
 		}
 
 		// Run the shipper's Sync() to upload unshipped blocks. Make sure the TSDB state is active, in order to
