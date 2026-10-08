@@ -680,7 +680,7 @@ func (rt *oauth2RoundTripper) RoundTrip(req *http.Request) (*http.Response, erro
 		}
 
 		tlsTransport := func(tlsConfig *tls.Config) (http.RoundTripper, error) {
-			return &http.Transport{
+			t := &http.Transport{
 				TLSClientConfig:       tlsConfig,
 				Proxy:                 http.ProxyURL(rt.config.ProxyURL.URL),
 				DisableKeepAlives:     !rt.opts.keepAlivesEnabled,
@@ -689,7 +689,17 @@ func (rt *oauth2RoundTripper) RoundTrip(req *http.Request) (*http.Response, erro
 				IdleConnTimeout:       10 * time.Second,
 				TLSHandshakeTimeout:   10 * time.Second,
 				ExpectContinueTimeout: 1 * time.Second,
-			}, nil
+			}
+			// SECURITY: honour the dial hook that callers inject via
+			// WithDialContextFunc (e.g. Cortex's receiver firewall). Without this
+			// the OAuth2 token client would use Go's default dialer and bypass
+			// any egress controls applied to the main HTTP transport.
+			if rt.opts != nil && rt.opts.dialContextFunc != nil {
+				t.DialContext = func(ctx context.Context, network, addr string) (net.Conn, error) {
+					return rt.opts.dialContextFunc(ctx, network, addr)
+				}
+			}
+			return t, nil
 		}
 
 		var t http.RoundTripper
@@ -706,7 +716,16 @@ func (rt *oauth2RoundTripper) RoundTrip(req *http.Request) (*http.Response, erro
 			t = NewUserAgentRoundTripper(ua, t)
 		}
 
-		client := &http.Client{Transport: t}
+		client := &http.Client{
+			Transport: t,
+			// SECURITY: refuse redirects on the OAuth2 token endpoint. Following
+			// redirects would allow a tenant-controlled token_url to redirect the
+			// request to an address not subject to the dial-hook check (e.g. after
+			// a DNS or redirect rebinding), re-opening the SSRF primitive.
+			CheckRedirect: func(req *http.Request, via []*http.Request) error {
+				return http.ErrUseLastResponse
+			},
+		}
 		ctx := context.WithValue(context.Background(), oauth2.HTTPClient, client)
 		tokenSource := config.TokenSource(ctx)
 
