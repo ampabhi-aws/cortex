@@ -10,6 +10,8 @@ import (
 	"io"
 	"mime"
 	"net/http"
+	"path/filepath"
+	"reflect"
 	"strconv"
 	"strings"
 
@@ -30,6 +32,13 @@ import (
 var (
 	ErrEmailNotificationsAreDisabled   = errors.New("email notifications are disabled")
 	ErrWebhookNotificationsAreDisabled = errors.New("webhook notifications are disabled")
+	// ErrFileReferenceNotAllowed is returned when the submitted Alertmanager
+	// config contains a non-empty *_file setting (password_file, bearer_token_file,
+	// credentials_file, TLS ca_file/cert_file/key_file, slack api_url_file,
+	// opsgenie api_key_file, victorops api_key_file, oauth2 client_secret_file,
+	// ...). Allowing these would let a tenant read arbitrary files from the
+	// Alertmanager process at notification time (CVE-2021-31232).
+	ErrFileReferenceNotAllowed = errors.New("setting *_file fields in the Alertmanager configuration is not allowed")
 )
 
 // Config configures Configs API
@@ -239,6 +248,73 @@ func validateAlertmanagerConfig(cfg string, noCfg NotificationsConfig) error {
 		}
 	}
 
+	// Reject any non-empty *_file setting anywhere in the Alertmanager config.
+	// This mirrors the deny-list enforced by pkg/alertmanager/api.go on the
+	// /api/v1/alerts write path and prevents CVE-2021-31232 style file
+	// disclosures through tenants that go through the legacy configs service
+	// combined with -alertmanager-storage.backend=configdb.
+	if err := rejectFileReferences(amCfg); err != nil {
+		return err
+	}
+
+	return nil
+}
+
+// rejectFileReferences walks the Alertmanager configuration structure and
+// returns an error if any non-empty string field tagged with a YAML name
+// ending in "_file" is set. The reflection-based rule is intentionally more
+// permissive than a hand-rolled type deny-list: any future upstream notifier
+// option whose YAML tag ends in _file is blocked by default.
+func rejectFileReferences(cfg interface{}) error {
+	return walkRejectFileReferences(reflect.ValueOf(cfg))
+}
+
+func walkRejectFileReferences(v reflect.Value) error {
+	if !v.IsValid() {
+		return nil
+	}
+
+	switch v.Kind() {
+	case reflect.Ptr, reflect.Interface:
+		if v.IsNil() {
+			return nil
+		}
+		return walkRejectFileReferences(v.Elem())
+	case reflect.Struct:
+		t := v.Type()
+		for i := 0; i < t.NumField(); i++ {
+			field := t.Field(i)
+			fv := v.FieldByIndex(field.Index)
+			if !fv.CanInterface() {
+				continue
+			}
+
+			yamlTag := strings.Split(field.Tag.Get("yaml"), ",")[0]
+			if yamlTag != "" && yamlTag != "-" && strings.HasSuffix(yamlTag, "_file") {
+				// A _file field is denied only when it's a non-empty scalar.
+				if fv.Kind() == reflect.String && fv.Len() > 0 {
+					return fmt.Errorf("%w: field %q is not allowed", ErrFileReferenceNotAllowed, yamlTag)
+				}
+			}
+
+			if err := walkRejectFileReferences(fv); err != nil {
+				return err
+			}
+		}
+	case reflect.Slice, reflect.Array:
+		for i := 0; i < v.Len(); i++ {
+			if err := walkRejectFileReferences(v.Index(i)); err != nil {
+				return err
+			}
+		}
+	case reflect.Map:
+		iter := v.MapRange()
+		for iter.Next() {
+			if err := walkRejectFileReferences(iter.Value()); err != nil {
+				return err
+			}
+		}
+	}
 	return nil
 }
 
@@ -249,11 +325,32 @@ func validateRulesFiles(c userconfig.Config) error {
 
 func validateTemplateFiles(c userconfig.Config) error {
 	for fn, content := range c.TemplateFiles {
+		if err := validateTemplateFilename(fn); err != nil {
+			return err
+		}
 		if _, err := template.New(fn).Funcs(template.FuncMap(amtemplate.DefaultFuncs)).Parse(content); err != nil {
 			return err
 		}
 	}
 
+	return nil
+}
+
+// validateTemplateFilename rejects template file names that are not plain
+// basenames (i.e. that contain any path separator or relative-path element).
+// This mirrors pkg/alertmanager.validateTemplateFilename and prevents a tenant
+// from persisting template names such as "../templates-x/evil.tpl" that would
+// otherwise be written outside the per-tenant templates directory.
+func validateTemplateFilename(filename string) error {
+	if filename == "" {
+		return fmt.Errorf("invalid template name: template name cannot be empty")
+	}
+	if filepath.Base(filename) != filename {
+		return fmt.Errorf("invalid template name %q: the template name cannot contain any path", filename)
+	}
+	if filepath.Dir(filepath.Clean(filename)) != "." {
+		return fmt.Errorf("invalid template name %q: the template name cannot contain any path", filename)
+	}
 	return nil
 }
 

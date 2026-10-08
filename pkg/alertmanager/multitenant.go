@@ -814,6 +814,31 @@ func (am *MultitenantAlertmanager) setConfig(cfg alertspb.AlertConfigDesc) error
 	var userTemplateDir = filepath.Join(am.getTenantDirectory(cfg.User), templatesDir)
 	var pathsToRemove = make(map[string]struct{})
 
+	// Re-validate the config read from the alert store before applying it. This is
+	// required because tenant configs may reach this code path through alternative
+	// write paths (e.g. the legacy configs service with -alertmanager-storage.backend=configdb)
+	// that do not apply the full validateUserConfig deny-list, which would otherwise
+	// let a tenant persist settings such as basic_auth.password_file / bearer_token_file /
+	// TLS *_file / slack api_url_file / opsgenie api_key_file pointing at arbitrary host
+	// files and exfiltrate their contents to a tenant-controlled receiver
+	// (CVE-2021-31232). Validate the raw config and every template filename at the
+	// point of use so the full deny-list is always applied.
+	//
+	// In production am.limits is always non-nil (set by NewMultitenantAlertmanager);
+	// a nil guard is kept only for tests that construct the multitenant alertmanager
+	// directly without a limits implementation. The template filename check is cheap
+	// and always runs.
+	if cfg.RawConfig != "" && am.limits != nil {
+		if err := validateUserConfig(am.logger, cfg, am.limits, cfg.User); err != nil {
+			return fmt.Errorf("invalid Alertmanager configuration for %v: %w", cfg.User, err)
+		}
+	}
+	for _, tmpl := range cfg.Templates {
+		if err := validateTemplateFilename(tmpl.Filename); err != nil {
+			return fmt.Errorf("invalid Alertmanager template for %v: %w", cfg.User, err)
+		}
+	}
+
 	// List existing files to keep track the ones to be removed
 	if oldTemplateFiles, err := os.ReadDir(userTemplateDir); err == nil {
 		for _, file := range oldTemplateFiles {
@@ -1325,8 +1350,10 @@ func safeTemplateFilepath(dir, templateName string) (string, error) {
 
 	// Ensure the actual path of the template is within the expected directory.
 	// This check is a counter-measure to make sure the tenant is not trying to
-	// escape its own directory on disk.
-	if !strings.HasPrefix(actualPath, containerDir) {
+	// escape its own directory on disk. The separator-aware check ensures that
+	// sibling directories with a shared prefix (e.g. "/data/tenant/templates"
+	// vs "/data/tenant/templates-x") are not accepted.
+	if actualPath != containerDir && !strings.HasPrefix(actualPath, containerDir+string(os.PathSeparator)) {
 		return "", fmt.Errorf("invalid template name %q: the template filepath is escaping the per-tenant local directory", templateName)
 	}
 
