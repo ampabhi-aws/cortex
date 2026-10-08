@@ -447,14 +447,29 @@ func (a *API) CreateRuleGroup(w http.ResponseWriter, req *http.Request) {
 		return
 	}
 
-	payload, err := io.ReadAll(req.Body)
+	// Cap the request body before buffering it to protect the ruler process from
+	// memory-exhaustion attacks via oversized tenant-controlled payloads. The
+	// per-tenant limit mirrors the Alertmanager configuration API.
+	maxSize := a.ruler.limits.RulerMaxRuleGroupSizeBytes(userID)
+	var body io.Reader = req.Body
+	if maxSize > 0 {
+		body = http.MaxBytesReader(w, req.Body, int64(maxSize))
+	}
+
+	payload, err := io.ReadAll(body)
 	if err != nil {
-		level.Error(logger).Log("msg", "unable to read rule group payload", "err", err.Error())
+		level.Error(logger).Log("msg", "unable to read rule group payload", "err", err.Error(), "user", userID, "maxSize", maxSize)
+		// http.MaxBytesReader does not expose a typed error; it reports via the
+		// generic error string. In either case the safe response is 413.
+		if maxSize > 0 && strings.Contains(err.Error(), "request body too large") {
+			http.Error(w, "rule group too large", http.StatusRequestEntityTooLarge)
+			return
+		}
 		http.Error(w, err.Error(), http.StatusBadRequest)
 		return
 	}
 
-	level.Debug(logger).Log("msg", "attempting to unmarshal rulegroup", "userID", userID, "group", string(payload))
+	level.Debug(logger).Log("msg", "attempting to unmarshal rulegroup", "userID", userID, "bytes", len(payload))
 
 	rg := rulefmt.RuleGroup{}
 	err = yaml.Unmarshal(payload, &rg)
@@ -489,7 +504,15 @@ func (a *API) CreateRuleGroup(w http.ResponseWriter, req *http.Request) {
 		return
 	}
 
-	if err := a.ruler.AssertMaxRuleGroups(userID, len(rgs)+1); err != nil {
+	// If this request overwrites an existing rule group it must not consume an
+	// additional slot of the per-tenant quota; otherwise a tenant exactly at its
+	// limit could never update an existing rule group.
+	count := len(rgs)
+	if !containsRuleGroup(rgs, namespace, rg.Name) {
+		count++
+	}
+
+	if err := a.ruler.AssertMaxRuleGroups(userID, count); err != nil {
 		level.Error(logger).Log("msg", "limit validation failure", "err", err.Error(), "user", userID)
 		http.Error(w, err.Error(), http.StatusBadRequest)
 		return
@@ -550,4 +573,20 @@ func (a *API) DeleteRuleGroup(w http.ResponseWriter, req *http.Request) {
 	}
 
 	respondAccepted(w, logger)
+}
+
+// containsRuleGroup reports whether the given rule group list already contains
+// a rule group with the specified namespace and name. It is used by the
+// CreateRuleGroup handler to avoid charging the per-tenant group-count quota
+// for an in-place overwrite of an existing rule group.
+func containsRuleGroup(groups rulespb.RuleGroupList, namespace, name string) bool {
+	for _, g := range groups {
+		if g == nil {
+			continue
+		}
+		if g.Namespace == namespace && g.Name == name {
+			return true
+		}
+	}
+	return false
 }
