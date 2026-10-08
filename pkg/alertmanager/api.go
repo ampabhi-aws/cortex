@@ -304,6 +304,18 @@ func (am *MultitenantAlertmanager) ListAllConfigs(w http.ResponseWriter, r *http
 	<-done
 }
 
+// ValidateAlertmanagerConfig is the exported entry point for the *_file / TLS-file
+// blocklist that pkg/alertmanager enforces on tenant-supplied configurations. It
+// MUST be called by every ingestion path that turns a tenant-supplied
+// Alertmanager YAML into a live notifier (including the legacy configs service),
+// otherwise a tenant can regain the local-file-read primitive described in
+// CVE write-ups for `password_file`, `bearer_token_file`, `credentials_file`,
+// TLS `ca_file`/`cert_file`/`key_file`, Slack `api_url_file` and VictorOps
+// `api_key_file`.
+func ValidateAlertmanagerConfig(cfg interface{}) error {
+	return validateAlertmanagerConfig(cfg)
+}
+
 // validateAlertmanagerConfig recursively scans the input config looking for data types for which
 // we have a specific validation and, whenever encountered, it runs their validation. Returns the
 // first error or nil if validation succeeds.

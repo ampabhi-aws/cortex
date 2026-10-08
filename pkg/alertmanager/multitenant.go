@@ -882,6 +882,17 @@ func (am *MultitenantAlertmanager) setConfig(cfg alertspb.AlertConfigDesc) error
 		return fmt.Errorf("no usable Alertmanager configuration for %v", cfg.User)
 	}
 
+	// Re-validate the loaded Alertmanager configuration against the Cortex
+	// *_file / TLS-file blocklist regardless of which ingestion path produced
+	// it. Enforcing this at the point where a raw config is compiled into a
+	// running Alertmanager ensures that alternative write paths (e.g. the
+	// legacy configs service feeding the configdb alertstore backend) cannot
+	// bypass the control implemented on the Alertmanager's own write handler.
+	if err := validateAlertmanagerConfig(userAmConfig); err != nil {
+		level.Error(am.logger).Log("msg", "rejecting tenant Alertmanager config", "user", cfg.User, "err", err)
+		return fmt.Errorf("invalid Cortex configuration for %v: %v", cfg.User, err)
+	}
+
 	// Transform webhook configs URLs to the per tenant monitor
 	if am.cfg.AutoWebhookRoot != "" {
 		for i, r := range userAmConfig.Receivers {

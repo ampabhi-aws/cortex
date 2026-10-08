@@ -20,6 +20,7 @@ import (
 	amconfig "github.com/prometheus/alertmanager/config"
 	amtemplate "github.com/prometheus/alertmanager/template"
 
+	"github.com/cortexproject/cortex/pkg/alertmanager"
 	"github.com/cortexproject/cortex/pkg/configs/db"
 	"github.com/cortexproject/cortex/pkg/configs/userconfig"
 	"github.com/cortexproject/cortex/pkg/tenant"
@@ -177,10 +178,12 @@ func (a *API) setConfig(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	if err := validateAlertmanagerConfig(cfg.AlertmanagerConfig, a.cfg.Notifications); err != nil && cfg.AlertmanagerConfig != "" {
-		level.Error(logger).Log("msg", "invalid Alertmanager config", "err", err)
-		http.Error(w, fmt.Sprintf("Invalid Alertmanager config: %v", err), http.StatusBadRequest)
-		return
+	if cfg.AlertmanagerConfig != "" {
+		if err := validateAlertmanagerConfig(cfg.AlertmanagerConfig, a.cfg.Notifications); err != nil {
+			level.Error(logger).Log("msg", "invalid Alertmanager config", "err", err)
+			http.Error(w, fmt.Sprintf("Invalid Alertmanager config: %v", err), http.StatusBadRequest)
+			return
+		}
 	}
 	if err := validateRulesFiles(cfg); err != nil {
 		level.Error(logger).Log("msg", "invalid rules", "err", err)
@@ -230,6 +233,32 @@ func validateAlertmanagerConfig(cfg string, noCfg NotificationsConfig) error {
 		return err
 	}
 
+	// Enforce the same *_file / TLS-file blocklist that the Alertmanager's
+	// own write handler applies (pkg/alertmanager.ValidateAlertmanagerConfig).
+	// Without this call a tenant can post a config via POST
+	// /api/prom/configs/alertmanager (or its /validate sibling) that embeds
+	// e.g. http_config.basic_auth.password_file pointing at an arbitrary
+	// local file; when the config is later compiled into a running notifier
+	// prometheus-common would read the file and send its contents to a
+	// tenant-chosen webhook URL.
+	if err := alertmanager.ValidateAlertmanagerConfig(amCfg); err != nil {
+		return err
+	}
+
+	if err := validateNotificationsAllowed(amCfg, noCfg); err != nil {
+		return err
+	}
+
+	return nil
+}
+
+// validateNotificationsAllowed enforces the operator-controlled
+// disable_email / disable_webhook toggles against an already-parsed
+// Alertmanager configuration. This used to be named validateAlertmanagerConfig,
+// which collided with the hardened validator in pkg/alertmanager and caused
+// the *_file blocklist to be forgotten on this ingestion path; it has been
+// renamed so the two validators can no longer be confused.
+func validateNotificationsAllowed(amCfg *amconfig.Config, noCfg NotificationsConfig) error {
 	for _, recv := range amCfg.Receivers {
 		if noCfg.DisableEmail && len(recv.EmailConfigs) > 0 {
 			return ErrEmailNotificationsAreDisabled
