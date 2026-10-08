@@ -83,6 +83,16 @@ func (t *SingleResolver) TenantID(ctx context.Context) (string, error) {
 		return "", err
 	}
 
+	// Enforce the documented tenant ID constraints (charset allow-list and
+	// 150-byte maximum) at the trust boundary. Without this, caller-supplied
+	// X-Scope-OrgID values flow directly into Prometheus metric labels and
+	// active-user map keys, enabling unbounded cardinality and unbounded
+	// per-entry size (up to ~1 MB per label value, Go's default
+	// http.DefaultMaxHeaderBytes).
+	if err := ValidTenantID(id); err != nil {
+		return "", err
+	}
+
 	if containsUnsafePathSegments(id) {
 		return "", errInvalidTenantID
 	}
