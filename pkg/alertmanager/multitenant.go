@@ -20,7 +20,6 @@ import (
 	amconfig "github.com/prometheus/alertmanager/config"
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/promauto"
-	tsdb_errors "github.com/prometheus/prometheus/tsdb/errors"
 	"github.com/weaveworks/common/httpgrpc"
 	"github.com/weaveworks/common/httpgrpc/server"
 	"github.com/weaveworks/common/user"
@@ -513,39 +512,52 @@ func (am *MultitenantAlertmanager) starting(ctx context.Context) (err error) {
 // TODO: Remove in Cortex 1.11.
 func (am *MultitenantAlertmanager) migrateStateFilesToPerTenantDirectories() error {
 	migrate := func(from, to string) error {
+		// Skip the migration when the destination already exists so we never
+		// clobber (or fatally fail on) existing per-tenant state. Previously an
+		// os.Rename over a non-empty destination returned ENOTEMPTY and aborted
+		// the whole alertmanager module (crash loop for every tenant).
+		if _, err := os.Stat(to); err == nil {
+			level.Warn(am.logger).Log("msg", "skipping alertmanager state migration: destination already exists", "from", from, "to", to)
+			return nil
+		} else if !os.IsNotExist(err) {
+			level.Warn(am.logger).Log("msg", "skipping alertmanager state migration: unable to stat destination", "from", from, "to", to, "err", err)
+			return nil
+		}
+
 		level.Info(am.logger).Log("msg", "migrating alertmanager state", "from", from, "to", to)
-		err := os.Rename(from, to)
-		return errors.Wrapf(err, "failed to migrate alertmanager state from %v to %v", from, to)
+		if err := os.Rename(from, to); err != nil {
+			// Log-and-continue instead of returning a fatal error, so a single
+			// malformed/attacker-controlled legacy entry cannot keep the entire
+			// alertmanager module from starting.
+			level.Warn(am.logger).Log("msg", "failed to migrate alertmanager state, continuing", "from", from, "to", to, "err", err)
+		}
+		return nil
 	}
 
 	st, err := am.getObsoleteFilesPerUser()
 	if err != nil {
-		return errors.Wrap(err, "failed to migrate alertmanager state files")
+		level.Warn(am.logger).Log("msg", "failed to migrate alertmanager state files, continuing", "err", err)
+		return nil
 	}
 
 	for userID, files := range st {
 		tenantDir := am.getTenantDirectory(userID)
 		err := os.MkdirAll(tenantDir, 0777)
 		if err != nil {
-			return errors.Wrapf(err, "failed to create per-tenant directory %v", tenantDir)
+			level.Warn(am.logger).Log("msg", "failed to create per-tenant directory, skipping migration for user", "user", userID, "dir", tenantDir, "err", err)
+			continue
 		}
 
-		errs := tsdb_errors.NewMulti()
-
 		if files.notificationLogSnapshot != "" {
-			errs.Add(migrate(files.notificationLogSnapshot, filepath.Join(tenantDir, notificationLogSnapshot)))
+			_ = migrate(files.notificationLogSnapshot, filepath.Join(tenantDir, notificationLogSnapshot))
 		}
 
 		if files.silencesSnapshot != "" {
-			errs.Add(migrate(files.silencesSnapshot, filepath.Join(tenantDir, silencesSnapshot)))
+			_ = migrate(files.silencesSnapshot, filepath.Join(tenantDir, silencesSnapshot))
 		}
 
 		if files.templatesDir != "" {
-			errs.Add(migrate(files.templatesDir, filepath.Join(tenantDir, templatesDir)))
-		}
-
-		if err := errs.Err(); err != nil {
-			return err
+			_ = migrate(files.templatesDir, filepath.Join(tenantDir, templatesDir))
 		}
 	}
 	return nil
@@ -571,6 +583,19 @@ func (am *MultitenantAlertmanager) getObsoleteFilesPerUser() (map[string]obsolet
 		templates             = "templates"
 	)
 
+	// Only treat <data_dir>/templates as the legacy layout when there are
+	// other legacy markers in the data dir (nflog:/silences: files). Otherwise
+	// a tenant whose ID is literally "templates" would see its new-layout
+	// tenant directory misinterpreted as the legacy templates container,
+	// enabling cross-tenant writes via the migration path.
+	hasLegacyMarkers := false
+	for _, f := range files {
+		if !f.IsDir() && (strings.HasPrefix(f.Name(), notificationLogPrefix) || strings.HasPrefix(f.Name(), silencesPrefix)) {
+			hasLegacyMarkers = true
+			break
+		}
+	}
+
 	result := map[string]obsoleteStateFiles{}
 
 	for _, f := range files {
@@ -580,6 +605,11 @@ func (am *MultitenantAlertmanager) getObsoleteFilesPerUser() (map[string]obsolet
 			// Process templates dir.
 			if f.Name() != templates {
 				// Ignore other files -- those are likely per tenant directories.
+				continue
+			}
+
+			if !hasLegacyMarkers {
+				level.Warn(am.logger).Log("msg", "refusing to treat <data_dir>/templates as legacy layout: no other legacy markers found; assuming it is a tenant directory", "path", fullPath)
 				continue
 			}
 
@@ -814,6 +844,23 @@ func (am *MultitenantAlertmanager) setConfig(cfg alertspb.AlertConfigDesc) error
 	var userTemplateDir = filepath.Join(am.getTenantDirectory(cfg.User), templatesDir)
 	var pathsToRemove = make(map[string]struct{})
 
+	// Enforce template count/size limits here as well as in the HTTP handler, so
+	// that configs coming from any alert store (configdb, local, bucket, ...) are
+	// bounded. Without this, a store that bypasses the HTTP validation path can
+	// write unbounded template data to the local disk.
+	if am.limits != nil {
+		if l := am.limits.AlertmanagerMaxTemplatesCount(cfg.User); l > 0 && len(cfg.Templates) > l {
+			return fmt.Errorf(errTooManyTemplates, len(cfg.Templates), l)
+		}
+		if maxSize := am.limits.AlertmanagerMaxTemplateSize(cfg.User); maxSize > 0 {
+			for _, tmpl := range cfg.Templates {
+				if size := len(tmpl.GetBody()); size > maxSize {
+					return fmt.Errorf(errTemplateTooBig, tmpl.GetFilename(), size, maxSize)
+				}
+			}
+		}
+	}
+
 	// List existing files to keep track the ones to be removed
 	if oldTemplateFiles, err := os.ReadDir(userTemplateDir); err == nil {
 		for _, file := range oldTemplateFiles {
@@ -822,6 +869,13 @@ func (am *MultitenantAlertmanager) setConfig(cfg alertspb.AlertConfigDesc) error
 	}
 
 	for _, tmpl := range cfg.Templates {
+		// Validate the template filename at the point of use (not only at HTTP
+		// upload time), so that configs coming from any alert store are confined
+		// to the per-tenant templates directory.
+		if err := validateTemplateFilename(tmpl.Filename); err != nil {
+			return err
+		}
+
 		templateFilePath, err := safeTemplateFilepath(userTemplateDir, tmpl.Filename)
 		if err != nil {
 			return err
@@ -1325,8 +1379,13 @@ func safeTemplateFilepath(dir, templateName string) (string, error) {
 
 	// Ensure the actual path of the template is within the expected directory.
 	// This check is a counter-measure to make sure the tenant is not trying to
-	// escape its own directory on disk.
-	if !strings.HasPrefix(actualPath, containerDir) {
+	// escape its own directory on disk. We cannot use strings.HasPrefix(actualPath,
+	// containerDir) alone because sibling directories (e.g. "<dir>-escape") would
+	// also satisfy that prefix test. Use filepath.Rel to compute the relative path
+	// and ensure it is strictly contained within containerDir (not equal to it,
+	// not escaping via ".." and not absolute).
+	rel, err := filepath.Rel(containerDir, actualPath)
+	if err != nil || rel == "." || rel == ".." || strings.HasPrefix(rel, ".."+string(os.PathSeparator)) || filepath.IsAbs(rel) {
 		return "", fmt.Errorf("invalid template name %q: the template filepath is escaping the per-tenant local directory", templateName)
 	}
 
