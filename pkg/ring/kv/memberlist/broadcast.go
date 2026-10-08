@@ -25,18 +25,19 @@ func (r ringBroadcast) Invalidates(old memberlist.Broadcast) bool {
 		}
 
 		// if 'content' (result of Mergeable.MergeContent) of this broadcast is a superset of content of old value,
-		// and this broadcast has resulted in a newer ring update, we can invalidate the old value
-
+		// and this broadcast has resulted in a newer ring update, we can invalidate the old value.
+		//
+		// We use a set lookup rather than a nested loop so this remains O(len(oldb.content)+len(r.content))
+		// instead of O(len(oldb.content)*len(r.content)). The content slices come from attacker-influenced
+		// gossip input (ring.Desc.MergeContent returns one entry per remote instance name), and the
+		// vendored memberlist TransmitLimitedQueue calls Invalidates on every queued item under its queue
+		// mutex, so a quadratic implementation here is a DoS vector.
+		newSet := make(map[string]struct{}, len(r.content))
+		for _, n := range r.content {
+			newSet[n] = struct{}{}
+		}
 		for _, oldName := range oldb.content {
-			found := false
-			for _, newName := range r.content {
-				if oldName == newName {
-					found = true
-					break
-				}
-			}
-
-			if !found {
+			if _, ok := newSet[oldName]; !ok {
 				return false
 			}
 		}
