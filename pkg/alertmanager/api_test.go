@@ -19,7 +19,6 @@ import (
 	"github.com/stretchr/testify/require"
 	"github.com/thanos-io/objstore"
 	"github.com/weaveworks/common/user"
-	"gopkg.in/yaml.v2"
 
 	"github.com/cortexproject/cortex/pkg/alertmanager/alertspb"
 	"github.com/cortexproject/cortex/pkg/alertmanager/alertstore/bucketclient"
@@ -681,18 +680,49 @@ receivers:
 
 	router := mux.NewRouter()
 	router.Path("/multitenant_alertmanager/configs").Methods(http.MethodGet).HandlerFunc(am.ListAllConfigs)
+
+	// By default, cross-tenant listing is disabled: the endpoint must return 404 and
+	// MUST NOT disclose any tenant configuration. This is the secure-by-default
+	// posture that replaces the previous behaviour of returning every tenant's
+	// raw Alertmanager config (which could embed Slack webhook URLs, SMTP passwords,
+	// PagerDuty routing keys, bearer tokens, etc.) to any caller able to reach the
+	// Cortex HTTP port.
 	req := httptest.NewRequest("GET", "https://localhost:8080/multitenant_alertmanager/configs", nil)
 	w := httptest.NewRecorder()
 	router.ServeHTTP(w, req)
 
 	resp := w.Result()
-	require.Equal(t, http.StatusOK, resp.StatusCode)
-	require.Equal(t, "application/yaml", resp.Header.Get("Content-Type"))
+	require.Equal(t, http.StatusNotFound, resp.StatusCode)
 	body, err := io.ReadAll(resp.Body)
 	require.NoError(t, err)
-	old, err := yaml.Marshal(testCases)
+	for u, cfg := range testCases {
+		require.NotContains(t, string(body), cfg.AlertmanagerConfig, "response must not leak tenant %s config", u)
+	}
+
+	// Opt-in: once the operator enables the admin listing, the endpoint returns 200
+	// but with METADATA ONLY (tenant ID, config hash/size, template counts). It must
+	// never echo the raw YAML or template bodies.
+	am.cfg.EnableAdminListAllConfigs = true
+
+	req = httptest.NewRequest("GET", "https://localhost:8080/multitenant_alertmanager/configs", nil)
+	w = httptest.NewRecorder()
+	router.ServeHTTP(w, req)
+
+	resp = w.Result()
+	require.Equal(t, http.StatusOK, resp.StatusCode)
+	require.Equal(t, "application/yaml", resp.Header.Get("Content-Type"))
+	body, err = io.ReadAll(resp.Body)
 	require.NoError(t, err)
-	require.YAMLEq(t, string(old), string(body))
+	bodyStr := string(body)
+	// Each tenant ID must appear as a key, but none of the raw YAML bodies may leak.
+	for u, cfg := range testCases {
+		require.Contains(t, bodyStr, u)
+		require.NotContains(t, bodyStr, cfg.AlertmanagerConfig, "admin listing must not include raw config for %s", u)
+		require.NotContains(t, bodyStr, "orgId=1")
+		require.NotContains(t, bodyStr, "orgId=2")
+	}
+	require.Contains(t, bodyStr, "config_hash")
+	require.Contains(t, bodyStr, "config_size")
 }
 
 func TestValidateAlertmanagerConfig(t *testing.T) {

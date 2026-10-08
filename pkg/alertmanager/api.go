@@ -2,6 +2,8 @@ package alertmanager
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"fmt"
 	"io"
 	"net/http"
@@ -51,6 +53,46 @@ var (
 type UserConfig struct {
 	TemplateFiles      map[string]string `yaml:"template_files"`
 	AlertmanagerConfig string            `yaml:"alertmanager_config"`
+}
+
+// UserConfigMetadata summarises a tenant's stored Alertmanager configuration for the
+// operator-only /multitenant_alertmanager/configs listing. It intentionally omits the
+// raw config and template bodies so that embedded third-party credentials
+// (Slack webhook URLs, SMTP passwords, PagerDuty routing keys, bearer tokens, etc.)
+// are never exposed on this cluster-wide listing.
+type UserConfigMetadata struct {
+	ConfigHash    string                 `yaml:"config_hash"`
+	ConfigSize    int                    `yaml:"config_size"`
+	TemplateCount int                    `yaml:"template_count"`
+	Templates     []TemplateFileMetadata `yaml:"templates,omitempty"`
+}
+
+// TemplateFileMetadata summarises a single tenant template file by name, size and hash.
+type TemplateFileMetadata struct {
+	Filename string `yaml:"filename"`
+	Size     int    `yaml:"size"`
+	Hash     string `yaml:"hash"`
+}
+
+func hashString(s string) string {
+	sum := sha256.Sum256([]byte(s))
+	return hex.EncodeToString(sum[:])
+}
+
+func buildUserConfigMetadata(cfg alertspb.AlertConfigDesc) *UserConfigMetadata {
+	meta := &UserConfigMetadata{
+		ConfigHash:    hashString(cfg.RawConfig),
+		ConfigSize:    len(cfg.RawConfig),
+		TemplateCount: len(cfg.Templates),
+	}
+	for _, t := range cfg.Templates {
+		meta.Templates = append(meta.Templates, TemplateFileMetadata{
+			Filename: t.Filename,
+			Size:     len(t.Body),
+			Hash:     hashString(t.Body),
+		})
+	}
+	return meta
 }
 
 func (am *MultitenantAlertmanager) GetUserConfig(w http.ResponseWriter, r *http.Request) {
@@ -259,8 +301,30 @@ func validateUserConfig(logger log.Logger, cfg alertspb.AlertConfigDesc, limits 
 	return nil
 }
 
+// ListAllConfigs is an operator-only endpoint that returns a listing of every tenant's
+// Alertmanager configuration metadata (tenant ID, config/template hashes and sizes).
+// It never returns raw configuration or template bodies, which may contain third-party
+// credentials (Slack webhook URLs, SMTP passwords, PagerDuty routing keys, bearer tokens,
+// etc.). The endpoint:
+//
+//   - is registered with auth=true in pkg/api/api.go so Cortex's AuthMiddleware (tenant
+//     header extraction) runs; operators are expected to additionally restrict this path
+//     to administrative callers at the gateway/reverse-proxy layer, and to serve all
+//     /multitenant_alertmanager/* admin routes on an internal listener unreachable by
+//     tenants.
+//   - is disabled by default and must be opted-in via
+//     -alertmanager.enable-admin-list-all-configs (returns 404 Not Found otherwise).
 func (am *MultitenantAlertmanager) ListAllConfigs(w http.ResponseWriter, r *http.Request) {
 	logger := util_log.WithContext(r.Context(), am.logger)
+
+	// Default-off: an administrative, cross-tenant endpoint must be explicitly opted-in
+	// by the operator. When disabled, present as a plain 404 so unauthorised callers
+	// learn nothing about cluster capabilities.
+	if !am.cfg.EnableAdminListAllConfigs {
+		http.Error(w, "not found", http.StatusNotFound)
+		return
+	}
+
 	userIDs, err := am.store.ListAllUsers(r.Context())
 	if err != nil {
 		level.Error(logger).Log("msg", "failed to list users of alertmanager", "err", err)
@@ -283,11 +347,9 @@ func (am *MultitenantAlertmanager) ListAllConfigs(w http.ResponseWriter, r *http
 		} else if err != nil {
 			return errors.Wrapf(err, "failed to fetch alertmanager config for user %s", userID)
 		}
-		data := map[string]*UserConfig{
-			userID: {
-				TemplateFiles:      alertspb.ParseTemplates(cfg),
-				AlertmanagerConfig: cfg.RawConfig,
-			},
+		// Return only metadata; never echo cfg.RawConfig or the template bodies here.
+		data := map[string]*UserConfigMetadata{
+			userID: buildUserConfigMetadata(cfg),
 		}
 
 		select {
