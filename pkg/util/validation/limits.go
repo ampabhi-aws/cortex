@@ -110,6 +110,7 @@ type Limits struct {
 	AlertmanagerMaxConfigSizeBytes             int `yaml:"alertmanager_max_config_size_bytes" json:"alertmanager_max_config_size_bytes"`
 	AlertmanagerMaxTemplatesCount              int `yaml:"alertmanager_max_templates_count" json:"alertmanager_max_templates_count"`
 	AlertmanagerMaxTemplateSizeBytes           int `yaml:"alertmanager_max_template_size_bytes" json:"alertmanager_max_template_size_bytes"`
+	AlertmanagerMaxTemplatesTotalSizeBytes     int `yaml:"alertmanager_max_templates_total_size_bytes" json:"alertmanager_max_templates_total_size_bytes"`
 	AlertmanagerMaxDispatcherAggregationGroups int `yaml:"alertmanager_max_dispatcher_aggregation_groups" json:"alertmanager_max_dispatcher_aggregation_groups"`
 	AlertmanagerMaxAlertsCount                 int `yaml:"alertmanager_max_alerts_count" json:"alertmanager_max_alerts_count"`
 	AlertmanagerMaxAlertsSizeBytes             int `yaml:"alertmanager_max_alerts_size_bytes" json:"alertmanager_max_alerts_size_bytes"`
@@ -182,9 +183,10 @@ func (l *Limits) RegisterFlags(f *flag.FlagSet) {
 		l.NotificationRateLimitPerIntegration = NotificationRateLimitMap{}
 	}
 	f.Var(&l.NotificationRateLimitPerIntegration, "alertmanager.notification-rate-limit-per-integration", "Per-integration notification rate limits. Value is a map, where each key is integration name and value is a rate-limit (float). On command line, this map is given in JSON format. Rate limit has the same meaning as -alertmanager.notification-rate-limit, but only applies for specific integration. Allowed integration names: "+strings.Join(allowedIntegrationNames, ", ")+".")
-	f.IntVar(&l.AlertmanagerMaxConfigSizeBytes, "alertmanager.max-config-size-bytes", 0, "Maximum size of configuration file for Alertmanager that tenant can upload via Alertmanager API. 0 = no limit.")
-	f.IntVar(&l.AlertmanagerMaxTemplatesCount, "alertmanager.max-templates-count", 0, "Maximum number of templates in tenant's Alertmanager configuration uploaded via Alertmanager API. 0 = no limit.")
-	f.IntVar(&l.AlertmanagerMaxTemplateSizeBytes, "alertmanager.max-template-size-bytes", 0, "Maximum size of single template in tenant's Alertmanager configuration uploaded via Alertmanager API. 0 = no limit.")
+	f.IntVar(&l.AlertmanagerMaxConfigSizeBytes, "alertmanager.max-config-size-bytes", 4*1024*1024, "Maximum size of configuration file for Alertmanager that tenant can upload via Alertmanager API. 0 = no limit (but the handler always applies a 4 MiB hard ceiling).")
+	f.IntVar(&l.AlertmanagerMaxTemplatesCount, "alertmanager.max-templates-count", 100, "Maximum number of templates in tenant's Alertmanager configuration uploaded via Alertmanager API. 0 = no limit.")
+	f.IntVar(&l.AlertmanagerMaxTemplateSizeBytes, "alertmanager.max-template-size-bytes", 256*1024, "Maximum size of single template in tenant's Alertmanager configuration uploaded via Alertmanager API. 0 = no limit.")
+	f.IntVar(&l.AlertmanagerMaxTemplatesTotalSizeBytes, "alertmanager.max-templates-total-size-bytes", 4*1024*1024, "Maximum total size in bytes of all templates in tenant's Alertmanager configuration (sum over all templates). Bounds the on-disk footprint of templates on the shared data volume. 0 = no limit.")
 	f.IntVar(&l.AlertmanagerMaxDispatcherAggregationGroups, "alertmanager.max-dispatcher-aggregation-groups", 0, "Maximum number of aggregation groups in Alertmanager's dispatcher that a tenant can have. Each active aggregation group uses single goroutine. When the limit is reached, dispatcher will not dispatch alerts that belong to additional aggregation groups, but existing groups will keep working properly. 0 = no limit.")
 	f.IntVar(&l.AlertmanagerMaxAlertsCount, "alertmanager.max-alerts-count", 0, "Maximum number of alerts that a single user can have. Inserting more alerts will fail with a log message and metric increment. 0 = no limit.")
 	f.IntVar(&l.AlertmanagerMaxAlertsSizeBytes, "alertmanager.max-alerts-size-bytes", 0, "Maximum total size of alerts that a single user can have, alert size is the sum of the bytes of its labels, annotations and generatorURL. Inserting more alerts will fail with a log message and metric increment. 0 = no limit.")
@@ -611,6 +613,10 @@ func (o *Overrides) AlertmanagerMaxTemplatesCount(userID string) int {
 
 func (o *Overrides) AlertmanagerMaxTemplateSize(userID string) int {
 	return o.getOverridesForUser(userID).AlertmanagerMaxTemplateSizeBytes
+}
+
+func (o *Overrides) AlertmanagerMaxTemplatesTotalSize(userID string) int {
+	return o.getOverridesForUser(userID).AlertmanagerMaxTemplatesTotalSizeBytes
 }
 
 func (o *Overrides) AlertmanagerMaxDispatcherAggregationGroups(userID string) int {

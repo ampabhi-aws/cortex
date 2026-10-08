@@ -25,18 +25,25 @@ import (
 )
 
 const (
-	errMarshallingYAML       = "error marshalling YAML Alertmanager config"
-	errValidatingConfig      = "error validating Alertmanager config"
-	errReadingConfiguration  = "unable to read the Alertmanager config"
-	errStoringConfiguration  = "unable to store the Alertmanager config"
-	errDeletingConfiguration = "unable to delete the Alertmanager config"
-	errNoOrgID               = "unable to determine the OrgID"
-	errListAllUser           = "unable to list the Alertmanager users"
-	errConfigurationTooBig   = "Alertmanager configuration is too big, limit: %d bytes"
-	errTooManyTemplates      = "too many templates in the configuration: %d (limit: %d)"
-	errTemplateTooBig        = "template %s is too big: %d bytes (limit: %d bytes)"
+	errMarshallingYAML        = "error marshalling YAML Alertmanager config"
+	errValidatingConfig       = "error validating Alertmanager config"
+	errReadingConfiguration   = "unable to read the Alertmanager config"
+	errStoringConfiguration   = "unable to store the Alertmanager config"
+	errDeletingConfiguration  = "unable to delete the Alertmanager config"
+	errNoOrgID                = "unable to determine the OrgID"
+	errListAllUser            = "unable to list the Alertmanager users"
+	errConfigurationTooBig    = "Alertmanager configuration is too big, limit: %d bytes"
+	errTooManyTemplates       = "too many templates in the configuration: %d (limit: %d)"
+	errTemplateTooBig         = "template %s is too big: %d bytes (limit: %d bytes)"
+	errTemplatesTotalTooBig   = "total size of templates is too big: %d bytes (limit: %d bytes)"
 
 	fetchConcurrency = 16
+
+	// defaultMaxConfigSize is the hard default ceiling applied to the Alertmanager
+	// configuration upload request body when no (or a looser) per-tenant limit is
+	// configured. It ensures the body size is always bounded (fail-closed), even
+	// if operators forget to set -alertmanager.max-config-size-bytes.
+	defaultMaxConfigSize = 4 << 20 // 4 MiB
 )
 
 var (
@@ -100,24 +107,33 @@ func (am *MultitenantAlertmanager) SetUserConfig(w http.ResponseWriter, r *http.
 		return
 	}
 
-	var input io.Reader
+	// Always cap the request body with a fail-closed hard ceiling. The per-tenant
+	// limit may be used to lower the ceiling, but never to disable it; a value of
+	// 0 ("no limit") or a value above the hard default is treated as the default.
+	// We read one extra byte so we can detect bodies that exceed the limit and
+	// return a clear error instead of a truncated payload.
 	maxConfigSize := am.limits.AlertmanagerMaxConfigSize(userID)
-	if maxConfigSize > 0 {
-		// LimitReader will return EOF after reading specified number of bytes. To check if
-		// we have read too many bytes, allow one extra byte.
-		input = io.LimitReader(r.Body, int64(maxConfigSize)+1)
-	} else {
-		input = r.Body
+	if maxConfigSize <= 0 || maxConfigSize > defaultMaxConfigSize {
+		maxConfigSize = defaultMaxConfigSize
 	}
+	r.Body = http.MaxBytesReader(w, r.Body, int64(maxConfigSize)+1)
 
-	payload, err := io.ReadAll(input)
+	payload, err := io.ReadAll(r.Body)
 	if err != nil {
+		// http.MaxBytesReader surfaces oversize bodies through ReadAll; report it as
+		// "configuration too big" so the operator-facing error matches the limit.
+		if len(payload) >= maxConfigSize {
+			msg := fmt.Sprintf(errConfigurationTooBig, maxConfigSize)
+			level.Warn(logger).Log("msg", msg)
+			http.Error(w, msg, http.StatusBadRequest)
+			return
+		}
 		level.Error(logger).Log("msg", errReadingConfiguration, "err", err.Error())
 		http.Error(w, fmt.Sprintf("%s: %s", errReadingConfiguration, err.Error()), http.StatusBadRequest)
 		return
 	}
 
-	if maxConfigSize > 0 && len(payload) > maxConfigSize {
+	if len(payload) > maxConfigSize {
 		msg := fmt.Sprintf(errConfigurationTooBig, maxConfigSize)
 		level.Warn(logger).Log("msg", msg)
 		http.Error(w, msg, http.StatusBadRequest)
@@ -207,6 +223,18 @@ func validateUserConfig(logger log.Logger, cfg alertspb.AlertConfigDesc, limits 
 			if size := len(tmpl.GetBody()); size > maxSize {
 				return fmt.Errorf(errTemplateTooBig, tmpl.GetFilename(), size, maxSize)
 			}
+		}
+	}
+
+	// Check the total size of all templates. count * per-template size is what
+	// actually consumes the shared Alertmanager data volume on every replica.
+	if maxTotal := limits.AlertmanagerMaxTemplatesTotalSize(user); maxTotal > 0 {
+		total := 0
+		for _, tmpl := range cfg.Templates {
+			total += len(tmpl.GetBody())
+		}
+		if total > maxTotal {
+			return fmt.Errorf(errTemplatesTotalTooBig, total, maxTotal)
 		}
 	}
 
