@@ -5,6 +5,7 @@ import (
 	"flag"
 	"io"
 	"net/http"
+	"regexp"
 	"sync"
 	"time"
 
@@ -47,6 +48,10 @@ type Scheduler struct {
 	connectedFrontendsMu sync.Mutex
 	connectedFrontends   map[string]*connectedFrontend
 
+	// allowedFrontends, when non-nil, restricts the FrontendAddress supplied at
+	// INIT to values whose literal matches this regular expression.
+	allowedFrontends *regexp.Regexp
+
 	requestQueue *queue.RequestQueue
 	activeUsers  *util.ActiveUsersCleanupService
 
@@ -79,16 +84,43 @@ type connectedFrontend struct {
 	cancel context.CancelFunc
 }
 
+// maxFrontendAddressLength caps the attacker-controllable FrontendAddress at a
+// reasonable upper bound. gRPC targets (host:port, DNS names, IPv6 with zone)
+// easily fit in 253 bytes; anything larger is treated as an abuse attempt.
+const maxFrontendAddressLength = 253
+
 type Config struct {
-	MaxOutstandingPerTenant int               `yaml:"max_outstanding_requests_per_tenant"`
-	QuerierForgetDelay      time.Duration     `yaml:"querier_forget_delay"`
-	GRPCClientConfig        grpcclient.Config `yaml:"grpc_client_config" doc:"description=This configures the gRPC client used to report errors back to the query-frontend."`
+	MaxOutstandingPerTenant   int               `yaml:"max_outstanding_requests_per_tenant"`
+	QuerierForgetDelay        time.Duration     `yaml:"querier_forget_delay"`
+	GRPCClientConfig          grpcclient.Config `yaml:"grpc_client_config" doc:"description=This configures the gRPC client used to report errors back to the query-frontend."`
+	AllowedFrontendAddresses  string            `yaml:"allowed_frontend_addresses"`
 }
 
 func (cfg *Config) RegisterFlags(f *flag.FlagSet) {
 	f.IntVar(&cfg.MaxOutstandingPerTenant, "query-scheduler.max-outstanding-requests-per-tenant", 100, "Maximum number of outstanding requests per tenant per query-scheduler. In-flight requests above this limit will fail with HTTP response status code 429.")
 	f.DurationVar(&cfg.QuerierForgetDelay, "query-scheduler.querier-forget-delay", 0, "If a querier disconnects without sending notification about graceful shutdown, the query-scheduler will keep the querier in the tenant's shard until the forget delay has passed. This feature is useful to reduce the blast radius when shuffle-sharding is enabled.")
+	f.StringVar(&cfg.AllowedFrontendAddresses, "query-scheduler.allowed-frontend-addresses", "", "Regular expression that the result-delivery address supplied by a query-frontend in its INIT message must match. When empty, any syntactically well-formed address is accepted (backwards compatible). Setting this to the list of trusted query-frontend addresses (e.g. '^query-frontend-[0-9]+\\.cortex\\.svc\\.cluster\\.local:[0-9]+$') is strongly recommended, since this address is the destination to which query results are POSTed and an attacker-controlled value gives an unauthenticated outbound gRPC primitive. See also docs/guides/security.md.")
 	cfg.GRPCClientConfig.RegisterFlagsWithPrefix("query-scheduler.grpc-client-config", f)
+}
+
+// isValidFrontendAddress applies basic syntactic validation to the attacker-
+// controllable FrontendAddress received over the FrontendLoop stream. It is a
+// defence-in-depth check: the ultimate guard against spoofed frontends is
+// operator-configured mTLS and network isolation, but rejecting malformed or
+// over-long addresses here prevents the most trivial SSRF-style abuse.
+func isValidFrontendAddress(addr string) bool {
+	if addr == "" || len(addr) > maxFrontendAddressLength {
+		return false
+	}
+	for _, r := range addr {
+		// Reject NUL, newlines, other control chars and whitespace that have no
+		// legitimate place in a gRPC dial target but could confuse logging,
+		// metrics or downstream resolvers.
+		if r < 0x20 || r == 0x7f || r == ' ' || r == '\t' {
+			return false
+		}
+	}
+	return true
 }
 
 // NewScheduler creates a new Scheduler.
@@ -100,6 +132,16 @@ func NewScheduler(cfg Config, limits Limits, log log.Logger, registerer promethe
 
 		pendingRequests:    map[requestKey]*schedulerRequest{},
 		connectedFrontends: map[string]*connectedFrontend{},
+	}
+
+	if cfg.AllowedFrontendAddresses != "" {
+		re, err := regexp.Compile(cfg.AllowedFrontendAddresses)
+		if err != nil {
+			return nil, errors.Wrap(err, "invalid -query-scheduler.allowed-frontend-addresses regexp")
+		}
+		s.allowedFrontends = re
+	} else {
+		level.Warn(log).Log("msg", "query-scheduler is accepting FrontendLoop callback addresses from untrusted callers; configure -query-scheduler.allowed-frontend-addresses and inter-component mTLS to prevent cross-tenant result exfiltration and outbound-SSRF via the FrontendAddress field")
 	}
 
 	s.queueLength = promauto.With(registerer).NewGaugeVec(prometheus.GaugeOpts{
@@ -234,6 +276,14 @@ func (s *Scheduler) frontendConnected(frontend schedulerpb.SchedulerForFrontend_
 	}
 	if msg.Type != schedulerpb.INIT || msg.FrontendAddress == "" {
 		return "", nil, errors.New("no frontend address")
+	}
+	if !isValidFrontendAddress(msg.FrontendAddress) {
+		level.Warn(s.log).Log("msg", "rejecting FrontendLoop INIT with malformed frontend address", "addr_len", len(msg.FrontendAddress))
+		return "", nil, errors.New("malformed frontend address")
+	}
+	if s.allowedFrontends != nil && !s.allowedFrontends.MatchString(msg.FrontendAddress) {
+		level.Warn(s.log).Log("msg", "rejecting FrontendLoop INIT whose frontend address is not in -query-scheduler.allowed-frontend-addresses", "frontend", msg.FrontendAddress)
+		return "", nil, errors.New("frontend address not allowed")
 	}
 
 	s.connectedFrontendsMu.Lock()
@@ -442,6 +492,16 @@ func (s *Scheduler) forwardRequestToQuerier(querier schedulerpb.SchedulerForQuer
 }
 
 func (s *Scheduler) forwardErrorToFrontend(ctx context.Context, req *schedulerRequest, requestErr error) {
+	// Re-validate the frontend address before dialing: the address was already
+	// checked at INIT, but this is the last line of defence before an
+	// unauthenticated outbound gRPC dial, so we re-check in case the field was
+	// mutated through unsafe code paths or future refactors.
+	if !isValidFrontendAddress(req.frontendAddress) ||
+		(s.allowedFrontends != nil && !s.allowedFrontends.MatchString(req.frontendAddress)) {
+		level.Warn(s.log).Log("msg", "refusing to forward error to unknown frontend address", "frontend", req.frontendAddress, "requestErr", requestErr)
+		return
+	}
+
 	opts, err := s.cfg.GRPCClientConfig.DialOption([]grpc.UnaryClientInterceptor{
 		otgrpc.OpenTracingClientInterceptor(opentracing.GlobalTracer()),
 		middleware.ClientUserHeaderInterceptor},
