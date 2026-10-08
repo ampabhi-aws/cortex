@@ -1206,7 +1206,12 @@ func (d *Distributor) AllUserStats(ctx context.Context) ([]UserIDStats, error) {
 	perUserTotals := make(map[string]UserStats)
 
 	req := &ingester_client.UserStatsRequest{}
-	ctx = user.InjectOrgID(ctx, "1") // fake: ingester insists on having an org ID
+	// Cluster-wide operator aggregation: inject the reserved cluster-admin
+	// pseudo-tenant so the ingester returns stats for every tenant it hosts.
+	// This path assumes the ingester gRPC listener is only reachable by trusted
+	// Cortex components (mTLS / internal network); untrusted callers reaching
+	// the ingester directly cannot pass this value through the fronting proxy.
+	ctx = user.InjectOrgID(ctx, ingester_client.ClusterAdminTenantID)
 	// Not using d.ForReplicationSet(), so we can fail after first error.
 	replicationSet, err := d.ingestersRing.GetAllHealthy(ring.Read)
 	if err != nil {

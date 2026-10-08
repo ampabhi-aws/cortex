@@ -3182,7 +3182,8 @@ func Test_Ingester_AllUserStats(t *testing.T) {
 	}
 
 	// Get label names
-	res, err := i.AllUserStats(context.Background(), &client.UserStatsRequest{})
+	adminCtx := user.InjectOrgID(context.Background(), client.ClusterAdminTenantID)
+	res, err := i.AllUserStats(adminCtx, &client.UserStatsRequest{})
 	require.NoError(t, err)
 
 	expect := []*client.UserIDStatsResponse{

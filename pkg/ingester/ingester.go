@@ -1556,10 +1556,24 @@ func (i *Ingester) UserStats(ctx context.Context, req *client.UserStatsRequest) 
 	return createUserStats(db), nil
 }
 
-// AllUserStats returns ingestion statistics for all users known to this ingester.
-func (i *Ingester) AllUserStats(_ context.Context, _ *client.UserStatsRequest) (*client.UsersStatsResponse, error) {
+// AllUserStats returns ingestion statistics for users known to this ingester.
+//
+// It is a cluster-wide, operator-only RPC when invoked with the reserved
+// cluster-admin pseudo-tenant (see client.ClusterAdminTenantID), which is
+// the mode used by Distributor.AllUserStats when fanning out to ingesters
+// over internal (trusted / mTLS) transport. For any other caller the
+// response is scoped to the caller's own tenant so that a tenant that can
+// reach the ingester cannot enumerate other tenants' identifiers or
+// usage metrics (cross-tenant disclosure, CWE-653). An unauthenticated
+// request (no X-Scope-OrgID / gRPC org-id metadata) is rejected.
+func (i *Ingester) AllUserStats(ctx context.Context, _ *client.UserStatsRequest) (*client.UsersStatsResponse, error) {
 	if err := i.checkRunning(); err != nil {
 		return nil, err
+	}
+
+	userID, err := tenant.TenantID(ctx)
+	if err != nil {
+		return nil, status.Error(codes.PermissionDenied, "all user stats requires an authenticated caller")
 	}
 
 	i.stoppedMtx.RLock()
@@ -1567,10 +1581,29 @@ func (i *Ingester) AllUserStats(_ context.Context, _ *client.UserStatsRequest) (
 
 	users := i.TSDBState.dbs
 
-	response := &client.UsersStatsResponse{
-		Stats: make([]*client.UserIDStatsResponse, 0, len(users)),
+	// Operator path: an internal Cortex component (e.g. the distributor) that
+	// has established trust on the gRPC side passes the reserved cluster-admin
+	// pseudo-tenant. Only in that case do we return every tenant's row.
+	if userID == client.ClusterAdminTenantID {
+		response := &client.UsersStatsResponse{
+			Stats: make([]*client.UserIDStatsResponse, 0, len(users)),
+		}
+		for id, db := range users {
+			response.Stats = append(response.Stats, &client.UserIDStatsResponse{
+				UserId: id,
+				Data:   createUserStats(db),
+			})
+		}
+		return response, nil
 	}
-	for userID, db := range users {
+
+	// Per-tenant fallback: never leak any other tenant's identifier or usage
+	// metrics. Return at most the caller's own row (empty if we do not host
+	// a TSDB for the caller).
+	response := &client.UsersStatsResponse{
+		Stats: make([]*client.UserIDStatsResponse, 0, 1),
+	}
+	if db, ok := users[userID]; ok {
 		response.Stats = append(response.Stats, &client.UserIDStatsResponse{
 			UserId: userID,
 			Data:   createUserStats(db),
