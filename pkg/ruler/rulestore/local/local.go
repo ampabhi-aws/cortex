@@ -3,8 +3,10 @@ package local
 import (
 	"context"
 	"flag"
+	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 
 	"github.com/pkg/errors"
 	promRules "github.com/prometheus/prometheus/rules"
@@ -168,7 +170,21 @@ func (l *Client) loadAllRulesGroupsForUser(ctx context.Context, userID string) (
 }
 
 func (l *Client) loadAllRulesGroupsForUserAndNamespace(_ context.Context, userID string, namespace string) (rulespb.RuleGroupList, error) {
-	filename := filepath.Join(l.cfg.Directory, userID, namespace)
+	// Defence in depth: ensure the resolved file stays within the per-tenant
+	// rules directory even if the caller passed an unvalidated namespace. This
+	// mirrors the containment check used by the alertmanager template loader
+	// (see pkg/alertmanager/multitenant.go: safeTemplateFilepath).
+	base, err := filepath.Abs(filepath.Join(l.cfg.Directory, userID))
+	if err != nil {
+		return nil, errors.Wrapf(err, "unable to resolve rules directory for user %s", userID)
+	}
+	filename, err := filepath.Abs(filepath.Join(base, namespace))
+	if err != nil {
+		return nil, errors.Wrapf(err, "unable to resolve rules file for user %s", userID)
+	}
+	if filename != base && !strings.HasPrefix(filename, base+string(os.PathSeparator)) {
+		return nil, fmt.Errorf("invalid namespace %q: escapes the per-tenant rules directory", namespace)
+	}
 
 	rulegroups, allErrors := l.loader.Load(filename)
 	if len(allErrors) > 0 {
