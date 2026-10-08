@@ -125,6 +125,13 @@ type Config struct {
 	ZoneAwarenessEnabled bool                   `yaml:"zone_awareness_enabled"`
 	ExcludedZones        flagext.StringSliceCSV `yaml:"excluded_zones"`
 
+	// EnableForgetEndpoint controls whether the HTTP `POST forget=<instance>`
+	// action on the ring status pages is accepted. It defaults to false:
+	// the endpoint is a destructive admin action (it CAS-writes the shared
+	// ring KV key and deletes the named instance) and must be opted in
+	// explicitly by the operator. When disabled, POST returns 405.
+	EnableForgetEndpoint bool `yaml:"enable_forget_endpoint"`
+
 	// Whether the shuffle-sharding subring cache is disabled. This option is set
 	// internally and never exposed to the user.
 	SubringCacheDisabled bool `yaml:"-"`
@@ -143,6 +150,7 @@ func (cfg *Config) RegisterFlagsWithPrefix(prefix string, f *flag.FlagSet) {
 	f.IntVar(&cfg.ReplicationFactor, prefix+"distributor.replication-factor", 3, "The number of ingesters to write to and read from.")
 	f.BoolVar(&cfg.ZoneAwarenessEnabled, prefix+"distributor.zone-awareness-enabled", false, "True to enable the zone-awareness and replicate ingested samples across different availability zones.")
 	f.Var(&cfg.ExcludedZones, prefix+"distributor.excluded-zones", "Comma-separated list of zones to exclude from the ring. Instances in excluded zones will be filtered out from the ring.")
+	f.BoolVar(&cfg.EnableForgetEndpoint, prefix+"ring.enable-forget-endpoint", false, "Enable the destructive 'forget instance' HTTP POST action on the ring status pages. Disabled by default: when disabled, POST requests to the ring page return 405. This endpoint has no authentication or CSRF protection built in and should only be enabled when the admin HTTP listener is protected by an external authenticated reverse proxy and is not reachable from tenant or browser networks.")
 }
 
 type instanceInfo struct {
