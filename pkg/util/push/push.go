@@ -29,6 +29,10 @@ func Handler(maxRecvMsgSize int, sourceIPs *middleware.SourceIPExtractor, push F
 			}
 		}
 		var req cortexpb.PreallocWriteRequest
+		// Cap the body itself, independently of the (untrusted) Content-Length
+		// header, so a lying header cannot force a large pre-allocation and so
+		// a very slow client cannot stream unbounded bytes into the parser.
+		r.Body = http.MaxBytesReader(w, r.Body, int64(maxRecvMsgSize)+1)
 		err := util.ParseProtoReader(ctx, r.Body, int(r.ContentLength), maxRecvMsgSize, &req, util.RawSnappy)
 		if err != nil {
 			level.Error(logger).Log("err", err.Error())
