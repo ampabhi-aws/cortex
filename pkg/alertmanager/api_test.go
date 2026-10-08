@@ -789,7 +789,7 @@ func TestValidateAlertmanagerConfig(t *testing.T) {
 
 	for testName, testData := range tests {
 		t.Run(testName, func(t *testing.T) {
-			err := validateAlertmanagerConfig(testData.input)
+			err := validateAlertmanagerConfig(testData.input, nil, "")
 			assert.ErrorIs(t, err, testData.expected)
 		})
 	}

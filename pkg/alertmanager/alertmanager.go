@@ -496,6 +496,16 @@ func buildReceiverIntegrations(nc *config.Receiver, tmpl *template.Template, fir
 		add("webhook", i, c, func(l log.Logger) (notify.Notifier, error) { return webhook.New(c, tmpl, l, httpOps...) })
 	}
 	for i, c := range nc.EmailConfigs {
+		// The upstream email notifier does not accept a dial function, so the
+		// receivers firewall (which is enforced via net.Dialer.Control) cannot be
+		// applied to SMTP connections. Refuse to build email integrations when the
+		// firewall is enabled to avoid silently bypassing a security control.
+		if firewallDialer.Enabled() {
+			err := fmt.Errorf("email receiver is not supported when the receivers firewall is enabled")
+			level.Warn(log.With(logger, "integration", "email")).Log("msg", "skipping unsupported receiver integration", "err", err)
+			errs.Add(err)
+			continue
+		}
 		add("email", i, c, func(l log.Logger) (notify.Notifier, error) { return email.New(c, tmpl, l), nil })
 	}
 	for i, c := range nc.PagerdutyConfigs {
@@ -565,10 +575,16 @@ func newFirewallDialerConfigProvider(userID string, limits Limits) firewallDiale
 }
 
 func (p firewallDialerConfigProvider) BlockCIDRNetworks() []flagext.CIDR {
+	if p.limits == nil {
+		return nil
+	}
 	return p.limits.AlertmanagerReceiversBlockCIDRNetworks(p.userID)
 }
 
 func (p firewallDialerConfigProvider) BlockPrivateAddresses() bool {
+	if p.limits == nil {
+		return false
+	}
 	return p.limits.AlertmanagerReceiversBlockPrivateAddresses(p.userID)
 }
 

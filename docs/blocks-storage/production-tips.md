@@ -108,4 +108,6 @@ Despite hardening the system is out of the scope of Cortex, Cortex provides a ba
 - `-alertmanager.receivers-firewall-block-cidr-networks`
 - `-alertmanager.receivers-firewall-block-private-addresses`
 
+The built-in firewall only covers HTTP-based receiver integrations (webhook, PagerDuty, OpsGenie, WeChat, Slack, VictorOps, Pushover and SNS), because it is implemented as a `net.Dialer.Control` hook on the HTTP client used by those notifiers. The upstream email notifier does not accept a custom dialer, so email receivers are **not covered** by the in-process firewall and Cortex refuses to build email integrations when the firewall is enabled. Because an in-process dialer hook can only cover notifiers that accept one, operators should also enforce egress restrictions outside the Cortex process (for example a Kubernetes `NetworkPolicy`, a cloud security group, or an egress proxy) as the authoritative control.
+
 _These settings can also be overridden on a per-tenant basis via overrides specified in the [runtime config](../configuration/arguments.md#runtime-configuration-file)._
