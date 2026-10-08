@@ -3,13 +3,67 @@ package tenant
 import (
 	"context"
 	"errors"
+	"fmt"
 	"net/http"
 	"strings"
+	"sync/atomic"
 
 	"github.com/weaveworks/common/user"
 )
 
 var defaultResolver Resolver = NewSingleResolver()
+
+// defaultMaxTenantIDs is the default upper bound on the number of tenant IDs
+// accepted in a single X-Scope-OrgID header. It is deliberately conservative
+// to prevent query fan-out amplification (CWE-770) in multi-tenant query
+// federation. Operators can tune this via tenantfederation.Config.MaxTenantIDs
+// (which calls SetMaxTenantIDs below) when a different ceiling is required.
+const defaultMaxTenantIDs = 16
+
+// maxTenantIDs is the active ceiling, loaded atomically so that it can be
+// updated once at startup from configuration without introducing locking on
+// the hot path.
+var maxTenantIDs int32 = defaultMaxTenantIDs
+
+// SetMaxTenantIDs overrides the maximum number of tenant IDs accepted inside a
+// single X-Scope-OrgID header. Values <= 0 reset the cap to the default. This
+// is intended to be called at process startup from tenantfederation.Config.
+func SetMaxTenantIDs(n int) {
+	if n <= 0 {
+		atomic.StoreInt32(&maxTenantIDs, defaultMaxTenantIDs)
+		return
+	}
+	atomic.StoreInt32(&maxTenantIDs, int32(n))
+}
+
+// MaxTenantIDs returns the currently configured ceiling.
+func MaxTenantIDs() int {
+	return int(atomic.LoadInt32(&maxTenantIDs))
+}
+
+// maxTenantIDsHeaderBytes caps the raw length of the X-Scope-OrgID header
+// before splitting on the separator. A single tenant ID is bounded to 150
+// characters by ValidTenantID, so this budget covers the worst-case joined
+// representation (plus a small slack for separators) and lets us reject
+// pathological ~1 MB headers before the expensive split/sort.
+func maxTenantIDsHeaderBytes() int {
+	// 150 chars per ID + 1 separator per ID; include a small constant slack.
+	return MaxTenantIDs()*(150+len(tenantIDsLabelSeparator)) + 16
+}
+
+var (
+	errTooManyTenantIDs       = errors.New("too many tenant IDs in X-Scope-OrgID header")
+	errTenantIDsHeaderTooLong = errors.New("X-Scope-OrgID header is too long")
+)
+
+// ErrTooManyTenantIDs is returned when the number of tenant IDs supplied in
+// the X-Scope-OrgID header exceeds the configured cap. Exposed so callers can
+// map it to an HTTP 400 response.
+func ErrTooManyTenantIDs() error { return errTooManyTenantIDs }
+
+// ErrTenantIDsHeaderTooLong is returned when the raw X-Scope-OrgID header is
+// larger than the configured byte budget. Exposed for the same reason.
+func ErrTenantIDsHeaderTooLong() error { return errTenantIDsHeaderTooLong }
 
 // WithDefaultResolver updates the resolver used for the package methods.
 func WithDefaultResolver(r Resolver) {
@@ -127,6 +181,21 @@ func (t *MultiResolver) TenantIDs(ctx context.Context) ([]string, error) {
 	orgID, err := user.ExtractOrgID(ctx)
 	if err != nil {
 		return nil, err
+	}
+
+	// Reject pathologically large headers before the expensive split/sort.
+	// Each valid tenant ID is capped at 150 characters, so a legitimate
+	// joined header stays well under this bound.
+	if len(orgID) > maxTenantIDsHeaderBytes() {
+		return nil, errTenantIDsHeaderTooLong
+	}
+
+	limit := MaxTenantIDs()
+	// Fast path: cap the count before allocating a []string of unbounded size.
+	// strings.Count(orgID, sep)+1 is the exact element count that Split would
+	// produce, computed in O(n) without allocating.
+	if strings.Count(orgID, tenantIDsLabelSeparator)+1 > limit {
+		return nil, fmt.Errorf("%w: got more than %d tenant IDs", errTooManyTenantIDs, limit)
 	}
 
 	orgIDs := strings.Split(orgID, tenantIDsLabelSeparator)

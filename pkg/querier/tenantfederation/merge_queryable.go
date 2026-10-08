@@ -47,6 +47,15 @@ func tenantQuerierCallback(queryable storage.Queryable) MergeQuerierCallback {
 			return nil, nil, err
 		}
 
+		// Defence in depth: the resolver already enforces the configured
+		// ceiling, but re-check here so that callers that construct a
+		// context with a hand-crafted tenant list cannot bypass the cap
+		// and amplify a single query into an unbounded number of
+		// per-tenant sub-queriers (CWE-770).
+		if limit := tenant.MaxTenantIDs(); len(tenantIDs) > limit {
+			return nil, nil, fmt.Errorf("too many tenant IDs for federated query: got %d, limit %d", len(tenantIDs), limit)
+		}
+
 		var queriers = make([]storage.Querier, len(tenantIDs))
 		for pos, tenantID := range tenantIDs {
 			q, err := queryable.Querier(

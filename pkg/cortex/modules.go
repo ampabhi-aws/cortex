@@ -233,6 +233,9 @@ func (t *Cortex) initTenantFederation() (serv services.Service, err error) {
 		// single tenant. This allows for a less impactful enabling of tenant
 		// federation.
 		byPassForSingleQuerier := true
+		// Propagate the configured tenant-ID cap into the tenant resolver so
+		// that every call site enforces the same limit (mitigates CWE-770).
+		t.Cfg.TenantFederation.Apply()
 		t.QuerierQueryable = querier.NewSampleAndChunkQueryable(tenantfederation.NewQueryable(t.QuerierQueryable, byPassForSingleQuerier))
 	}
 	return nil, nil
