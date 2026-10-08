@@ -28,8 +28,14 @@ func Handler(maxRecvMsgSize int, sourceIPs *middleware.SourceIPExtractor, push F
 				logger = log.WithSourceIPs(source, logger)
 			}
 		}
+		// Bound the body regardless of what the client claims via Content-Length.
+		// The +1 lets ParseProtoReader observe an over-limit body and return the
+		// standard "message larger than max" error rather than a generic read error.
+		r.Body = http.MaxBytesReader(w, r.Body, int64(maxRecvMsgSize)+1)
 		var req cortexpb.PreallocWriteRequest
-		err := util.ParseProtoReader(ctx, r.Body, int(r.ContentLength), maxRecvMsgSize, &req, util.RawSnappy)
+		// Do not trust Content-Length for pre-allocation: pass 0 as expectedSize so
+		// the buffer grows incrementally as bytes actually arrive.
+		err := util.ParseProtoReader(ctx, r.Body, 0, maxRecvMsgSize, &req, util.RawSnappy)
 		if err != nil {
 			level.Error(logger).Log("err", err.Error())
 			http.Error(w, err.Error(), http.StatusBadRequest)
