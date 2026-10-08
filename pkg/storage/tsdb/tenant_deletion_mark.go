@@ -30,6 +30,25 @@ func NewTenantDeletionMark(deletionTime time.Time) *TenantDeletionMark {
 	return &TenantDeletionMark{DeletionTime: deletionTime.Unix()}
 }
 
+// GetDeletionTime returns the time at which the tenant deletion mark was created.
+func (m *TenantDeletionMark) GetDeletionTime() time.Time {
+	if m == nil {
+		return time.Time{}
+	}
+	return time.Unix(m.DeletionTime, 0)
+}
+
+// DeleteTenantDeletionMark removes the tenant deletion mark object if it exists.
+// Returns nil if the mark does not exist.
+func DeleteTenantDeletionMark(ctx context.Context, bkt objstore.Bucket, userID string, cfgProvider bucket.TenantConfigProvider) error {
+	userBkt := bucket.NewUserBucketClient(userID, bkt, cfgProvider)
+	err := userBkt.Delete(ctx, TenantDeletionMarkPath)
+	if err != nil && !userBkt.IsObjNotFoundErr(err) {
+		return errors.Wrap(err, "delete tenant deletion mark")
+	}
+	return nil
+}
+
 // Checks for deletion mark for tenant. Errors other than "object not found" are returned.
 func TenantDeletionMarkExists(ctx context.Context, bkt objstore.BucketReader, userID string) (bool, error) {
 	markerFile := path.Join(userID, TenantDeletionMarkPath)
