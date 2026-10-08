@@ -4,7 +4,9 @@ import (
 	"context"
 	"fmt"
 	"io"
+	gonet "net"
 	"net/http"
+	"net/url"
 	"os"
 	"path/filepath"
 	"reflect"
@@ -45,6 +47,7 @@ var (
 	errTLSFileNotAllowed             = errors.New("setting TLS ca_file, cert_file and key_file is not allowed")
 	errSlackAPIURLFileNotAllowed     = errors.New("setting Slack api_url_file and global slack_api_url_file is not allowed")
 	errVictorOpsAPIKeyFileNotAllowed = errors.New("setting VictorOps api_key_file is not allowed")
+	errURLNotAllowed                 = errors.New("receiver URL points at an unspecified, loopback or link-local address")
 )
 
 // UserConfig is used to communicate a users alertmanager configs
@@ -341,6 +344,16 @@ func validateAlertmanagerConfig(cfg interface{}) error {
 			return err
 		}
 
+	case reflect.TypeOf(config.URL{}):
+		if err := validateReceiverURL(v.Interface().(config.URL).URL); err != nil {
+			return err
+		}
+
+	case reflect.TypeOf(config.SecretURL{}):
+		if err := validateReceiverURL(v.Interface().(config.SecretURL).URL); err != nil {
+			return err
+		}
+
 	case reflect.TypeOf(config.SlackConfig{}):
 		if err := validateSlackConfig(v.Interface().(config.SlackConfig)); err != nil {
 			return err
@@ -411,7 +424,48 @@ func validateReceiverHTTPConfig(cfg commoncfg.HTTPClientConfig) error {
 	if cfg.OAuth2 != nil && cfg.OAuth2.ClientSecretFile != "" {
 		return errOAuth2SecretFileNotAllowed
 	}
+	if cfg.OAuth2 != nil && cfg.OAuth2.ProxyURL.URL != nil {
+		if err := validateReceiverURL(cfg.OAuth2.ProxyURL.URL); err != nil {
+			return err
+		}
+	}
+	if cfg.ProxyURL.URL != nil {
+		if err := validateReceiverURL(cfg.ProxyURL.URL); err != nil {
+			return err
+		}
+	}
 	return validateReceiverTLSConfig(cfg.TLSConfig)
+}
+
+// validateReceiverURL rejects receiver URLs whose host literal is an
+// unspecified (0.0.0.0 / ::), loopback or link-local address. These literals
+// bypass the firewall dialer on some platforms (notably Linux, where
+// connect() to 0.0.0.0 is delivered to the loopback interface) and have no
+// legitimate use in a tenant-supplied receiver configuration, so we reject
+// them at config-upload time with a 400 rather than relying on the dialer
+// to silently block the connection at send-time.
+func validateReceiverURL(u *url.URL) error {
+	if u == nil || u.Host == "" {
+		return nil
+	}
+	host := u.Hostname()
+	if host == "" {
+		return nil
+	}
+	ip := gonet.ParseIP(host)
+	if ip == nil {
+		// Not a literal IP - the dialer will perform DNS resolution and
+		// re-check against the firewall at dial time.
+		return nil
+	}
+	if v4 := ip.To4(); v4 != nil {
+		ip = v4
+	}
+	if ip.IsUnspecified() || ip.IsLoopback() || ip.IsLinkLocalUnicast() ||
+		ip.IsLinkLocalMulticast() || ip.IsInterfaceLocalMulticast() {
+		return errURLNotAllowed
+	}
+	return nil
 }
 
 // validateReceiverTLSConfig validates the TLS config and returns an error if it contains
