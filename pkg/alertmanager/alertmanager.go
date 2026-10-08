@@ -438,7 +438,23 @@ func (am *Alertmanager) StopAndWait() {
 		}
 	}
 
-	am.wg.Wait()
+	// Watchdog on am.wg.Wait(): a wedged tenant (e.g. a goroutine permanently
+	// blocked inside the vendored silences/nflog maintenance under Silences.mtx)
+	// must not freeze syncConfigs for the whole MultitenantAlertmanager instance.
+	// If background goroutines fail to exit within the timeout we log and return
+	// anyway; the per-tenant Alertmanager is being discarded, so leaking a
+	// goroutine is strictly better than deadlocking the entire instance.
+	const stopWaitTimeout = 15 * time.Second
+	waitDone := make(chan struct{})
+	go func() {
+		am.wg.Wait()
+		close(waitDone)
+	}()
+	select {
+	case <-waitDone:
+	case <-time.After(stopWaitTimeout):
+		level.Warn(am.logger).Log("msg", "timed out waiting for per-tenant alertmanager goroutines to exit; abandoning them to avoid wedging the config sync loop", "timeout", stopWaitTimeout)
+	}
 }
 
 func (am *Alertmanager) mergePartialExternalState(part *clusterpb.Part) error {

@@ -24,6 +24,12 @@ const (
 	defaultSettleReadTimeout = 15 * time.Second
 	defaultStoreReadTimeout  = 15 * time.Second
 
+	// msgcBufferSize is the capacity of the buffered broadcast channel. Giving it a bounded buffer
+	// prevents transient replication slowness (each ReplicateStateForUser can block up to the
+	// configured peer remote-timeout) from stalling silence writes that call broadcast while
+	// holding the vendored Silences.mtx.
+	msgcBufferSize = 200
+
 	// Initial sync outcome label values.
 	syncFromReplica  = "from-replica"
 	syncFromStorage  = "from-storage"
@@ -60,6 +66,11 @@ type state struct {
 	initialSyncDuration      prometheus.Histogram
 
 	msgc chan *clusterpb.Part
+	// done is closed when running() exits, so broadcast() can observe that the
+	// consumer is gone and drop the message instead of blocking forever on an
+	// unbuffered channel (which would also strand the vendored Silences.mtx
+	// held by the caller).
+	done chan struct{}
 }
 
 // newReplicatedStates creates a new state struct, which manages state to be replicated between alertmanagers.
@@ -72,7 +83,8 @@ func newReplicatedStates(userID string, rf int, re Replicator, st alertstore.Ale
 		replicator:        re,
 		store:             st,
 		states:            make(map[string]cluster.State, 2), // we use two, one for the notifications and one for silences.
-		msgc:              make(chan *clusterpb.Part),
+		msgc:              make(chan *clusterpb.Part, msgcBufferSize),
+		done:              make(chan struct{}),
 		reg:               r,
 		settleReadTimeout: defaultSettleReadTimeout,
 		storeReadTimeout:  defaultStoreReadTimeout,
@@ -277,12 +289,18 @@ func (s *state) mergeFullStates(fs []*clusterpb.FullState) error {
 }
 
 func (s *state) running(ctx context.Context) error {
+	// Signal any goroutine parked in broadcast() that the consumer is gone,
+	// so it can observe this and drop the message instead of blocking forever.
+	defer close(s.done)
+
 	for {
 		select {
 		case p := <-s.msgc:
-			// If the replication factor is <= 1, we don't need to replicate any state anywhere else.
+			// If the replication factor is <= 1, we don't need to replicate any state anywhere else,
+			// but we must keep draining the channel: broadcast() is called from vendored Alertmanager
+			// code while Silences.mtx is held, so abandoning the channel would deadlock the tenant.
 			if s.replicationFactor <= 1 {
-				return nil
+				continue
 			}
 
 			s.stateReplicationTotal.WithLabelValues(p.Key).Inc()
@@ -298,8 +316,22 @@ func (s *state) running(ctx context.Context) error {
 
 func (s *state) broadcast(key string, b []byte) {
 	// We should ignore the Merges into the initial state during settling.
-	if s.Ready() {
-		s.msgc <- &clusterpb.Part{Key: key, Data: b}
+	if !s.Ready() {
+		return
+	}
+
+	// broadcast() is invoked from the vendored Prometheus Alertmanager while
+	// Silences.mtx is held. A blocking send would permanently strand that mutex
+	// if the consumer goroutine (running()) has already exited or is slow to
+	// drain, so the send is both cancellable (via s.done) and non-blocking.
+	select {
+	case s.msgc <- &clusterpb.Part{Key: key, Data: b}:
+	case <-s.done:
+		// Consumer is gone (service stopping/stopped). Drop and count it.
+		s.stateReplicationFailed.WithLabelValues(key).Inc()
+	default:
+		// Buffer is full: drop the message rather than block the caller holding Silences.mtx.
+		s.stateReplicationFailed.WithLabelValues(key).Inc()
 	}
 }
 
