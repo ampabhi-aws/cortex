@@ -2109,6 +2109,8 @@ type mockAlertManagerLimits struct {
 	maxDispatcherAggregationGroups int
 	maxAlertsCount                 int
 	maxAlertsSizeBytes             int
+	receiversBlockPrivate          bool
+	receiversBlockCIDR             []flagext.CIDR
 }
 
 func (m *mockAlertManagerLimits) AlertmanagerMaxConfigSize(tenant string) int {
@@ -2124,11 +2126,11 @@ func (m *mockAlertManagerLimits) AlertmanagerMaxTemplateSize(tenant string) int 
 }
 
 func (m *mockAlertManagerLimits) AlertmanagerReceiversBlockCIDRNetworks(user string) []flagext.CIDR {
-	panic("implement me")
+	return m.receiversBlockCIDR
 }
 
 func (m *mockAlertManagerLimits) AlertmanagerReceiversBlockPrivateAddresses(user string) bool {
-	panic("implement me")
+	return m.receiversBlockPrivate
 }
 
 func (m *mockAlertManagerLimits) NotificationRateLimit(_ string, integration string) rate.Limit {

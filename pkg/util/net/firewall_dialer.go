@@ -34,6 +34,22 @@ func (d *FirewallDialer) DialContext(ctx context.Context, network, address strin
 	return d.parent.DialContext(ctx, network, address)
 }
 
+// NetDialer returns the underlying *net.Dialer which has the firewall Control
+// hook installed. Callers that need to supply a *net.Dialer directly (e.g. the
+// vendored Alertmanager email notifier, which does not accept a DialContextFunc)
+// can pass this value so the firewall is enforced on their TCP connects too.
+func (d *FirewallDialer) NetDialer() *net.Dialer {
+	return d.parent
+}
+
+// Control is a syscall.RawConn Control hook which enforces the firewall. It is
+// exported so that non-net.Dialer code paths (e.g. the vendored Alertmanager
+// email notifier, which uses tls.Dial directly) can wire the same check into
+// their own dialers via net.Dialer{Control: dialer.Control}.
+func (d *FirewallDialer) Control(network, address string, c syscall.RawConn) error {
+	return d.control(network, address, c)
+}
+
 func (d *FirewallDialer) control(_, address string, _ syscall.RawConn) error {
 	blockPrivateAddresses := d.cfgProvider.BlockPrivateAddresses()
 	blockCIDRNetworks := d.cfgProvider.BlockCIDRNetworks()
@@ -54,18 +70,33 @@ func (d *FirewallDialer) control(_, address string, _ syscall.RawConn) error {
 		return errBlockedAddress
 	}
 
-	if blockPrivateAddresses && (isPrivate(ip) || isLocal(ip)) {
+	if IsBlockedAddress(ip, blockPrivateAddresses, blockCIDRNetworks) {
 		return errBlockedAddress
-	}
-
-	for _, cidr := range blockCIDRNetworks {
-		if cidr.Value.Contains(ip) {
-			return errBlockedAddress
-		}
 	}
 
 	return nil
 }
+
+// IsBlockedAddress reports whether the given IP is blocked by the given
+// firewall policy. It is used both by the dial-time Control hook and by
+// admission-time validation (e.g. of an Alertmanager email smarthost) so that
+// the same policy is enforced in both places.
+func IsBlockedAddress(ip net.IP, blockPrivateAddresses bool, blockCIDRNetworks []flagext.CIDR) bool {
+	if blockPrivateAddresses && (isPrivate(ip) || isLocal(ip)) {
+		return true
+	}
+
+	for _, cidr := range blockCIDRNetworks {
+		if cidr.Value.Contains(ip) {
+			return true
+		}
+	}
+
+	return false
+}
+
+// ErrBlockedAddress is returned when the firewall blocks a destination.
+var ErrBlockedAddress = errBlockedAddress
 
 func isLocal(ip net.IP) bool {
 	return ip.IsLoopback() || ip.IsLinkLocalUnicast() || ip.IsLinkLocalMulticast()

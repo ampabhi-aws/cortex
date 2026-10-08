@@ -47,10 +47,17 @@ type Email struct {
 	tmpl     *template.Template
 	logger   log.Logger
 	hostname string
+	dialer   *net.Dialer
 }
 
 // New returns a new Email notifier.
-func New(c *config.EmailConfig, t *template.Template, l log.Logger) *Email {
+//
+// Cortex SSRF hardening: an optional *net.Dialer may be supplied as a trailing
+// argument so callers (e.g. Cortex's per-tenant receiver firewall) can inject
+// a Control hook that is honoured by both the plaintext and the implicit-TLS
+// (port 465) code paths in Notify. Passing no dialer, or nil, preserves the
+// upstream Prometheus Alertmanager behaviour of using a bare net.Dialer{}.
+func New(c *config.EmailConfig, t *template.Template, l log.Logger, dialer ...*net.Dialer) *Email {
 	if _, ok := c.Headers["Subject"]; !ok {
 		c.Headers["Subject"] = config.DefaultEmailSubject
 	}
@@ -66,7 +73,11 @@ func New(c *config.EmailConfig, t *template.Template, l log.Logger) *Email {
 	if err != nil {
 		h = "localhost.localdomain"
 	}
-	return &Email{conf: c, tmpl: t, logger: l, hostname: h}
+	var d *net.Dialer
+	if len(dialer) > 0 {
+		d = dialer[0]
+	}
+	return &Email{conf: c, tmpl: t, logger: l, hostname: h, dialer: d}
 }
 
 // auth resolves a string of authentication mechanisms.
@@ -131,15 +142,37 @@ func (n *Email) Notify(ctx context.Context, as ...*types.Alert) (bool, error) {
 			tlsConfig.ServerName = n.conf.Smarthost.Host
 		}
 
-		conn, err = tls.Dial("tcp", n.conf.Smarthost.String(), tlsConfig)
-		if err != nil {
-			return true, errors.Wrap(err, "establish TLS connection to server")
+		// Cortex SSRF hardening: when a dialer with a firewall Control hook has
+		// been injected, route the implicit-TLS (port 465) path through it so
+		// the receiver firewall also applies to email destinations.
+		if n.dialer != nil {
+			var rawConn net.Conn
+			rawConn, err = n.dialer.DialContext(ctx, "tcp", n.conf.Smarthost.String())
+			if err != nil {
+				return true, errors.Wrap(err, "establish connection to server")
+			}
+			tlsConn := tls.Client(rawConn, tlsConfig)
+			if err := tlsConn.HandshakeContext(ctx); err != nil {
+				rawConn.Close()
+				return true, errors.Wrap(err, "establish TLS connection to server")
+			}
+			conn = tlsConn
+		} else {
+			conn, err = tls.Dial("tcp", n.conf.Smarthost.String(), tlsConfig)
+			if err != nil {
+				return true, errors.Wrap(err, "establish TLS connection to server")
+			}
 		}
 	} else {
 		var (
 			d   = net.Dialer{}
 			err error
 		)
+		// Cortex SSRF hardening: use the injected firewall-aware dialer when
+		// available so plaintext SMTP destinations are also filtered.
+		if n.dialer != nil {
+			d = *n.dialer
+		}
 		conn, err = d.DialContext(ctx, "tcp", n.conf.Smarthost.String())
 		if err != nil {
 			return true, errors.Wrap(err, "establish connection to server")
