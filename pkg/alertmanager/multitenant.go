@@ -524,8 +524,12 @@ func (am *MultitenantAlertmanager) migrateStateFilesToPerTenantDirectories() err
 	}
 
 	for userID, files := range st {
-		tenantDir := am.getTenantDirectory(userID)
-		err := os.MkdirAll(tenantDir, 0777)
+		tenantDir, err := am.getTenantDirectory(userID)
+		if err != nil {
+			level.Warn(am.logger).Log("msg", "skipping migration of obsolete state files for invalid tenant ID", "user", userID, "err", err)
+			continue
+		}
+		err = os.MkdirAll(tenantDir, 0777)
 		if err != nil {
 			return errors.Wrapf(err, "failed to create per-tenant directory %v", tenantDir)
 		}
@@ -811,7 +815,11 @@ func (am *MultitenantAlertmanager) setConfig(cfg alertspb.AlertConfigDesc) error
 	var userAmConfig *amconfig.Config
 	var err error
 	var hasTemplateChanges bool
-	var userTemplateDir = filepath.Join(am.getTenantDirectory(cfg.User), templatesDir)
+	tenantDir, err := am.getTenantDirectory(cfg.User)
+	if err != nil {
+		return err
+	}
+	var userTemplateDir = filepath.Join(tenantDir, templatesDir)
 	var pathsToRemove = make(map[string]struct{})
 
 	// List existing files to keep track the ones to be removed
@@ -919,15 +927,32 @@ func (am *MultitenantAlertmanager) setConfig(cfg alertspb.AlertConfigDesc) error
 	return nil
 }
 
-func (am *MultitenantAlertmanager) getTenantDirectory(userID string) string {
-	return filepath.Join(am.cfg.DataDir, userID)
+// getTenantDirectory returns the on-disk directory used to persist state for
+// the given tenant. It validates userID so a malformed or empty tenant ID can
+// never collapse the per-tenant directory onto the shared data root or alias a
+// well-known internal directory (e.g. the legacy `templates` migration dir).
+func (am *MultitenantAlertmanager) getTenantDirectory(userID string) (string, error) {
+	if userID == "" || filepath.Base(userID) != userID || userID == "." || userID == ".." {
+		return "", fmt.Errorf("invalid tenant ID %q", userID)
+	}
+	// Refuse tenant IDs that would alias a well-known internal directory
+	// managed at the shared data root. The legacy pre-1.11 layout stored
+	// per-tenant state under <data_dir>/templates/<tenant>, so a tenant named
+	// "templates" would alias that migration tree.
+	if userID == templatesDir {
+		return "", fmt.Errorf("invalid tenant ID %q: reserved for internal use", userID)
+	}
+	return filepath.Join(am.cfg.DataDir, userID), nil
 }
 
 func (am *MultitenantAlertmanager) newAlertmanager(userID string, amConfig *amconfig.Config, rawCfg string) (*Alertmanager, error) {
 	reg := prometheus.NewRegistry()
 
-	tenantDir := am.getTenantDirectory(userID)
-	err := os.MkdirAll(tenantDir, 0777)
+	tenantDir, err := am.getTenantDirectory(userID)
+	if err != nil {
+		return nil, err
+	}
+	err = os.MkdirAll(tenantDir, 0777)
 	if err != nil {
 		return nil, errors.Wrapf(err, "failed to create per-tenant directory %v", tenantDir)
 	}
