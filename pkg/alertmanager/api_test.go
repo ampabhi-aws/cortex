@@ -15,6 +15,7 @@ import (
 	"github.com/prometheus/alertmanager/config"
 	"github.com/prometheus/client_golang/prometheus"
 	commoncfg "github.com/prometheus/common/config"
+	"github.com/prometheus/common/sigv4"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	"github.com/thanos-io/objstore"
@@ -784,6 +785,42 @@ func TestValidateAlertmanagerConfig(t *testing.T) {
 				}},
 			},
 			expected: errTLSFileNotAllowed,
+		},
+		"SNSConfig without sigv4 credentials uses the Cortex default credential chain": {
+			input: config.SNSConfig{
+				Sigv4: sigv4.SigV4Config{Region: "us-east-1"},
+			},
+			expected: errSNSCredentialsRequired,
+		},
+		"SNSConfig with only an access key is rejected": {
+			input: config.SNSConfig{
+				Sigv4: sigv4.SigV4Config{Region: "us-east-1", AccessKey: "AKIA..."},
+			},
+			expected: errSNSCredentialsRequired,
+		},
+		"SNSConfig with sigv4.profile is rejected (reads operator's shared credentials file)": {
+			input: config.SNSConfig{
+				Sigv4: sigv4.SigV4Config{Region: "us-east-1", Profile: "cortex"},
+			},
+			expected: errSNSProfileNotAllowed,
+		},
+		"SNSConfig with sigv4.role_arn is rejected (would AssumeRole with Cortex identity)": {
+			input: config.SNSConfig{
+				Sigv4: sigv4.SigV4Config{Region: "us-east-1", RoleARN: "arn:aws:iam::1234:role/cortex"},
+			},
+			expected: errSNSRoleARNNotAllowed,
+		},
+		"SNSConfig as nested child within a Receiver slice is validated": {
+			input: config.Config{
+				Receivers: []*config.Receiver{{
+					Name: "sns",
+					SNSConfigs: []*config.SNSConfig{{
+						Sigv4:    sigv4.SigV4Config{Region: "us-east-1"},
+						TopicARN: "arn:aws:sns:us-east-1:1234:topic",
+					}},
+				}},
+			},
+			expected: errSNSCredentialsRequired,
 		},
 	}
 
