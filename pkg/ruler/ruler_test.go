@@ -1101,6 +1101,7 @@ type ruleGroupKey struct {
 func TestRuler_ListAllRules(t *testing.T) {
 	store := newMockRuleStore(mockRules)
 	cfg := defaultRulerConfig(t)
+	cfg.AdminTenant = "admin"
 
 	r := newTestRuler(t, cfg, store, nil)
 	defer services.StopAndAwaitTerminated(context.Background(), r) //nolint:errcheck
@@ -1108,7 +1109,23 @@ func TestRuler_ListAllRules(t *testing.T) {
 	router := mux.NewRouter()
 	router.Path("/ruler/rule_groups").Methods(http.MethodGet).HandlerFunc(r.ListAllRules)
 
-	req := requestFor(t, http.MethodGet, "https://localhost:8080/ruler/rule_groups", nil, "")
+	// A caller without an org ID should be rejected.
+	{
+		unauthReq := httptest.NewRequest(http.MethodGet, "https://localhost:8080/ruler/rule_groups", nil)
+		unauthW := httptest.NewRecorder()
+		router.ServeHTTP(unauthW, unauthReq)
+		require.Equal(t, http.StatusUnauthorized, unauthW.Result().StatusCode)
+	}
+
+	// A non-admin tenant should be forbidden.
+	{
+		forbiddenReq := requestFor(t, http.MethodGet, "https://localhost:8080/ruler/rule_groups", nil, "user1")
+		forbiddenW := httptest.NewRecorder()
+		router.ServeHTTP(forbiddenW, forbiddenReq)
+		require.Equal(t, http.StatusForbidden, forbiddenW.Result().StatusCode)
+	}
+
+	req := requestFor(t, http.MethodGet, "https://localhost:8080/ruler/rule_groups", nil, "admin")
 	w := httptest.NewRecorder()
 	router.ServeHTTP(w, req)
 

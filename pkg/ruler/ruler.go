@@ -123,6 +123,11 @@ type Config struct {
 
 	EnableQueryStats      bool `yaml:"query_stats_enabled"`
 	DisableRuleGroupLabel bool `yaml:"disable_rule_group_label"`
+
+	// AdminTenant is the tenant ID that is allowed to call cross-tenant admin
+	// endpoints such as GET /ruler/rule_groups. If empty, those endpoints are
+	// disabled regardless of the caller's X-Scope-OrgID.
+	AdminTenant string `yaml:"admin_tenant"`
 }
 
 // Validate config and returns error on failure
@@ -183,6 +188,7 @@ func (cfg *Config) RegisterFlags(f *flag.FlagSet) {
 
 	f.BoolVar(&cfg.EnableQueryStats, "ruler.query-stats-enabled", false, "Report the wall time for ruler queries to complete as a per user metric and as an info level log message.")
 	f.BoolVar(&cfg.DisableRuleGroupLabel, "ruler.disable-rule-group-label", false, "Disable the rule_group label on exported metrics")
+	f.StringVar(&cfg.AdminTenant, "ruler.admin-tenant", "", "Tenant ID (X-Scope-OrgID) that is permitted to call cross-tenant admin endpoints such as GET /ruler/rule_groups. If empty (default), such endpoints are disabled and return 403 regardless of the caller's tenant.")
 
 	cfg.RingCheckPeriod = 5 * time.Second
 }
@@ -863,6 +869,22 @@ func (r *Ruler) DeleteTenantConfiguration(w http.ResponseWriter, req *http.Reque
 func (r *Ruler) ListAllRules(w http.ResponseWriter, req *http.Request) {
 	logger := util_log.WithContext(req.Context(), r.logger)
 
+	// Require an authenticated identity (via the X-Scope-OrgID header injected
+	// by the auth middleware); only an explicitly configured admin tenant may
+	// enumerate every tenant's rule groups. This handler used to be registered
+	// with auth=false and performed no tenant scoping, allowing any caller
+	// that could reach the HTTP listener to dump every tenant's rule-group
+	// configuration (CWE-306).
+	userID, err := tenant.TenantID(req.Context())
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusUnauthorized)
+		return
+	}
+	if r.cfg.AdminTenant == "" || userID != r.cfg.AdminTenant {
+		http.Error(w, "forbidden", http.StatusForbidden)
+		return
+	}
+
 	userIDs, err := r.store.ListAllUsers(req.Context())
 	if err != nil {
 		level.Error(logger).Log("msg", errListAllUser, "err", err)
@@ -879,6 +901,10 @@ func (r *Ruler) ListAllRules(w http.ResponseWriter, req *http.Request) {
 	}()
 
 	err = concurrency.ForEachUser(req.Context(), userIDs, fetchRulesConcurrency, func(ctx context.Context, userID string) error {
+		if !r.allowedTenants.IsAllowed(userID) {
+			level.Debug(logger).Log("msg", "ignoring rule groups for user, not allowed", "user", userID)
+			return nil
+		}
 		rg, err := r.store.ListRuleGroupsForUserAndNamespace(ctx, userID, "")
 		if err != nil {
 			return errors.Wrapf(err, "failed to fetch ruler config for user %s", userID)
