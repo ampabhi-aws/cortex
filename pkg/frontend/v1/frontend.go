@@ -2,6 +2,7 @@ package v1
 
 import (
 	"context"
+	"crypto/x509"
 	"flag"
 	"fmt"
 	"net/http"
@@ -14,6 +15,10 @@ import (
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/promauto"
 	"github.com/weaveworks/common/httpgrpc"
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/credentials"
+	"google.golang.org/grpc/peer"
+	"google.golang.org/grpc/status"
 
 	"github.com/cortexproject/cortex/pkg/frontend/v1/frontendv1pb"
 	"github.com/cortexproject/cortex/pkg/querier/stats"
@@ -190,9 +195,30 @@ func (f *Frontend) RoundTripGRPC(ctx context.Context, req *httpgrpc.HTTPRequest)
 
 // Process allows backends to pull requests from the frontend.
 func (f *Frontend) Process(server frontendv1pb.Frontend_ProcessServer) error {
+	// If the gRPC server is configured with mutual TLS and the peer presented
+	// a verified client certificate, derive the authoritative querier identity
+	// from the authenticated channel. The client-supplied ClientID returned by
+	// getQuerierID is then only accepted if it matches that identity. This
+	// prevents a peer from impersonating another querier on bookkeeping and
+	// shuffle-sharding by sending an arbitrary ClientID string (CWE-287 /
+	// CWE-306: Missing Authentication for Critical Function).
+	peerID, hasPeerID := peerIdentity(server.Context())
+
 	querierID, err := getQuerierID(server)
 	if err != nil {
 		return err
+	}
+
+	if hasPeerID {
+		if querierID != "" && querierID != peerID {
+			level.Warn(f.log).Log("msg", "rejecting querier Process: ClientID does not match authenticated peer identity",
+				"claimed", querierID, "peer", peerID)
+			return status.Error(codes.PermissionDenied, "clientID does not match authenticated peer")
+		}
+		// Bind the registration to the authenticated peer identity so that
+		// request routing and NotifyClientShutdown bookkeeping cannot be
+		// manipulated by a peer claiming another querier's ID.
+		querierID = peerID
 	}
 
 	f.requestQueue.RegisterQuerierConnection(querierID)
@@ -285,11 +311,68 @@ func (f *Frontend) Process(server frontendv1pb.Frontend_ProcessServer) error {
 	}
 }
 
-func (f *Frontend) NotifyClientShutdown(_ context.Context, req *frontendv1pb.NotifyClientShutdownRequest) (*frontendv1pb.NotifyClientShutdownResponse, error) {
-	level.Info(f.log).Log("msg", "received shutdown notification from querier", "querier", req.GetClientID())
-	f.requestQueue.NotifyQuerierShutdown(req.GetClientID())
+func (f *Frontend) NotifyClientShutdown(ctx context.Context, req *frontendv1pb.NotifyClientShutdownRequest) (*frontendv1pb.NotifyClientShutdownResponse, error) {
+	clientID := req.GetClientID()
+
+	// If mutual TLS is configured and the peer presented a verified client
+	// certificate, require that the caller-supplied ClientID matches the
+	// authenticated peer identity. Otherwise a peer could notify shutdown on
+	// behalf of another querier and have the frontend forget it immediately,
+	// bypassing -query-frontend.querier-forget-delay.
+	if peerID, ok := peerIdentity(ctx); ok {
+		if clientID != "" && clientID != peerID {
+			level.Warn(f.log).Log("msg", "rejecting querier shutdown notification: ClientID does not match authenticated peer identity",
+				"claimed", clientID, "peer", peerID)
+			return nil, status.Error(codes.PermissionDenied, "clientID does not match authenticated peer")
+		}
+		clientID = peerID
+	}
+
+	level.Info(f.log).Log("msg", "received shutdown notification from querier", "querier", clientID)
+	f.requestQueue.NotifyQuerierShutdown(clientID)
 
 	return &frontendv1pb.NotifyClientShutdownResponse{}, nil
+}
+
+// peerIdentity returns the verified identity of the gRPC peer when the
+// connection is authenticated with mutual TLS and the peer presented a client
+// certificate that was verified by the server. The identity is derived from
+// the leaf certificate: a URI SAN (useful for SPIFFE IDs) is preferred, then
+// the first DNS SAN, then the Subject Common Name. The second return value is
+// false when the connection is not mutually authenticated, in which case the
+// caller falls back to the legacy, trusted-network behavior for backward
+// compatibility with deployments that enforce authentication at the network
+// layer (see docs/guides/authentication-and-authorisation.md).
+func peerIdentity(ctx context.Context) (string, bool) {
+	p, ok := peer.FromContext(ctx)
+	if !ok || p == nil || p.AuthInfo == nil {
+		return "", false
+	}
+	tlsInfo, ok := p.AuthInfo.(credentials.TLSInfo)
+	if !ok {
+		return "", false
+	}
+	if len(tlsInfo.State.VerifiedChains) == 0 || len(tlsInfo.State.VerifiedChains[0]) == 0 {
+		return "", false
+	}
+	return certIdentity(tlsInfo.State.VerifiedChains[0][0]), true
+}
+
+// certIdentity selects a stable identity string from a verified peer
+// certificate.
+func certIdentity(cert *x509.Certificate) string {
+	if cert == nil {
+		return ""
+	}
+	for _, u := range cert.URIs {
+		if u != nil && u.String() != "" {
+			return u.String()
+		}
+	}
+	if len(cert.DNSNames) > 0 && cert.DNSNames[0] != "" {
+		return cert.DNSNames[0]
+	}
+	return cert.Subject.CommonName
 }
 
 func getQuerierID(server frontendv1pb.Frontend_ProcessServer) (string, error) {
