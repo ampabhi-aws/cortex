@@ -243,8 +243,9 @@ type Ruler struct {
 	// Pool of clients used to connect to other ruler replicas.
 	clientsPool ClientsPool
 
-	ringCheckErrors prometheus.Counter
-	rulerSync       *prometheus.CounterVec
+	ringCheckErrors      prometheus.Counter
+	rulerSync            *prometheus.CounterVec
+	rulerSyncFailed      *prometheus.CounterVec
 
 	allowedTenants *util.AllowedTenants
 
@@ -277,6 +278,11 @@ func newRuler(cfg Config, manager MultiTenantManager, reg prometheus.Registerer,
 			Name: "cortex_ruler_sync_rules_total",
 			Help: "Total number of times the ruler sync operation triggered.",
 		}, []string{"reason"}),
+
+		rulerSyncFailed: promauto.With(reg).NewCounterVec(prometheus.CounterOpts{
+			Name: "cortex_ruler_sync_rules_failed_total",
+			Help: "Total number of times the ruler failed to load rules for a tenant during a sync cycle. The tenant is skipped for that cycle so other tenants are not affected.",
+		}, []string{"user"}),
 	}
 
 	if len(cfg.EnabledTenants) > 0 {
@@ -491,10 +497,16 @@ func (r *Ruler) syncRules(ctx context.Context, reason string) {
 		return
 	}
 
-	err = r.store.LoadRuleGroups(ctx, configs)
-	if err != nil {
-		level.Error(r.logger).Log("msg", "unable to load rules owned by this ruler", "err", err)
-		return
+	// Load rule groups one tenant at a time so a single tenant whose load fails
+	// (for example, due to an attacker-driven list/delete race producing
+	// ErrGroupNotFound) does not block every other tenant's sync cycle.
+	for userID, groups := range configs {
+		if err := r.store.LoadRuleGroups(ctx, map[string]rulespb.RuleGroupList{userID: groups}); err != nil {
+			level.Error(r.logger).Log("msg", "unable to load rules for user, skipping this user", "user", userID, "err", err)
+			r.rulerSyncFailed.WithLabelValues(userID).Inc()
+			delete(configs, userID)
+			continue
+		}
 	}
 
 	// This will also delete local group files for users that are no longer in 'configs' map.
