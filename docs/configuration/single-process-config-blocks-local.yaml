@@ -7,6 +7,12 @@
 # X-Scope-OrgID header. `fake` will be substituted in instead.
 auth_enabled: false
 
+api:
+  # Expose /config for development only; this endpoint prints the full
+  # effective configuration (with credential fields redacted) and is off
+  # by default.
+  expose_config: true
+
 server:
   http_listen_port: 9009
 

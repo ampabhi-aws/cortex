@@ -48,6 +48,16 @@ type Config struct {
 	AlertmanagerHTTPPrefix string `yaml:"alertmanager_http_prefix"`
 	PrometheusHTTPPrefix   string `yaml:"prometheus_http_prefix"`
 
+	// ExposeConfig, when true, exposes the current configuration on an
+	// unauthenticated `GET /config` route. The configuration may still
+	// contain operator-visible information (TLS paths, endpoints, bucket
+	// names, ...) so this is off by default to avoid leaking information
+	// to any network-reachable caller. Credential-bearing fields are also
+	// masked by `flagext.Secret`/`flagext.URLValue`, but this switch is a
+	// defence-in-depth control for operators who do not want /config at
+	// all.
+	ExposeConfig bool `yaml:"expose_config"`
+
 	// The following configs are injected by the upstream caller.
 	ServerPrefix       string               `yaml:"-"`
 	LegacyHTTPPrefix   string               `yaml:"-"`
@@ -70,6 +80,7 @@ type Config struct {
 // RegisterFlags adds the flags required to config this to the given FlagSet.
 func (cfg *Config) RegisterFlags(f *flag.FlagSet) {
 	f.BoolVar(&cfg.ResponseCompression, "api.response-compression-enabled", false, "Use GZIP compression for API responses. Some endpoints serve large YAML or JSON blobs which can benefit from compression.")
+	f.BoolVar(&cfg.ExposeConfig, "api.expose-config", false, "If true, expose the Cortex configuration on an unauthenticated `GET /config` route. This is off by default; the endpoint should only be enabled when the HTTP listener is reachable from trusted operators only (defence-in-depth; credential fields are also redacted by type).")
 	f.Var(&cfg.HTTPRequestHeadersToLog, "api.http-request-headers-to-log", "Which HTTP Request headers to add to logs")
 	cfg.RegisterFlagsWithPrefix("", f)
 }
@@ -214,10 +225,15 @@ func (a *API) RegisterAlertmanager(am *alertmanager.MultitenantAlertmanager, tar
 
 // RegisterAPI registers the standard endpoints associated with a running Cortex.
 func (a *API) RegisterAPI(httpPathPrefix string, actualCfg interface{}, defaultCfg interface{}) {
-	a.indexPage.AddLink(SectionAdminEndpoints, "/config", "Current Config (including the default values)")
-	a.indexPage.AddLink(SectionAdminEndpoints, "/config?mode=diff", "Current Config (show only values that differ from the defaults)")
-
-	a.RegisterRoute("/config", a.cfg.configHandler(actualCfg, defaultCfg), false, "GET")
+	if a.cfg.ExposeConfig {
+		a.indexPage.AddLink(SectionAdminEndpoints, "/config", "Current Config (including the default values)")
+		a.indexPage.AddLink(SectionAdminEndpoints, "/config?mode=diff", "Current Config (show only values that differ from the defaults)")
+		a.RegisterRoute("/config", a.cfg.configHandler(actualCfg, defaultCfg), false, "GET")
+	} else {
+		// Even when disabled, serve a stable response explaining how to enable it so
+		// operators get a clear signal rather than a generic 404.
+		a.RegisterRoute("/config", http.HandlerFunc(disabledConfigHandler), false, "GET")
+	}
 	a.RegisterRoute("/", indexHandler(httpPathPrefix, a.indexPage), false, "GET")
 	a.RegisterRoute("/debug/fgprof", fgprof.Handler(), false, "GET")
 }

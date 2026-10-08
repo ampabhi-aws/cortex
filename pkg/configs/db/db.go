@@ -10,13 +10,14 @@ import (
 	"github.com/cortexproject/cortex/pkg/configs/db/memory"
 	"github.com/cortexproject/cortex/pkg/configs/db/postgres"
 	"github.com/cortexproject/cortex/pkg/configs/userconfig"
+	"github.com/cortexproject/cortex/pkg/util/flagext"
 )
 
 // Config configures the database.
 type Config struct {
-	URI           string `yaml:"uri"`
-	MigrationsDir string `yaml:"migrations_dir"`
-	PasswordFile  string `yaml:"password_file"`
+	URI           flagext.URLValue `yaml:"uri"`
+	MigrationsDir string           `yaml:"migrations_dir"`
+	PasswordFile  string           `yaml:"password_file"`
 
 	// Allow injection of mock DBs for unit testing.
 	Mock DB `yaml:"-"`
@@ -24,7 +25,11 @@ type Config struct {
 
 // RegisterFlags adds the flags required to configure this to the given FlagSet.
 func (cfg *Config) RegisterFlags(f *flag.FlagSet) {
-	f.StringVar(&cfg.URI, "configs.database.uri", "postgres://postgres@configs-db.weave.local/configs?sslmode=disable", "URI where the database can be found (for dev you can use memory://)")
+	// Set the default URI by parsing it so the URLValue is populated.
+	if err := cfg.URI.Set("postgres://postgres@configs-db.weave.local/configs?sslmode=disable"); err != nil {
+		panic(err)
+	}
+	f.Var(&cfg.URI, "configs.database.uri", "URI where the database can be found (for dev you can use memory://)")
 	f.StringVar(&cfg.MigrationsDir, "configs.database.migrations-dir", "", "Path where the database migration files can be found")
 	f.StringVar(&cfg.PasswordFile, "configs.database.password-file", "", "File containing password (username goes in URI)")
 }
@@ -64,7 +69,11 @@ func New(cfg Config) (DB, error) {
 		return cfg.Mock, nil
 	}
 
-	u, err := url.Parse(cfg.URI)
+	if cfg.URI.URL == nil {
+		return nil, fmt.Errorf("configs.database.uri is required")
+	}
+
+	u, err := url.Parse(cfg.URI.String())
 	if err != nil {
 		return nil, err
 	}
