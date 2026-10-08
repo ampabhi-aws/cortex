@@ -76,11 +76,21 @@ func containsUnsafePathSegments(id string) bool {
 
 var errInvalidTenantID = errors.New("invalid tenant ID")
 
+// maxTenantIDLength is the hard cap on the number of bytes allowed in a tenant
+// ID extracted from the X-Scope-OrgID header. It matches the documented limit
+// enforced by ValidTenantID and bounds the memory consumed by per-tenant
+// caches keyed on this value.
+const maxTenantIDLength = 150
+
 func (t *SingleResolver) TenantID(ctx context.Context) (string, error) {
 	//lint:ignore faillint wrapper around upstream method
 	id, err := user.ExtractOrgID(ctx)
 	if err != nil {
 		return "", err
+	}
+
+	if len(id) > maxTenantIDLength {
+		return "", errTenantIDTooLong
 	}
 
 	if containsUnsafePathSegments(id) {

@@ -22,6 +22,12 @@ const (
 	// readIndexTimeout is the maximum allowed time when reading a single bucket index
 	// from the storage. It's hard-coded to a reasonably high value.
 	readIndexTimeout = 15 * time.Second
+
+	// maxCachedIndexes bounds the per-tenant cache so a caller that can set an
+	// arbitrary tenant ID (e.g. X-Scope-OrgID) cannot grow this map without
+	// limit. When the cap is reached, the entry whose last-requested timestamp
+	// is oldest is evicted to make room for the new one.
+	maxCachedIndexes = 10000
 )
 
 type LoaderConfig struct {
@@ -109,6 +115,17 @@ func (l *Loader) GetIndex(ctx context.Context, userID string) (*Index, error) {
 	l.loadAttempts.Inc()
 	idx, err := ReadIndex(ctx, l.bkt, userID, l.cfgProvider, l.logger)
 	if err != nil {
+		// Do not cache load failures that were triggered by a caller-cancelled or
+		// expired context. Caching them would otherwise promote cheap
+		// client-side cancellations to the aggressive UpdateOnErrorInterval
+		// background refresh cadence, amplifying each cancelled request into
+		// recurring object-store GETs for up to IdleTimeout.
+		if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+			l.loadFailures.Inc()
+			level.Warn(l.logger).Log("msg", "bucket index load aborted", "user", userID, "err", err)
+			return nil, err
+		}
+
 		// Cache the error, to avoid hammering the object store in case of persistent issues
 		// (eg. corrupted bucket index or not existing).
 		l.cacheIndex(userID, nil, err)
@@ -138,9 +155,39 @@ func (l *Loader) cacheIndex(userID string, idx *Index, err error) {
 	l.indexesMx.Lock()
 	defer l.indexesMx.Unlock()
 
+	// Bound the cache: if we are about to insert a new key and we are already
+	// at the configured cap, evict the entry that was least recently requested.
+	// This prevents an attacker who can set an unvalidated tenant ID header
+	// from growing the map without limit.
+	if _, exists := l.indexes[userID]; !exists && len(l.indexes) >= maxCachedIndexes {
+		l.evictLeastRecentlyRequestedLocked()
+	}
+
 	// Not an issue if, due to concurrency, another index was already cached
 	// and we overwrite it: last will win.
 	l.indexes[userID] = newCachedIndex(idx, err)
+}
+
+// evictLeastRecentlyRequestedLocked removes the entry with the oldest
+// requestedAt timestamp. The caller must hold l.indexesMx for writing.
+func (l *Loader) evictLeastRecentlyRequestedLocked() {
+	var (
+		oldestUserID string
+		oldestFound  bool
+		oldestTS     int64
+	)
+	for userID, entry := range l.indexes {
+		ts := entry.requestedAt.Load()
+		if !oldestFound || ts < oldestTS {
+			oldestUserID = userID
+			oldestTS = ts
+			oldestFound = true
+		}
+	}
+	if oldestFound {
+		delete(l.indexes, oldestUserID)
+		level.Info(l.logger).Log("msg", "evicted bucket index", "user", oldestUserID, "reason", "cache_full")
+	}
 }
 
 // checkCachedIndexes checks all cached indexes and, for each of them, does two things:
