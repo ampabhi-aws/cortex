@@ -230,9 +230,31 @@ func (a *API) RegisterRuntimeConfig(runtimeConfigHandler http.HandlerFunc) {
 	a.RegisterRoute("/runtime_config", runtimeConfigHandler, false, "GET")
 }
 
+// scrubbingDistributor wraps a *distributor.Distributor to defensively clear
+// the wire-controlled SkipLabelNameValidation flag on every gRPC Push.
+//
+// The HTTP remote-write handler already resets this field (see
+// pkg/util/push/push.go) because it is tenant-controlled and must not be
+// honoured from the wire. The gRPC Push method is registered on the same
+// internal plane and must apply the same scrubbing so that only operator
+// configuration (Distributor.cfg.SkipLabelNameValidation) can enable the
+// label-name validation skip.
+type scrubbingDistributor struct {
+	*distributor.Distributor
+}
+
+// Push forwards to the embedded Distributor after clearing the
+// request-supplied SkipLabelNameValidation flag.
+func (s *scrubbingDistributor) Push(ctx context.Context, req *cortexpb.WriteRequest) (*cortexpb.WriteResponse, error) {
+	if req != nil {
+		req.SkipLabelNameValidation = false
+	}
+	return s.Distributor.Push(ctx, req)
+}
+
 // RegisterDistributor registers the endpoints associated with the distributor.
 func (a *API) RegisterDistributor(d *distributor.Distributor, pushConfig distributor.Config) {
-	distributorpb.RegisterDistributorServer(a.server.GRPC, d)
+	distributorpb.RegisterDistributorServer(a.server.GRPC, &scrubbingDistributor{Distributor: d})
 
 	a.RegisterRoute("/api/v1/push", push.Handler(pushConfig.MaxRecvMsgSize, a.sourceIPs, a.cfg.wrapDistributorPush(d)), true, "POST")
 
