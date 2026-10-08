@@ -396,15 +396,21 @@ func (c *haTracker) checkReplica(ctx context.Context, userID, cluster, replica s
 	}
 
 	err := c.checkKVStore(ctx, key, replica, now)
-	c.kvCASCalls.WithLabelValues(userID, cluster).Inc()
 	if err != nil {
 		// The callback within checkKVStore will return a replicasNotMatchError if the sample is being deduped,
 		// otherwise there may have been an actual error CAS'ing that we should log.
 		if !errors.Is(err, replicasNotMatchError{}) {
 			level.Error(c.logger).Log("msg", "rejecting sample", "err", err)
 		}
+		// Only record a kvCASCalls metric child for clusters whose CAS actually
+		// completed without an error. This avoids pinning an attacker-controlled
+		// cluster string in the metric registry (and leaking heap / inflating
+		// cardinality) when the KV write failed, e.g. because the key was
+		// rejected by the KV backend.
+		return err
 	}
-	return err
+	c.kvCASCalls.WithLabelValues(userID, cluster).Inc()
+	return nil
 }
 
 func (c *haTracker) checkKVStore(ctx context.Context, key, replica string, now time.Time) error {
