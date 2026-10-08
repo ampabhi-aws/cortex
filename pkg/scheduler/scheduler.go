@@ -19,12 +19,15 @@ import (
 	"github.com/weaveworks/common/middleware"
 	"github.com/weaveworks/common/user"
 	"google.golang.org/grpc"
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/status"
 
 	"github.com/cortexproject/cortex/pkg/frontend/v2/frontendv2pb"
 	"github.com/cortexproject/cortex/pkg/scheduler/queue"
 	"github.com/cortexproject/cortex/pkg/scheduler/schedulerpb"
 	"github.com/cortexproject/cortex/pkg/tenant"
 	"github.com/cortexproject/cortex/pkg/util"
+	"github.com/cortexproject/cortex/pkg/util/flagext"
 	"github.com/cortexproject/cortex/pkg/util/grpcclient"
 	"github.com/cortexproject/cortex/pkg/util/httpgrpcutil"
 	"github.com/cortexproject/cortex/pkg/util/services"
@@ -80,15 +83,40 @@ type connectedFrontend struct {
 }
 
 type Config struct {
-	MaxOutstandingPerTenant int               `yaml:"max_outstanding_requests_per_tenant"`
-	QuerierForgetDelay      time.Duration     `yaml:"querier_forget_delay"`
-	GRPCClientConfig        grpcclient.Config `yaml:"grpc_client_config" doc:"description=This configures the gRPC client used to report errors back to the query-frontend."`
+	MaxOutstandingPerTenant int                   `yaml:"max_outstanding_requests_per_tenant"`
+	QuerierForgetDelay      time.Duration         `yaml:"querier_forget_delay"`
+	GRPCClientConfig        grpcclient.Config     `yaml:"grpc_client_config" doc:"description=This configures the gRPC client used to report errors back to the query-frontend."`
+	// AllowedQueriers, when non-empty, restricts which querier IDs may register with
+	// the scheduler via QuerierLoop / NotifyQuerierShutdown. The identity is still the
+	// self-asserted ID the querier sends, so this is a defence-in-depth control on top
+	// of the usual network isolation of the scheduler gRPC port - it is NOT a
+	// replacement for keeping that port off tenant-reachable networks. When empty
+	// (the default) behaviour is unchanged and any ID is accepted, preserving backwards
+	// compatibility with Cortex's documented inter-component trust model.
+	AllowedQueriers         flagext.StringSliceCSV `yaml:"allowed_queriers"`
 }
 
 func (cfg *Config) RegisterFlags(f *flag.FlagSet) {
 	f.IntVar(&cfg.MaxOutstandingPerTenant, "query-scheduler.max-outstanding-requests-per-tenant", 100, "Maximum number of outstanding requests per tenant per query-scheduler. In-flight requests above this limit will fail with HTTP response status code 429.")
 	f.DurationVar(&cfg.QuerierForgetDelay, "query-scheduler.querier-forget-delay", 0, "If a querier disconnects without sending notification about graceful shutdown, the query-scheduler will keep the querier in the tenant's shard until the forget delay has passed. This feature is useful to reduce the blast radius when shuffle-sharding is enabled.")
+	f.Var(&cfg.AllowedQueriers, "query-scheduler.allowed-queriers", "Comma-separated list of querier IDs allowed to register with this query-scheduler. When empty (default) any ID is accepted. When set, QuerierLoop and NotifyQuerierShutdown reject streams whose self-asserted querier ID is not in the list. This is a defence-in-depth hardening on top of network isolation of the scheduler gRPC port.")
 	cfg.GRPCClientConfig.RegisterFlagsWithPrefix("query-scheduler.grpc-client-config", f)
+}
+
+// isQuerierAllowed returns true if the (self-asserted) querierID is accepted by
+// this scheduler's current configuration. If no allowlist is configured, every
+// non-empty ID is accepted so that the default inter-component trust model is
+// preserved. An empty ID is always rejected when an allowlist is configured.
+func (cfg *Config) isQuerierAllowed(querierID string) bool {
+	if len(cfg.AllowedQueriers) == 0 {
+		return true
+	}
+	for _, allowed := range cfg.AllowedQueriers {
+		if allowed != "" && allowed == querierID {
+			return true
+		}
+	}
+	return false
 }
 
 // NewScheduler creates a new Scheduler.
@@ -338,6 +366,11 @@ func (s *Scheduler) QuerierLoop(querier schedulerpb.SchedulerForQuerier_QuerierL
 
 	querierID := resp.GetQuerierID()
 
+	if !s.cfg.isQuerierAllowed(querierID) {
+		level.Warn(s.log).Log("msg", "rejecting querier connection: querier ID not in allowed_queriers list", "querier", querierID)
+		return status.Error(codes.PermissionDenied, "querier ID is not permitted to connect to this scheduler")
+	}
+
 	s.requestQueue.RegisterQuerierConnection(querierID)
 	defer s.requestQueue.UnregisterQuerierConnection(querierID)
 
@@ -393,8 +426,13 @@ func (s *Scheduler) QuerierLoop(querier schedulerpb.SchedulerForQuerier_QuerierL
 }
 
 func (s *Scheduler) NotifyQuerierShutdown(_ context.Context, req *schedulerpb.NotifyQuerierShutdownRequest) (*schedulerpb.NotifyQuerierShutdownResponse, error) {
-	level.Info(s.log).Log("msg", "received shutdown notification from querier", "querier", req.GetQuerierID())
-	s.requestQueue.NotifyQuerierShutdown(req.GetQuerierID())
+	querierID := req.GetQuerierID()
+	if !s.cfg.isQuerierAllowed(querierID) {
+		level.Warn(s.log).Log("msg", "rejecting shutdown notification: querier ID not in allowed_queriers list", "querier", querierID)
+		return nil, status.Error(codes.PermissionDenied, "querier ID is not permitted to notify this scheduler")
+	}
+	level.Info(s.log).Log("msg", "received shutdown notification from querier", "querier", querierID)
+	s.requestQueue.NotifyQuerierShutdown(querierID)
 
 	return &schedulerpb.NotifyQuerierShutdownResponse{}, nil
 }

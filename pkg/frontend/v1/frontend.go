@@ -20,6 +20,7 @@ import (
 	"github.com/cortexproject/cortex/pkg/scheduler/queue"
 	"github.com/cortexproject/cortex/pkg/tenant"
 	"github.com/cortexproject/cortex/pkg/util"
+	"github.com/cortexproject/cortex/pkg/util/flagext"
 	"github.com/cortexproject/cortex/pkg/util/httpgrpcutil"
 	"github.com/cortexproject/cortex/pkg/util/services"
 	"github.com/cortexproject/cortex/pkg/util/validation"
@@ -31,14 +32,39 @@ var (
 
 // Config for a Frontend.
 type Config struct {
-	MaxOutstandingPerTenant int           `yaml:"max_outstanding_per_tenant"`
-	QuerierForgetDelay      time.Duration `yaml:"querier_forget_delay"`
+	MaxOutstandingPerTenant int                    `yaml:"max_outstanding_per_tenant"`
+	QuerierForgetDelay      time.Duration          `yaml:"querier_forget_delay"`
+	// AllowedQueriers, when non-empty, restricts which querier client IDs may
+	// register with this query-frontend via Process / NotifyClientShutdown. The
+	// identity is still the self-asserted ID the querier returns in reply to
+	// GET_ID, so this is a defence-in-depth hardening on top of network isolation
+	// of the frontend gRPC port - it is NOT a replacement for keeping that port
+	// off tenant-reachable networks. When empty (the default) behaviour is
+	// unchanged and any ID is accepted, preserving backwards compatibility.
+	AllowedQueriers         flagext.StringSliceCSV `yaml:"allowed_queriers"`
 }
 
 // RegisterFlags adds the flags required to config this to the given FlagSet.
 func (cfg *Config) RegisterFlags(f *flag.FlagSet) {
 	f.IntVar(&cfg.MaxOutstandingPerTenant, "querier.max-outstanding-requests-per-tenant", 100, "Maximum number of outstanding requests per tenant per frontend; requests beyond this error with HTTP 429.")
 	f.DurationVar(&cfg.QuerierForgetDelay, "query-frontend.querier-forget-delay", 0, "If a querier disconnects without sending notification about graceful shutdown, the query-frontend will keep the querier in the tenant's shard until the forget delay has passed. This feature is useful to reduce the blast radius when shuffle-sharding is enabled.")
+	f.Var(&cfg.AllowedQueriers, "query-frontend.allowed-queriers", "Comma-separated list of querier client IDs allowed to register with this query-frontend (v1 Process / NotifyClientShutdown). When empty (default) any ID is accepted. This is a defence-in-depth hardening on top of network isolation of the frontend gRPC port.")
+}
+
+// isQuerierAllowed returns true if the (self-asserted) querierID is accepted by
+// this frontend's current configuration. If no allowlist is configured, every
+// ID is accepted so that the default inter-component trust model is preserved.
+// An empty ID is always rejected when an allowlist is configured.
+func (cfg *Config) isQuerierAllowed(querierID string) bool {
+	if len(cfg.AllowedQueriers) == 0 {
+		return true
+	}
+	for _, allowed := range cfg.AllowedQueriers {
+		if allowed != "" && allowed == querierID {
+			return true
+		}
+	}
+	return false
 }
 
 type Limits interface {
@@ -195,6 +221,11 @@ func (f *Frontend) Process(server frontendv1pb.Frontend_ProcessServer) error {
 		return err
 	}
 
+	if !f.cfg.isQuerierAllowed(querierID) {
+		level.Warn(f.log).Log("msg", "rejecting querier connection: querier ID not in allowed_queriers list", "querier", querierID)
+		return httpgrpc.Errorf(http.StatusForbidden, "querier ID is not permitted to connect to this frontend")
+	}
+
 	f.requestQueue.RegisterQuerierConnection(querierID)
 	defer f.requestQueue.UnregisterQuerierConnection(querierID)
 
@@ -286,8 +317,13 @@ func (f *Frontend) Process(server frontendv1pb.Frontend_ProcessServer) error {
 }
 
 func (f *Frontend) NotifyClientShutdown(_ context.Context, req *frontendv1pb.NotifyClientShutdownRequest) (*frontendv1pb.NotifyClientShutdownResponse, error) {
-	level.Info(f.log).Log("msg", "received shutdown notification from querier", "querier", req.GetClientID())
-	f.requestQueue.NotifyQuerierShutdown(req.GetClientID())
+	clientID := req.GetClientID()
+	if !f.cfg.isQuerierAllowed(clientID) {
+		level.Warn(f.log).Log("msg", "rejecting shutdown notification: client ID not in allowed_queriers list", "querier", clientID)
+		return nil, httpgrpc.Errorf(http.StatusForbidden, "querier ID is not permitted to notify this frontend")
+	}
+	level.Info(f.log).Log("msg", "received shutdown notification from querier", "querier", clientID)
+	f.requestQueue.NotifyQuerierShutdown(clientID)
 
 	return &frontendv1pb.NotifyClientShutdownResponse{}, nil
 }
