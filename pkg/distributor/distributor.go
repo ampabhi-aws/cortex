@@ -687,7 +687,13 @@ func (d *Distributor) Push(ctx context.Context, req *cortexpb.WriteRequest) (*co
 			return nil, err
 		}
 
-		skipLabelNameValidation := d.cfg.SkipLabelNameValidation || req.GetSkipLabelNameValidation()
+		// The request-level SkipLabelNameValidation field is deliberately ignored here:
+		// it is a client-settable protobuf field (cortexpb.WriteRequest.SkipLabelNameValidation)
+		// and must not be allowed to turn off server-side label-name syntax validation from
+		// externally reachable entry points (HTTP /api/v1/push already scrubs it in
+		// pkg/util/push/push.go, but the gRPC Push service does not). Only the
+		// operator-controlled, YAML-hidden distributor config may opt in.
+		skipLabelNameValidation := d.cfg.SkipLabelNameValidation
 		validatedSeries, validationErr := d.validateSeries(ts, userID, skipLabelNameValidation)
 
 		// Errors in validation are considered non-fatal, as one series in a request may contain
