@@ -22,6 +22,7 @@ import (
 	"github.com/cortexproject/cortex/pkg/util"
 	"github.com/cortexproject/cortex/pkg/util/concurrency"
 	util_log "github.com/cortexproject/cortex/pkg/util/log"
+	util_net "github.com/cortexproject/cortex/pkg/util/net"
 )
 
 const (
@@ -45,6 +46,8 @@ var (
 	errTLSFileNotAllowed             = errors.New("setting TLS ca_file, cert_file and key_file is not allowed")
 	errSlackAPIURLFileNotAllowed     = errors.New("setting Slack api_url_file and global slack_api_url_file is not allowed")
 	errVictorOpsAPIKeyFileNotAllowed = errors.New("setting VictorOps api_key_file is not allowed")
+	errEmailSMTPSmarthostBlocked     = errors.New("email receiver smarthost resolves to an address blocked by the receivers firewall")
+	errGlobalSMTPSmarthostBlocked    = errors.New("global smtp_smarthost resolves to an address blocked by the receivers firewall")
 )
 
 // UserConfig is used to communicate a users alertmanager configs
@@ -186,7 +189,7 @@ func validateUserConfig(logger log.Logger, cfg alertspb.AlertConfigDesc, limits 
 	}
 
 	// Validate the config recursively scanning it.
-	if err := validateAlertmanagerConfig(amCfg); err != nil {
+	if err := validateAlertmanagerConfig(amCfg, user, limits); err != nil {
 		return err
 	}
 
@@ -307,7 +310,11 @@ func (am *MultitenantAlertmanager) ListAllConfigs(w http.ResponseWriter, r *http
 // validateAlertmanagerConfig recursively scans the input config looking for data types for which
 // we have a specific validation and, whenever encountered, it runs their validation. Returns the
 // first error or nil if validation succeeds.
-func validateAlertmanagerConfig(cfg interface{}) error {
+//
+// The user and limits parameters are threaded through so that per-tenant
+// policy (e.g. the receivers firewall) can be enforced on fields that cannot
+// honour the firewall at dial time, such as EmailConfig.Smarthost.
+func validateAlertmanagerConfig(cfg interface{}, user string, limits Limits) error {
 	v := reflect.ValueOf(cfg)
 	t := v.Type()
 
@@ -327,7 +334,7 @@ func validateAlertmanagerConfig(cfg interface{}) error {
 	// At this point the value can't be a pointer anymore.
 	switch t {
 	case reflect.TypeOf(config.GlobalConfig{}):
-		if err := validateGlobalConfig(v.Interface().(config.GlobalConfig)); err != nil {
+		if err := validateGlobalConfig(v.Interface().(config.GlobalConfig), user, limits); err != nil {
 			return err
 		}
 
@@ -350,6 +357,11 @@ func validateAlertmanagerConfig(cfg interface{}) error {
 		if err := validateVictorOpsConfig(v.Interface().(config.VictorOpsConfig)); err != nil {
 			return err
 		}
+
+	case reflect.TypeOf(config.EmailConfig{}):
+		if err := validateEmailConfig(v.Interface().(config.EmailConfig), user, limits); err != nil {
+			return err
+		}
 	}
 
 	// If the input config is a struct, recursively iterate on all fields.
@@ -360,7 +372,7 @@ func validateAlertmanagerConfig(cfg interface{}) error {
 
 			// Skip any field value which can't be converted to interface (eg. primitive types).
 			if fieldValue.CanInterface() {
-				if err := validateAlertmanagerConfig(fieldValue.Interface()); err != nil {
+				if err := validateAlertmanagerConfig(fieldValue.Interface(), user, limits); err != nil {
 					return err
 				}
 			}
@@ -373,7 +385,7 @@ func validateAlertmanagerConfig(cfg interface{}) error {
 
 			// Skip any field value which can't be converted to interface (eg. primitive types).
 			if fieldValue.CanInterface() {
-				if err := validateAlertmanagerConfig(fieldValue.Interface()); err != nil {
+				if err := validateAlertmanagerConfig(fieldValue.Interface(), user, limits); err != nil {
 					return err
 				}
 			}
@@ -386,7 +398,7 @@ func validateAlertmanagerConfig(cfg interface{}) error {
 
 			// Skip any field value which can't be converted to interface (eg. primitive types).
 			if fieldValue.CanInterface() {
-				if err := validateAlertmanagerConfig(fieldValue.Interface()); err != nil {
+				if err := validateAlertmanagerConfig(fieldValue.Interface(), user, limits); err != nil {
 					return err
 				}
 			}
@@ -425,9 +437,21 @@ func validateReceiverTLSConfig(cfg commoncfg.TLSConfig) error {
 
 // validateGlobalConfig validates the Global config and returns an error if it contains
 // settings now allowed by Cortex.
-func validateGlobalConfig(cfg config.GlobalConfig) error {
+func validateGlobalConfig(cfg config.GlobalConfig, user string, limits Limits) error {
 	if cfg.SlackAPIURLFile != "" {
 		return errSlackAPIURLFileNotAllowed
+	}
+	// Enforce the receivers firewall against the global SMTP smarthost, since
+	// email receivers inherit this value when they don't set their own and the
+	// email notifier does not route its dial through the FirewallDialer.
+	if cfg.SMTPSmarthost.Host != "" && limits != nil {
+		if util_net.IsBlockedHost(
+			cfg.SMTPSmarthost.Host,
+			limits.AlertmanagerReceiversBlockPrivateAddresses(user),
+			limits.AlertmanagerReceiversBlockCIDRNetworks(user),
+		) {
+			return errGlobalSMTPSmarthostBlocked
+		}
 	}
 	return nil
 }
@@ -446,6 +470,32 @@ func validateSlackConfig(cfg config.SlackConfig) error {
 func validateVictorOpsConfig(cfg config.VictorOpsConfig) error {
 	if cfg.APIKeyFile != "" {
 		return errVictorOpsAPIKeyFileNotAllowed
+	}
+	return nil
+}
+
+// validateEmailConfig validates the Email receiver config and returns an error
+// if its smarthost resolves to an address the per-tenant receivers firewall
+// would block. This is enforced at upload time because the vendored email
+// notifier dials the smarthost with a bare net.Dialer / tls.Dial that does
+// not go through the FirewallDialer, so the firewall cannot be applied at
+// connect time for SMTP as it is for every other receiver integration.
+func validateEmailConfig(cfg config.EmailConfig, user string, limits Limits) error {
+	if limits == nil {
+		return nil
+	}
+	host := cfg.Smarthost.Host
+	if host == "" {
+		// Smarthost may be inherited from GlobalConfig.SMTPSmarthost, which is
+		// validated separately in validateGlobalConfig.
+		return nil
+	}
+	if util_net.IsBlockedHost(
+		host,
+		limits.AlertmanagerReceiversBlockPrivateAddresses(user),
+		limits.AlertmanagerReceiversBlockCIDRNetworks(user),
+	) {
+		return errEmailSMTPSmarthostBlocked
 	}
 	return nil
 }

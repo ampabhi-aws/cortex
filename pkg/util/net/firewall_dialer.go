@@ -54,17 +54,60 @@ func (d *FirewallDialer) control(_, address string, _ syscall.RawConn) error {
 		return errBlockedAddress
 	}
 
-	if blockPrivateAddresses && (isPrivate(ip) || isLocal(ip)) {
+	if IsBlockedIP(ip, blockPrivateAddresses, blockCIDRNetworks) {
 		return errBlockedAddress
 	}
+	return nil
+}
 
+// IsBlockedIP returns true if the given IP would be rejected by a
+// FirewallDialer configured with the supplied options. It implements the same
+// policy as the dialer's Control hook so callers can pre-validate addresses
+// before dialling (for example at config-upload time, for integrations such as
+// the vendored SMTP email notifier that do not route their connections through
+// the firewall dialer).
+func IsBlockedIP(ip net.IP, blockPrivateAddresses bool, blockCIDRNetworks []flagext.CIDR) bool {
+	if ip == nil {
+		return false
+	}
+	if blockPrivateAddresses && (isPrivate(ip) || isLocal(ip)) {
+		return true
+	}
 	for _, cidr := range blockCIDRNetworks {
 		if cidr.Value.Contains(ip) {
-			return errBlockedAddress
+			return true
 		}
 	}
+	return false
+}
 
-	return nil
+// IsBlockedHost resolves host (if it is not already a literal IP) and reports
+// whether any resulting address would be rejected by a FirewallDialer with the
+// supplied options. An empty host is never blocked. When the firewall is
+// active and DNS resolution fails the host is treated as blocked, matching the
+// FirewallDialer's fail-closed behaviour for unresolvable targets.
+func IsBlockedHost(host string, blockPrivateAddresses bool, blockCIDRNetworks []flagext.CIDR) bool {
+	if host == "" {
+		return false
+	}
+	if !blockPrivateAddresses && len(blockCIDRNetworks) == 0 {
+		return false
+	}
+	if ip := net.ParseIP(host); ip != nil {
+		return IsBlockedIP(ip, blockPrivateAddresses, blockCIDRNetworks)
+	}
+	ips, err := net.LookupIP(host)
+	if err != nil {
+		// Fail closed: when the firewall is active, we cannot allow a target we
+		// are unable to verify.
+		return true
+	}
+	for _, ip := range ips {
+		if IsBlockedIP(ip, blockPrivateAddresses, blockCIDRNetworks) {
+			return true
+		}
+	}
+	return false
 }
 
 func isLocal(ip net.IP) bool {
