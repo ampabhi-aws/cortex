@@ -209,6 +209,11 @@ type Limits interface {
 	// AlertmanagerMaxTemplateSize returns max size of individual template. 0 = no limit.
 	AlertmanagerMaxTemplateSize(tenant string) int
 
+	// AlertmanagerMaxTemplatesTotalSize returns the total maximum size in bytes of all
+	// templates in the tenant's Alertmanager configuration (sum over all templates).
+	// It bounds the on-disk footprint of templates on the shared data volume. 0 = no limit.
+	AlertmanagerMaxTemplatesTotalSize(tenant string) int
+
 	// AlertmanagerMaxDispatcherAggregationGroups returns maximum number of aggregation groups in Alertmanager's dispatcher that a tenant can have.
 	// Each aggregation group consumes single goroutine. 0 = unlimited.
 	AlertmanagerMaxDispatcherAggregationGroups(t string) int
@@ -813,6 +818,32 @@ func (am *MultitenantAlertmanager) setConfig(cfg alertspb.AlertConfigDesc) error
 	var hasTemplateChanges bool
 	var userTemplateDir = filepath.Join(am.getTenantDirectory(cfg.User), templatesDir)
 	var pathsToRemove = make(map[string]struct{})
+
+	// Enforce template limits again at the sync boundary so that configs loaded
+	// from object storage (e.g. written before stricter limits were applied) are
+	// not expanded onto the shared data volume. This is defense in depth; the
+	// API handler is the primary enforcement point.
+	if am.limits != nil {
+		if l := am.limits.AlertmanagerMaxTemplatesCount(cfg.User); l > 0 && len(cfg.Templates) > l {
+			return fmt.Errorf(errTooManyTemplates, len(cfg.Templates), l)
+		}
+		if maxSize := am.limits.AlertmanagerMaxTemplateSize(cfg.User); maxSize > 0 {
+			for _, tmpl := range cfg.Templates {
+				if size := len(tmpl.GetBody()); size > maxSize {
+					return fmt.Errorf(errTemplateTooBig, tmpl.GetFilename(), size, maxSize)
+				}
+			}
+		}
+		if maxTotal := am.limits.AlertmanagerMaxTemplatesTotalSize(cfg.User); maxTotal > 0 {
+			total := 0
+			for _, tmpl := range cfg.Templates {
+				total += len(tmpl.GetBody())
+			}
+			if total > maxTotal {
+				return fmt.Errorf(errTemplatesTotalTooBig, total, maxTotal)
+			}
+		}
+	}
 
 	// List existing files to keep track the ones to be removed
 	if oldTemplateFiles, err := os.ReadDir(userTemplateDir); err == nil {
