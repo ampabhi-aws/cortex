@@ -1,6 +1,7 @@
 package api
 
 import (
+	"crypto/subtle"
 	"database/sql"
 	"encoding/json"
 	"errors"
@@ -24,6 +25,7 @@ import (
 	"github.com/cortexproject/cortex/pkg/configs/userconfig"
 	"github.com/cortexproject/cortex/pkg/tenant"
 	"github.com/cortexproject/cortex/pkg/util"
+	"github.com/cortexproject/cortex/pkg/util/flagext"
 	util_log "github.com/cortexproject/cortex/pkg/util/log"
 )
 
@@ -35,6 +37,14 @@ var (
 // Config configures Configs API
 type Config struct {
 	Notifications NotificationsConfig `yaml:"notifications"`
+
+	// PrivateAPIToken is the shared bearer token required to call the
+	// /private/api/prom/configs/* endpoints (used by the ruler and alertmanager
+	// configs client for service-to-service lookups). When empty the private
+	// endpoints are disabled (they return 401) to prevent unauthenticated
+	// cross-tenant disclosure of rules and alertmanager configurations
+	// (including receiver secrets).
+	PrivateAPIToken flagext.Secret `yaml:"private_api_token"`
 }
 
 // NotificationsConfig configures Alertmanager notifications method.
@@ -47,6 +57,7 @@ type NotificationsConfig struct {
 func (cfg *Config) RegisterFlags(f *flag.FlagSet) {
 	f.BoolVar(&cfg.Notifications.DisableEmail, "configs.notifications.disable-email", false, "Disable Email notifications for Alertmanager.")
 	f.BoolVar(&cfg.Notifications.DisableWebHook, "configs.notifications.disable-webhook", false, "Disable WebHook notifications for Alertmanager.")
+	f.Var(&cfg.PrivateAPIToken, "configs.api.private-token", "Bearer token required to call /private/api/prom/configs/* endpoints. When empty, those endpoints are disabled (return 401). Must match -ruler.configs.private-token / -alertmanager.configs.private-token on the client side.")
 }
 
 // API implements the configs api.
@@ -263,7 +274,31 @@ type ConfigsView struct {
 	Configs map[string]userconfig.View `json:"configs"`
 }
 
+// authorizeInternal gates the /private/api/prom/configs/* endpoints behind a
+// configured bearer token. These endpoints return every tenant's
+// configuration (including Alertmanager receiver secrets) and must not be
+// reachable by unauthenticated callers. The comparison is constant-time to
+// avoid leaking token bytes through timing.
+func (a *API) authorizeInternal(r *http.Request) bool {
+	expected := a.cfg.PrivateAPIToken.Value
+	if expected == "" {
+		// Fail closed: without a configured token the endpoint is disabled.
+		return false
+	}
+	authz := r.Header.Get("Authorization")
+	const prefix = "Bearer "
+	if !strings.HasPrefix(authz, prefix) {
+		return false
+	}
+	provided := strings.TrimPrefix(authz, prefix)
+	return subtle.ConstantTimeCompare([]byte(provided), []byte(expected)) == 1
+}
+
 func (a *API) getConfigs(w http.ResponseWriter, r *http.Request) {
+	if !a.authorizeInternal(r) {
+		http.Error(w, "unauthorized", http.StatusUnauthorized)
+		return
+	}
 	var cfgs map[string]userconfig.View
 	var cfgErr error
 	logger := util_log.WithContext(r.Context(), util_log.Logger)

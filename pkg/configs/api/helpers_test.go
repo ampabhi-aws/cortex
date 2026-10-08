@@ -7,9 +7,11 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 
 	"github.com/cortexproject/cortex/pkg/configs/userconfig"
+	"github.com/cortexproject/cortex/pkg/util/flagext"
 
 	"github.com/stretchr/testify/require"
 	"github.com/weaveworks/common/user"
@@ -17,6 +19,8 @@ import (
 	"github.com/cortexproject/cortex/pkg/configs/db"
 	"github.com/cortexproject/cortex/pkg/configs/db/dbtest"
 )
+
+const testPrivateAPIToken = "test-private-token"
 
 var (
 	app      *API
@@ -31,6 +35,7 @@ func setup(t *testing.T) {
 		Notifications: NotificationsConfig{
 			DisableEmail: true,
 		},
+		PrivateAPIToken: flagext.Secret{Value: testPrivateAPIToken},
 	})
 	counter = 0
 }
@@ -42,6 +47,7 @@ func setupWithEmailEnabled(t *testing.T) {
 		Notifications: NotificationsConfig{
 			DisableEmail: false,
 		},
+		PrivateAPIToken: flagext.Secret{Value: testPrivateAPIToken},
 	})
 	counter = 0
 }
@@ -51,8 +57,23 @@ func cleanup(t *testing.T) {
 	dbtest.Cleanup(t, database)
 }
 
-// request makes a request to the configs API.
+// request makes a request to the configs API. For requests to the
+// /private/* endpoints the configured private API token is attached as a
+// bearer token so the tests exercise the internal-authenticated path.
 func request(t *testing.T, method, urlStr string, body io.Reader) *httptest.ResponseRecorder {
+	w := httptest.NewRecorder()
+	r, err := http.NewRequest(method, urlStr, body)
+	require.NoError(t, err)
+	if strings.HasPrefix(urlStr, "/private/") {
+		r.Header.Set("Authorization", "Bearer "+testPrivateAPIToken)
+	}
+	app.ServeHTTP(w, r)
+	return w
+}
+
+// requestAnonymous is like request but without any bearer token, used to
+// verify unauthenticated callers are rejected.
+func requestAnonymous(t *testing.T, method, urlStr string, body io.Reader) *httptest.ResponseRecorder {
 	w := httptest.NewRecorder()
 	r, err := http.NewRequest(method, urlStr, body)
 	require.NoError(t, err)
