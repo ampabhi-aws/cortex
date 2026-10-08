@@ -2,7 +2,9 @@ package memberlist
 
 import (
 	"bytes"
+	"crypto/hmac"
 	"crypto/md5"
+	"crypto/sha256"
 	"crypto/tls"
 	"flag"
 	"fmt"
@@ -59,6 +61,13 @@ type TCPTransportConfig struct {
 
 	TLSEnabled bool                   `yaml:"tls_enabled"`
 	TLS        cortextls.ClientConfig `yaml:",inline"`
+
+	// PacketAuthKey, when non-empty, is used to authenticate incoming and outgoing
+	// "packet" frames with HMAC-SHA256 instead of a keyless MD5 checksum. When this
+	// key is set the transport will reject packets that do not carry a valid HMAC.
+	// This field is populated internally from KVConfig.SecretKey; it is not exposed
+	// as its own CLI flag.
+	PacketAuthKey []byte `yaml:"-"`
 }
 
 func (cfg *TCPTransportConfig) RegisterFlags(f *flag.FlagSet) {
@@ -82,13 +91,15 @@ func (cfg *TCPTransportConfig) RegisterFlagsWithPrefix(f *flag.FlagSet, prefix s
 // operations ("packet" and "stream" are terms used by memberlist).
 // It uses a new TCP connections for each operation. There is no connection reuse.
 type TCPTransport struct {
-	cfg          TCPTransportConfig
-	logger       log.Logger
-	packetCh     chan *memberlist.Packet
-	connCh       chan net.Conn
-	wg           sync.WaitGroup
-	tcpListeners []net.Listener
-	tlsConfig    *tls.Config
+	cfg             TCPTransportConfig
+	logger          log.Logger
+	packetCh        chan *memberlist.Packet
+	connCh          chan net.Conn
+	wg              sync.WaitGroup
+	tcpListeners    []net.Listener
+	tlsClientConfig *tls.Config
+	tlsServerConfig *tls.Config
+	packetAuthKey   []byte // when non-empty, packet frames are authenticated with HMAC-SHA256
 
 	shutdown atomic.Int32
 
@@ -127,10 +138,24 @@ func NewTCPTransport(config TCPTransportConfig, logger log.Logger) (*TCPTranspor
 
 	var err error
 	if config.TLSEnabled {
-		t.tlsConfig, err = config.TLS.GetTLSConfig()
+		t.tlsClientConfig, err = config.TLS.GetTLSConfig()
 		if err != nil {
-			return nil, errors.Wrap(err, "unable to create TLS config")
+			return nil, errors.Wrap(err, "unable to create TLS client config")
 		}
+
+		// The server-side TLS config must authenticate its peers (mutual TLS); we
+		// cannot reuse the client config here because it does not set ClientAuth or
+		// ClientCAs, which would leave the gossip listener accepting any TCP peer
+		// that completes a TLS handshake.
+		t.tlsServerConfig, err = config.TLS.GetServerTLSConfig()
+		if err != nil {
+			return nil, errors.Wrap(err, "unable to create TLS server config")
+		}
+	}
+
+	if len(config.PacketAuthKey) > 0 {
+		// Copy to protect against mutation by the caller.
+		t.packetAuthKey = append([]byte(nil), config.PacketAuthKey...)
 	}
 
 	t.registerMetrics(config.MetricsRegisterer)
@@ -151,7 +176,7 @@ func NewTCPTransport(config TCPTransportConfig, logger log.Logger) (*TCPTranspor
 
 		var tcpLn net.Listener
 		if config.TLSEnabled {
-			tcpLn, err = tls.Listen("tcp", tcpAddr.String(), t.tlsConfig)
+			tcpLn, err = tls.Listen("tcp", tcpAddr.String(), t.tlsServerConfig)
 			if err != nil {
 				return nil, errors.Wrapf(err, "failed to start TLS TCP listener on %q port %d", addr, port)
 			}
@@ -288,20 +313,51 @@ func (t *TCPTransport) handleConnection(conn net.Conn) {
 			return
 		}
 
-		if len(buf) < md5.Size {
+		// Determine the authentication/integrity scheme in use. When PacketAuthKey
+		// is configured, each packet carries an HMAC-SHA256 of the payload keyed
+		// with the cluster-wide shared secret and we verify it as an authenticity
+		// check. Otherwise we fall back to the historic keyless md5 checksum,
+		// which only detects accidental corruption. Either way, a mismatch now
+		// fails closed: the packet is dropped before being handed to memberlist.
+		var (
+			digestSize     int
+			expectedDigest []byte
+			authScheme     string
+		)
+		if len(t.packetAuthKey) > 0 {
+			digestSize = sha256.Size
+			authScheme = "hmac-sha256"
+		} else {
+			digestSize = md5.Size
+			authScheme = "md5"
+		}
+
+		if len(buf) < digestSize {
 			t.receivedPacketsErrors.Inc()
 			level.Warn(t.logger).Log("msg", "not enough data received", "data_length", len(buf), "remote", conn.RemoteAddr())
 			return
 		}
 
-		receivedDigest := buf[len(buf)-md5.Size:]
-		buf = buf[:len(buf)-md5.Size]
+		receivedDigest := buf[len(buf)-digestSize:]
+		buf = buf[:len(buf)-digestSize]
 
-		expectedDigest := md5.Sum(buf)
+		if len(t.packetAuthKey) > 0 {
+			mac := hmac.New(sha256.New, t.packetAuthKey)
+			mac.Write(buf)
+			expectedDigest = mac.Sum(nil)
+		} else {
+			sum := md5.Sum(buf)
+			expectedDigest = sum[:]
+		}
 
-		if !bytes.Equal(receivedDigest, expectedDigest[:]) {
+		if !hmac.Equal(receivedDigest, expectedDigest) {
 			t.receivedPacketsErrors.Inc()
-			level.Warn(t.logger).Log("msg", "packet digest mismatch", "expected", fmt.Sprintf("%x", expectedDigest), "received", fmt.Sprintf("%x", receivedDigest), "data_length", len(buf), "remote", conn.RemoteAddr())
+			level.Warn(t.logger).Log("msg", "packet digest mismatch", "scheme", authScheme, "data_length", len(buf), "remote", conn.RemoteAddr())
+			// Fail closed: a wrong digest means either corruption on the wire or an
+			// unauthenticated / forged frame. Either way the payload must not be
+			// handed to memberlist, which would otherwise merge it into the shared
+			// ring and re-gossip it cluster-wide.
+			return
 		}
 
 		t.debugLog().Log("msg", "Received packet", "addr", addr(addrBuf), "size", len(buf), "hash", fmt.Sprintf("%x", receivedDigest))
@@ -331,7 +387,7 @@ func (a addr) String() string {
 
 func (t *TCPTransport) getConnection(addr string, timeout time.Duration) (net.Conn, error) {
 	if t.cfg.TLSEnabled {
-		return tls.DialWithDialer(&net.Dialer{Timeout: timeout}, "tcp", addr, t.tlsConfig)
+		return tls.DialWithDialer(&net.Dialer{Timeout: timeout}, "tcp", addr, t.tlsClientConfig)
 	}
 	return net.DialTimeout("tcp", addr, timeout)
 }
@@ -452,9 +508,18 @@ func (t *TCPTransport) writeTo(b []byte, addr string) error {
 
 	// Compute the digest *before* setting the deadline on the connection (so that the time
 	// it takes to compute the digest is not taken in account).
-	// We use md5 as quick and relatively short hash, not in cryptographic context.
-	// It's also used to detect if the whole packet has been received on the receiver side.
-	digest := md5.Sum(b)
+	// When a cluster-wide shared secret is configured we use HMAC-SHA256 so that the
+	// receiver can authenticate the sender; otherwise we fall back to the historic
+	// md5 checksum, which is only an integrity hint.
+	var digest []byte
+	if len(t.packetAuthKey) > 0 {
+		mac := hmac.New(sha256.New, t.packetAuthKey)
+		mac.Write(b)
+		digest = mac.Sum(nil)
+	} else {
+		sum := md5.Sum(b)
+		digest = sum[:]
+	}
 
 	// Prepare the header *before* setting the deadline on the connection.
 	headerBuf := bytes.Buffer{}
@@ -494,7 +559,7 @@ func (t *TCPTransport) writeTo(b []byte, addr string) error {
 	}
 
 	// Append digest.
-	n, err = c.Write(digest[:])
+	n, err = c.Write(digest)
 	if err != nil {
 		return fmt.Errorf("digest: %v", err)
 	}

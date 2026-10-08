@@ -44,14 +44,10 @@ func (cfg *ClientConfig) GetTLSConfig() (*tls.Config, error) {
 
 	// read ca certificates
 	if cfg.CAPath != "" {
-		var caCertPool *x509.CertPool
-		caCert, err := os.ReadFile(cfg.CAPath)
+		caCertPool, err := cfg.loadCAPool()
 		if err != nil {
-			return nil, errors.Wrapf(err, "error loading ca cert: %s", cfg.CAPath)
+			return nil, err
 		}
-		caCertPool = x509.NewCertPool()
-		caCertPool.AppendCertsFromPEM(caCert)
-
 		config.RootCAs = caCertPool
 	}
 
@@ -71,6 +67,54 @@ func (cfg *ClientConfig) GetTLSConfig() (*tls.Config, error) {
 	}
 
 	return config, nil
+}
+
+// loadCAPool loads the configured CA certificates into an x509.CertPool. It
+// returns an error when the CA file cannot be read; callers should only invoke
+// it when a CA path is configured.
+func (cfg *ClientConfig) loadCAPool() (*x509.CertPool, error) {
+	caCert, err := os.ReadFile(cfg.CAPath)
+	if err != nil {
+		return nil, errors.Wrapf(err, "error loading ca cert: %s", cfg.CAPath)
+	}
+	pool := x509.NewCertPool()
+	pool.AppendCertsFromPEM(caCert)
+	return pool, nil
+}
+
+// GetServerTLSConfig returns a *tls.Config suitable for use on a TLS listener
+// that must authenticate its peers (mutual TLS). Unlike GetTLSConfig (which
+// produces a client config), this method configures ClientAuth =
+// RequireAndVerifyClientCert and the ClientCAs pool so the server requests and
+// verifies a client certificate signed by the configured CA. A minimum TLS
+// version of 1.2 is enforced.
+//
+// A CA path and a server certificate/key are required: without a CA the server
+// cannot authenticate peers.
+func (cfg *ClientConfig) GetServerTLSConfig() (*tls.Config, error) {
+	if cfg.CAPath == "" {
+		return nil, errors.New("TLS server config requires a CA certificate (tls_ca_path) to authenticate peers")
+	}
+	if cfg.CertPath == "" || cfg.KeyPath == "" {
+		return nil, errors.New("TLS server config requires both a certificate (tls_cert_path) and key (tls_key_path)")
+	}
+
+	caCertPool, err := cfg.loadCAPool()
+	if err != nil {
+		return nil, err
+	}
+
+	serverCert, err := tls.LoadX509KeyPair(cfg.CertPath, cfg.KeyPath)
+	if err != nil {
+		return nil, errors.Wrapf(err, "failed to load TLS certificate %s,%s", cfg.CertPath, cfg.KeyPath)
+	}
+
+	return &tls.Config{
+		Certificates: []tls.Certificate{serverCert},
+		ClientCAs:    caCertPool,
+		ClientAuth:   tls.RequireAndVerifyClientCert,
+		MinVersion:   tls.VersionTLS12,
+	}, nil
 }
 
 // GetGRPCDialOptions creates GRPC DialOptions for TLS
