@@ -114,6 +114,16 @@ type Alertmanager struct {
 	configHashMetric prometheus.Gauge
 
 	rateLimitedNotifications *prometheus.CounterVec
+
+	// limiters holds the per-(tenant, integration) rate limiters. The
+	// Alertmanager owns the limiters so they survive across config reloads
+	// and are shared by all integration entries targeting the same
+	// integration type: a tenant that declares N integration entries of the
+	// same type (e.g. N webhook_configs) must not multiply the configured
+	// per-user rate limit by N and must not reset the burst bucket by
+	// re-uploading the config.
+	limitersMtx sync.Mutex
+	limiters    map[string]*rate.Limiter
 }
 
 var (
@@ -168,6 +178,7 @@ func New(cfg *Config, reg *prometheus.Registry) (*Alertmanager, error) {
 			Help: "Number of rate-limited notifications per integration.",
 		}, []string{"integration"}), // "integration" is consistent with other alertmanager metrics.
 
+		limiters: map[string]*rate.Limiter{},
 	}
 
 	am.registry = reg
@@ -360,7 +371,13 @@ func (am *Alertmanager) ApplyConfig(userID string, conf *config.Config, rawCfg s
 				integration: integrationName,
 			}
 
-			return newRateLimitedNotifier(notifier, rl, 10*time.Second, am.rateLimitedNotifications.WithLabelValues(integrationName))
+			// Share a single limiter per (tenant, integration) across all
+			// integration entries of this receiver and across config
+			// reloads so that declaring N integration entries cannot
+			// multiply the configured rate limit by N, and re-uploading
+			// a trivially different config cannot refill the burst
+			// bucket.
+			return newRateLimitedNotifierWithLimiter(notifier, rl, am.limiterFor(integrationName, rl), 10*time.Second, am.rateLimitedNotifications.WithLabelValues(integrationName))
 		}
 		return notifier
 	})
@@ -584,6 +601,24 @@ func (t *tenantRateLimits) RateLimit() rate.Limit {
 
 func (t *tenantRateLimits) Burst() int {
 	return t.limits.NotificationBurstSize(t.tenant, t.integration)
+}
+
+// limiterFor returns the rate.Limiter instance shared across all notifiers of
+// the given integration for this (per-tenant) Alertmanager, creating one on
+// first use. The limit/burst are kept in sync with the operator-controlled
+// configured values by the notifier's periodic recheck.
+func (am *Alertmanager) limiterFor(integration string, l rateLimits) *rate.Limiter {
+	am.limitersMtx.Lock()
+	defer am.limitersMtx.Unlock()
+	if am.limiters == nil {
+		am.limiters = map[string]*rate.Limiter{}
+	}
+	if lim, ok := am.limiters[integration]; ok {
+		return lim
+	}
+	lim := rate.NewLimiter(l.RateLimit(), l.Burst())
+	am.limiters[integration] = lim
+	return lim
 }
 
 type dispatcherLimits struct {

@@ -35,6 +35,8 @@ const (
 	errConfigurationTooBig   = "Alertmanager configuration is too big, limit: %d bytes"
 	errTooManyTemplates      = "too many templates in the configuration: %d (limit: %d)"
 	errTemplateTooBig        = "template %s is too big: %d bytes (limit: %d bytes)"
+	errTooManyReceivers      = "too many receivers in the configuration: %d (limit: %d)"
+	errTooManyIntegrations   = "too many integration entries in the configuration: %d (limit: %d)"
 
 	fetchConcurrency = 16
 )
@@ -188,6 +190,26 @@ func validateUserConfig(logger log.Logger, cfg alertspb.AlertConfigDesc, limits 
 	// Validate the config recursively scanning it.
 	if err := validateAlertmanagerConfig(amCfg); err != nil {
 		return err
+	}
+
+	// Admission limits: cap the number of receivers and the total number of
+	// integration entries across all receivers. Without this, a tenant can
+	// upload a config with thousands of integration entries pointing at the
+	// same URL and use the Alertmanager as an outbound request amplifier.
+	if l := limits.AlertmanagerMaxReceivers(user); l > 0 && len(amCfg.Receivers) > l {
+		return fmt.Errorf(errTooManyReceivers, len(amCfg.Receivers), l)
+	}
+	if l := limits.AlertmanagerMaxIntegrationsPerConfig(user); l > 0 {
+		total := 0
+		for _, r := range amCfg.Receivers {
+			total += len(r.WebhookConfigs) + len(r.EmailConfigs) + len(r.PagerdutyConfigs) +
+				len(r.OpsGenieConfigs) + len(r.WechatConfigs) + len(r.SlackConfigs) +
+				len(r.VictorOpsConfigs) + len(r.PushoverConfigs) + len(r.SNSConfigs) +
+				len(r.TelegramConfigs)
+		}
+		if total > l {
+			return fmt.Errorf(errTooManyIntegrations, total, l)
+		}
 	}
 
 	// Validate templates referenced in the alertmanager config.
