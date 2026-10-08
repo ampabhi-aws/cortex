@@ -76,5 +76,12 @@ func (l limitsMiddleware) Do(ctx context.Context, r tripperware.Request) (trippe
 		}
 	}
 
+	// Enforce the max query expression size (in bytes) before any middleware parses the
+	// expression. This protects against unbounded PromQL AST depth / size that would otherwise
+	// cause fatal stack exhaustion or quadratic CPU in parser.ParseExpr / expr.String().
+	if err := tripperware.ValidateQueryExpressionSize(ctx, r.GetQuery(), l.Limits); err != nil {
+		return nil, err
+	}
+
 	return l.next.Do(ctx, r)
 }

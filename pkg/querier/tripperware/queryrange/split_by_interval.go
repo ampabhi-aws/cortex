@@ -100,6 +100,9 @@ func evaluateAtModifierFunction(query string, start, end int64) (string, error) 
 	if err != nil {
 		return "", httpgrpc.Errorf(http.StatusBadRequest, "%s", err)
 	}
+	if err := tripperware.ValidateASTDepth(expr, tripperware.MaxPromQLASTDepth); err != nil {
+		return "", err
+	}
 	parser.Inspect(expr, func(n parser.Node, _ []parser.Node) error {
 		if selector, ok := n.(*parser.VectorSelector); ok {
 			switch selector.StartOrEnd {

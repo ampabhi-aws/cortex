@@ -328,6 +328,14 @@ func (s resultsCache) isAtModifierCachable(ctx context.Context, r tripperware.Re
 		return false
 	}
 
+	// Defensive depth check: fail closed on over-deep expressions before Walk / PreprocessExpr
+	// re-serialises the AST, since Go stack exhaustion from a recursive walk is fatal and
+	// cannot be recovered.
+	if err := tripperware.ValidateASTDepth(expr, tripperware.MaxPromQLASTDepth); err != nil {
+		level.Warn(util_log.WithContext(ctx, s.logger)).Log("msg", "rejecting @ modifier cache check for over-deep query", "query", query, "err", err)
+		return false
+	}
+
 	// This resolves the start() and end() used with the @ modifier.
 	expr = promql.PreprocessExpr(expr, timestamp.Time(r.GetStart()), timestamp.Time(r.GetEnd()))
 

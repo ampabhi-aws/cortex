@@ -21,4 +21,8 @@ type Limits interface {
 
 	// QueryVerticalShardSize returns the maximum number of queriers that can handle requests for this user.
 	QueryVerticalShardSize(userID string) int
+
+	// MaxQueryExpressionSizeBytes returns the max size, in bytes, of a PromQL query expression that a tenant
+	// is allowed to submit. A value of 0 disables the limit.
+	MaxQueryExpressionSizeBytes(userID string) int
 }
