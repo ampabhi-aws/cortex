@@ -14,6 +14,7 @@ import (
 	"github.com/thanos-io/objstore"
 	"github.com/thanos-io/thanos/pkg/block"
 	"github.com/thanos-io/thanos/pkg/block/metadata"
+	"github.com/thanos-io/thanos/pkg/compact"
 
 	"github.com/cortexproject/cortex/pkg/storage/bucket"
 	cortex_tsdb "github.com/cortexproject/cortex/pkg/storage/tsdb"
@@ -366,6 +367,21 @@ func (c *BlocksCleaner) cleanUser(ctx context.Context, userID string, firstRun b
 	// error if the cleanup of partial blocks fail.
 	if len(partials) > 0 {
 		c.cleanUserPartialBlocks(ctx, partials, idx, userBucket, userLogger)
+	}
+
+	// Backstop: hard-delete partial blocks that are older than
+	// compact.PartialUploadThresholdAge AND lack a deletion mark. Such
+	// prefixes can be created, for example, if a stray heartbeat tick
+	// recreates a <ULID>/visit-mark.json after block.Delete already
+	// removed the block (meta.json + deletion-mark.json gone). Without
+	// this collector those prefixes would otherwise remain forever as
+	// un-collectable partial blocks because cleanUserPartialBlocks above
+	// only deletes partial blocks that still carry a deletion mark. We
+	// delegate to the Thanos helper which already enforces an age
+	// threshold (default 2 days, based on the block ULID's embedded
+	// time) to protect against racing with in-flight uploads.
+	if len(partials) > 0 {
+		compact.BestEffortCleanAbortedPartialUploads(ctx, userLogger, partials, userBucket, c.blocksMarkedForDeletion, c.blocksCleanedTotal, c.blocksFailedTotal)
 	}
 
 	// Upload the updated index to the storage.
