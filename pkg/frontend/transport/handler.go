@@ -7,6 +7,7 @@ import (
 	"flag"
 	"fmt"
 	"io"
+	"mime"
 	"net/http"
 	"net/url"
 	"strconv"
@@ -142,9 +143,7 @@ func (f *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 
 	hs := w.Header()
-	for h, vs := range resp.Header {
-		hs[h] = vs
-	}
+	copyResponseHeaders(hs, resp.Header)
 
 	if f.cfg.QueryStatsEnabled {
 		writeServiceTimingHeader(queryResponseTime, hs, stats)
@@ -265,4 +264,58 @@ func writeServiceTimingHeader(queryResponseTime time.Duration, headers http.Head
 func statsValue(name string, d time.Duration) string {
 	durationInMs := strconv.FormatFloat(float64(d)/float64(time.Millisecond), 'f', -1, 64)
 	return name + ";dur=" + durationInMs
+}
+
+// allowedResponseMediaTypes limits the base media types that may be copied
+// from a downstream (querier) response back to the end user. This prevents a
+// compromised/rogue querier from forging content types such as text/html that
+// could enable stored XSS when rendered in a browser. Parameters such as
+// "charset=utf-8" are preserved.
+var allowedResponseMediaTypes = map[string]struct{}{
+	"application/json":       {},
+	"application/x-protobuf": {},
+	"text/plain":             {},
+}
+
+// allowedResponseHeaders is the set of response headers (canonical form) that
+// may be propagated verbatim from the downstream querier response to the end
+// user. Any other header is dropped — in particular Set-Cookie, caching
+// directives, and arbitrary custom headers cannot be injected into the
+// victim's HTTP response via the gRPC response path.
+var allowedResponseHeaders = map[string]struct{}{
+	"Content-Type":     {},
+	"Content-Encoding": {},
+	"Server-Timing":    {},
+}
+
+// copyResponseHeaders copies only an allowlisted subset of headers from src
+// to dst, and additionally restricts Content-Type to a well-known allowlist
+// of media types. This is the response-forgery hardening described in the
+// query-scheduler trust-boundary guidance.
+func copyResponseHeaders(dst, src http.Header) {
+	for h, vs := range src {
+		canon := http.CanonicalHeaderKey(h)
+		if _, ok := allowedResponseHeaders[canon]; !ok {
+			continue
+		}
+		if canon == "Content-Type" {
+			filtered := make([]string, 0, len(vs))
+			for _, v := range vs {
+				mt, _, err := mime.ParseMediaType(v)
+				if err != nil {
+					continue
+				}
+				if _, ok := allowedResponseMediaTypes[strings.ToLower(mt)]; !ok {
+					continue
+				}
+				filtered = append(filtered, v)
+			}
+			if len(filtered) == 0 {
+				continue
+			}
+			dst[canon] = filtered
+			continue
+		}
+		dst[canon] = vs
+	}
 }
