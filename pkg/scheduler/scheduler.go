@@ -19,6 +19,8 @@ import (
 	"github.com/weaveworks/common/middleware"
 	"github.com/weaveworks/common/user"
 	"google.golang.org/grpc"
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/status"
 
 	"github.com/cortexproject/cortex/pkg/frontend/v2/frontendv2pb"
 	"github.com/cortexproject/cortex/pkg/scheduler/queue"
@@ -26,6 +28,7 @@ import (
 	"github.com/cortexproject/cortex/pkg/tenant"
 	"github.com/cortexproject/cortex/pkg/util"
 	"github.com/cortexproject/cortex/pkg/util/grpcclient"
+	"github.com/cortexproject/cortex/pkg/util/grpcutil"
 	"github.com/cortexproject/cortex/pkg/util/httpgrpcutil"
 	"github.com/cortexproject/cortex/pkg/util/services"
 	"github.com/cortexproject/cortex/pkg/util/validation"
@@ -338,6 +341,24 @@ func (s *Scheduler) QuerierLoop(querier schedulerpb.SchedulerForQuerier_QuerierL
 
 	querierID := resp.GetQuerierID()
 
+	// Defence in depth: when the gRPC listener is configured with mTLS and
+	// has a verified client certificate for this peer, bind the querier
+	// identity used for queue registration/sharding to that verified
+	// identity instead of the free-form string the client sent. This
+	// prevents a peer that reached the gRPC port (and holds a valid
+	// component cert) from impersonating a different querier ID, and
+	// mirrors the mitigation guidance in docs/guides/tls.md. When mTLS is
+	// NOT configured (historical default) peerID is empty and behaviour
+	// is unchanged, preserving compatibility.
+	if peerID, ok := grpcutil.AuthenticatedPeerIdentity(querier.Context()); ok {
+		if querierID != "" && querierID != peerID {
+			level.Warn(s.log).Log("msg", "rejecting QuerierLoop: querierID does not match authenticated TLS peer identity",
+				"claimed_querier_id", querierID, "peer_identity", peerID)
+			return status.Error(codes.PermissionDenied, "querierID does not match authenticated peer")
+		}
+		querierID = peerID
+	}
+
 	s.requestQueue.RegisterQuerierConnection(querierID)
 	defer s.requestQueue.UnregisterQuerierConnection(querierID)
 
@@ -392,9 +413,26 @@ func (s *Scheduler) QuerierLoop(querier schedulerpb.SchedulerForQuerier_QuerierL
 	return errSchedulerIsNotRunning
 }
 
-func (s *Scheduler) NotifyQuerierShutdown(_ context.Context, req *schedulerpb.NotifyQuerierShutdownRequest) (*schedulerpb.NotifyQuerierShutdownResponse, error) {
-	level.Info(s.log).Log("msg", "received shutdown notification from querier", "querier", req.GetQuerierID())
-	s.requestQueue.NotifyQuerierShutdown(req.GetQuerierID())
+func (s *Scheduler) NotifyQuerierShutdown(ctx context.Context, req *schedulerpb.NotifyQuerierShutdownRequest) (*schedulerpb.NotifyQuerierShutdownResponse, error) {
+	querierID := req.GetQuerierID()
+
+	// Defence in depth: if the gRPC listener is configured with mTLS and
+	// the peer presents a verified client certificate, require the
+	// shutdown notification to match that identity. This prevents one
+	// authenticated component from deregistering an unrelated querier.
+	// When no verified peer identity is available (e.g. mTLS not
+	// configured) behaviour is unchanged.
+	if peerID, ok := grpcutil.AuthenticatedPeerIdentity(ctx); ok {
+		if querierID != "" && querierID != peerID {
+			level.Warn(s.log).Log("msg", "rejecting NotifyQuerierShutdown: querierID does not match authenticated TLS peer identity",
+				"claimed_querier_id", querierID, "peer_identity", peerID)
+			return nil, status.Error(codes.PermissionDenied, "querierID does not match authenticated peer")
+		}
+		querierID = peerID
+	}
+
+	level.Info(s.log).Log("msg", "received shutdown notification from querier", "querier", querierID)
+	s.requestQueue.NotifyQuerierShutdown(querierID)
 
 	return &schedulerpb.NotifyQuerierShutdownResponse{}, nil
 }
