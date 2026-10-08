@@ -3,6 +3,7 @@ package configdb
 import (
 	"context"
 	fmt "fmt"
+	"sync"
 	"testing"
 	time "time"
 
@@ -158,6 +159,73 @@ func Test_ConfigRuleStoreSinceSet(t *testing.T) {
 
 	_, _ = store.ListAllRuleGroups(context.Background())
 	assert.Equal(t, userconfig.ID(101), store.since)
+}
+
+// Test_ConfigRuleStoreConcurrentAccess exercises the store from many
+// goroutines (as the unauthenticated /ruler/rule_groups handler does via
+// concurrency.ForEachUser) to detect data races and ensure callers never see
+// a shared/mutated cache. Run with `go test -race` for full coverage.
+func Test_ConfigRuleStoreConcurrentAccess(t *testing.T) {
+	mock := &MockClient{
+		cfgs: map[string]userconfig.VersionedRulesConfig{
+			"user-a": {ID: 1, Config: fakeRuleConfig(), DeletedAt: zeroTime},
+			"user-b": {ID: 2, Config: fakeRuleConfig(), DeletedAt: zeroTime},
+			"user-c": {ID: 3, Config: fakeRuleConfig(), DeletedAt: zeroTime},
+		},
+		err: nil,
+	}
+
+	store := NewConfigRuleStore(mock)
+
+	const goroutines = 16
+	var wg sync.WaitGroup
+	wg.Add(goroutines)
+	for i := 0; i < goroutines; i++ {
+		go func() {
+			defer wg.Done()
+			if _, err := store.ListAllRuleGroups(context.Background()); err != nil {
+				t.Errorf("ListAllRuleGroups: %v", err)
+				return
+			}
+			if _, err := store.ListRuleGroupsForUserAndNamespace(context.Background(), "user-a", ""); err != nil {
+				t.Errorf("ListRuleGroupsForUserAndNamespace (all ns): %v", err)
+				return
+			}
+			if _, err := store.ListRuleGroupsForUserAndNamespace(context.Background(), "user-a", "test"); err != nil {
+				t.Errorf("ListRuleGroupsForUserAndNamespace (ns=test): %v", err)
+				return
+			}
+		}()
+	}
+	wg.Wait()
+}
+
+// Test_ConfigRuleStoreDoesNotMutateCache verifies that filtering by namespace
+// does not corrupt the cached rule groups: repeatedly asking for a specific
+// namespace must not change what ListAllRuleGroups returns for the same user.
+func Test_ConfigRuleStoreDoesNotMutateCache(t *testing.T) {
+	mock := &MockClient{
+		cfgs: map[string]userconfig.VersionedRulesConfig{
+			"user": {ID: 1, Config: fakeRuleConfig(), DeletedAt: zeroTime},
+		},
+		err: nil,
+	}
+
+	store := NewConfigRuleStore(mock)
+
+	before, err := store.ListAllRuleGroups(context.Background())
+	assert.NoError(t, err)
+	origLen := len(before["user"])
+
+	// Filtering by a namespace that does not exist should return an empty
+	// slice and must not mutate the cached slice for the user.
+	filtered, err := store.ListRuleGroupsForUserAndNamespace(context.Background(), "user", "does-not-exist")
+	assert.NoError(t, err)
+	assert.Equal(t, 0, len(filtered))
+
+	after, err := store.ListAllRuleGroups(context.Background())
+	assert.NoError(t, err)
+	assert.Equal(t, origLen, len(after["user"]), "cache length must not change after a namespace-filtered read")
 }
 
 func fakeRuleConfig() userconfig.RulesConfig {
