@@ -1241,6 +1241,14 @@ func (i *Ingester) QueryExemplars(ctx context.Context, req *client.ExemplarQuery
 		return nil, err
 	}
 
+	// Defensive cap on the number of selector sets. The querier applies the
+	// same limit, but a misbehaving or compromised querier (or a direct gRPC
+	// client) must not be able to force every ingester to decode and compile
+	// an unbounded number of matcher sets before any early exit.
+	if max := i.limits.MaxExemplarsPerQuery(userID); max > 0 && req != nil && len(req.Matchers) > max {
+		return nil, httpgrpc.Errorf(http.StatusBadRequest, "too many selectors in exemplar query: %d (limit: %d)", len(req.Matchers), max)
+	}
+
 	from, through, matchers, err := client.FromExemplarQueryRequest(req)
 	if err != nil {
 		return nil, err

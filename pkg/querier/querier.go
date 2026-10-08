@@ -153,6 +153,7 @@ func New(cfg Config, limits *validation.Overrides, distributor Distributor, stor
 	}
 	queryable := NewQueryable(distributorQueryable, ns, iteratorFunc, cfg, limits, tombstonesLoader)
 	exemplarQueryable := newDistributorExemplarQueryable(distributor)
+	exemplarQueryable = newLimitedExemplarQueryable(exemplarQueryable, limits, cfg.MaxQueryIntoFuture)
 
 	lazyQueryable := storage.QueryableFunc(func(ctx context.Context, mint int64, maxt int64) (storage.Querier, error) {
 		querier, err := queryable.Querier(ctx, mint, maxt)
