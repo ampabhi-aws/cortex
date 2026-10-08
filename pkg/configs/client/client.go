@@ -32,12 +32,17 @@ type Config struct {
 	ConfigsAPIURL flagext.URLValue     `yaml:"configs_api_url"`
 	ClientTimeout time.Duration        `yaml:"client_timeout"` // HTTP timeout duration for requests made to the Weave Cloud configs service.
 	TLS           tls_cfg.ClientConfig `yaml:",inline"`
+	// InternalAPIToken is a shared secret presented to the configdb server as
+	// `Authorization: Bearer <token>`. It must match the server's
+	// -configs.internal-api-token / `internal_api_token` configuration.
+	InternalAPIToken flagext.Secret `yaml:"internal_api_token"`
 }
 
 // RegisterFlagsWithPrefix adds the flags required to config this to the given FlagSet
 func (cfg *Config) RegisterFlagsWithPrefix(prefix string, f *flag.FlagSet) {
 	f.Var(&cfg.ConfigsAPIURL, prefix+"configs.url", "URL of configs API server.")
 	f.DurationVar(&cfg.ClientTimeout, prefix+"configs.client-timeout", 5*time.Second, "Timeout for requests to Weave Cloud configs service.")
+	f.Var(&cfg.InternalAPIToken, prefix+"configs.internal-api-token", "Shared secret presented to the configdb server as `Authorization: Bearer <token>`. Must match the server's -configs.internal-api-token.")
 	cfg.TLS.RegisterFlagsWithPrefix(prefix+"configs", f)
 }
 
@@ -66,8 +71,9 @@ func New(cfg Config) (*ConfigDBClient, error) {
 	}
 
 	client := &ConfigDBClient{
-		URL:     cfg.ConfigsAPIURL.URL,
-		Timeout: cfg.ClientTimeout,
+		URL:              cfg.ConfigsAPIURL.URL,
+		Timeout:          cfg.ClientTimeout,
+		InternalAPIToken: cfg.InternalAPIToken.Value,
 	}
 
 	tlsConfig, err := cfg.TLS.GetTLSConfig()
@@ -83,9 +89,10 @@ func New(cfg Config) (*ConfigDBClient, error) {
 
 // ConfigDBClient allows retrieving recording and alerting rules from the configs server.
 type ConfigDBClient struct {
-	URL       *url.URL
-	Timeout   time.Duration
-	TLSConfig *tls.Config
+	URL              *url.URL
+	Timeout          time.Duration
+	TLSConfig        *tls.Config
+	InternalAPIToken string
 }
 
 // GetRules implements Client
@@ -98,7 +105,7 @@ func (c ConfigDBClient) GetRules(ctx context.Context, since userconfig.ID) (map[
 	var response *ConfigsResponse
 	err := instrument.CollectedRequest(ctx, "GetRules", configsRequestDuration, instrument.ErrorCode, func(ctx context.Context) error {
 		var err error
-		response, err = doRequest(endpoint, c.Timeout, c.TLSConfig, since)
+		response, err = doRequest(endpoint, c.Timeout, c.TLSConfig, c.InternalAPIToken, since)
 		return err
 	})
 	if err != nil {
@@ -124,13 +131,13 @@ func (c ConfigDBClient) GetAlerts(ctx context.Context, since userconfig.ID) (*Co
 	var response *ConfigsResponse
 	err := instrument.CollectedRequest(ctx, "GetAlerts", configsRequestDuration, instrument.ErrorCode, func(ctx context.Context) error {
 		var err error
-		response, err = doRequest(endpoint, c.Timeout, c.TLSConfig, since)
+		response, err = doRequest(endpoint, c.Timeout, c.TLSConfig, c.InternalAPIToken, since)
 		return err
 	})
 	return response, err
 }
 
-func doRequest(endpoint string, timeout time.Duration, tlsConfig *tls.Config, since userconfig.ID) (*ConfigsResponse, error) {
+func doRequest(endpoint string, timeout time.Duration, tlsConfig *tls.Config, internalAPIToken string, since userconfig.ID) (*ConfigsResponse, error) {
 	req, err := http.NewRequest("GET", endpoint, nil)
 	if err != nil {
 		return nil, err
@@ -142,6 +149,9 @@ func doRequest(endpoint string, timeout time.Duration, tlsConfig *tls.Config, si
 	}
 
 	req.Header.Set("User-Agent", fmt.Sprintf("Cortex/%s", version.Version))
+	if internalAPIToken != "" {
+		req.Header.Set("Authorization", "Bearer "+internalAPIToken)
+	}
 
 	resp, err := client.Do(req)
 	if err != nil {
