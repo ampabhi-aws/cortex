@@ -16,6 +16,9 @@ func (c *HttpgrpcHeadersCarrier) Set(key, val string) {
 }
 
 func (c *HttpgrpcHeadersCarrier) ForeachKey(handler func(key, val string) error) error {
+	if c == nil {
+		return nil
+	}
 	for _, h := range c.Headers {
 		for _, v := range h.Values {
 			if err := handler(h.Key, v); err != nil {
@@ -27,7 +30,7 @@ func (c *HttpgrpcHeadersCarrier) ForeachKey(handler func(key, val string) error)
 }
 
 func GetParentSpanForRequest(tracer opentracing.Tracer, req *httpgrpc.HTTPRequest) (opentracing.SpanContext, error) {
-	if tracer == nil {
+	if tracer == nil || req == nil {
 		return nil, nil
 	}
 

@@ -276,8 +276,11 @@ func (s *Scheduler) enqueueRequest(frontendContext context.Context, frontendAddr
 
 	// Extract tracing information from headers in HTTP request. FrontendContext doesn't have the correct tracing
 	// information, since that is a long-running request.
+	if msg.GetHttpRequest() == nil {
+		return errors.New("missing httpRequest in ENQUEUE message")
+	}
 	tracer := opentracing.GlobalTracer()
-	parentSpanContext, err := httpgrpcutil.GetParentSpanForRequest(tracer, msg.HttpRequest)
+	parentSpanContext, err := httpgrpcutil.GetParentSpanForRequest(tracer, msg.GetHttpRequest())
 	if err != nil {
 		return err
 	}

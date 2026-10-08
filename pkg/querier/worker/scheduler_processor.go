@@ -127,12 +127,21 @@ func (sp *schedulerProcessor) querierLoop(c schedulerpb.SchedulerForQuerier_Quer
 		// here, as we're running in lock step with the server - each Recv is
 		// paired with a Send.
 		go func() {
+			// Defence in depth: ignore malformed messages that lack an HTTPRequest payload.
+			if request.GetHttpRequest() == nil {
+				level.Warn(sp.log).Log("msg", "received scheduler request with missing httpRequest; ignoring", "addr", address)
+				if err := c.Send(&schedulerpb.QuerierToScheduler{}); err != nil {
+					level.Error(sp.log).Log("msg", "error notifying scheduler about finished query", "err", err, "addr", address)
+				}
+				return
+			}
+
 			// We need to inject user into context for sending response back.
 			ctx := user.InjectOrgID(ctx, request.UserID)
 
 			tracer := opentracing.GlobalTracer()
 			// Ignore errors here. If we cannot get parent span, we just don't create new one.
-			parentSpanContext, _ := httpgrpcutil.GetParentSpanForRequest(tracer, request.HttpRequest)
+			parentSpanContext, _ := httpgrpcutil.GetParentSpanForRequest(tracer, request.GetHttpRequest())
 			if parentSpanContext != nil {
 				queueSpan, spanCtx := opentracing.StartSpanFromContextWithTracer(ctx, tracer, "querier_processor_runRequest", opentracing.ChildOf(parentSpanContext))
 				defer queueSpan.Finish()
