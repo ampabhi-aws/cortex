@@ -241,12 +241,17 @@ func (a *API) RegisterDistributor(d *distributor.Distributor, pushConfig distrib
 	a.indexPage.AddLink(SectionAdminEndpoints, "/distributor/ha_tracker", "HA Tracking Status")
 
 	a.RegisterRoute("/distributor/ring", d, false, "GET", "POST")
-	a.RegisterRoute("/distributor/all_user_stats", http.HandlerFunc(d.AllUserStatsHandler), false, "GET")
+	// /distributor/all_user_stats surfaces per-tenant ingestion stats aggregated
+	// across every ingester. Require authentication so the handler cannot be
+	// reached without an X-Scope-OrgID header; operators should additionally
+	// gate this route in their fronting auth proxy (see
+	// docs/guides/authentication-and-authorisation.md).
+	a.RegisterRoute("/distributor/all_user_stats", http.HandlerFunc(d.AllUserStatsHandler), true, "GET")
 	a.RegisterRoute("/distributor/ha_tracker", d.HATracker, false, "GET")
 
 	// Legacy Routes
 	a.RegisterRoute(path.Join(a.cfg.LegacyHTTPPrefix, "/push"), push.Handler(pushConfig.MaxRecvMsgSize, a.sourceIPs, a.cfg.wrapDistributorPush(d)), true, "POST")
-	a.RegisterRoute("/all_user_stats", http.HandlerFunc(d.AllUserStatsHandler), false, "GET")
+	a.RegisterRoute("/all_user_stats", http.HandlerFunc(d.AllUserStatsHandler), true, "GET")
 	a.RegisterRoute("/ha-tracker", d.HATracker, false, "GET")
 }
 
