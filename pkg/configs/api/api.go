@@ -1,6 +1,7 @@
 package api
 
 import (
+	"crypto/subtle"
 	"database/sql"
 	"encoding/json"
 	"errors"
@@ -35,6 +36,14 @@ var (
 // Config configures Configs API
 type Config struct {
 	Notifications NotificationsConfig `yaml:"notifications"`
+
+	// PrivateAPIAuthToken, if non-empty, is required as a bearer token on the
+	// internal (cross-tenant) /private/api/prom/configs/* endpoints. The ruler
+	// and alertmanager configs clients must be configured with the same token.
+	// When unset, the private endpoints remain unauthenticated for backward
+	// compatibility and must be protected by network-level controls as
+	// documented in docs/guides/authentication-and-authorisation.md.
+	PrivateAPIAuthToken string `yaml:"private_api_auth_token"`
 }
 
 // NotificationsConfig configures Alertmanager notifications method.
@@ -47,6 +56,7 @@ type NotificationsConfig struct {
 func (cfg *Config) RegisterFlags(f *flag.FlagSet) {
 	f.BoolVar(&cfg.Notifications.DisableEmail, "configs.notifications.disable-email", false, "Disable Email notifications for Alertmanager.")
 	f.BoolVar(&cfg.Notifications.DisableWebHook, "configs.notifications.disable-webhook", false, "Disable WebHook notifications for Alertmanager.")
+	f.StringVar(&cfg.PrivateAPIAuthToken, "configs.private-api-auth-token", "", "Shared bearer token required on the internal /private/api/prom/configs/* endpoints that return all tenants' rules and Alertmanager configs. The ruler and alertmanager configs clients must send the same token via -<prefix>.configs.private-api-auth-token. When empty (the default), these endpoints are unauthenticated and MUST be protected externally.")
 }
 
 // API implements the configs api.
@@ -62,10 +72,42 @@ func New(database db.DB, cfg Config) *API {
 		db:  database,
 		cfg: cfg,
 	}
+	if cfg.PrivateAPIAuthToken == "" {
+		level.Warn(util_log.Logger).Log("msg",
+			"configs: internal /private/api/prom/configs/{rules,alertmanager} endpoints are unauthenticated; "+
+				"set -configs.private-api-auth-token (and the matching client flag) or ensure they are protected by an external authentication layer, "+
+				"otherwise any caller with network access can read every tenant's rules and Alertmanager configuration")
+	}
 	r := mux.NewRouter()
 	a.RegisterRoutes(r)
 	a.Handler = r
 	return a
+}
+
+// authorizePrivateAPI enforces the shared bearer token on the internal
+// cross-tenant endpoints. When no token is configured it is a no-op so that
+// existing deployments protected by network controls continue to work; when a
+// token is configured we require a matching Authorization: Bearer <token>
+// header (compared in constant time) before any configuration is returned.
+func (a *API) authorizePrivateAPI(w http.ResponseWriter, r *http.Request) bool {
+	expected := a.cfg.PrivateAPIAuthToken
+	if expected == "" {
+		return true
+	}
+	auth := r.Header.Get("Authorization")
+	const prefix = "Bearer "
+	if !strings.HasPrefix(auth, prefix) {
+		w.Header().Set("WWW-Authenticate", `Bearer realm="cortex-configs"`)
+		http.Error(w, "unauthorized", http.StatusUnauthorized)
+		return false
+	}
+	provided := strings.TrimPrefix(auth, prefix)
+	if subtle.ConstantTimeCompare([]byte(provided), []byte(expected)) != 1 {
+		w.Header().Set("WWW-Authenticate", `Bearer realm="cortex-configs"`)
+		http.Error(w, "unauthorized", http.StatusUnauthorized)
+		return false
+	}
+	return true
 }
 
 func (a *API) admin(w http.ResponseWriter, r *http.Request) {
@@ -264,6 +306,9 @@ type ConfigsView struct {
 }
 
 func (a *API) getConfigs(w http.ResponseWriter, r *http.Request) {
+	if !a.authorizePrivateAPI(w, r) {
+		return
+	}
 	var cfgs map[string]userconfig.View
 	var cfgErr error
 	logger := util_log.WithContext(r.Context(), util_log.Logger)
