@@ -45,6 +45,14 @@ func TestFirewallDialer(t *testing.T) {
 				{"127.0.0.1", true},
 				{"192.168.0.1", true},
 				{"10.0.0.1", true},
+				{"0.0.0.0", true},                  // IPv4 unspecified (connect maps to loopback)
+				{"::", true},                       // IPv6 unspecified
+				{"100.64.0.1", true},               // RFC6598 CGNAT
+				{"192.0.0.1", true},                // RFC6890 protocol assignments
+				{"198.18.0.1", true},               // RFC2544 benchmarking
+				{"255.255.255.255", true},          // Limited broadcast
+				{"239.0.0.1", true},                // Non-link-local multicast
+				{"64:ff9b::1", true},               // RFC6052 NAT64
 				{"google.com", false},
 				{"172.217.168.78", false},
 				{"fdf8:f53b:82e4::53", true},       // Local
@@ -52,6 +60,8 @@ func TestFirewallDialer(t *testing.T) {
 				{"2001:4860:4860::8844", false},    // Google DNS
 				{"::ffff:172.217.168.78", false},   // IPv6 mapped v4 non-private
 				{"::ffff:192.168.0.1", true},       // IPv6 mapped v4 private
+				{"::ffff:127.0.0.1", true},         // IPv6 mapped v4 loopback
+				{"::ffff:0.0.0.0", true},           // IPv6 mapped v4 unspecified
 			},
 		},
 		"should support blocking custom CIDRs": {
@@ -100,14 +110,25 @@ func TestFirewallDialer(t *testing.T) {
 	}
 }
 
-func TestIsPrivate(t *testing.T) {
+func TestIsBlocked(t *testing.T) {
 	tests := []struct {
 		ip       net.IP
 		expected bool
 	}{
-		{nil, false},
+		{nil, true},
+		// Unspecified addresses.
+		{net.IPv4(0, 0, 0, 0), true},
+		{net.IPv4(0, 0, 0, 0).To4(), true},
+		{net.IPv6unspecified, true},
+		// Loopback.
+		{net.IPv4(127, 0, 0, 1), true},
+		{net.IPv6loopback, true},
+		// Link-local.
+		{net.IPv4(169, 254, 1, 1), true},
+		// Public IPv4 - not blocked.
 		{net.IPv4(1, 1, 1, 1), false},
 		{net.IPv4(9, 255, 255, 255), false},
+		// RFC1918.
 		{net.IPv4(10, 0, 0, 0), true},
 		{net.IPv4(10, 255, 255, 255), true},
 		{net.IPv4(11, 0, 0, 0), false},
@@ -122,15 +143,38 @@ func TestIsPrivate(t *testing.T) {
 		{net.IPv4(192, 168, 0, 0), true},
 		{net.IPv4(192, 168, 255, 255), true},
 		{net.IPv4(192, 169, 0, 0), false},
+		// RFC6598 CGNAT.
+		{net.IPv4(100, 63, 255, 255), false},
+		{net.IPv4(100, 64, 0, 0), true},
+		{net.IPv4(100, 127, 255, 255), true},
+		{net.IPv4(100, 128, 0, 0), false},
+		// RFC6890 protocol assignments.
+		{net.IPv4(192, 0, 0, 1), true},
+		// RFC2544 benchmarking.
+		{net.IPv4(198, 18, 0, 0), true},
+		{net.IPv4(198, 19, 255, 255), true},
+		// Broadcast.
+		{net.IPv4(255, 255, 255, 255), true},
+		// Multicast.
+		{net.IPv4(224, 0, 0, 1), true},
+		{net.IPv4(239, 0, 0, 1), true},
+		// IPv6 unique local (fc00::/7).
 		{net.IP{0xfc, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0}, true},
 		{net.IP{0xfc, 0xff, 0x12, 0, 0, 0, 0, 0x44, 0, 0, 0, 0, 0, 0, 0, 0}, true},
 		{net.IP{0xfb, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff}, false},
 		{net.IP{0xfd, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff}, true},
+		// Random non-blocked IPv6.
 		{net.IP{0xfe, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0}, false},
+		// NAT64.
+		{net.ParseIP("64:ff9b::1"), true},
 	}
 
 	for _, test := range tests {
-		assert.Equalf(t, test.expected, isPrivate(test.ip), "ip: %s", test.ip.String())
+		normalised := test.ip
+		if v4 := test.ip.To4(); v4 != nil {
+			normalised = v4
+		}
+		assert.Equalf(t, test.expected, isBlocked(normalised), "ip: %s", test.ip.String())
 	}
 }
 

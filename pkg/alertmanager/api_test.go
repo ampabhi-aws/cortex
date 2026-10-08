@@ -419,6 +419,48 @@ alertmanager_config: |
 			err: errors.Wrap(errVictorOpsAPIKeyFileNotAllowed, "error validating Alertmanager config"),
 		},
 		{
+			name: "Should return error if a webhook URL points at the IPv4 unspecified address",
+			cfg: `
+alertmanager_config: |
+  receivers:
+    - name: default-receiver
+      webhook_configs:
+        - url: http://0.0.0.0:8080/pwned
+
+  route:
+    receiver: 'default-receiver'
+`,
+			err: errors.Wrap(errURLNotAllowed, "error validating Alertmanager config"),
+		},
+		{
+			name: "Should return error if a webhook URL points at the IPv6 unspecified address",
+			cfg: `
+alertmanager_config: |
+  receivers:
+    - name: default-receiver
+      webhook_configs:
+        - url: http://[::]:8080/pwned
+
+  route:
+    receiver: 'default-receiver'
+`,
+			err: errors.Wrap(errURLNotAllowed, "error validating Alertmanager config"),
+		},
+		{
+			name: "Should return error if a webhook URL points at the IPv4 loopback address",
+			cfg: `
+alertmanager_config: |
+  receivers:
+    - name: default-receiver
+      webhook_configs:
+        - url: http://127.0.0.1:8080/pwned
+
+  route:
+    receiver: 'default-receiver'
+`,
+			err: errors.Wrap(errURLNotAllowed, "error validating Alertmanager config"),
+		},
+		{
 			name: "should return error if template is wrong",
 			cfg: `
 alertmanager_config: |

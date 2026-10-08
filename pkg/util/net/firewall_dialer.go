@@ -13,6 +13,72 @@ import (
 var errBlockedAddress = errors.New("blocked address")
 var errInvalidAddress = errors.New("invalid address")
 
+// blockedNets is the deny-list of special-purpose IP prefixes that must never
+// be reachable when BlockPrivateAddresses() is enabled. It covers the IPv4
+// and IPv6 ranges that are either private, link-local, loopback,
+// benchmarking, broadcast, multicast or otherwise non-routable on the public
+// Internet. See IANA's "IANA IPv4 Special-Purpose Address Registry" and
+// "IANA IPv6 Special-Purpose Address Registry".
+//
+// Note: the unspecified addresses (0.0.0.0/32 and ::/128), loopback,
+// link-local and multicast ranges are also handled by the explicit
+// net.IP method checks in isBlocked, so this list is defence-in-depth
+// against partial-match edge cases (e.g. IPv4-mapped IPv6 forms).
+var blockedNets = func() []*net.IPNet {
+	cidrs := []string{
+		"0.0.0.0/8",          // RFC1122 "this network"
+		"10.0.0.0/8",         // RFC1918
+		"100.64.0.0/10",      // RFC6598 CGNAT
+		"127.0.0.0/8",        // RFC1122 loopback
+		"169.254.0.0/16",     // RFC3927 link-local
+		"172.16.0.0/12",      // RFC1918
+		"192.0.0.0/24",       // RFC6890 IETF protocol assignments
+		"192.168.0.0/16",     // RFC1918
+		"198.18.0.0/15",      // RFC2544 benchmarking
+		"224.0.0.0/4",        // RFC5771 multicast
+		"255.255.255.255/32", // RFC919 limited broadcast
+		"::/128",             // RFC4291 unspecified
+		"::1/128",            // RFC4291 loopback
+		"fc00::/7",           // RFC4193 unique local
+		"fe80::/10",          // RFC4291 link-local
+		"ff00::/8",           // RFC4291 multicast
+		"64:ff9b::/96",       // RFC6052 IPv4/IPv6 translation (NAT64)
+	}
+	out := make([]*net.IPNet, 0, len(cidrs))
+	for _, c := range cidrs {
+		_, n, err := net.ParseCIDR(c)
+		if err != nil {
+			// This should never happen because the list is a compile-time
+			// constant: fail loudly rather than silently permit traffic.
+			panic("firewall_dialer: invalid CIDR in blockedNets: " + c + ": " + err.Error())
+		}
+		out = append(out, n)
+	}
+	return out
+}()
+
+// isBlocked reports whether the given IP must be rejected when
+// BlockPrivateAddresses() is true. It rejects the IPv4/IPv6 unspecified
+// addresses, loopback, link-local (unicast and multicast), multicast and
+// every prefix listed in blockedNets. Callers should pass the canonical
+// form (use ip.To4() first when applicable) so that IPv4-mapped IPv6
+// addresses are matched against the IPv4 prefixes.
+func isBlocked(ip net.IP) bool {
+	if ip == nil {
+		return true
+	}
+	if ip.IsUnspecified() || ip.IsLoopback() || ip.IsLinkLocalUnicast() ||
+		ip.IsLinkLocalMulticast() || ip.IsInterfaceLocalMulticast() || ip.IsMulticast() {
+		return true
+	}
+	for _, n := range blockedNets {
+		if n.Contains(ip) {
+			return true
+		}
+	}
+	return false
+}
+
 type FirewallDialerConfigProvider interface {
 	BlockCIDRNetworks() []flagext.CIDR
 	BlockPrivateAddresses() bool
@@ -54,43 +120,23 @@ func (d *FirewallDialer) control(_, address string, _ syscall.RawConn) error {
 		return errBlockedAddress
 	}
 
-	if blockPrivateAddresses && (isPrivate(ip) || isLocal(ip)) {
+	// Normalise IPv4-in-IPv6 to its 4-byte form so the IPv4 prefixes in
+	// blockedNets match the IPv4-mapped IPv6 representation
+	// (e.g. ::ffff:127.0.0.1).
+	normalised := ip
+	if v4 := ip.To4(); v4 != nil {
+		normalised = v4
+	}
+
+	if blockPrivateAddresses && isBlocked(normalised) {
 		return errBlockedAddress
 	}
 
 	for _, cidr := range blockCIDRNetworks {
-		if cidr.Value.Contains(ip) {
+		if cidr.Value.Contains(normalised) {
 			return errBlockedAddress
 		}
 	}
 
 	return nil
-}
-
-func isLocal(ip net.IP) bool {
-	return ip.IsLoopback() || ip.IsLinkLocalUnicast() || ip.IsLinkLocalMulticast()
-}
-
-// isPrivate reports whether ip is a private address, according to
-// RFC 1918 (IPv4 addresses) and RFC 4193 (IPv6 addresses).
-//
-// This function has been copied from golang and should be removed once
-// we'll upgrade to go 1.17. See: https://github.com/golang/go/pull/42793
-func isPrivate(ip net.IP) bool {
-	if ip4 := ip.To4(); ip4 != nil {
-		// Following RFC 4193, Section 3. Local IPv6 Unicast Addresses which says:
-		//   The Internet Assigned Numbers Authority (IANA) has reserved the
-		//   following three blocks of the IPv4 address space for private internets:
-		//     10.0.0.0        -   10.255.255.255  (10/8 prefix)
-		//     172.16.0.0      -   172.31.255.255  (172.16/12 prefix)
-		//     192.168.0.0     -   192.168.255.255 (192.168/16 prefix)
-		return ip4[0] == 10 ||
-			(ip4[0] == 172 && ip4[1]&0xf0 == 16) ||
-			(ip4[0] == 192 && ip4[1] == 168)
-	}
-	// Following RFC 4193, Section 3. Private Address Space which says:
-	//   The Internet Assigned Numbers Authority (IANA) has reserved the
-	//   following block of the IPv6 address space for local internets:
-	//     FC00::  -  FDFF:FFFF:FFFF:FFFF:FFFF:FFFF:FFFF:FFFF (FC00::/7 prefix)
-	return len(ip) == net.IPv6len && ip[0]&0xfe == 0xfc
 }
