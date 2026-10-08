@@ -222,6 +222,9 @@ func (c *Config) Validate(log log.Logger) error {
 	if err := c.Alertmanager.Validate(c.AlertmanagerStorage); err != nil {
 		return errors.Wrap(err, "invalid alertmanager config")
 	}
+	if err := c.Configs.DB.Validate(); err != nil {
+		return errors.Wrap(err, "invalid configs database config")
+	}
 
 	if err := c.Tracing.Validate(); err != nil {
 		return errors.Wrap(err, "invalid tracing config")
