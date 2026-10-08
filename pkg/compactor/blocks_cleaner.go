@@ -52,6 +52,7 @@ type BlocksCleaner struct {
 	blocksCleanedTotal                prometheus.Counter
 	blocksFailedTotal                 prometheus.Counter
 	blocksMarkedForDeletion           prometheus.Counter
+	blocksDeletedAfterTenantDeletion  prometheus.Counter
 	tenantBlocks                      *prometheus.GaugeVec
 	tenantBlocksMarkedForDelete       *prometheus.GaugeVec
 	tenantBlocksMarkedForNoCompaction *prometheus.GaugeVec
@@ -94,6 +95,10 @@ func NewBlocksCleaner(cfg BlocksCleanerConfig, bucketClient objstore.Bucket, use
 			Name:        blocksMarkedForDeletionName,
 			Help:        blocksMarkedForDeletionHelp,
 			ConstLabels: prometheus.Labels{"reason": "retention"},
+		}),
+		blocksDeletedAfterTenantDeletion: promauto.With(reg).NewCounter(prometheus.CounterOpts{
+			Name: "cortex_compactor_blocks_deleted_after_tenant_deletion_total",
+			Help: "Total number of blocks deleted by the blocks cleaner after the tenant deletion mark's FinishedTime was already recorded. A non-zero value indicates data was ingested for a tenant that was marked for deletion and that data was destroyed.",
 		}),
 
 		// The following metrics don't have the "cortex_compactor" prefix because not strictly related to
@@ -261,16 +266,45 @@ func (c *BlocksCleaner) deleteUserMarkedForDeletion(ctx context.Context, userID 
 		return errors.Wrap(err, "cannot find tenant deletion mark anymore")
 	}
 
-	// If we have just deleted some blocks, update "finished" time. Also update "finished" time if it wasn't set yet, but there are no blocks.
-	// Note: this UPDATES the tenant deletion mark. Components that use caching bucket will NOT SEE this update,
-	// but that is fine -- they only check whether tenant deletion marker exists or not.
-	if deletedBlocks > 0 || mark.FinishedTime == 0 {
+	// Surface blocks that arrived AFTER the mark's finished time had already been
+	// recorded. Such blocks are an indicator that writes are still being accepted
+	// for a tenant that was marked for deletion: callers that trust the
+	// "deleted" signal and re-provisioned the tenant ID will see their data
+	// silently destroyed here. We warn loudly and bump a dedicated counter so
+	// this condition is observable, but we do NOT advance the mark's deadline
+	// below -- doing so would let newly-arriving blocks indefinitely postpone
+	// mark removal (see https://cortexmetrics.io docs/proposals/tenant-deletion).
+	if deletedBlocks > 0 && mark.FinishedTime != 0 {
+		c.blocksDeletedAfterTenantDeletion.Add(float64(deletedBlocks))
+		level.Warn(userLogger).Log(
+			"msg", "deleted blocks that were shipped AFTER the tenant deletion mark was finalized; writes are still being accepted for a tenant marked for deletion and that data has been destroyed",
+			"deletedBlocks", deletedBlocks,
+		)
+	}
+
+	// Record a one-shot FinishedTime the first time we observe no outstanding
+	// work for this tenant. We intentionally do NOT rewrite FinishedTime on
+	// subsequent cycles, even when newly-arrived blocks are deleted: the
+	// terminal cleanup deadline below is anchored to the fixed DeletionTime and
+	// must not be pushed out by the destruction this cleaner itself performs.
+	//
+	// Note: this UPDATES the tenant deletion mark. Components that use caching
+	// bucket will NOT SEE this update, but that is fine -- they only check
+	// whether tenant deletion marker exists or not.
+	if mark.FinishedTime == 0 {
 		level.Info(userLogger).Log("msg", "updating finished time in tenant deletion mark")
 		mark.FinishedTime = time.Now().Unix()
 		return errors.Wrap(cortex_tsdb.WriteTenantDeletionMark(ctx, c.bucketClient, userID, c.cfgProvider, mark), "failed to update tenant deletion mark")
 	}
 
-	if time.Since(time.Unix(mark.FinishedTime, 0)) < c.cfg.TenantCleanupDelay {
+	// Base the terminal cleanup deadline on the fixed DeletionTime so that newly
+	// arriving blocks cannot push it out. Fall back to FinishedTime for marks
+	// written by older versions that may not have had a DeletionTime set.
+	deadlineAnchor := mark.DeletionTime
+	if deadlineAnchor == 0 {
+		deadlineAnchor = mark.FinishedTime
+	}
+	if time.Since(time.Unix(deadlineAnchor, 0)) < c.cfg.TenantCleanupDelay {
 		return nil
 	}
 
