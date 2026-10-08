@@ -1230,6 +1230,13 @@ func (i *Ingester) Query(ctx context.Context, req *client.QueryRequest) (*client
 	return result, ss.Err()
 }
 
+// maxIngesterExemplarMatcherSets caps the number of matcher sets a single
+// ExemplarQueryRequest may contain at the ingester. This mirrors the querier
+// cap (maxExemplarMatcherSets) and ensures that even if the fan-out bypasses
+// the querier (e.g. a trusted internal caller), an ingester will refuse to
+// compile an unbounded number of regex matchers before any TSDB check.
+const maxIngesterExemplarMatcherSets = 64
+
 // Query implements service.IngesterServer
 func (i *Ingester) QueryExemplars(ctx context.Context, req *client.ExemplarQueryRequest) (*client.ExemplarQueryResponse, error) {
 	if err := i.checkRunning(); err != nil {
@@ -1239,6 +1246,12 @@ func (i *Ingester) QueryExemplars(ctx context.Context, req *client.ExemplarQuery
 	userID, err := tenant.TenantID(ctx)
 	if err != nil {
 		return nil, err
+	}
+
+	// Reject obviously oversized exemplar requests before paying the
+	// per-matcher regex-compilation cost in FromExemplarQueryRequest.
+	if len(req.Matchers) > maxIngesterExemplarMatcherSets {
+		return nil, status.Errorf(codes.InvalidArgument, "too many matcher sets in exemplar query: %d > %d", len(req.Matchers), maxIngesterExemplarMatcherSets)
 	}
 
 	from, through, matchers, err := client.FromExemplarQueryRequest(req)

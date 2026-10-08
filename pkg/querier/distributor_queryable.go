@@ -2,6 +2,7 @@ package querier
 
 import (
 	"context"
+	"fmt"
 	"sort"
 	"time"
 
@@ -16,11 +17,23 @@ import (
 	"github.com/cortexproject/cortex/pkg/ingester/client"
 	"github.com/cortexproject/cortex/pkg/prom1/storage/metric"
 	"github.com/cortexproject/cortex/pkg/querier/series"
+	"github.com/cortexproject/cortex/pkg/tenant"
 	"github.com/cortexproject/cortex/pkg/util"
 	"github.com/cortexproject/cortex/pkg/util/chunkcompat"
+	"github.com/cortexproject/cortex/pkg/util/limiter"
 	"github.com/cortexproject/cortex/pkg/util/math"
 	"github.com/cortexproject/cortex/pkg/util/spanlogger"
+	"github.com/cortexproject/cortex/pkg/util/validation"
 )
+
+// maxExemplarMatcherSets caps the number of matcher sets (vector selectors)
+// that a single /api/v1/query_exemplars request may expand to. The exemplar
+// read path fans out to every ingester, each of which compiles every regex
+// matcher before any exemplar-enabled / TSDB check, so without this cap a
+// single authenticated request could force O(100k) regexp compilations per
+// ingester on the shared read path. 64 selectors matches the practical
+// upper bound for well-formed PromQL and matches the Mimir fork's default.
+const maxExemplarMatcherSets = 64
 
 // Distributor is the read interface to the distributor, made an interface here
 // to reduce package coupling.
@@ -279,30 +292,79 @@ func (q *distributorQuerier) Close() error {
 }
 
 type distributorExemplarQueryable struct {
-	distributor Distributor
+	distributor        Distributor
+	limits             *validation.Overrides
+	maxQueryIntoFuture time.Duration
 }
 
-func newDistributorExemplarQueryable(d Distributor) storage.ExemplarQueryable {
+func newDistributorExemplarQueryable(d Distributor, limits *validation.Overrides, maxQueryIntoFuture time.Duration) storage.ExemplarQueryable {
 	return &distributorExemplarQueryable{
-		distributor: d,
+		distributor:        d,
+		limits:             limits,
+		maxQueryIntoFuture: maxQueryIntoFuture,
 	}
 }
 
 func (d distributorExemplarQueryable) ExemplarQuerier(ctx context.Context) (storage.ExemplarQuerier, error) {
 	return &distributorExemplarQuerier{
-		distributor: d.distributor,
-		ctx:         ctx,
+		distributor:        d.distributor,
+		ctx:                ctx,
+		limits:             d.limits,
+		maxQueryIntoFuture: d.maxQueryIntoFuture,
 	}, nil
 }
 
 type distributorExemplarQuerier struct {
-	distributor Distributor
-	ctx         context.Context
+	distributor        Distributor
+	ctx                context.Context
+	limits             *validation.Overrides
+	maxQueryIntoFuture time.Duration
 }
 
 // Select querys for exemplars, prometheus' storage.ExemplarQuerier's Select function takes the time range as two int64 values.
 func (q *distributorExemplarQuerier) Select(start, end int64, matchers ...[]*labels.Matcher) ([]exemplar.QueryResult, error) {
-	allResults, err := q.distributor.QueryExemplars(q.ctx, model.Time(start), model.Time(end), matchers...)
+	userID, err := tenant.TenantID(q.ctx)
+	if err != nil {
+		return nil, err
+	}
+
+	// Cap the number of matcher sets (vector selectors) a single query may
+	// fan out to. Each matcher set is sent to every ingester and compiled
+	// before any exemplar-enabled / TSDB check, so this is the primary
+	// guard against regex-compilation CPU/heap exhaustion on the shared
+	// ingester read path.
+	if q.limits != nil && len(matchers) > maxExemplarMatcherSets {
+		return nil, validation.LimitError(fmt.Sprintf("too many selectors in exemplar query: %d > %d", len(matchers), maxExemplarMatcherSets))
+	}
+
+	ctx := q.ctx
+	startMs := start
+	endMs := end
+
+	if q.limits != nil {
+		var err error
+		startMs, endMs, err = validateQueryTimeRange(q.ctx, userID, start, end, q.limits, q.maxQueryIntoFuture)
+		if err == errEmptyTimeRange {
+			return nil, nil
+		} else if err != nil {
+			return nil, err
+		}
+
+		if maxQueryLength := q.limits.MaxQueryLength(userID); maxQueryLength > 0 && model.Time(endMs).Sub(model.Time(startMs)) > maxQueryLength {
+			return nil, validation.LimitError(fmt.Sprintf(validation.ErrQueryTooLong, model.Time(endMs).Sub(model.Time(startMs)), maxQueryLength))
+		}
+
+		// Install a per-query QueryLimiter so the exemplar fan-out is accounted
+		// against the tenant's per-query byte/series budget, mirroring the sample path.
+		ctx = limiter.AddQueryLimiterToContext(ctx, limiter.NewQueryLimiter(
+			q.limits.MaxFetchedSeriesPerQuery(userID),
+			q.limits.MaxFetchedChunkBytesPerQuery(userID),
+			q.limits.MaxChunksPerQuery(userID),
+			q.limits.MaxFetchedDataBytesPerQuery(userID),
+		))
+	}
+
+	allResults, err := q.distributor.QueryExemplars(ctx, model.Time(startMs), model.Time(endMs), matchers...)
 
 	if err != nil {
 		return nil, err
