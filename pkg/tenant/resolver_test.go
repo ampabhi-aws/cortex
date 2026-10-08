@@ -147,3 +147,36 @@ func TestMultiResolver(t *testing.T) {
 		t.Run(tc.name, tc.test(r))
 	}
 }
+
+func TestMultiResolverMaxTenants(t *testing.T) {
+	r := NewMultiResolverWithMaxTenants(2)
+
+	// Under the limit succeeds.
+	ctx := user.InjectOrgID(context.Background(), "tenant-a")
+	tenantIDs, err := r.TenantIDs(ctx)
+	assert.NoError(t, err)
+	assert.Equal(t, []string{"tenant-a"}, tenantIDs)
+
+	// At the limit succeeds.
+	ctx = user.InjectOrgID(context.Background(), "tenant-a|tenant-b")
+	tenantIDs, err = r.TenantIDs(ctx)
+	assert.NoError(t, err)
+	assert.Equal(t, []string{"tenant-a", "tenant-b"}, tenantIDs)
+
+	// Over the limit is rejected with ErrTooManyTenants before any per-ID
+	// validation runs. Include an ID that would otherwise be invalid to
+	// confirm we short-circuit.
+	ctx = user.InjectOrgID(context.Background(), "tenant-a|tenant-b|..")
+	_, err = r.TenantIDs(ctx)
+	assert.ErrorIs(t, err, ErrTooManyTenants)
+
+	// TenantID (single) also propagates the error.
+	_, err = r.TenantID(ctx)
+	assert.ErrorIs(t, err, ErrTooManyTenants)
+
+	// maxTenants <= 0 disables the bound (backwards compatible).
+	unbounded := NewMultiResolverWithMaxTenants(0)
+	ctx = user.InjectOrgID(context.Background(), "a|b|c|d|e|f|g|h|i|j|k")
+	_, err = unbounded.TenantIDs(ctx)
+	assert.NoError(t, err)
+}
