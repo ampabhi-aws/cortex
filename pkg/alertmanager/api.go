@@ -45,6 +45,9 @@ var (
 	errTLSFileNotAllowed             = errors.New("setting TLS ca_file, cert_file and key_file is not allowed")
 	errSlackAPIURLFileNotAllowed     = errors.New("setting Slack api_url_file and global slack_api_url_file is not allowed")
 	errVictorOpsAPIKeyFileNotAllowed = errors.New("setting VictorOps api_key_file is not allowed")
+	errSNSCredentialsRequired        = errors.New("sns receiver requires sigv4.access_key and sigv4.secret_key")
+	errSNSProfileNotAllowed          = errors.New("sns receiver sigv4.profile is not allowed")
+	errSNSRoleARNNotAllowed          = errors.New("sns receiver sigv4.role_arn is not allowed")
 )
 
 // UserConfig is used to communicate a users alertmanager configs
@@ -350,6 +353,11 @@ func validateAlertmanagerConfig(cfg interface{}) error {
 		if err := validateVictorOpsConfig(v.Interface().(config.VictorOpsConfig)); err != nil {
 			return err
 		}
+
+	case reflect.TypeOf(config.SNSConfig{}):
+		if err := validateSNSConfig(v.Interface().(config.SNSConfig)); err != nil {
+			return err
+		}
 	}
 
 	// If the input config is a struct, recursively iterate on all fields.
@@ -446,6 +454,29 @@ func validateSlackConfig(cfg config.SlackConfig) error {
 func validateVictorOpsConfig(cfg config.VictorOpsConfig) error {
 	if cfg.APIKeyFile != "" {
 		return errVictorOpsAPIKeyFileNotAllowed
+	}
+	return nil
+}
+
+// validateSNSConfig validates the SNS config and returns an error if it contains
+// settings that would make Cortex sign AWS requests with the operator's own
+// identity. The SNS integration is exposed to untrusted tenants, so we must
+// require tenants to supply their own static sigv4 credentials and forbid
+// fields that reach the Cortex process credential chain:
+//   - sigv4.profile reads from the operator's shared AWS credentials file.
+//   - sigv4.role_arn triggers sts:AssumeRole using the Cortex process identity.
+//   - omitting sigv4.access_key / sigv4.secret_key makes the AWS SDK fall back
+//     to the process default credential chain (env vars, shared creds, IRSA /
+//     EC2 / ECS role) - i.e. Cortex's own IAM identity (confused deputy).
+func validateSNSConfig(cfg config.SNSConfig) error {
+	if cfg.Sigv4.Profile != "" {
+		return errSNSProfileNotAllowed
+	}
+	if cfg.Sigv4.RoleARN != "" {
+		return errSNSRoleARNNotAllowed
+	}
+	if cfg.Sigv4.AccessKey == "" || string(cfg.Sigv4.SecretKey) == "" {
+		return errSNSCredentialsRequired
 	}
 	return nil
 }
