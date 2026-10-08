@@ -100,13 +100,14 @@ type TCPTransport struct {
 	outgoingStreams      prometheus.Counter
 	outgoingStreamErrors prometheus.Counter
 
-	receivedPackets       prometheus.Counter
-	receivedPacketsBytes  prometheus.Counter
-	receivedPacketsErrors prometheus.Counter
-	sentPackets           prometheus.Counter
-	sentPacketsBytes      prometheus.Counter
-	sentPacketsErrors     prometheus.Counter
-	unknownConnections    prometheus.Counter
+	receivedPackets               prometheus.Counter
+	receivedPacketsBytes          prometheus.Counter
+	receivedPacketsErrors         prometheus.Counter
+	receivedPacketsDigestMismatch prometheus.Counter
+	sentPackets                   prometheus.Counter
+	sentPacketsBytes              prometheus.Counter
+	sentPacketsErrors             prometheus.Counter
+	unknownConnections            prometheus.Counter
 }
 
 // NewTCPTransport returns a new tcp-based transport with the given configuration. On
@@ -301,7 +302,9 @@ func (t *TCPTransport) handleConnection(conn net.Conn) {
 
 		if !bytes.Equal(receivedDigest, expectedDigest[:]) {
 			t.receivedPacketsErrors.Inc()
-			level.Warn(t.logger).Log("msg", "packet digest mismatch", "expected", fmt.Sprintf("%x", expectedDigest), "received", fmt.Sprintf("%x", receivedDigest), "data_length", len(buf), "remote", conn.RemoteAddr())
+			t.receivedPacketsDigestMismatch.Inc()
+			level.Warn(t.logger).Log("msg", "packet digest mismatch, dropping packet", "expected", fmt.Sprintf("%x", expectedDigest), "received", fmt.Sprintf("%x", receivedDigest), "data_length", len(buf), "remote", conn.RemoteAddr())
+			return
 		}
 
 		t.debugLog().Log("msg", "Received packet", "addr", addr(addrBuf), "size", len(buf), "hash", fmt.Sprintf("%x", receivedDigest))
@@ -604,6 +607,13 @@ func (t *TCPTransport) registerMetrics(registerer prometheus.Registerer) {
 		Subsystem: subsystem,
 		Name:      "packets_received_errors_total",
 		Help:      "Number of errors when receiving memberlist packets",
+	})
+
+	t.receivedPacketsDigestMismatch = promauto.With(registerer).NewCounter(prometheus.CounterOpts{
+		Namespace: t.cfg.MetricsNamespace,
+		Subsystem: subsystem,
+		Name:      "packets_received_digest_mismatch_total",
+		Help:      "Number of received memberlist packets dropped because the trailing MD5 digest did not match the payload (packet corruption, truncation, or tampering).",
 	})
 
 	t.sentPackets = promauto.With(registerer).NewCounter(prometheus.CounterOpts{
