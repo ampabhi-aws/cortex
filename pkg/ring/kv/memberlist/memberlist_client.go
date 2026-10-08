@@ -28,6 +28,20 @@ import (
 const (
 	maxCasRetries              = 10          // max retries in CAS operation
 	noChangeDetectedRetrySleep = time.Second // how long to sleep after no change was detected in CAS
+
+	// maxKeyLength bounds the size of a gossip-supplied key before it is used in
+	// logs, metrics, the /memberlist page or the KV store. Any longer key is
+	// treated as invalid. The legitimate Cortex key set is a small list of short
+	// static strings (e.g. "collectors/ring"), so 256 bytes is comfortably large.
+	maxKeyLength = 256
+
+	// maxStoreKeys bounds the number of distinct keys the KV will accept into
+	// its in-memory store as defence in depth against unauthenticated gossip
+	// peers injecting attacker-chosen keys. Once the store contains this many
+	// entries, updates for keys we do not already know are dropped. Updates for
+	// keys we already know (including the small, static legitimate set) are
+	// always allowed through.
+	maxStoreKeys = 128
 )
 
 // Client implements kv.Client interface, by using memberlist.KV
@@ -165,6 +179,14 @@ type KVConfig struct {
 
 	// Codecs to register. Codecs need to be registered before joining other members.
 	Codecs []codec.Codec `yaml:"-"`
+
+	// AllowedKeys is the set of KV keys this node is willing to accept from the
+	// gossip plane. Any key not in this set that arrives via NotifyMsg or
+	// MergeRemoteState is dropped before it reaches the store or any
+	// Prometheus label. If AllowedKeys is empty, the key namespace is
+	// unrestricted (back-compat only); callers should populate this with the
+	// static set of keys the process actually uses (ring, store-gateway, etc.).
+	AllowedKeys []string `yaml:"-"`
 }
 
 // RegisterFlagsWithPrefix registers flags.
@@ -237,6 +259,12 @@ type KV struct {
 
 	// Codec registry
 	codecs map[string]codec.Codec
+
+	// Set of keys we are willing to accept from the gossip plane. Populated
+	// from KVConfig.AllowedKeys at construction time and never mutated
+	// afterwards, so it is safe to read without a lock. An empty map means no
+	// allowlist was configured and all (otherwise valid) keys are accepted.
+	allowedKeys map[string]struct{}
 
 	// Key watchers
 	watchersMu     sync.Mutex
@@ -346,10 +374,15 @@ func NewKV(cfg KVConfig, logger log.Logger, dnsProvider DNSProvider, registerer 
 
 		store:          make(map[string]valueDesc),
 		codecs:         make(map[string]codec.Codec),
+		allowedKeys:    make(map[string]struct{}, len(cfg.AllowedKeys)),
 		watchers:       make(map[string][]chan string),
 		prefixWatchers: make(map[string][]chan string),
 		shutdown:       make(chan struct{}),
 		maxCasRetries:  maxCasRetries,
+	}
+
+	for _, k := range cfg.AllowedKeys {
+		mlkv.allowedKeys[k] = struct{}{}
 	}
 
 	mlkv.createAndRegisterMetrics()
@@ -508,6 +541,41 @@ func (m *KV) rejoinMemberlist(ctx context.Context) {
 // GetCodec returns codec for given ID or nil.
 func (m *KV) GetCodec(codecID string) codec.Codec {
 	return m.codecs[codecID]
+}
+
+// keyAllowed reports whether key is in the configured allowlist of keys this
+// node accepts from the gossip plane. If no allowlist is configured, all keys
+// are accepted (back-compat). Callers must additionally reject empty keys or
+// keys longer than maxKeyLength before calling this.
+func (m *KV) keyAllowed(key string) bool {
+	if len(m.allowedKeys) == 0 {
+		return true
+	}
+	_, ok := m.allowedKeys[key]
+	return ok
+}
+
+// validateIncomingKey checks a key arriving from the gossip plane. It returns
+// true if the key is acceptable (non-empty, within length bound, and in the
+// allowlist when one is configured). On rejection it increments the invalid
+// message counter and logs a warning.
+func (m *KV) validateIncomingKey(key string, source string) bool {
+	if len(key) == 0 {
+		level.Warn(m.logger).Log("msg", "received an invalid KV Pair (empty key)", "source", source)
+		m.numberOfInvalidReceivedMessages.Inc()
+		return false
+	}
+	if len(key) > maxKeyLength {
+		level.Warn(m.logger).Log("msg", "rejected gossip key exceeding max length", "source", source, "key_length", len(key), "max", maxKeyLength)
+		m.numberOfInvalidReceivedMessages.Inc()
+		return false
+	}
+	if !m.keyAllowed(key) {
+		level.Warn(m.logger).Log("msg", "rejected gossip for unknown key", "source", source, "key", key)
+		m.numberOfInvalidReceivedMessages.Inc()
+		return false
+	}
+	return true
 }
 
 // GetListeningPort returns port used for listening for memberlist communication. Useful when BindPort is set to 0.
@@ -972,9 +1040,7 @@ func (m *KV) NotifyMsg(msg []byte) {
 		return
 	}
 
-	if len(kvPair.Key) == 0 {
-		level.Warn(m.logger).Log("msg", "received an invalid KV Pair (empty key)")
-		m.numberOfInvalidReceivedMessages.Inc()
+	if !m.validateIncomingKey(kvPair.Key, "NotifyMsg") {
 		return
 	}
 
@@ -1151,6 +1217,10 @@ func (m *KV) MergeRemoteState(data []byte, join bool) {
 
 		data = data[kvPairLength:]
 
+		if !m.validateIncomingKey(kvPair.Key, "MergeRemoteState") {
+			continue
+		}
+
 		codec := m.GetCodec(kvPair.GetCodec())
 		if codec == nil {
 			level.Error(m.logger).Log("msg", "failed to parse remote state: unknown codec for key", "codec", kvPair.GetCodec(), "key", kvPair.GetKey())
@@ -1211,11 +1281,22 @@ func (m *KV) mergeValueForKey(key string, incomingValue Mergeable, casVersion ui
 	// Note that we do not take a deep copy of curr.value here, it is modified in-place.
 	// This is safe because the entire function runs under the store lock; we do not return
 	// the full state anywhere as is done elsewhere (i.e. Get/WatchKey/CAS).
-	curr := m.store[key]
+	curr, existing := m.store[key]
 	// if casVersion is 0, then there was no previous value, so we will just do normal merge, without localCAS flag set.
 	if casVersion > 0 && curr.version != casVersion {
 		return nil, 0, errVersionMismatch
 	}
+
+	// Defence in depth: refuse to grow the store past maxStoreKeys for keys we
+	// have never seen before. Updates to known keys always proceed. This caps
+	// the heap-growth and metric-cardinality blast radius of an attacker who
+	// can reach the gossip port even if the allowlist is misconfigured.
+	if !existing && len(m.store) >= maxStoreKeys {
+		level.Warn(m.logger).Log("msg", "rejecting KV update, store at capacity", "key", key, "max", maxStoreKeys)
+		m.numberOfInvalidReceivedMessages.Inc()
+		return nil, 0, nil
+	}
+
 	result, change, err := computeNewValue(incomingValue, curr.value, casVersion > 0)
 	if err != nil {
 		return nil, 0, err
@@ -1229,8 +1310,14 @@ func (m *KV) mergeValueForKey(key string, incomingValue Mergeable, casVersion ui
 	if m.cfg.LeftIngestersTimeout > 0 {
 		limit := time.Now().Add(-m.cfg.LeftIngestersTimeout)
 		total, removed := result.RemoveTombstones(limit)
-		m.storeTombstones.WithLabelValues(key).Set(float64(total))
-		m.storeRemovedTombstones.WithLabelValues(key).Add(float64(removed))
+		// Only expose a Prometheus label value for keys we recognise. When no
+		// allowlist is configured we fall back to the previous behaviour, but
+		// in that mode the operator has explicitly opted out of key-based
+		// label validation.
+		if m.keyAllowed(key) {
+			m.storeTombstones.WithLabelValues(key).Set(float64(total))
+			m.storeRemovedTombstones.WithLabelValues(key).Add(float64(removed))
+		}
 
 		// Remove tombstones from change too. If change turns out to be empty after this,
 		// we don't need to gossip the change. However, the local value will be always be updated.
