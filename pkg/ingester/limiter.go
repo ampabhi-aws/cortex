@@ -247,10 +247,16 @@ func (l *Limiter) convertGlobalToLocalLimit(userID string, globalLimit int) int 
 	// (global limit / number of ingesters) * replication factor
 	numIngesters := l.ring.HealthyInstancesCount()
 
-	// May happen because the number of ingesters is asynchronously updated.
-	// If happens, we just temporarily ignore the global limit.
-	if numIngesters == 0 {
-		return 0
+	// May happen because the number of ingesters is asynchronously updated
+	// (e.g. right after startup, during a KV-store outage, or if all ring
+	// entries have been forgotten). Previously this returned 0, which caused
+	// the caller to drop the global limit entirely and -- if the local limit
+	// was also disabled -- substitute math.MaxInt32 (effectively unlimited).
+	// Fail closed instead by capping this ingester at the cluster-wide global
+	// limit: a single ingester must never admit more unique series than the
+	// tenant's whole-cluster budget.
+	if numIngesters <= 0 {
+		return globalLimit
 	}
 
 	// If the number of available ingesters is greater than the tenant's shard
@@ -261,7 +267,17 @@ func (l *Limiter) convertGlobalToLocalLimit(userID string, globalLimit int) int 
 		numIngesters = util_math.Min(numIngesters, util.ShuffleShardExpectedInstances(shardSize, l.getNumZones()))
 	}
 
-	return int((float64(globalLimit) / float64(numIngesters)) * float64(l.replicationFactor))
+	local := int((float64(globalLimit) / float64(numIngesters)) * float64(l.replicationFactor))
+
+	// Clamp the per-ingester limit at the cluster-wide global limit so a
+	// shrinking ring (natural attrition, KV outage, or malicious
+	// POST /ingester/ring?forget=... / /ingester/shutdown calls) cannot inflate
+	// each surviving ingester's local limit without bound. In steady state
+	// local <= globalLimit because numIngesters*RF cancels out; this ceiling
+	// only engages when the ring has shrunk below the replication factor and
+	// prevents the self-amplifying metastable OOM cascade documented in
+	// CWE-770.
+	return util_math.Min(local, globalLimit)
 }
 
 func (l *Limiter) getShardSize(userID string) int {
