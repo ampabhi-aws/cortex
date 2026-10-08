@@ -23,6 +23,22 @@ import (
 
 const messageSizeLargerErrFmt = "received message larger than max (%d vs %d)"
 
+// maxPreallocSize is an upper bound on the buffer pre-allocation hint we are
+// willing to honour based on client-supplied size signals (e.g. the HTTP
+// Content-Length header). Clients can set Content-Length to any value Go's
+// net/http accepts without being obliged to actually transmit that many
+// bytes, so sizing an allocation directly from it is a cheap
+// memory-amplification vector. We cap the hint at 1 MiB and let bytes.Buffer
+// grow naturally as data actually arrives.
+const maxPreallocSize = 1 << 20 // 1 MiB
+
+// maxSnappyExpansionRatio bounds the ratio between a snappy-decoded payload
+// and its compressed form that we are willing to pre-allocate for. The
+// snappy format's practical compression ceiling is around 64x; anything
+// claiming more than this from a tiny body is almost certainly an attempt
+// to force a large allocation ahead of validating the stream.
+const maxSnappyExpansionRatio = 64
+
 // IsRequestBodyTooLarge returns true if the error is "http: request body too large".
 func IsRequestBodyTooLarge(err error) bool {
 	return err != nil && strings.Contains(err.Error(), "http: request body too large")
@@ -200,7 +216,18 @@ func decompressFromReader(reader io.Reader, expectedSize, maxSize int, compressi
 		err  error
 	)
 	if expectedSize > 0 {
-		buf.Grow(expectedSize + bytes.MinRead) // extra space guarantees no reallocation
+		// Do NOT trust expectedSize (which is derived from the client-controlled
+		// Content-Length header on the HTTP push path) to size the allocation
+		// up-front. A malicious client can set Content-Length to the configured
+		// maxSize and never actually send the bytes, which would force us to
+		// pre-allocate ~maxSize of heap per connection before any body byte is
+		// read. Clamp the hint to maxPreallocSize and let bytes.Buffer grow
+		// naturally as data arrives.
+		hint := expectedSize
+		if hint > maxPreallocSize {
+			hint = maxPreallocSize
+		}
+		buf.Grow(hint + bytes.MinRead)
 	}
 	// Read from LimitReader with limit max+1. So if the underlying
 	// reader is over limit, the result will be bigger than max.
@@ -237,6 +264,15 @@ func decompressFromBuffer(buffer *bytes.Buffer, maxSize int, compression Compres
 		}
 		if size > maxSize {
 			return nil, fmt.Errorf(messageSizeLargerErrFmt, size, maxSize)
+		}
+		// Reject implausible expansion ratios before calling snappy.Decode,
+		// which allocates `size` bytes via make([]byte, dLen) BEFORE validating
+		// the compressed stream. The snappy format's practical compression
+		// ceiling is ~64x, so a decoded length wildly larger than
+		// maxSnappyExpansionRatio * len(compressed) can only be an attempt to
+		// force a large allocation from a tiny body.
+		if compressed := len(buffer.Bytes()); compressed > 0 && size/maxSnappyExpansionRatio > compressed {
+			return nil, fmt.Errorf("snappy decoded length %d implausible for %d compressed bytes", size, compressed)
 		}
 		body, err := snappy.Decode(nil, buffer.Bytes())
 		if err != nil {
