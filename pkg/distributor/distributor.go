@@ -489,6 +489,21 @@ func (d *Distributor) checkSample(ctx context.Context, userID, cluster, replica 
 		return false, nil
 	}
 
+	// The cluster label value becomes part of the HA tracker KV store key and
+	// is used as a Prometheus metric label value on cortex_ha_tracker_* and
+	// cortex_distributor_deduped_samples_total. Prometheus CounterVec children
+	// (and the strings referenced by their label values) are retained until
+	// explicitly deleted, so an unbounded attacker-controlled cluster value
+	// leaks heap and inflates metric cardinality for the lifetime of the
+	// process. Reject cluster label values whose length exceeds the configured
+	// max label value length before they are allowed to reach the HA tracker
+	// or any metric that is labelled by them.
+	if len(cluster) > d.limits.MaxLabelValueLength(userID) {
+		return false, httpgrpc.Errorf(http.StatusBadRequest,
+			"%s label value is too long: %d bytes (limit: %d)",
+			d.limits.HAClusterLabel(userID), len(cluster), d.limits.MaxLabelValueLength(userID))
+	}
+
 	// At this point we know we have both HA labels, we should lookup
 	// the cluster/instance here to see if we want to accept this sample.
 	err := d.HATracker.checkReplica(ctx, userID, cluster, replica, time.Now())
