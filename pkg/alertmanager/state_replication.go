@@ -142,9 +142,24 @@ func (s *state) AddState(key string, cs cluster.State, _ prometheus.Registerer) 
 	}
 }
 
+// maxMergePartialStateSize bounds the size of a single partial state payload
+// accepted via gRPC. It is a defence-in-depth guard against a peer
+// attempting to exhaust memory by sending oversized or crafted state.
+// MergePartialState enforces this cap in addition to any caller-side check.
+const maxMergePartialStateSize = 16 * 1024 * 1024
+
 // MergePartialState merges a received partial message with an internal state.
 func (s *state) MergePartialState(p *clusterpb.Part) error {
+	if p == nil {
+		s.partialStateMergesFailed.WithLabelValues("").Inc()
+		return fmt.Errorf("empty state part")
+	}
 	s.partialStateMergesTotal.WithLabelValues(p.Key).Inc()
+
+	if len(p.Data) > maxMergePartialStateSize {
+		s.partialStateMergesFailed.WithLabelValues(p.Key).Inc()
+		return fmt.Errorf("state part %q is too large (%d bytes, maximum is %d)", p.Key, len(p.Data), maxMergePartialStateSize)
+	}
 
 	s.mtx.Lock()
 	defer s.mtx.Unlock()

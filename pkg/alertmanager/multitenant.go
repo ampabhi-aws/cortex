@@ -25,6 +25,8 @@ import (
 	"github.com/weaveworks/common/httpgrpc/server"
 	"github.com/weaveworks/common/user"
 	"golang.org/x/time/rate"
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/status"
 
 	"github.com/cortexproject/cortex/pkg/alertmanager/alertmanagerpb"
 	"github.com/cortexproject/cortex/pkg/alertmanager/alertspb"
@@ -73,6 +75,19 @@ type MultitenantAlertmanagerConfig struct {
 	ShardingEnabled bool       `yaml:"sharding_enabled"`
 	ShardingRing    RingConfig `yaml:"sharding_ring"`
 
+	// PeerAuthorizationEnabled turns on ring-membership authorization on the
+	// inter-Alertmanager gRPC service (UpdateState, ReadState, HandleRequest).
+	// It should be enabled together with -server.grpc-tls-client-auth=
+	// RequireAndVerifyClientCert and -alertmanager.alertmanager-client.
+	// tls-enabled so that the peer address compared against the ring is also
+	// cryptographically attested by a client certificate.
+	PeerAuthorizationEnabled bool `yaml:"peer_authorization_enabled"`
+
+	// MaxStatePartBytes bounds the size of a single clusterpb.Part accepted by
+	// UpdateState/MergePartialState. It prevents a peer (compromised or
+	// otherwise) from exhausting memory via oversized state payloads.
+	MaxStatePartBytes int64 `yaml:"max_state_part_bytes"`
+
 	FallbackConfigFile string `yaml:"fallback_config_file"`
 	AutoWebhookRoot    string `yaml:"auto_webhook_root"`
 
@@ -116,6 +131,8 @@ func (cfg *MultitenantAlertmanagerConfig) RegisterFlags(f *flag.FlagSet) {
 	f.BoolVar(&cfg.EnableAPI, "experimental.alertmanager.enable-api", false, "Enable the experimental alertmanager config api.")
 
 	f.BoolVar(&cfg.ShardingEnabled, "alertmanager.sharding-enabled", false, "Shard tenants across multiple alertmanager instances.")
+	f.BoolVar(&cfg.PeerAuthorizationEnabled, "alertmanager.peer-authorization-enabled", false, "Require that callers of the inter-Alertmanager gRPC service (UpdateState, ReadState, HandleRequest) are members of the Alertmanager ring for the asserted tenant. Should be used together with -server.grpc-tls-client-auth=RequireAndVerifyClientCert so that the peer address compared against the ring is cryptographically attested by a client certificate.")
+	f.Int64Var(&cfg.MaxStatePartBytes, "alertmanager.max-state-part-bytes", 16<<20, "Maximum size (in bytes) of a single cluster state part accepted via the Alertmanager UpdateState gRPC method. Zero disables the limit.")
 
 	cfg.AlertmanagerClient.RegisterFlagsWithPrefix("alertmanager.alertmanager-client", f)
 	cfg.Persister.RegisterFlagsWithPrefix("alertmanager", f)
@@ -1004,6 +1021,16 @@ func (am *MultitenantAlertmanager) ServeHTTP(w http.ResponseWriter, req *http.Re
 
 // HandleRequest implements gRPC Alertmanager service, which receives request from AlertManager-Distributor.
 func (am *MultitenantAlertmanager) HandleRequest(ctx context.Context, in *httpgrpc.HTTPRequest) (*httpgrpc.HTTPResponse, error) {
+	userID, err := tenant.TenantID(ctx)
+	if err != nil {
+		return nil, err
+	}
+	if err := am.authorizePeer(ctx, userID); err != nil {
+		return nil, err
+	}
+	if am.grpcServer == nil {
+		return nil, status.Error(codes.Unavailable, "alertmanager gRPC server is not configured")
+	}
 	return am.grpcServer.Handle(ctx, in)
 }
 
@@ -1159,6 +1186,17 @@ func (am *MultitenantAlertmanager) UpdateState(ctx context.Context, part *cluste
 		return nil, err
 	}
 
+	if err := am.authorizePeer(ctx, userID); err != nil {
+		return nil, err
+	}
+
+	if part != nil && am.cfg.MaxStatePartBytes > 0 && int64(len(part.Data)) > am.cfg.MaxStatePartBytes {
+		return &alertmanagerpb.UpdateStateResponse{
+			Status: alertmanagerpb.MERGE_ERROR,
+			Error:  fmt.Sprintf("state part %q exceeds the configured maximum size (%d > %d bytes)", part.Key, len(part.Data), am.cfg.MaxStatePartBytes),
+		}, nil
+	}
+
 	am.alertmanagersMtx.Lock()
 	userAM, ok := am.alertmanagers[userID]
 	am.alertmanagersMtx.Unlock()
@@ -1262,6 +1300,10 @@ func (am *MultitenantAlertmanager) getPerUserDirectories() map[string]string {
 func (am *MultitenantAlertmanager) ReadState(ctx context.Context, req *alertmanagerpb.ReadStateRequest) (*alertmanagerpb.ReadStateResponse, error) {
 	userID, err := tenant.TenantID(ctx)
 	if err != nil {
+		return nil, err
+	}
+
+	if err := am.authorizePeer(ctx, userID); err != nil {
 		return nil, err
 	}
 
