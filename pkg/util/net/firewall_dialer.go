@@ -3,6 +3,7 @@ package net
 import (
 	"context"
 	"net"
+	"net/url"
 	"syscall"
 
 	"github.com/pkg/errors"
@@ -69,6 +70,73 @@ func (d *FirewallDialer) control(_, address string, _ syscall.RawConn) error {
 
 func isLocal(ip net.IP) bool {
 	return ip.IsLoopback() || ip.IsLinkLocalUnicast() || ip.IsLinkLocalMulticast()
+}
+
+// IsBlockedAddress reports whether the given IP would be refused by a
+// FirewallDialer configured with the supplied options. It is exported so
+// admission-time validators (for example, Cortex's Alertmanager config API)
+// can reject tenant-supplied URLs that resolve to firewalled addresses rather
+// than relying solely on a dial-time hook, which can be bypassed by code paths
+// (for example OAuth2 token clients) that construct independent transports
+// without the hook.
+func IsBlockedAddress(ip net.IP, blockPrivateAddresses bool, blockCIDRNetworks []flagext.CIDR) bool {
+	if !blockPrivateAddresses && len(blockCIDRNetworks) == 0 {
+		return false
+	}
+	if blockPrivateAddresses && (isPrivate(ip) || isLocal(ip)) {
+		return true
+	}
+	for _, cidr := range blockCIDRNetworks {
+		if cidr.Value.Contains(ip) {
+			return true
+		}
+	}
+	return false
+}
+
+// ValidateURLAgainstFirewall parses rawURL and returns an error if the URL's
+// host resolves (via net.DefaultResolver) to any address that would be refused
+// by a FirewallDialer configured with blockPrivateAddresses and
+// blockCIDRNetworks. An empty rawURL is considered valid (nothing to check).
+//
+// Enforcement is best-effort: it hardens admission control but cannot by
+// itself defeat DNS rebinding — the dial-time hook must also be applied by
+// every HTTP transport that eventually sends tenant traffic.
+func ValidateURLAgainstFirewall(rawURL string, blockPrivateAddresses bool, blockCIDRNetworks []flagext.CIDR) error {
+	if rawURL == "" {
+		return nil
+	}
+	if !blockPrivateAddresses && len(blockCIDRNetworks) == 0 {
+		return nil
+	}
+	u, err := url.Parse(rawURL)
+	if err != nil {
+		return errors.Wrapf(errInvalidAddress, "could not parse URL %q", rawURL)
+	}
+	host := u.Hostname()
+	if host == "" {
+		return errors.Wrapf(errInvalidAddress, "URL %q has no host", rawURL)
+	}
+	// Literal IP: check directly.
+	if ip := net.ParseIP(host); ip != nil {
+		if IsBlockedAddress(ip, blockPrivateAddresses, blockCIDRNetworks) {
+			return errors.Wrapf(errBlockedAddress, "URL %q resolves to a blocked address", rawURL)
+		}
+		return nil
+	}
+	// Hostname: resolve and check every answer. Fail closed if any resolved
+	// address is blocked, but do not fail if resolution itself fails — the
+	// dial-time check will still refuse the connection.
+	ips, err := net.DefaultResolver.LookupIPAddr(context.Background(), host)
+	if err != nil {
+		return nil
+	}
+	for _, ipAddr := range ips {
+		if IsBlockedAddress(ipAddr.IP, blockPrivateAddresses, blockCIDRNetworks) {
+			return errors.Wrapf(errBlockedAddress, "URL %q resolves to a blocked address", rawURL)
+		}
+	}
+	return nil
 }
 
 // isPrivate reports whether ip is a private address, according to

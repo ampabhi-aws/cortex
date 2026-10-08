@@ -22,6 +22,7 @@ import (
 	"github.com/cortexproject/cortex/pkg/util"
 	"github.com/cortexproject/cortex/pkg/util/concurrency"
 	util_log "github.com/cortexproject/cortex/pkg/util/log"
+	util_net "github.com/cortexproject/cortex/pkg/util/net"
 )
 
 const (
@@ -45,6 +46,8 @@ var (
 	errTLSFileNotAllowed             = errors.New("setting TLS ca_file, cert_file and key_file is not allowed")
 	errSlackAPIURLFileNotAllowed     = errors.New("setting Slack api_url_file and global slack_api_url_file is not allowed")
 	errVictorOpsAPIKeyFileNotAllowed = errors.New("setting VictorOps api_key_file is not allowed")
+	errOAuth2TokenURLBlocked         = errors.New("OAuth2 token_url resolves to an address blocked by the receiver firewall")
+	errProxyURLBlocked               = errors.New("proxy_url resolves to an address blocked by the receiver firewall")
 )
 
 // UserConfig is used to communicate a users alertmanager configs
@@ -186,7 +189,7 @@ func validateUserConfig(logger log.Logger, cfg alertspb.AlertConfigDesc, limits 
 	}
 
 	// Validate the config recursively scanning it.
-	if err := validateAlertmanagerConfig(amCfg); err != nil {
+	if err := validateAlertmanagerConfig(amCfg, limits, user); err != nil {
 		return err
 	}
 
@@ -307,7 +310,7 @@ func (am *MultitenantAlertmanager) ListAllConfigs(w http.ResponseWriter, r *http
 // validateAlertmanagerConfig recursively scans the input config looking for data types for which
 // we have a specific validation and, whenever encountered, it runs their validation. Returns the
 // first error or nil if validation succeeds.
-func validateAlertmanagerConfig(cfg interface{}) error {
+func validateAlertmanagerConfig(cfg interface{}, limits Limits, user string) error {
 	v := reflect.ValueOf(cfg)
 	t := v.Type()
 
@@ -332,7 +335,12 @@ func validateAlertmanagerConfig(cfg interface{}) error {
 		}
 
 	case reflect.TypeOf(commoncfg.HTTPClientConfig{}):
-		if err := validateReceiverHTTPConfig(v.Interface().(commoncfg.HTTPClientConfig)); err != nil {
+		if err := validateReceiverHTTPConfig(v.Interface().(commoncfg.HTTPClientConfig), limits, user); err != nil {
+			return err
+		}
+
+	case reflect.TypeOf(commoncfg.OAuth2{}):
+		if err := validateReceiverOAuth2Config(v.Interface().(commoncfg.OAuth2), limits, user); err != nil {
 			return err
 		}
 
@@ -360,7 +368,7 @@ func validateAlertmanagerConfig(cfg interface{}) error {
 
 			// Skip any field value which can't be converted to interface (eg. primitive types).
 			if fieldValue.CanInterface() {
-				if err := validateAlertmanagerConfig(fieldValue.Interface()); err != nil {
+				if err := validateAlertmanagerConfig(fieldValue.Interface(), limits, user); err != nil {
 					return err
 				}
 			}
@@ -373,7 +381,7 @@ func validateAlertmanagerConfig(cfg interface{}) error {
 
 			// Skip any field value which can't be converted to interface (eg. primitive types).
 			if fieldValue.CanInterface() {
-				if err := validateAlertmanagerConfig(fieldValue.Interface()); err != nil {
+				if err := validateAlertmanagerConfig(fieldValue.Interface(), limits, user); err != nil {
 					return err
 				}
 			}
@@ -386,7 +394,7 @@ func validateAlertmanagerConfig(cfg interface{}) error {
 
 			// Skip any field value which can't be converted to interface (eg. primitive types).
 			if fieldValue.CanInterface() {
-				if err := validateAlertmanagerConfig(fieldValue.Interface()); err != nil {
+				if err := validateAlertmanagerConfig(fieldValue.Interface(), limits, user); err != nil {
 					return err
 				}
 			}
@@ -398,7 +406,7 @@ func validateAlertmanagerConfig(cfg interface{}) error {
 
 // validateReceiverHTTPConfig validates the HTTP config and returns an error if it contains
 // settings not allowed by Cortex.
-func validateReceiverHTTPConfig(cfg commoncfg.HTTPClientConfig) error {
+func validateReceiverHTTPConfig(cfg commoncfg.HTTPClientConfig, limits Limits, user string) error {
 	if cfg.BasicAuth != nil && cfg.BasicAuth.PasswordFile != "" {
 		return errPasswordFileNotAllowed
 	}
@@ -411,7 +419,54 @@ func validateReceiverHTTPConfig(cfg commoncfg.HTTPClientConfig) error {
 	if cfg.OAuth2 != nil && cfg.OAuth2.ClientSecretFile != "" {
 		return errOAuth2SecretFileNotAllowed
 	}
+	// Validate the HTTP client proxy_url against the receiver firewall so a
+	// tenant cannot route traffic through an internal proxy that the firewall
+	// is configured to block (defence in depth — the dial hook also catches
+	// this, but doing it at admission fails closed earlier and is immune to
+	// code paths that bypass the hook).
+	if cfg.ProxyURL.URL != nil {
+		if err := validateURLAgainstFirewall(cfg.ProxyURL.String(), limits, user); err != nil {
+			return errors.Wrap(errProxyURLBlocked, err.Error())
+		}
+	}
 	return validateReceiverTLSConfig(cfg.TLSConfig)
+}
+
+// validateReceiverOAuth2Config validates the OAuth2 config and returns an error
+// if it contains settings not allowed by Cortex. In particular, the
+// tenant-controlled token_url and proxy_url are checked against the per-tenant
+// receiver firewall. The vendored prometheus/common OAuth2 round tripper
+// historically constructed a token-fetch http.Transport without the firewall
+// dialer, so this admission-time check is required to make the egress policy
+// stick regardless of the enforcement point.
+func validateReceiverOAuth2Config(cfg commoncfg.OAuth2, limits Limits, user string) error {
+	if cfg.ClientSecretFile != "" {
+		return errOAuth2SecretFileNotAllowed
+	}
+	if err := validateURLAgainstFirewall(cfg.TokenURL, limits, user); err != nil {
+		return errors.Wrap(errOAuth2TokenURLBlocked, err.Error())
+	}
+	if cfg.ProxyURL.URL != nil {
+		if err := validateURLAgainstFirewall(cfg.ProxyURL.String(), limits, user); err != nil {
+			return errors.Wrap(errProxyURLBlocked, err.Error())
+		}
+	}
+	return validateReceiverTLSConfig(cfg.TLSConfig)
+}
+
+// validateURLAgainstFirewall rejects rawURL if any of its resolved addresses
+// are blocked by the per-tenant Alertmanager receiver firewall. It is a
+// no-op when the firewall is disabled for the tenant or when limits is nil
+// (e.g. in unit tests that only exercise the structural validator).
+func validateURLAgainstFirewall(rawURL string, limits Limits, user string) error {
+	if limits == nil || rawURL == "" {
+		return nil
+	}
+	return util_net.ValidateURLAgainstFirewall(
+		rawURL,
+		limits.AlertmanagerReceiversBlockPrivateAddresses(user),
+		limits.AlertmanagerReceiversBlockCIDRNetworks(user),
+	)
 }
 
 // validateReceiverTLSConfig validates the TLS config and returns an error if it contains

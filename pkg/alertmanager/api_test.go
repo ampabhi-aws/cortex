@@ -789,8 +789,106 @@ func TestValidateAlertmanagerConfig(t *testing.T) {
 
 	for testName, testData := range tests {
 		t.Run(testName, func(t *testing.T) {
-			err := validateAlertmanagerConfig(testData.input)
+			err := validateAlertmanagerConfig(testData.input, nil, "")
 			assert.ErrorIs(t, err, testData.expected)
+		})
+	}
+}
+
+// firewallBlockAllLimits is a mock Limits that reports the Alertmanager
+// receiver firewall as enabled for private/local addresses, so a token_url
+// targeting a loopback address is rejected at admission.
+type firewallBlockAllLimits struct {
+	mockAlertManagerLimits
+}
+
+func (firewallBlockAllLimits) AlertmanagerReceiversBlockPrivateAddresses(string) bool {
+	return true
+}
+
+func (firewallBlockAllLimits) AlertmanagerReceiversBlockCIDRNetworks(string) []flagext.CIDR {
+	return nil
+}
+
+// TestValidateAlertmanagerConfig_RejectsOAuth2TokenURLToBlockedAddress is the
+// regression test for the Alertmanager receiver OAuth2 token_url SSRF bypass
+// (receiver firewall was previously enforced only as the main transport's
+// DialContext, so a tenant could set http_config.oauth2.token_url to a
+// loopback or link-local address and the vendored prometheus/common OAuth2
+// token client would still reach it on every notification). Admission
+// control must reject such configurations fail-closed, independently of the
+// enforcement point used at request time.
+func TestValidateAlertmanagerConfig_RejectsOAuth2TokenURLToBlockedAddress(t *testing.T) {
+	limits := &firewallBlockAllLimits{}
+
+	cases := map[string]struct {
+		cfg       interface{}
+		wantBlock bool
+	}{
+		"oauth2 token_url pointing at loopback is rejected": {
+			cfg: &commoncfg.HTTPClientConfig{
+				OAuth2: &commoncfg.OAuth2{
+					ClientID:     "probe",
+					ClientSecret: "probe",
+					TokenURL:     "http://127.0.0.1:9999/ssrf-via-oauth2",
+				},
+			},
+			wantBlock: true,
+		},
+		"oauth2 token_url pointing at link-local metadata is rejected": {
+			cfg: &commoncfg.HTTPClientConfig{
+				OAuth2: &commoncfg.OAuth2{
+					ClientID: "probe", ClientSecret: "probe",
+					TokenURL: "http://169.254.169.254/latest/api/token",
+				},
+			},
+			wantBlock: true,
+		},
+		"oauth2 token_url pointing at private RFC1918 is rejected": {
+			cfg: &commoncfg.HTTPClientConfig{
+				OAuth2: &commoncfg.OAuth2{
+					ClientID: "probe", ClientSecret: "probe",
+					TokenURL: "http://10.0.0.1/token",
+				},
+			},
+			wantBlock: true,
+		},
+		"oauth2 token_url with public literal IP is accepted": {
+			cfg: &commoncfg.HTTPClientConfig{
+				OAuth2: &commoncfg.OAuth2{
+					ClientID: "probe", ClientSecret: "probe",
+					TokenURL: "https://8.8.8.8/token",
+				},
+			},
+			wantBlock: false,
+		},
+		"receiver struct carrying oauth2 token_url to loopback is rejected": {
+			cfg: config.Config{
+				Receivers: []*config.Receiver{{
+					Name: "test",
+					WebhookConfigs: []*config.WebhookConfig{{
+						HTTPConfig: &commoncfg.HTTPClientConfig{
+							OAuth2: &commoncfg.OAuth2{
+								ClientID: "probe", ClientSecret: "probe",
+								TokenURL: "http://127.0.0.1:9093/x",
+							},
+						},
+					}},
+				}},
+			},
+			wantBlock: true,
+		},
+	}
+
+	for name, tc := range cases {
+		t.Run(name, func(t *testing.T) {
+			err := validateAlertmanagerConfig(tc.cfg, limits, "tenant")
+			if tc.wantBlock {
+				require.Error(t, err)
+				assert.ErrorIs(t, err, errOAuth2TokenURLBlocked)
+			} else {
+				require.NoError(t, err)
+			}
 		})
 	}
 }
