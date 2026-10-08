@@ -48,9 +48,10 @@ var (
 	errInvalidBlockRanges = "compactor block range periods should be divisible by the previous one, but %s is not divisible by %s"
 	RingOp                = ring.NewOp([]ring.InstanceState{ring.ACTIVE}, nil)
 
-	supportedShardingStrategies = []string{util.ShardingStrategyDefault, util.ShardingStrategyShuffle}
-	errInvalidShardingStrategy  = errors.New("invalid sharding strategy")
-	errInvalidTenantShardSize   = errors.New("invalid tenant shard size, the value must be greater than 0")
+	supportedShardingStrategies        = []string{util.ShardingStrategyDefault, util.ShardingStrategyShuffle}
+	errInvalidShardingStrategy         = errors.New("invalid sharding strategy")
+	errInvalidTenantShardSize          = errors.New("invalid tenant shard size, the value must be greater than 0")
+	errShuffleShardingRequiresSharding = errors.New("-compactor.sharding-strategy=shuffle-sharding requires -compactor.sharding-enabled=true")
 
 	DefaultBlocksGrouperFactory = func(ctx context.Context, cfg Config, bkt objstore.InstrumentedBucket, logger log.Logger, reg prometheus.Registerer, blocksMarkedForDeletion, blocksMarkedForNoCompaction, garbageCollectedBlocks prometheus.Counter, _ prometheus.Gauge, _ prometheus.Counter, _ prometheus.Counter, _ *ring.Ring, _ *ring.Lifecycler, _ Limits, _ string) compact.Grouper {
 		return compact.NewDefaultGrouper(
@@ -68,6 +69,24 @@ var (
 	}
 
 	ShuffleShardingGrouperFactory = func(ctx context.Context, cfg Config, bkt objstore.InstrumentedBucket, logger log.Logger, reg prometheus.Registerer, blocksMarkedForDeletion, blocksMarkedForNoCompaction, garbageCollectedBlocks prometheus.Counter, remainingPlannedCompactions prometheus.Gauge, blockVisitMarkerReadFailed prometheus.Counter, blockVisitMarkerWriteFailed prometheus.Counter, ring *ring.Ring, ringLifecycle *ring.Lifecycler, limits Limits, userID string) compact.Grouper {
+		// Defensive: shuffle sharding requires the compactor ring and lifecycler. If either is
+		// nil (e.g. compactor sharding is disabled), fall back to the default grouper and log an
+		// error rather than panic on nil pointer dereference below.
+		if ring == nil || ringLifecycle == nil {
+			level.Error(logger).Log("msg", "shuffle sharding grouper requires the compactor ring; falling back to default grouper. This indicates a misconfiguration: -compactor.sharding-strategy=shuffle-sharding requires -compactor.sharding-enabled=true")
+			return compact.NewDefaultGrouper(
+				logger,
+				bkt,
+				false, // Do not accept malformed indexes
+				true,  // Enable vertical compaction
+				reg,
+				blocksMarkedForDeletion,
+				garbageCollectedBlocks,
+				blocksMarkedForNoCompaction,
+				metadata.NoneFunc,
+				cfg.BlockFilesConcurrency,
+				cfg.BlocksFetchConcurrency)
+		}
 		return NewShuffleShardingGrouper(
 			ctx,
 			logger,
@@ -114,6 +133,13 @@ var (
 		}
 
 		plannerFactory := func(ctx context.Context, bkt objstore.InstrumentedBucket, logger log.Logger, cfg Config, noCompactionMarkFilter *compact.GatherNoCompactionMarkFilter, ringLifecycle *ring.Lifecycler, blockVisitMarkerReadFailed prometheus.Counter, blockVisitMarkerWriteFailed prometheus.Counter) compact.Planner {
+			// Defensive: shuffle sharding requires the compactor ring lifecycler. If it is nil
+			// (e.g. compactor sharding is disabled), fall back to the default planner rather
+			// than panic on nil pointer dereference below.
+			if ringLifecycle == nil {
+				level.Error(logger).Log("msg", "shuffle sharding planner requires the compactor ring lifecycler; falling back to default planner. This indicates a misconfiguration: -compactor.sharding-strategy=shuffle-sharding requires -compactor.sharding-enabled=true")
+				return compact.NewPlanner(logger, cfg.BlockRanges.ToMilliseconds(), noCompactionMarkFilter)
+			}
 
 			return NewShuffleShardingPlanner(ctx, bkt, logger, cfg.BlockRanges.ToMilliseconds(), noCompactionMarkFilter.NoCompactMarkedBlocks, ringLifecycle.ID, cfg.BlockVisitMarkerTimeout, cfg.BlockVisitMarkerFileUpdateInterval, blockVisitMarkerReadFailed, blockVisitMarkerWriteFailed)
 		}
@@ -257,7 +283,10 @@ func (cfg *Config) Validate(limits validation.Limits) error {
 		return errInvalidShardingStrategy
 	}
 
-	if cfg.ShardingEnabled && cfg.ShardingStrategy == util.ShardingStrategyShuffle {
+	if cfg.ShardingStrategy == util.ShardingStrategyShuffle {
+		if !cfg.ShardingEnabled {
+			return errShuffleShardingRequiresSharding
+		}
 		if limits.CompactorTenantShardSize <= 0 {
 			return errInvalidTenantShardSize
 		}
@@ -338,9 +367,13 @@ func NewCompactor(compactorCfg Config, storageCfg cortex_tsdb.BlocksStorageConfi
 		return bucket.NewClient(ctx, storageCfg.Bucket, "compactor", logger, registerer)
 	}
 
+	// Shuffle-sharding implementations require the compactor ring and lifecycler, which
+	// are only created when sharding is enabled. Gate the factory selection on both
+	// switches so a misconfiguration that slipped past Validate (e.g. a future refactor)
+	// cannot cause a nil pointer dereference inside the shuffle factories.
 	blocksGrouperFactory := compactorCfg.BlocksGrouperFactory
 	if blocksGrouperFactory == nil {
-		if compactorCfg.ShardingStrategy == util.ShardingStrategyShuffle {
+		if compactorCfg.ShardingEnabled && compactorCfg.ShardingStrategy == util.ShardingStrategyShuffle {
 			blocksGrouperFactory = ShuffleShardingGrouperFactory
 		} else {
 			blocksGrouperFactory = DefaultBlocksGrouperFactory
@@ -349,7 +382,7 @@ func NewCompactor(compactorCfg Config, storageCfg cortex_tsdb.BlocksStorageConfi
 
 	blocksCompactorFactory := compactorCfg.BlocksCompactorFactory
 	if blocksCompactorFactory == nil {
-		if compactorCfg.ShardingStrategy == util.ShardingStrategyShuffle {
+		if compactorCfg.ShardingEnabled && compactorCfg.ShardingStrategy == util.ShardingStrategyShuffle {
 			blocksCompactorFactory = ShuffleShardingBlocksCompactorFactory
 		} else {
 			blocksCompactorFactory = DefaultBlocksCompactorFactory
