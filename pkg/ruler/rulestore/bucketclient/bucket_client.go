@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"io"
 	"strings"
+	"sync"
 
 	"github.com/go-kit/log"
 	"github.com/go-kit/log/level"
@@ -25,6 +26,11 @@ const (
 	rulesPrefix = "rules"
 
 	loadConcurrency = 10
+
+	// deleteNamespaceMaxAttempts bounds the number of re-list/delete passes
+	// DeleteNamespace performs so a concurrent writer cannot keep the loop
+	// running forever while still ensuring the namespace is empty on success.
+	deleteNamespaceMaxAttempts = 8
 )
 
 var (
@@ -165,8 +171,30 @@ func (b *BucketRuleStore) ListRuleGroupsForUserAndNamespace(ctx context.Context,
 }
 
 // LoadRuleGroups implements rules.RuleStore.
+//
+// A rule-group object that disappears between List and Load (ErrGroupNotFound)
+// is treated as an expected concurrent-delete race rather than a hard error:
+// the missing descriptors are removed from groupsToLoad so the caller syncs
+// the remaining, consistent set. This prevents a single tenant churning
+// create/delete calls from freezing rule-group synchronization for every
+// other tenant that shares the same ruler replica.
 func (b *BucketRuleStore) LoadRuleGroups(ctx context.Context, groupsToLoad map[string]rulespb.RuleGroupList) error {
 	ch := make(chan *rulespb.RuleGroupDesc)
+
+	var (
+		missingMtx sync.Mutex
+		missing   = map[string]map[string]struct{}{}
+	)
+
+	recordMissing := func(gr *rulespb.RuleGroupDesc) {
+		missingMtx.Lock()
+		defer missingMtx.Unlock()
+		user := gr.GetUser()
+		if _, ok := missing[user]; !ok {
+			missing[user] = map[string]struct{}{}
+		}
+		missing[user][missingKey(gr.GetNamespace(), gr.GetName())] = struct{}{}
+	}
 
 	// Given we store one file per rule group. With this, we create a pool of workers that will
 	// download all rule groups in parallel. We limit the number of workers to avoid a
@@ -180,13 +208,21 @@ func (b *BucketRuleStore) LoadRuleGroups(ctx context.Context, groupsToLoad map[s
 					return fmt.Errorf("invalid rule group: user=%q, namespace=%q, group=%q", user, namespace, group)
 				}
 
-				gr, err := b.getRuleGroup(gCtx, user, namespace, group, gr) // reuse group pointer from the map.
-				if err != nil {
+				loaded, err := b.getRuleGroup(gCtx, user, namespace, group, gr) // reuse group pointer from the map.
+				switch {
+				case errors.Is(err, rulestore.ErrGroupNotFound):
+					// The group was deleted between List and Load: drop it from
+					// this cycle instead of failing the whole multi-tenant batch.
+					level.Warn(b.logger).Log("msg", "rule group deleted while loading, skipping",
+						"user", user, "namespace", namespace, "group", group)
+					recordMissing(gr)
+					continue
+				case err != nil:
 					return errors.Wrapf(err, "get rule group user=%q, namespace=%q, name=%q", user, namespace, group)
 				}
 
-				if user != gr.User || namespace != gr.Namespace || group != gr.Name {
-					return fmt.Errorf("mismatch between requested rule group and loaded rule group, requested: user=%q, namespace=%q, group=%q, loaded: user=%q, namespace=%q, group=%q", user, namespace, group, gr.User, gr.Namespace, gr.Name)
+				if user != loaded.User || namespace != loaded.Namespace || group != loaded.Name {
+					return fmt.Errorf("mismatch between requested rule group and loaded rule group, requested: user=%q, namespace=%q, group=%q, loaded: user=%q, namespace=%q, group=%q", user, namespace, group, loaded.User, loaded.Namespace, loaded.Name)
 				}
 			}
 
@@ -210,7 +246,44 @@ outer:
 	}
 	close(ch)
 
-	return g.Wait()
+	if err := g.Wait(); err != nil {
+		return err
+	}
+
+	// Drop descriptors for groups that disappeared mid-load so the caller
+	// hands a consistent set to the manager.
+	if len(missing) > 0 {
+		for user, keys := range missing {
+			list, ok := groupsToLoad[user]
+			if !ok {
+				continue
+			}
+			filtered := list[:0]
+			for _, gr := range list {
+				if gr == nil {
+					continue
+				}
+				if _, drop := keys[missingKey(gr.GetNamespace(), gr.GetName())]; drop {
+					continue
+				}
+				filtered = append(filtered, gr)
+			}
+			if len(filtered) == 0 {
+				delete(groupsToLoad, user)
+			} else {
+				groupsToLoad[user] = filtered
+			}
+		}
+	}
+
+	return nil
+}
+
+// missingKey builds a stable, unambiguous key for the (namespace, group) pair.
+// We use a NUL byte separator so values that contain the separator cannot
+// collide across different (namespace, group) pairs.
+func missingKey(namespace, group string) string {
+	return namespace + "\x00" + group
 }
 
 // GetRuleGroup implements rules.RuleStore.
@@ -240,31 +313,52 @@ func (b *BucketRuleStore) DeleteRuleGroup(ctx context.Context, userID string, na
 }
 
 // DeleteNamespace implements rules.RuleStore.
+//
+// DeleteNamespace iterates List+Delete until the namespace is observed empty
+// or we hit a bounded attempt cap. The loop tolerates per-object not-found
+// errors (another writer may have deleted the same group concurrently) and
+// re-lists after each pass so a group created after the initial list is not
+// silently retained in the namespace.
 func (b *BucketRuleStore) DeleteNamespace(ctx context.Context, userID string, namespace string) error {
-	ruleGroupList, err := b.ListRuleGroupsForUserAndNamespace(ctx, userID, namespace)
-	if err != nil {
-		return err
-	}
-
-	if len(ruleGroupList) == 0 {
-		return rulestore.ErrGroupNamespaceNotFound
-	}
-
 	userBucket := bucket.NewUserBucketClient(userID, b.bucket, b.cfgProvider)
-	for _, rg := range ruleGroupList {
+
+	firstPass := true
+	for attempt := 0; attempt < deleteNamespaceMaxAttempts; attempt++ {
 		if err := ctx.Err(); err != nil {
 			return err
 		}
-		objectKey := getRuleGroupObjectKey(rg.Namespace, rg.Name)
-		level.Debug(b.logger).Log("msg", "deleting rule group", "user", userID, "namespace", namespace, "key", objectKey)
-		err = userBucket.Delete(ctx, objectKey)
+
+		ruleGroupList, err := b.ListRuleGroupsForUserAndNamespace(ctx, userID, namespace)
 		if err != nil {
-			level.Error(b.logger).Log("msg", "unable to delete rule group from namespace", "user", userID, "namespace", namespace, "key", objectKey, "err", err)
 			return err
+		}
+
+		if len(ruleGroupList) == 0 {
+			if firstPass {
+				return rulestore.ErrGroupNamespaceNotFound
+			}
+			return nil
+		}
+		firstPass = false
+
+		for _, rg := range ruleGroupList {
+			if err := ctx.Err(); err != nil {
+				return err
+			}
+			objectKey := getRuleGroupObjectKey(rg.Namespace, rg.Name)
+			level.Debug(b.logger).Log("msg", "deleting rule group", "user", userID, "namespace", namespace, "key", objectKey)
+			if err := userBucket.Delete(ctx, objectKey); err != nil {
+				if userBucket.IsObjNotFoundErr(err) {
+					// Another caller deleted the same object - treat as idempotent.
+					continue
+				}
+				level.Error(b.logger).Log("msg", "unable to delete rule group from namespace", "user", userID, "namespace", namespace, "key", objectKey, "err", err)
+				return err
+			}
 		}
 	}
 
-	return nil
+	return errors.Errorf("namespace %q for user %q was not empty after %d delete passes", namespace, userID, deleteNamespaceMaxAttempts)
 }
 
 func getNamespacePrefix(namespace string) string {

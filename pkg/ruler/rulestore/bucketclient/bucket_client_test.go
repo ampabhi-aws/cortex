@@ -158,13 +158,32 @@ func TestLoadRules(t *testing.T) {
 			}, allGroupsMap["user2"])
 		}
 
-		// Loading group with mismatched info fails.
+		// Loading group with mismatched info still fails.
 		require.NoError(t, rs.SetRuleGroup(context.Background(), "user1", "hello", &rulespb.RuleGroupDesc{User: "user2", Namespace: "world", Name: "first testGroup"}))
 		require.EqualError(t, rs.LoadRuleGroups(context.Background(), allGroupsMap), "mismatch between requested rule group and loaded rule group, requested: user=\"user1\", namespace=\"hello\", group=\"first testGroup\", loaded: user=\"user2\", namespace=\"world\", group=\"first testGroup\"")
 
-		// Load with missing rule groups fails.
-		require.NoError(t, rs.DeleteRuleGroup(context.Background(), "user1", "hello", "first testGroup"))
-		require.EqualError(t, rs.LoadRuleGroups(context.Background(), allGroupsMap), "get rule group user=\"user2\", namespace=\"world\", name=\"first testGroup\": group does not exist")
+		// Rebuild a consistent map and verify that LoadRuleGroups now tolerates
+		// a rule group that was deleted between List and Load (the attacker-
+		// driven list/delete race). The missing descriptor must be dropped
+		// from the input map so the caller syncs a consistent set.
+		deletedGroup := &rulespb.RuleGroupDesc{User: "user1", Namespace: "hello", Name: "second testGroup"}
+		reducedMap := map[string]rulespb.RuleGroupList{
+			"user1": {
+				{User: "user1", Namespace: "world", Name: "another namespace testGroup"},
+				deletedGroup,
+			},
+			"user2": {
+				{User: "user2", Namespace: "+-!@#$%. ", Name: "different user"},
+			},
+		}
+		require.NoError(t, rs.DeleteRuleGroup(context.Background(), "user1", "hello", "second testGroup"))
+		require.NoError(t, rs.LoadRuleGroups(context.Background(), reducedMap))
+		for _, gr := range reducedMap["user1"] {
+			require.False(t, gr.Namespace == "hello" && gr.Name == "second testGroup",
+				"missing rule group should have been removed from the input map")
+		}
+		require.Len(t, reducedMap["user1"], 1)
+		require.Len(t, reducedMap["user2"], 1)
 	})
 }
 
