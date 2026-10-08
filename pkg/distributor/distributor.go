@@ -684,7 +684,16 @@ func (d *Distributor) Push(ctx context.Context, req *cortexpb.WriteRequest) (*co
 		// label and dropped labels (if any)
 		key, err := d.tokenForLabels(userID, ts.Labels)
 		if err != nil {
-			return nil, err
+			// Same treatment as any other per-series validation failure (e.g.
+			// validation.ValidateLabels detects the missing __name__ label and
+			// returns a per-series 400). Treating this as a 5xx would cause
+			// remote-write senders to retry the whole batch indefinitely, so we
+			// classify it as a client error, record it, and skip just this series.
+			if firstPartialErr == nil {
+				firstPartialErr = httpgrpc.Errorf(http.StatusBadRequest, "%s", err)
+			}
+			validation.DiscardedSamples.WithLabelValues("missing_metric_name", userID).Add(float64(len(ts.Samples)))
+			continue
 		}
 
 		skipLabelNameValidation := d.cfg.SkipLabelNameValidation || req.GetSkipLabelNameValidation()
