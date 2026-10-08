@@ -7,17 +7,16 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
-	"reflect"
 
 	"github.com/go-kit/log"
 	"github.com/go-kit/log/level"
 	"github.com/pkg/errors"
 	"github.com/prometheus/alertmanager/config"
 	"github.com/prometheus/alertmanager/template"
-	commoncfg "github.com/prometheus/common/config"
 	"gopkg.in/yaml.v2"
 
 	"github.com/cortexproject/cortex/pkg/alertmanager/alertspb"
+	amvalidation "github.com/cortexproject/cortex/pkg/alertmanager/validation"
 	"github.com/cortexproject/cortex/pkg/tenant"
 	"github.com/cortexproject/cortex/pkg/util"
 	"github.com/cortexproject/cortex/pkg/util/concurrency"
@@ -39,12 +38,15 @@ const (
 	fetchConcurrency = 16
 )
 
+// These sentinel errors are aliased to the shared validation package so that
+// the single, hardened validator is used from every tenant-authored write
+// path. See pkg/alertmanager/validation for details and callers.
 var (
-	errPasswordFileNotAllowed        = errors.New("setting password_file, bearer_token_file and credentials_file is not allowed")
-	errOAuth2SecretFileNotAllowed    = errors.New("setting OAuth2 client_secret_file is not allowed")
-	errTLSFileNotAllowed             = errors.New("setting TLS ca_file, cert_file and key_file is not allowed")
-	errSlackAPIURLFileNotAllowed     = errors.New("setting Slack api_url_file and global slack_api_url_file is not allowed")
-	errVictorOpsAPIKeyFileNotAllowed = errors.New("setting VictorOps api_key_file is not allowed")
+	errPasswordFileNotAllowed        = amvalidation.ErrPasswordFileNotAllowed
+	errOAuth2SecretFileNotAllowed    = amvalidation.ErrOAuth2SecretFileNotAllowed
+	errTLSFileNotAllowed             = amvalidation.ErrTLSFileNotAllowed
+	errSlackAPIURLFileNotAllowed     = amvalidation.ErrSlackAPIURLFileNotAllowed
+	errVictorOpsAPIKeyFileNotAllowed = amvalidation.ErrVictorOpsAPIKeyFileNotAllowed
 )
 
 // UserConfig is used to communicate a users alertmanager configs
@@ -185,7 +187,8 @@ func validateUserConfig(logger log.Logger, cfg alertspb.AlertConfigDesc, limits 
 		return err
 	}
 
-	// Validate the config recursively scanning it.
+	// Validate the config recursively scanning it (file-reference checks live
+	// in pkg/alertmanager/validation and are shared with the legacy configs API).
 	if err := validateAlertmanagerConfig(amCfg); err != nil {
 		return err
 	}
@@ -307,145 +310,11 @@ func (am *MultitenantAlertmanager) ListAllConfigs(w http.ResponseWriter, r *http
 // validateAlertmanagerConfig recursively scans the input config looking for data types for which
 // we have a specific validation and, whenever encountered, it runs their validation. Returns the
 // first error or nil if validation succeeds.
+//
+// This is a thin wrapper around the shared, hardened validator in
+// pkg/alertmanager/validation. Keeping the wrapper preserves the existing call
+// sites while guaranteeing that any future hardening lands in a single place
+// used by both the maintained Alertmanager API and the legacy configs API.
 func validateAlertmanagerConfig(cfg interface{}) error {
-	v := reflect.ValueOf(cfg)
-	t := v.Type()
-
-	// Skip invalid, the zero value or a nil pointer (checked by zero value).
-	if !v.IsValid() || v.IsZero() {
-		return nil
-	}
-
-	// If the input config is a pointer then we need to get its value.
-	// At this point the pointer value can't be nil.
-	if v.Kind() == reflect.Ptr {
-		v = v.Elem()
-		t = v.Type()
-	}
-
-	// Check if the input config is a data type for which we have a specific validation.
-	// At this point the value can't be a pointer anymore.
-	switch t {
-	case reflect.TypeOf(config.GlobalConfig{}):
-		if err := validateGlobalConfig(v.Interface().(config.GlobalConfig)); err != nil {
-			return err
-		}
-
-	case reflect.TypeOf(commoncfg.HTTPClientConfig{}):
-		if err := validateReceiverHTTPConfig(v.Interface().(commoncfg.HTTPClientConfig)); err != nil {
-			return err
-		}
-
-	case reflect.TypeOf(commoncfg.TLSConfig{}):
-		if err := validateReceiverTLSConfig(v.Interface().(commoncfg.TLSConfig)); err != nil {
-			return err
-		}
-
-	case reflect.TypeOf(config.SlackConfig{}):
-		if err := validateSlackConfig(v.Interface().(config.SlackConfig)); err != nil {
-			return err
-		}
-
-	case reflect.TypeOf(config.VictorOpsConfig{}):
-		if err := validateVictorOpsConfig(v.Interface().(config.VictorOpsConfig)); err != nil {
-			return err
-		}
-	}
-
-	// If the input config is a struct, recursively iterate on all fields.
-	if t.Kind() == reflect.Struct {
-		for i := 0; i < t.NumField(); i++ {
-			field := t.Field(i)
-			fieldValue := v.FieldByIndex(field.Index)
-
-			// Skip any field value which can't be converted to interface (eg. primitive types).
-			if fieldValue.CanInterface() {
-				if err := validateAlertmanagerConfig(fieldValue.Interface()); err != nil {
-					return err
-				}
-			}
-		}
-	}
-
-	if t.Kind() == reflect.Slice || t.Kind() == reflect.Array {
-		for i := 0; i < v.Len(); i++ {
-			fieldValue := v.Index(i)
-
-			// Skip any field value which can't be converted to interface (eg. primitive types).
-			if fieldValue.CanInterface() {
-				if err := validateAlertmanagerConfig(fieldValue.Interface()); err != nil {
-					return err
-				}
-			}
-		}
-	}
-
-	if t.Kind() == reflect.Map {
-		for _, key := range v.MapKeys() {
-			fieldValue := v.MapIndex(key)
-
-			// Skip any field value which can't be converted to interface (eg. primitive types).
-			if fieldValue.CanInterface() {
-				if err := validateAlertmanagerConfig(fieldValue.Interface()); err != nil {
-					return err
-				}
-			}
-		}
-	}
-
-	return nil
-}
-
-// validateReceiverHTTPConfig validates the HTTP config and returns an error if it contains
-// settings not allowed by Cortex.
-func validateReceiverHTTPConfig(cfg commoncfg.HTTPClientConfig) error {
-	if cfg.BasicAuth != nil && cfg.BasicAuth.PasswordFile != "" {
-		return errPasswordFileNotAllowed
-	}
-	if cfg.Authorization != nil && cfg.Authorization.CredentialsFile != "" {
-		return errPasswordFileNotAllowed
-	}
-	if cfg.BearerTokenFile != "" {
-		return errPasswordFileNotAllowed
-	}
-	if cfg.OAuth2 != nil && cfg.OAuth2.ClientSecretFile != "" {
-		return errOAuth2SecretFileNotAllowed
-	}
-	return validateReceiverTLSConfig(cfg.TLSConfig)
-}
-
-// validateReceiverTLSConfig validates the TLS config and returns an error if it contains
-// settings not allowed by Cortex.
-func validateReceiverTLSConfig(cfg commoncfg.TLSConfig) error {
-	if cfg.CAFile != "" || cfg.CertFile != "" || cfg.KeyFile != "" {
-		return errTLSFileNotAllowed
-	}
-	return nil
-}
-
-// validateGlobalConfig validates the Global config and returns an error if it contains
-// settings now allowed by Cortex.
-func validateGlobalConfig(cfg config.GlobalConfig) error {
-	if cfg.SlackAPIURLFile != "" {
-		return errSlackAPIURLFileNotAllowed
-	}
-	return nil
-}
-
-// validateSlackConfig validates the Slack config and returns an error if it contains
-// settings now allowed by Cortex.
-func validateSlackConfig(cfg config.SlackConfig) error {
-	if cfg.APIURLFile != "" {
-		return errSlackAPIURLFileNotAllowed
-	}
-	return nil
-}
-
-// validateVictorOpsConfig validates the VictorOps config and returns an error if it contains
-// settings now allowed by Cortex.
-func validateVictorOpsConfig(cfg config.VictorOpsConfig) error {
-	if cfg.APIKeyFile != "" {
-		return errVictorOpsAPIKeyFileNotAllowed
-	}
-	return nil
+	return amvalidation.ValidateAlertmanagerConfig(cfg)
 }

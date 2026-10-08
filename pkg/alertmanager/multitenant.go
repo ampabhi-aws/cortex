@@ -29,6 +29,7 @@ import (
 	"github.com/cortexproject/cortex/pkg/alertmanager/alertmanagerpb"
 	"github.com/cortexproject/cortex/pkg/alertmanager/alertspb"
 	"github.com/cortexproject/cortex/pkg/alertmanager/alertstore"
+	amvalidation "github.com/cortexproject/cortex/pkg/alertmanager/validation"
 	"github.com/cortexproject/cortex/pkg/ring"
 	"github.com/cortexproject/cortex/pkg/ring/client"
 	"github.com/cortexproject/cortex/pkg/ring/kv"
@@ -872,6 +873,24 @@ func (am *MultitenantAlertmanager) setConfig(cfg alertspb.AlertConfigDesc) error
 			// working configuration.
 			return fmt.Errorf("invalid Cortex configuration for %v: %v", cfg.User, err)
 		}
+
+		// Defence in depth: re-validate tenant-authored configs against the
+		// shared validator at load time. Stored configs may predate the
+		// validation hardening (or have been written via a path that did not
+		// enforce it, e.g. the legacy configs service), so refuse to apply a
+		// config that references server-local files for credentials or TLS
+		// material regardless of the alertstore backend in use. See
+		// pkg/alertmanager/validation for the exact set of checks.
+		if userAmConfig != nil {
+			if vErr := amvalidation.ValidateAlertmanagerConfig(userAmConfig); vErr != nil {
+				return fmt.Errorf("invalid Cortex configuration for %v: %v", cfg.User, vErr)
+			}
+			for _, name := range userAmConfig.Templates {
+				if vErr := amvalidation.ValidateTemplateFilename(name); vErr != nil {
+					return fmt.Errorf("invalid Cortex configuration for %v: %v", cfg.User, vErr)
+				}
+			}
+		}
 	}
 
 	// We can have an empty configuration here if:
@@ -1294,17 +1313,11 @@ func (am *MultitenantAlertmanager) ReadState(ctx context.Context, req *alertmana
 // validateTemplateFilename validated the template filename and returns error if it's not valid.
 // The validation done in this function is a first fence to avoid having a tenant submitting
 // a config which may escape the per-tenant data directory on disk.
+//
+// Thin wrapper around the shared validator so all call sites share a single
+// implementation.
 func validateTemplateFilename(filename string) error {
-	if filepath.Base(filename) != filename {
-		return fmt.Errorf("invalid template name %q: the template name cannot contain any path", filename)
-	}
-
-	// Further enforce no path in the template name.
-	if filepath.Dir(filepath.Clean(filename)) != "." {
-		return fmt.Errorf("invalid template name %q: the template name cannot contain any path", filename)
-	}
-
-	return nil
+	return amvalidation.ValidateTemplateFilename(filename)
 }
 
 // safeTemplateFilepath builds and return the template filepath within the provided dir.
