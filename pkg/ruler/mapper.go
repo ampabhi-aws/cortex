@@ -5,6 +5,7 @@ import (
 	"net/url"
 	"path/filepath"
 	"sort"
+	"strings"
 
 	"github.com/go-kit/log"
 	"github.com/go-kit/log/level"
@@ -75,7 +76,7 @@ func (m *mapper) MapRules(user string, ruleConfigs map[string][]rulefmt.RuleGrou
 
 	// user rule files will be stored as `/<path>/<userid>/<encoded filename>`
 	path := filepath.Join(m.Path, user)
-	err := m.FS.MkdirAll(path, 0777)
+	err := m.FS.MkdirAll(path, 0750)
 	if err != nil {
 		return false, nil, err
 	}
@@ -84,7 +85,26 @@ func (m *mapper) MapRules(user string, ruleConfigs map[string][]rulefmt.RuleGrou
 	for filename, groups := range ruleConfigs {
 		// Store the encoded file name to better handle `/` characters
 		encodedFileName := url.PathEscape(filename)
+
+		// url.PathEscape does not escape '.', so namespaces like "", "." or
+		// ".." would steer filepath.Join outside the per-tenant directory.
+		// Reject these (defence in depth: the API also rejects them in
+		// parseNamespace) and skip the offending namespace rather than
+		// aborting the whole tenant sync, so one bad rule group cannot
+		// silently disable all rule and alert evaluation for the tenant.
+		if encodedFileName == "" || encodedFileName == "." || encodedFileName == ".." ||
+			strings.ContainsAny(encodedFileName, `/\`) {
+			level.Warn(m.logger).Log("msg", "skipping rule group with unsafe namespace", "user", user, "namespace", filename)
+			continue
+		}
+
 		fullFileName := filepath.Join(path, encodedFileName)
+
+		// Assert the resulting file remains inside the per-tenant directory.
+		if rel, err := filepath.Rel(path, fullFileName); err != nil || rel != encodedFileName {
+			level.Warn(m.logger).Log("msg", "skipping rule group whose file escapes the tenant directory", "user", user, "namespace", filename, "path", fullFileName)
+			continue
+		}
 
 		fileUpdated, err := m.writeRuleGroupsIfNewer(groups, fullFileName)
 		if err != nil {
@@ -152,7 +172,7 @@ func (m *mapper) writeRuleGroupsIfNewer(groups []rulefmt.RuleGroup, filename str
 	}
 
 	level.Info(m.logger).Log("msg", "updating rule file", "file", filename)
-	err = afero.WriteFile(m.FS, filename, d, 0777)
+	err = afero.WriteFile(m.FS, filename, d, 0640)
 	if err != nil {
 		return false, err
 	}
