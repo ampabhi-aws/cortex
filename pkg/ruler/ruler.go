@@ -63,6 +63,7 @@ const (
 	// Limit errors
 	errMaxRuleGroupsPerUserLimitExceeded        = "per-user rule groups limit (limit: %d actual: %d) exceeded"
 	errMaxRulesPerRuleGroupPerUserLimitExceeded = "per-user rules per rule group limit (limit: %d actual: %d) exceeded"
+	errMinRuleEvaluationIntervalNotMet          = "rule group evaluation interval (%s) is shorter than the per-tenant minimum (%s)"
 
 	// errors
 	errListAllUser = "unable to list the ruler users"
@@ -837,6 +838,31 @@ func (r *Ruler) AssertMaxRulesPerRuleGroup(userID string, rules int) error {
 		return nil
 	}
 	return fmt.Errorf(errMaxRulesPerRuleGroupPerUserLimitExceeded, limit, rules)
+}
+
+// AssertMinRuleEvaluationInterval returns an error if the rule group's
+// evaluation interval is below the per-tenant configured minimum. An
+// unset (zero) group interval is always allowed because the Prometheus
+// manager falls back to the operator-configured default evaluation
+// interval in that case. A tenant minimum of 0 disables the check.
+func (r *Ruler) AssertMinRuleEvaluationInterval(userID string, interval time.Duration) error {
+	min := r.limits.RulerMinRuleEvaluationInterval(userID)
+
+	if min <= 0 {
+		return nil
+	}
+
+	if interval <= 0 {
+		// Group did not specify an interval; the ruler's default
+		// evaluation interval will be used instead.
+		return nil
+	}
+
+	if interval >= min {
+		return nil
+	}
+
+	return fmt.Errorf(errMinRuleEvaluationIntervalNotMet, interval, min)
 }
 
 func (r *Ruler) DeleteTenantConfiguration(w http.ResponseWriter, req *http.Request) {
