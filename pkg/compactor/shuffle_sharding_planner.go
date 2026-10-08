@@ -89,7 +89,24 @@ func (p *ShuffleShardingPlanner) Plan(_ context.Context, metasByMinTime []*metad
 		return nil, nil
 	}
 
-	go markBlocksVisitedHeartBeat(p.ctx, p.bkt, p.logger, resultMetas, p.ringLifecyclerID, p.blockVisitMarkerFileUpdateInterval, p.blockVisitMarkerWriteFailed)
+	// Spawn the heartbeat on a cancellable child context so a persistent
+	// refresh failure terminates the heartbeat quickly instead of
+	// swallowing the error indefinitely. Once this heartbeat stops, the
+	// visit marker will expire after blockVisitMarkerTimeout, at which
+	// point other compactors can legitimately take over - but at least
+	// this compactor stops advertising a lease it can no longer refresh.
+	heartbeatCtx, cancelHeartbeat := context.WithCancel(p.ctx)
+	go markBlocksVisitedHeartBeat(
+		heartbeatCtx,
+		p.bkt,
+		p.logger,
+		resultMetas,
+		p.ringLifecyclerID,
+		p.blockVisitMarkerFileUpdateInterval,
+		p.blockVisitMarkerTimeout,
+		p.blockVisitMarkerWriteFailed,
+		cancelHeartbeat,
+	)
 
 	return resultMetas, nil
 }

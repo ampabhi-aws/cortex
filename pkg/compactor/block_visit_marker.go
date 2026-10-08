@@ -84,6 +84,10 @@ func UpdateBlockVisitMarker(ctx context.Context, bkt objstore.Bucket, blockID st
 	return nil
 }
 
+// markBlocksVisited uploads a visit marker for every block. It returns the
+// first error encountered. Callers must treat a non-nil error as "lease not
+// acquired" and skip the group, otherwise two compactors can hold overlapping
+// "visit" state (CWE-367).
 func markBlocksVisited(
 	ctx context.Context,
 	bkt objstore.Bucket,
@@ -91,31 +95,93 @@ func markBlocksVisited(
 	blocks []*metadata.Meta,
 	marker BlockVisitMarker,
 	blockVisitMarkerWriteFailed prometheus.Counter,
-) {
+) error {
 	visitMarkerFileContent, err := json.Marshal(marker)
 	if err != nil {
 		blockVisitMarkerWriteFailed.Inc()
-		return
+		return err
 	}
 	reader := bytes.NewReader(visitMarkerFileContent)
+	var firstErr error
 	for _, block := range blocks {
 		blockID := block.ULID.String()
 		if err := UpdateBlockVisitMarker(ctx, bkt, blockID, reader, blockVisitMarkerWriteFailed); err != nil {
 			level.Error(logger).Log("msg", "unable to upsert visit marker file content for block", "blockID", blockID, "err", err)
+			if firstErr == nil {
+				firstErr = err
+			}
 		}
 		reader.Reset(visitMarkerFileContent)
 	}
+	return firstErr
 }
 
-func markBlocksVisitedHeartBeat(ctx context.Context, bkt objstore.Bucket, logger log.Logger, blocks []*metadata.Meta, compactorID string, blockVisitMarkerFileUpdateInterval time.Duration, blockVisitMarkerWriteFailed prometheus.Counter) {
+// verifyBlocksVisitedBy re-reads the visit marker for every block and returns
+// an error if any marker is present but is not owned by compactorID. This is
+// used as a post-write fence to narrow the TOCTOU window inherent in using a
+// non-conditional object-store write to express the lease: when two
+// compactors race to PUT the same marker, the loser will see the winner's
+// compactorID on re-read and bow out. Read failures and missing markers are
+// treated as inconclusive (not an exclusivity violation) and do not fail the
+// check - a stronger fence requires conditional-put support in the object
+// store wrapper.
+func verifyBlocksVisitedBy(
+	ctx context.Context,
+	bkt objstore.InstrumentedBucketReader,
+	logger log.Logger,
+	blocks []*metadata.Meta,
+	compactorID string,
+	blockVisitMarkerTimeout time.Duration,
+	blockVisitMarkerReadFailed prometheus.Counter,
+) error {
+	for _, block := range blocks {
+		blockID := block.ULID.String()
+		marker, err := ReadBlockVisitMarker(ctx, bkt, logger, blockID, blockVisitMarkerReadFailed)
+		if err != nil {
+			// Treat read errors (including NotFound after an eventual-consistency
+			// gap) as inconclusive rather than a lease loss. Log and move on.
+			level.Warn(logger).Log("msg", "unable to verify block visit marker after acquisition", "blockID", blockID, "err", err)
+			continue
+		}
+		if marker.CompactorID != compactorID {
+			return errors.Errorf("block %s lease held by compactor %q, not %s", blockID, marker.CompactorID, compactorID)
+		}
+		if !marker.isVisited(blockVisitMarkerTimeout) {
+			return errors.Errorf("block %s lease expired before verification (visitTime=%d)", blockID, marker.VisitTime)
+		}
+	}
+	return nil
+}
+
+// markBlocksVisitedHeartBeat refreshes the visit marker periodically for the
+// lifetime of ctx. If marker writes keep failing for longer than
+// blockVisitMarkerTimeout/2 (the fencing half-life), cancelHeartbeat is
+// invoked so the heartbeat terminates instead of silently advertising a
+// lease it can no longer refresh. cancelHeartbeat may be nil (e.g. in
+// tests), in which case the previous best-effort behaviour is retained.
+func markBlocksVisitedHeartBeat(
+	ctx context.Context,
+	bkt objstore.Bucket,
+	logger log.Logger,
+	blocks []*metadata.Meta,
+	compactorID string,
+	blockVisitMarkerFileUpdateInterval time.Duration,
+	blockVisitMarkerTimeout time.Duration,
+	blockVisitMarkerWriteFailed prometheus.Counter,
+	cancelHeartbeat context.CancelFunc,
+) {
 	var blockIds []string
 	for _, block := range blocks {
 		blockIds = append(blockIds, block.ULID.String())
 	}
 	blocksInfo := strings.Join(blockIds, ",")
 	level.Info(logger).Log("msg", fmt.Sprintf("start heart beat for blocks: %s", blocksInfo))
+	if cancelHeartbeat != nil {
+		defer cancelHeartbeat()
+	}
 	ticker := time.NewTicker(blockVisitMarkerFileUpdateInterval)
 	defer ticker.Stop()
+	lastSuccessfulRefresh := time.Now()
 heartBeat:
 	for {
 		level.Debug(logger).Log("msg", fmt.Sprintf("heart beat for blocks: %s", blocksInfo))
@@ -124,7 +190,20 @@ heartBeat:
 			CompactorID: compactorID,
 			Version:     VisitMarkerVersion1,
 		}
-		markBlocksVisited(ctx, bkt, logger, blocks, blockVisitMarker, blockVisitMarkerWriteFailed)
+		if err := markBlocksVisited(ctx, bkt, logger, blocks, blockVisitMarker, blockVisitMarkerWriteFailed); err != nil {
+			// A heartbeat failure means another compactor could consider the
+			// lease expired once blockVisitMarkerTimeout elapses. Terminate the
+			// heartbeat once we have lost at least half of the timeout budget
+			// so we fail fast instead of silently advertising a lease we can
+			// no longer refresh.
+			if blockVisitMarkerTimeout > 0 && cancelHeartbeat != nil && time.Since(lastSuccessfulRefresh) > blockVisitMarkerTimeout/2 {
+				level.Error(logger).Log("msg", "aborting block visit heartbeat: lost block visit lease", "blocks", blocksInfo, "err", err, "since_last_refresh", time.Since(lastSuccessfulRefresh).String())
+				cancelHeartbeat()
+				break heartBeat
+			}
+		} else {
+			lastSuccessfulRefresh = time.Now()
+		}
 
 		select {
 		case <-ctx.Done():

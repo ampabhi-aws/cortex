@@ -347,6 +347,14 @@ func TestShuffleShardingGrouper_Groups(t *testing.T) {
 
 			bkt := &bucket.ClientMock{}
 			blockVisitMarkerTimeout := 5 * time.Minute
+			// Track blocks that will be re-read by the post-write fence so we can
+			// register the "after acquisition" marker response below.
+			acquiredBlocks := map[ulid.ULID]bool{}
+			for _, group := range testData.expected {
+				for _, blockID := range group {
+					acquiredBlocks[blockID] = true
+				}
+			}
 			for _, visitedBlock := range testData.visitedBlocks {
 				visitMarkerFile := path.Join(visitedBlock.id.String(), BlockVisitMarkerFile)
 				expireTime := time.Now()
@@ -359,7 +367,30 @@ func TestShuffleShardingGrouper_Groups(t *testing.T) {
 					Version:     VisitMarkerVersion1,
 				}
 				visitMarkerFileContent, _ := json.Marshal(blockVisitMarker)
-				bkt.MockGet(visitMarkerFile, string(visitMarkerFileContent), nil)
+				// If this block ends up being acquired by the current compactor
+				// (e.g. the existing marker was expired), the post-write fence in
+				// Groups() will re-read the marker and expect to see the fresh
+				// owner. Limit the "stale" response to the single CHECK call so
+				// that the subsequent VERIFY call falls through to the acquired
+				// marker mock registered below.
+				if acquiredBlocks[visitedBlock.id] {
+					bkt.MockGetTimes(visitMarkerFile, string(visitMarkerFileContent), nil, 1)
+				} else {
+					bkt.MockGet(visitMarkerFile, string(visitMarkerFileContent), nil)
+				}
+			}
+			// Mock the Get for every block that is expected to be acquired by this
+			// compactor so that the post-write re-read fence in Groups() sees a
+			// marker owned by testCompactorID.
+			for blockID := range acquiredBlocks {
+				visitMarkerFile := path.Join(blockID.String(), BlockVisitMarkerFile)
+				acquiredMarker := BlockVisitMarker{
+					CompactorID: testCompactorID,
+					VisitTime:   time.Now().Unix(),
+					Version:     VisitMarkerVersion1,
+				}
+				acquiredContent, _ := json.Marshal(acquiredMarker)
+				bkt.MockGet(visitMarkerFile, string(acquiredContent), nil)
 			}
 			bkt.MockUpload(mock.Anything, nil)
 			bkt.MockGet(mock.Anything, "", nil)

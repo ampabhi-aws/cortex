@@ -229,7 +229,23 @@ mainLoop:
 			CompactorID: g.ringLifecyclerID,
 			Version:     VisitMarkerVersion1,
 		}
-		markBlocksVisited(g.ctx, g.bkt, g.logger, group.blocks, blockVisitMarker, g.blockVisitMarkerWriteFailed)
+		if err := markBlocksVisited(g.ctx, g.bkt, g.logger, group.blocks, blockVisitMarker, g.blockVisitMarkerWriteFailed); err != nil {
+			level.Warn(g.logger).Log("msg", "skipping group because visit marker write failed", "group_hash", groupHash, "err", err)
+			remainingCompactions--
+			continue
+		}
+		// The visit marker upload is not atomic (no conditional-put support in
+		// the generic objstore interface used here), so immediately re-read
+		// every marker to detect a concurrent compactor that overwrote our
+		// claim between our GET and our PUT (CWE-367 TOCTOU). This narrows the
+		// race window to a single additional round trip; the longer-lived
+		// fences live in the planner (verification before compaction starts)
+		// and the heartbeat (lost-lease compaction cancellation).
+		if err := verifyBlocksVisitedBy(g.ctx, g.bkt, g.logger, group.blocks, g.ringLifecyclerID, g.blockVisitMarkerTimeout, g.blockVisitMarkerReadFailed); err != nil {
+			level.Warn(g.logger).Log("msg", "skipping group because another compactor acquired the visit marker lease", "group_hash", groupHash, "err", err)
+			remainingCompactions--
+			continue
+		}
 
 		// All the blocks within the same group have the same downsample
 		// resolution and external labels.
