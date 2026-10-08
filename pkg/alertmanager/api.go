@@ -4,7 +4,9 @@ import (
 	"context"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
+	"net/url"
 	"os"
 	"path/filepath"
 	"reflect"
@@ -21,6 +23,7 @@ import (
 	"github.com/cortexproject/cortex/pkg/tenant"
 	"github.com/cortexproject/cortex/pkg/util"
 	"github.com/cortexproject/cortex/pkg/util/concurrency"
+	"github.com/cortexproject/cortex/pkg/util/flagext"
 	util_log "github.com/cortexproject/cortex/pkg/util/log"
 )
 
@@ -42,6 +45,8 @@ const (
 var (
 	errPasswordFileNotAllowed        = errors.New("setting password_file, bearer_token_file and credentials_file is not allowed")
 	errOAuth2SecretFileNotAllowed    = errors.New("setting OAuth2 client_secret_file is not allowed")
+	errOAuth2ProxyNotAllowed         = errors.New("setting OAuth2 proxy_url is not allowed")
+	errOAuth2TokenURLNotAllowed      = errors.New("setting OAuth2 token_url to an address blocked by the receivers firewall is not allowed")
 	errTLSFileNotAllowed             = errors.New("setting TLS ca_file, cert_file and key_file is not allowed")
 	errSlackAPIURLFileNotAllowed     = errors.New("setting Slack api_url_file and global slack_api_url_file is not allowed")
 	errVictorOpsAPIKeyFileNotAllowed = errors.New("setting VictorOps api_key_file is not allowed")
@@ -185,8 +190,11 @@ func validateUserConfig(logger log.Logger, cfg alertspb.AlertConfigDesc, limits 
 		return err
 	}
 
-	// Validate the config recursively scanning it.
-	if err := validateAlertmanagerConfig(amCfg); err != nil {
+	// Validate the config recursively scanning it. The URL policy enforces the
+	// receivers firewall on tenant-supplied endpoints (e.g. OAuth2 token_url)
+	// that bypass the per-request DialContext hook.
+	policy := newReceiverURLPolicy(limits, user)
+	if err := validateAlertmanagerConfigWithPolicy(amCfg, policy); err != nil {
 		return err
 	}
 
@@ -306,8 +314,17 @@ func (am *MultitenantAlertmanager) ListAllConfigs(w http.ResponseWriter, r *http
 
 // validateAlertmanagerConfig recursively scans the input config looking for data types for which
 // we have a specific validation and, whenever encountered, it runs their validation. Returns the
-// first error or nil if validation succeeds.
+// first error or nil if validation succeeds. It applies a strict receiver URL policy that rejects
+// tenant-supplied OAuth2 proxy_url outright and performs defensive host checks on token_url;
+// callers that need per-tenant firewall enforcement (e.g. block CIDR networks) should use
+// validateAlertmanagerConfigWithPolicy.
 func validateAlertmanagerConfig(cfg interface{}) error {
+	return validateAlertmanagerConfigWithPolicy(cfg, defaultReceiverURLPolicy)
+}
+
+// validateAlertmanagerConfigWithPolicy is the receiver-URL-policy-aware variant of
+// validateAlertmanagerConfig.
+func validateAlertmanagerConfigWithPolicy(cfg interface{}, policy receiverURLPolicy) error {
 	v := reflect.ValueOf(cfg)
 	t := v.Type()
 
@@ -332,7 +349,7 @@ func validateAlertmanagerConfig(cfg interface{}) error {
 		}
 
 	case reflect.TypeOf(commoncfg.HTTPClientConfig{}):
-		if err := validateReceiverHTTPConfig(v.Interface().(commoncfg.HTTPClientConfig)); err != nil {
+		if err := validateReceiverHTTPConfig(v.Interface().(commoncfg.HTTPClientConfig), policy); err != nil {
 			return err
 		}
 
@@ -360,7 +377,7 @@ func validateAlertmanagerConfig(cfg interface{}) error {
 
 			// Skip any field value which can't be converted to interface (eg. primitive types).
 			if fieldValue.CanInterface() {
-				if err := validateAlertmanagerConfig(fieldValue.Interface()); err != nil {
+				if err := validateAlertmanagerConfigWithPolicy(fieldValue.Interface(), policy); err != nil {
 					return err
 				}
 			}
@@ -373,7 +390,7 @@ func validateAlertmanagerConfig(cfg interface{}) error {
 
 			// Skip any field value which can't be converted to interface (eg. primitive types).
 			if fieldValue.CanInterface() {
-				if err := validateAlertmanagerConfig(fieldValue.Interface()); err != nil {
+				if err := validateAlertmanagerConfigWithPolicy(fieldValue.Interface(), policy); err != nil {
 					return err
 				}
 			}
@@ -386,7 +403,7 @@ func validateAlertmanagerConfig(cfg interface{}) error {
 
 			// Skip any field value which can't be converted to interface (eg. primitive types).
 			if fieldValue.CanInterface() {
-				if err := validateAlertmanagerConfig(fieldValue.Interface()); err != nil {
+				if err := validateAlertmanagerConfigWithPolicy(fieldValue.Interface(), policy); err != nil {
 					return err
 				}
 			}
@@ -397,8 +414,11 @@ func validateAlertmanagerConfig(cfg interface{}) error {
 }
 
 // validateReceiverHTTPConfig validates the HTTP config and returns an error if it contains
-// settings not allowed by Cortex.
-func validateReceiverHTTPConfig(cfg commoncfg.HTTPClientConfig) error {
+// settings not allowed by Cortex. The OAuth2 token_url and proxy_url are additionally checked
+// against the receiver URL policy because, unlike the main notification transport, the vendored
+// prometheus/common OAuth2 round tripper builds its own http.Transport without honouring the
+// per-tenant FirewallDialer injected as DialContext (CWE-918).
+func validateReceiverHTTPConfig(cfg commoncfg.HTTPClientConfig, policy receiverURLPolicy) error {
 	if cfg.BasicAuth != nil && cfg.BasicAuth.PasswordFile != "" {
 		return errPasswordFileNotAllowed
 	}
@@ -408,10 +428,104 @@ func validateReceiverHTTPConfig(cfg commoncfg.HTTPClientConfig) error {
 	if cfg.BearerTokenFile != "" {
 		return errPasswordFileNotAllowed
 	}
-	if cfg.OAuth2 != nil && cfg.OAuth2.ClientSecretFile != "" {
-		return errOAuth2SecretFileNotAllowed
+	if cfg.OAuth2 != nil {
+		if cfg.OAuth2.ClientSecretFile != "" {
+			return errOAuth2SecretFileNotAllowed
+		}
+		// The OAuth2 token transport in prometheus/common does not inherit the
+		// tenant FirewallDialer, so proxy_url would bypass the receivers
+		// firewall entirely. Reject it outright.
+		if cfg.OAuth2.ProxyURL.URL != nil {
+			return errOAuth2ProxyNotAllowed
+		}
+		// Enforce the host/CIDR policy on the tenant-supplied token endpoint
+		// so blind SSRF via the OAuth2 code path is blocked at upload time.
+		if err := policy.validateURL(cfg.OAuth2.TokenURL); err != nil {
+			return err
+		}
 	}
 	return validateReceiverTLSConfig(cfg.TLSConfig)
+}
+
+// receiverURLPolicy enforces host/IP restrictions on tenant-supplied URLs that
+// would otherwise bypass the per-request FirewallDialer (for example the
+// OAuth2 token_url, whose transport is built independently by
+// prometheus/common and does not inherit DialContext).
+type receiverURLPolicy struct {
+	blockPrivateAddresses bool
+	blockCIDRNetworks     []flagext.CIDR
+}
+
+// defaultReceiverURLPolicy is applied when no per-tenant limits are available
+// (e.g. unit tests of validateAlertmanagerConfig). It is intentionally
+// permissive on host policy — the per-tenant firewall is applied via
+// newReceiverURLPolicy on real upload paths — but it still rejects URLs that
+// fail to parse so malformed input is caught early.
+var defaultReceiverURLPolicy = receiverURLPolicy{}
+
+func newReceiverURLPolicy(limits Limits, user string) receiverURLPolicy {
+	if limits == nil {
+		return defaultReceiverURLPolicy
+	}
+	return receiverURLPolicy{
+		blockPrivateAddresses: limits.AlertmanagerReceiversBlockPrivateAddresses(user),
+		blockCIDRNetworks:     limits.AlertmanagerReceiversBlockCIDRNetworks(user),
+	}
+}
+
+// validateURL rejects a tenant-supplied URL whose host would be refused by the
+// receivers firewall. An empty URL is accepted (upstream Validate() enforces
+// mandatory fields).
+func (p receiverURLPolicy) validateURL(raw string) error {
+	if raw == "" {
+		return nil
+	}
+	if !p.blockPrivateAddresses && len(p.blockCIDRNetworks) == 0 {
+		return nil
+	}
+	u, err := url.Parse(raw)
+	if err != nil || u.Host == "" {
+		return errOAuth2TokenURLNotAllowed
+	}
+	host := u.Hostname()
+	if host == "" {
+		return errOAuth2TokenURLNotAllowed
+	}
+	var ips []net.IP
+	if ip := net.ParseIP(host); ip != nil {
+		ips = []net.IP{ip}
+	} else {
+		// Resolve the hostname so we can enforce the same policy the
+		// FirewallDialer applies at dial time. Best-effort: if resolution
+		// fails the URL is still rejected so a tenant cannot bypass the
+		// policy with an unresolvable name that resolves at notification
+		// time to a blocked address.
+		resolved, resolveErr := net.LookupIP(host)
+		if resolveErr != nil || len(resolved) == 0 {
+			return errOAuth2TokenURLNotAllowed
+		}
+		ips = resolved
+	}
+	for _, ip := range ips {
+		if p.blockPrivateAddresses && isPrivateOrLocal(ip) {
+			return errOAuth2TokenURLNotAllowed
+		}
+		for _, cidr := range p.blockCIDRNetworks {
+			if cidr.Value.Contains(ip) {
+				return errOAuth2TokenURLNotAllowed
+			}
+		}
+	}
+	return nil
+}
+
+// isPrivateOrLocal mirrors the set of addresses considered "private" by
+// FirewallDialer: loopback, link-local, multicast, unspecified, and
+// RFC1918/ULA/RFC4193 ranges.
+func isPrivateOrLocal(ip net.IP) bool {
+	return ip.IsLoopback() || ip.IsLinkLocalUnicast() || ip.IsLinkLocalMulticast() ||
+		ip.IsInterfaceLocalMulticast() || ip.IsMulticast() || ip.IsUnspecified() ||
+		ip.IsPrivate()
 }
 
 // validateReceiverTLSConfig validates the TLS config and returns an error if it contains
