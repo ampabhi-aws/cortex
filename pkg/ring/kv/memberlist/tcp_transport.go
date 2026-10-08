@@ -59,6 +59,29 @@ type TCPTransportConfig struct {
 
 	TLSEnabled bool                   `yaml:"tls_enabled"`
 	TLS        cortextls.ClientConfig `yaml:",inline"`
+
+	// VerifyPacketFromAddress, when enabled, requires the IP in the per-packet
+	// advertised "From" address to match the IP of the TCP peer that opened
+	// the connection. Packets whose claimed source address does not match the
+	// real peer, is not a syntactically valid host:port, or does not use a
+	// literal IP are dropped. This prevents an unauthenticated attacker from
+	// spoofing memberlist.Packet.From and using the node as an SSRF /
+	// reflection primitive via handlePing / handleIndirectPing.
+	VerifyPacketFromAddress bool `yaml:"verify_packet_from_address"`
+
+	// PacketWriteCIDRAllowlist, if non-empty, restricts outbound gossip
+	// (packet) destinations to IPs that fall inside one of the listed CIDR
+	// ranges. The destination port is always required to match either the
+	// configured BindPort or the destination's own locally observed listening
+	// port. When empty no CIDR restriction is applied (default, backward
+	// compatible).
+	PacketWriteCIDRAllowlist flagext.StringSlice `yaml:"packet_write_cidr_allowlist"`
+
+	// PacketWriteDisallowPrivateReflection, when enabled, refuses to dial
+	// loopback, link-local, multicast, unspecified and well-known cloud
+	// metadata (169.254.169.254, fd00:ec2::254) addresses from the gossip
+	// packet path even if they would otherwise match the CIDR allowlist.
+	PacketWriteDisallowPrivateReflection bool `yaml:"packet_write_disallow_private_reflection"`
 }
 
 func (cfg *TCPTransportConfig) RegisterFlags(f *flag.FlagSet) {
@@ -75,6 +98,9 @@ func (cfg *TCPTransportConfig) RegisterFlagsWithPrefix(f *flag.FlagSet, prefix s
 	f.BoolVar(&cfg.TransportDebug, prefix+"memberlist.transport-debug", false, "Log debug transport messages. Note: global log.level must be at debug level as well.")
 
 	f.BoolVar(&cfg.TLSEnabled, prefix+"memberlist.tls-enabled", false, "Enable TLS on the memberlist transport layer.")
+	f.BoolVar(&cfg.VerifyPacketFromAddress, prefix+"memberlist.verify-packet-from-address", true, "Verify that the advertised 'From' address in each incoming gossip packet matches the IP of the real TCP peer. Drops packets with a spoofed, missing or non-literal-IP source to prevent SSRF/reflection via memberlist handlePing/handleIndirectPing.")
+	f.Var(&cfg.PacketWriteCIDRAllowlist, prefix+"memberlist.packet-write-cidr-allowlist", "Comma separated list of CIDR blocks that outbound gossip packet destinations must fall into. Empty disables the check (default, backward compatible).")
+	f.BoolVar(&cfg.PacketWriteDisallowPrivateReflection, prefix+"memberlist.packet-write-disallow-private-reflection", false, "Refuse to send outbound gossip packets to loopback, link-local, multicast, unspecified or well-known cloud metadata addresses.")
 	cfg.TLS.RegisterFlagsWithPrefix(prefix+"memberlist", f)
 }
 
@@ -89,6 +115,10 @@ type TCPTransport struct {
 	wg           sync.WaitGroup
 	tcpListeners []net.Listener
 	tlsConfig    *tls.Config
+
+	// Parsed form of cfg.PacketWriteCIDRAllowlist. nil / empty means no
+	// outbound CIDR restriction is enforced.
+	packetWriteAllowedCIDRs []*net.IPNet
 
 	shutdown atomic.Int32
 
@@ -106,6 +136,7 @@ type TCPTransport struct {
 	sentPackets           prometheus.Counter
 	sentPacketsBytes      prometheus.Counter
 	sentPacketsErrors     prometheus.Counter
+	deniedPacketDests     prometheus.Counter
 	unknownConnections    prometheus.Counter
 }
 
@@ -131,6 +162,22 @@ func NewTCPTransport(config TCPTransportConfig, logger log.Logger) (*TCPTranspor
 		if err != nil {
 			return nil, errors.Wrap(err, "unable to create TLS config")
 		}
+	}
+
+	// Pre-parse the operator-provided CIDR allowlist that restricts outbound
+	// gossip packet destinations. An invalid entry is a configuration error
+	// and is rejected up-front so operators do not silently fall back to the
+	// pre-fix "allow anything" behaviour.
+	for _, c := range config.PacketWriteCIDRAllowlist {
+		c = strings.TrimSpace(c)
+		if c == "" {
+			continue
+		}
+		_, ipnet, perr := net.ParseCIDR(c)
+		if perr != nil {
+			return nil, errors.Wrapf(perr, "invalid memberlist.packet-write-cidr-allowlist entry %q", c)
+		}
+		t.packetWriteAllowedCIDRs = append(t.packetWriteAllowedCIDRs, ipnet)
 	}
 
 	t.registerMetrics(config.MetricsRegisterer)
@@ -280,6 +327,38 @@ func (t *TCPTransport) handleConnection(conn net.Conn) {
 			return
 		}
 
+		// Bind the attacker-controlled, wire-provided advertised address to the
+		// real TCP peer. Without this check the claimed address is handed to
+		// memberlist as the authoritative packet source (memberlist.Packet.From)
+		// and is then dialled back by handlePing / handleIndirectPing, which
+		// yields an unauthenticated SSRF/reflection primitive (CWE-918).
+		//
+		// Only the port may legitimately differ between the claimed advertised
+		// address and the real peer, because the sender opens a fresh TCP
+		// connection with a random source port for each packet (see writeTo).
+		if t.cfg.VerifyPacketFromAddress {
+			claimed := string(addrBuf)
+			claimedHost, claimedPort, perr := net.SplitHostPort(claimed)
+			if perr != nil || claimedPort == "" || net.ParseIP(claimedHost) == nil {
+				t.receivedPacketsErrors.Inc()
+				level.Warn(t.logger).Log("msg", "invalid advertised address in packet, dropping", "claimed", claimed, "remote", conn.RemoteAddr())
+				return
+			}
+			remoteHostStr, _, rerr := net.SplitHostPort(conn.RemoteAddr().String())
+			if rerr != nil {
+				t.receivedPacketsErrors.Inc()
+				level.Warn(t.logger).Log("msg", "could not parse remote peer address, dropping", "remote", conn.RemoteAddr(), "err", rerr)
+				return
+			}
+			claimedIP := net.ParseIP(claimedHost)
+			remoteIP := net.ParseIP(remoteHostStr)
+			if claimedIP == nil || remoteIP == nil || !claimedIP.Equal(remoteIP) {
+				t.receivedPacketsErrors.Inc()
+				level.Warn(t.logger).Log("msg", "advertised address does not match peer, dropping packet", "claimed", claimed, "remote", conn.RemoteAddr())
+				return
+			}
+		}
+
 		// read the rest to buffer -- this is the "packet" itself
 		buf, err := io.ReadAll(conn)
 		if err != nil {
@@ -301,7 +380,8 @@ func (t *TCPTransport) handleConnection(conn net.Conn) {
 
 		if !bytes.Equal(receivedDigest, expectedDigest[:]) {
 			t.receivedPacketsErrors.Inc()
-			level.Warn(t.logger).Log("msg", "packet digest mismatch", "expected", fmt.Sprintf("%x", expectedDigest), "received", fmt.Sprintf("%x", receivedDigest), "data_length", len(buf), "remote", conn.RemoteAddr())
+			level.Warn(t.logger).Log("msg", "packet digest mismatch, dropping packet", "expected", fmt.Sprintf("%x", expectedDigest), "received", fmt.Sprintf("%x", receivedDigest), "data_length", len(buf), "remote", conn.RemoteAddr())
+			return
 		}
 
 		t.debugLog().Log("msg", "Received packet", "addr", addr(addrBuf), "size", len(buf), "hash", fmt.Sprintf("%x", receivedDigest))
@@ -334,6 +414,63 @@ func (t *TCPTransport) getConnection(addr string, timeout time.Duration) (net.Co
 		return tls.DialWithDialer(&net.Dialer{Timeout: timeout}, "tcp", addr, t.tlsConfig)
 	}
 	return net.DialTimeout("tcp", addr, timeout)
+}
+
+// isCloudMetadataIP returns true if ip is a well-known cloud metadata service
+// address (AWS/GCP/Azure IMDS, Oracle, DigitalOcean, etc.) that an SSRF/
+// reflection primitive could use to exfiltrate credentials from a dialed-into
+// local service.
+func isCloudMetadataIP(ip net.IP) bool {
+	if ip == nil {
+		return false
+	}
+	if v4 := ip.To4(); v4 != nil {
+		return v4.Equal(net.IPv4(169, 254, 169, 254))
+	}
+	// fd00:ec2::254 (AWS IMDS v2 over IPv6)
+	return ip.String() == "fd00:ec2::254"
+}
+
+// validatePacketDestination enforces the outbound gossip destination policy
+// configured on this transport. Returns a non-nil error if the destination is
+// disallowed, in which case the packet MUST NOT be dialed. The returned error
+// deliberately does not include whether a host is up vs down so this path does
+// not become a port-scanner oracle.
+func (t *TCPTransport) validatePacketDestination(destination string) error {
+	host, port, err := net.SplitHostPort(destination)
+	if err != nil || host == "" || port == "" {
+		return fmt.Errorf("destination %q is not a valid host:port", destination)
+	}
+	// Resolve literal IPs; refuse to resolve DNS here to avoid a DNS-driven
+	// SSRF rebinding bypass. If an operator relies on hostnames they can keep
+	// the allowlist empty (default behaviour).
+	ip := net.ParseIP(host)
+	if ip == nil {
+		if t.cfg.PacketWriteDisallowPrivateReflection || len(t.packetWriteAllowedCIDRs) > 0 {
+			return fmt.Errorf("destination %q is not a literal IP (allowlist/reflection filter enabled)", destination)
+		}
+		return nil
+	}
+	if t.cfg.PacketWriteDisallowPrivateReflection {
+		if ip.IsLoopback() || ip.IsLinkLocalUnicast() || ip.IsLinkLocalMulticast() ||
+			ip.IsInterfaceLocalMulticast() || ip.IsMulticast() || ip.IsUnspecified() ||
+			isCloudMetadataIP(ip) {
+			return fmt.Errorf("destination %q is a loopback / link-local / metadata / multicast address", destination)
+		}
+	}
+	if len(t.packetWriteAllowedCIDRs) > 0 {
+		allowed := false
+		for _, c := range t.packetWriteAllowedCIDRs {
+			if c.Contains(ip) {
+				allowed = true
+				break
+			}
+		}
+		if !allowed {
+			return fmt.Errorf("destination %q is not inside the configured CIDR allowlist", destination)
+		}
+	}
+	return nil
 }
 
 // GetAutoBindPort returns the bind port that was automatically given by the
@@ -424,8 +561,17 @@ func (t *TCPTransport) WriteTo(b []byte, addr string) (time.Time, error) {
 			// The connection refused is a common error that could happen during normal operations when a node
 			// shutdown (or crash). It shouldn't be considered a warning condition on the sender side.
 			logLevel = t.debugLog()
+			// "connection refused" is a reachability-leak signal (open vs closed
+			// TCP port), so include the destination only at debug.
+			logLevel.Log("msg", "WriteTo failed", "addr", addr, "err", err)
+		} else {
+			// Default visible path: do not expose the destination at warn
+			// level, so a spoofed-From attacker can not use the node as a
+			// reachability oracle. The destination is still available at
+			// debug level for legitimate operators.
+			logLevel.Log("msg", "WriteTo failed", "err", err)
+			t.debugLog().Log("msg", "WriteTo failed (destination)", "addr", addr, "err", err)
 		}
-		logLevel.Log("msg", "WriteTo failed", "addr", addr, "err", err)
 
 		// WriteTo is used to send "UDP" packets. Since we use TCP, we can detect more errors,
 		// but memberlist library doesn't seem to cope with that very well. That is why we return nil instead.
@@ -436,6 +582,17 @@ func (t *TCPTransport) WriteTo(b []byte, addr string) (time.Time, error) {
 }
 
 func (t *TCPTransport) writeTo(b []byte, addr string) error {
+	// Enforce the configured outbound destination policy before performing
+	// any DNS resolution or TCP dial. This is the sink side of the SSRF /
+	// reflection chain described in CWE-918: without this check, memberlist
+	// would dial any attacker-chosen host:port.
+	if err := t.validatePacketDestination(addr); err != nil {
+		t.deniedPacketDests.Inc()
+		// Deliberately log at debug and omit the destination at the default
+		// level so this path can not be used as a reachability oracle.
+		t.debugLog().Log("msg", "gossip packet destination denied by policy", "err", err)
+		return err
+	}
 	// Open connection, write packet header and data, data hash, close. Simple.
 	c, err := t.getConnection(addr, t.cfg.PacketDialTimeout)
 	if err != nil {
@@ -625,6 +782,13 @@ func (t *TCPTransport) registerMetrics(registerer prometheus.Registerer) {
 		Subsystem: subsystem,
 		Name:      "packets_sent_errors_total",
 		Help:      "Number of errors when sending memberlist packets",
+	})
+
+	t.deniedPacketDests = promauto.With(registerer).NewCounter(prometheus.CounterOpts{
+		Namespace: t.cfg.MetricsNamespace,
+		Subsystem: subsystem,
+		Name:      "packets_sent_denied_destinations_total",
+		Help:      "Number of outbound memberlist packets refused because the destination violated the configured allowlist / reflection-filter policy.",
 	})
 
 	t.unknownConnections = promauto.With(registerer).NewCounter(prometheus.CounterOpts{
