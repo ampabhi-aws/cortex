@@ -403,3 +403,131 @@ func TestStateReplication_GetFullState(t *testing.T) {
 		})
 	}
 }
+
+// TestStateReplication_RF1_StaysRunningAfterBroadcast exercises the regression
+// where running() used to return nil (terminating the service) the first time a
+// state message arrived with replicationFactor <= 1. After the first broadcast
+// Ready()/WaitReady() must remain healthy, otherwise GossipSettleStage will
+// permanently abort every notification pipeline for the tenant.
+func TestStateReplication_RF1_StaysRunningAfterBroadcast(t *testing.T) {
+	reg := prometheus.NewPedanticRegistry()
+	replicator := newFakeReplicator()
+	replicator.read = readStateResult{res: nil, err: nil}
+	store := newFakeAlertStore()
+	s := newReplicatedStates("user-1", 1, replicator, store, log.NewNopLogger(), reg)
+
+	require.NoError(t, services.StartAndAwaitRunning(context.Background(), s))
+	t.Cleanup(func() {
+		require.NoError(t, services.StopAndAwaitTerminated(context.Background(), s))
+	})
+
+	require.True(t, s.Ready())
+
+	ch := s.AddState("nflog", &fakeState{}, reg)
+	ch.Broadcast([]byte("first"))
+	ch.Broadcast([]byte("second"))
+
+	// Give running() a chance to observe the broadcasts.
+	time.Sleep(100 * time.Millisecond)
+
+	// The service must still be Running — a terminated service here would
+	// mean WaitReady() permanently errors and GossipSettleStage silently
+	// drops every notification for this tenant.
+	require.True(t, s.Ready(), "state service must stay Running after a broadcast with RF=1")
+
+	ctx, cancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
+	defer cancel()
+	require.NoError(t, s.WaitReady(ctx), "WaitReady must succeed after a broadcast with RF=1")
+}
+
+// TestStateReplication_BroadcastReturnsPromptlyAfterStop exercises the
+// regression where broadcast() used to perform a blocking send on an unbuffered
+// channel whose only consumer was running(). Once the service stops the sender
+// (which is upstream Alertmanager code holding the silences/nflog mutex) must
+// not block forever: it must drop the message instead.
+func TestStateReplication_BroadcastReturnsPromptlyAfterStop(t *testing.T) {
+	reg := prometheus.NewPedanticRegistry()
+	replicator := newFakeReplicator()
+	replicator.read = readStateResult{res: nil, err: nil}
+	store := newFakeAlertStore()
+	s := newReplicatedStates("user-1", 3, replicator, store, log.NewNopLogger(), reg)
+
+	require.NoError(t, services.StartAndAwaitRunning(context.Background(), s))
+
+	ch := s.AddState("nflog", &fakeState{}, reg)
+
+	// Stop the service: the running() consumer exits and stoppingCh is closed.
+	require.NoError(t, services.StopAndAwaitTerminated(context.Background(), s))
+	require.False(t, s.Ready())
+
+	// Fill the buffer so the next broadcast cannot be accepted. Even if the
+	// buffer were empty, broadcast() returns because Ready()==false; this
+	// scenario specifically exercises the lifecycle-aware select.
+	for i := 0; i < msgcBufferSize+4; i++ {
+		done := make(chan struct{})
+		go func() {
+			ch.Broadcast([]byte("after-stop"))
+			close(done)
+		}()
+		select {
+		case <-done:
+		case <-time.After(2 * time.Second):
+			t.Fatalf("broadcast() blocked after the service stopped")
+		}
+	}
+}
+
+// TestStateReplication_BroadcastDoesNotBlockWhenBufferFull verifies that
+// broadcast() drops messages (and increments the dropped counter) rather than
+// blocking when the running() consumer is temporarily slow and the msgc buffer
+// is full. This protects callers that hold the silences/nflog mutex.
+func TestStateReplication_BroadcastDoesNotBlockWhenBufferFull(t *testing.T) {
+	// Use a blocking replicator so running() stops draining msgc after the
+	// first message, letting the buffer fill up.
+	reg := prometheus.NewPedanticRegistry()
+	replicator := &blockingReplicator{block: make(chan struct{})}
+	store := newFakeAlertStore()
+	s := newReplicatedStates("user-1", 3, replicator, store, log.NewNopLogger(), reg)
+
+	require.NoError(t, services.StartAndAwaitRunning(context.Background(), s))
+	t.Cleanup(func() {
+		close(replicator.block)
+		_ = services.StopAndAwaitTerminated(context.Background(), s)
+	})
+
+	ch := s.AddState("nflog", &fakeState{}, reg)
+
+	// Flood more messages than the buffer can hold; broadcast() must return
+	// promptly for every call.
+	for i := 0; i < msgcBufferSize*4; i++ {
+		done := make(chan struct{})
+		go func() {
+			ch.Broadcast([]byte("flood"))
+			close(done)
+		}()
+		select {
+		case <-done:
+		case <-time.After(2 * time.Second):
+			t.Fatalf("broadcast() blocked on full msgc buffer")
+		}
+	}
+}
+
+type blockingReplicator struct {
+	block chan struct{}
+}
+
+func (b *blockingReplicator) ReplicateStateForUser(ctx context.Context, _ string, _ *clusterpb.Part) error {
+	select {
+	case <-b.block:
+		return nil
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+}
+
+func (b *blockingReplicator) GetPositionForUser(_ string) int { return 0 }
+
+func (b *blockingReplicator) ReadFullStateForUser(_ context.Context, _ string) ([]*clusterpb.FullState, error) {
+	return nil, nil
+}

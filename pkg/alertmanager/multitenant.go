@@ -798,11 +798,34 @@ func (am *MultitenantAlertmanager) syncConfigs(cfgs map[string]alertspb.AlertCon
 	am.alertmanagersMtx.Unlock()
 
 	// Now stop alertmanagers and wait until they are really stopped, without holding lock.
+	// Each per-tenant Alertmanager is stopped in its own goroutine with a bounded timeout
+	// so that a single wedged tenant (for example one blocked on silence/nflog mutexes)
+	// cannot halt the whole MultitenantAlertmanager config-sync loop or prevent later
+	// tenants from being deactivated.
+	const perTenantStopTimeout = 15 * time.Second
+	var stopWG sync.WaitGroup
 	for userID, userAM := range userAlertmanagersToStop {
-		level.Info(am.logger).Log("msg", "deactivating per-tenant alertmanager", "user", userID)
-		userAM.StopAndWait()
-		level.Info(am.logger).Log("msg", "deactivated per-tenant alertmanager", "user", userID)
+		stopWG.Add(1)
+		go func(userID string, userAM *Alertmanager) {
+			defer stopWG.Done()
+			level.Info(am.logger).Log("msg", "deactivating per-tenant alertmanager", "user", userID)
+			done := make(chan struct{})
+			go func() {
+				userAM.StopAndWait()
+				close(done)
+			}()
+			select {
+			case <-done:
+				level.Info(am.logger).Log("msg", "deactivated per-tenant alertmanager", "user", userID)
+			case <-time.After(perTenantStopTimeout):
+				// Abandon the goroutine; it will finish on its own if/when the
+				// stuck mutex is released. Logging at Warn makes the leaked
+				// shutdown observable without wedging config sync.
+				level.Warn(am.logger).Log("msg", "timed out waiting for per-tenant alertmanager to stop; abandoning", "user", userID, "timeout", perTenantStopTimeout)
+			}
+		}(userID, userAM)
 	}
+	stopWG.Wait()
 }
 
 // setConfig applies the given configuration to the alertmanager for `userID`,
