@@ -3181,8 +3181,11 @@ func Test_Ingester_AllUserStats(t *testing.T) {
 		db.ingestedRuleSamples.Tick()
 	}
 
-	// Get label names
-	res, err := i.AllUserStats(context.Background(), &client.UserStatsRequest{})
+	// Get label names. AllUserStats is an operator-only cross-tenant RPC and now
+	// requires the caller to assert one of the admin tenant IDs configured on
+	// the ingester (default "1", matching the distributor fan-out).
+	adminCtx := user.InjectOrgID(context.Background(), "1")
+	res, err := i.AllUserStats(adminCtx, &client.UserStatsRequest{})
 	require.NoError(t, err)
 
 	expect := []*client.UserIDStatsResponse{

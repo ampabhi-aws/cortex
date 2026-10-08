@@ -111,6 +111,17 @@ type Config struct {
 
 	IgnoreSeriesLimitForMetricNames string `yaml:"ignore_series_limit_for_metric_names"`
 
+	// AdminTenantIDs is the comma-separated allow-list of tenant IDs permitted
+	// to call operator-only RPCs that aggregate across tenants (e.g.
+	// cortex.Ingester/AllUserStats). The distributor's documented fan-out
+	// injects tenant ID "1" when calling these RPCs, so "1" is the default
+	// to preserve existing operator admin pages. Operators that place the
+	// ingester gRPC port inside a tenant-reachable trust boundary should
+	// override this with an identity that is only ever asserted by trusted
+	// internal peers (and ideally terminate mTLS / an authenticating proxy
+	// in front of the ingester).
+	AdminTenantIDs string `yaml:"admin_tenant_ids"`
+
 	// For testing, you can override the address and ID of this ingester.
 	ingesterClientFactory func(addr string, cfg client.Config) (client.HealthAndIngesterClient, error)
 }
@@ -132,6 +143,25 @@ func (cfg *Config) RegisterFlags(f *flag.FlagSet) {
 	f.Int64Var(&cfg.DefaultLimits.MaxInflightPushRequests, "ingester.instance-limits.max-inflight-push-requests", 0, "Max inflight push requests that this ingester can handle (across all tenants). Additional requests will be rejected. 0 = unlimited.")
 
 	f.StringVar(&cfg.IgnoreSeriesLimitForMetricNames, "ingester.ignore-series-limit-for-metric-names", "", "Comma-separated list of metric names, for which -ingester.max-series-per-metric and -ingester.max-global-series-per-metric limits will be ignored. Does not affect max-series-per-user or max-global-series-per-metric limits.")
+	f.StringVar(&cfg.AdminTenantIDs, "ingester.admin-tenant-ids", "1", "Comma-separated allow-list of tenant IDs permitted to call operator-only, cross-tenant ingester RPCs (currently cortex.Ingester/AllUserStats). The distributor fan-out that backs the /distributor/all_user_stats admin page injects tenant ID '1', which is the default. Any other caller will receive PermissionDenied. Set to an empty string to disable the allow-list (NOT RECOMMENDED: this restores the pre-remediation behaviour where any caller reaching the ingester gRPC port could enumerate all tenants).")
+}
+
+func (cfg *Config) getAdminTenantIDsMap() map[string]struct{} {
+	if cfg.AdminTenantIDs == "" {
+		return nil
+	}
+
+	result := map[string]struct{}{}
+	for _, s := range strings.Split(cfg.AdminTenantIDs, ",") {
+		tr := strings.TrimSpace(s)
+		if tr != "" {
+			result[tr] = struct{}{}
+		}
+	}
+	if len(result) == 0 {
+		return nil
+	}
+	return result
 }
 
 func (cfg *Config) getIgnoreSeriesLimitForMetricNamesMap() map[string]struct{} {
@@ -872,6 +902,29 @@ func (i *Ingester) checkRunning() error {
 	return status.Error(codes.Unavailable, s.String())
 }
 
+// assertAdminTenant returns nil when ctx carries a tenant ID that is listed in
+// cfg.AdminTenantIDs, and a PermissionDenied gRPC error otherwise. It is used
+// to gate operator-only cross-tenant RPCs (e.g. AllUserStats) so that a bare
+// X-Scope-OrgID header asserted by a tenant-reachable caller cannot reach the
+// cross-tenant data path. When cfg.AdminTenantIDs is empty the check is
+// disabled (the caller must still carry some tenant ID, matching the
+// pre-existing gRPC auth-middleware requirement).
+func (i *Ingester) assertAdminTenant(ctx context.Context) error {
+	userID, err := tenant.TenantID(ctx)
+	if err != nil {
+		return status.Error(codes.PermissionDenied, "not authorized: missing tenant ID")
+	}
+	admins := i.cfg.getAdminTenantIDsMap()
+	if admins == nil {
+		// Allow-list disabled by configuration; still require a tenant ID.
+		return nil
+	}
+	if _, ok := admins[userID]; !ok {
+		return status.Error(codes.PermissionDenied, "not authorized: caller is not an operator tenant")
+	}
+	return nil
+}
+
 // GetRef() is an extra method added to TSDB to let Cortex check before calling Add()
 type extendedAppender interface {
 	storage.Appender
@@ -1557,8 +1610,25 @@ func (i *Ingester) UserStats(ctx context.Context, req *client.UserStatsRequest) 
 }
 
 // AllUserStats returns ingestion statistics for all users known to this ingester.
-func (i *Ingester) AllUserStats(_ context.Context, _ *client.UserStatsRequest) (*client.UsersStatsResponse, error) {
+//
+// This is an operator-only, cross-tenant aggregate RPC: it returns every
+// tenant ID hosted by the ingester plus its live series count and ingestion
+// rates. The method is registered on the same gRPC server that serves the
+// tenant-facing cortex.Distributor/Push, so without an explicit caller check
+// any party able to reach the ingester gRPC port could enumerate the full
+// tenant inventory (see CWE-1212 / CWE-653). To mitigate that, the caller
+// must assert a tenant ID that is listed in -ingester.admin-tenant-ids.
+// Operators are still expected to terminate authentication (mTLS / an
+// authenticating proxy) in front of the ingester, as documented in
+// docs/guides/authentication-and-authorisation.md; this check is a
+// defence-in-depth fail-closed guard that stops a bare X-Scope-OrgID header
+// from reaching the cross-tenant data path.
+func (i *Ingester) AllUserStats(ctx context.Context, _ *client.UserStatsRequest) (*client.UsersStatsResponse, error) {
 	if err := i.checkRunning(); err != nil {
+		return nil, err
+	}
+
+	if err := i.assertAdminTenant(ctx); err != nil {
 		return nil, err
 	}
 
