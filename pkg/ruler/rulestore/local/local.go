@@ -5,6 +5,7 @@ import (
 	"flag"
 	"os"
 	"path/filepath"
+	"strings"
 
 	"github.com/pkg/errors"
 	promRules "github.com/prometheus/prometheus/rules"
@@ -167,8 +168,35 @@ func (l *Client) loadAllRulesGroupsForUser(ctx context.Context, userID string) (
 	return allLists, nil
 }
 
+// errInvalidNamespace is returned when the resolved rule-group filename
+// escapes the per-user rule directory. The error text is intentionally
+// generic so callers cannot use it as a filesystem oracle.
+var errInvalidNamespace = errors.New("invalid namespace")
+
+// resolveNamespaceFile returns the absolute path for a rule-group file given a
+// userID and namespace, after verifying that the result is contained inside
+// the per-user directory. This defends against path traversal via the
+// namespace component when the caller has not validated it upstream.
+func (l *Client) resolveNamespaceFile(userID, namespace string) (string, error) {
+	userRoot, err := filepath.Abs(filepath.Join(l.cfg.Directory, userID))
+	if err != nil {
+		return "", err
+	}
+	filename, err := filepath.Abs(filepath.Join(userRoot, namespace))
+	if err != nil {
+		return "", err
+	}
+	if filename != userRoot && !strings.HasPrefix(filename, userRoot+string(os.PathSeparator)) {
+		return "", errInvalidNamespace
+	}
+	return filename, nil
+}
+
 func (l *Client) loadAllRulesGroupsForUserAndNamespace(_ context.Context, userID string, namespace string) (rulespb.RuleGroupList, error) {
-	filename := filepath.Join(l.cfg.Directory, userID, namespace)
+	filename, err := l.resolveNamespaceFile(userID, namespace)
+	if err != nil {
+		return nil, err
+	}
 
 	rulegroups, allErrors := l.loader.Load(filename)
 	if len(allErrors) > 0 {
