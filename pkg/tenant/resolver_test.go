@@ -2,6 +2,7 @@ package tenant
 
 import (
 	"context"
+	"strings"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
@@ -82,10 +83,28 @@ func TestSingleResolver(t *testing.T) {
 	r := NewSingleResolver()
 	for _, tc := range append(commonResolverTestCases, []resolverTestCase{
 		{
-			name:        "multi-tenant",
-			headerValue: strptr("tenant-a|tenant-b"),
-			tenantID:    "tenant-a|tenant-b",
-			tenantIDs:   []string{"tenant-a|tenant-b"},
+			name:         "multi-tenant",
+			headerValue:  strptr("tenant-a|tenant-b"),
+			errTenantID:  errInvalidTenantID,
+			errTenantIDs: errInvalidTenantID,
+		},
+		{
+			name:         "containing-colon",
+			headerValue:  strptr("acme:job"),
+			errTenantID:  errInvalidTenantID,
+			errTenantIDs: errInvalidTenantID,
+		},
+		{
+			name:         "containing-pipe",
+			headerValue:  strptr("acme|globex"),
+			errTenantID:  errInvalidTenantID,
+			errTenantIDs: errInvalidTenantID,
+		},
+		{
+			name:         "too-long",
+			headerValue:  strptr(strings.Repeat("a", 151)),
+			errTenantID:  errInvalidTenantIDLength,
+			errTenantIDs: errInvalidTenantIDLength,
 		},
 		{
 			name:         "containing-forward-slash",

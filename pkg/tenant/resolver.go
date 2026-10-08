@@ -74,7 +74,30 @@ func containsUnsafePathSegments(id string) bool {
 	return strings.ContainsAny(id, "\\/")
 }
 
-var errInvalidTenantID = errors.New("invalid tenant ID")
+// maxTenantIDLength is the maximum length (in bytes) of a tenant ID. It
+// mirrors the limit enforced by ValidTenantID (see pkg/tenant/tenant.go) and
+// is applied to the default SingleResolver to bound the size of tenant IDs
+// used throughout the system (filesystem paths, object-store keys, cache
+// keys, metric label values, etc.).
+const maxTenantIDLength = 150
+
+var (
+	errInvalidTenantID       = errors.New("invalid tenant ID")
+	errInvalidTenantIDLength = errors.New("invalid tenant ID: too long (max 150 bytes)")
+)
+
+// containsSeparatorChars rejects tenant-ID characters that are structurally
+// unsafe regardless of the operator's auth gateway configuration:
+//   - ':' collides with the field separator used by the query results-cache
+//     key, allowing cross-tenant key confusion (a tenant named "acme:job"
+//     would produce the same key as tenant "acme" querying "job:...").
+//   - '|' is the multi-tenant separator used by the MultiResolver; accepting
+//     it with the SingleResolver means that enabling tenant federation
+//     silently reinterprets an existing single-tenant ID as a set of
+//     tenants.
+func containsSeparatorChars(id string) bool {
+	return strings.ContainsAny(id, ":|")
+}
 
 func (t *SingleResolver) TenantID(ctx context.Context) (string, error) {
 	//lint:ignore faillint wrapper around upstream method
@@ -83,7 +106,15 @@ func (t *SingleResolver) TenantID(ctx context.Context) (string, error) {
 		return "", err
 	}
 
+	if len(id) > maxTenantIDLength {
+		return "", errInvalidTenantIDLength
+	}
+
 	if containsUnsafePathSegments(id) {
+		return "", errInvalidTenantID
+	}
+
+	if containsSeparatorChars(id) {
 		return "", errInvalidTenantID
 	}
 
