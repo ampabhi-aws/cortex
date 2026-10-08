@@ -87,6 +87,17 @@ func (t *SingleResolver) TenantID(ctx context.Context) (string, error) {
 		return "", errInvalidTenantID
 	}
 
+	// Cap the length of the tenant ID even in the single-resolver (lenient)
+	// mode. SingleResolver intentionally allows a wider character set than
+	// MultiResolver (so operators can pass pipe-separated IDs through), but an
+	// unbounded caller-controlled string becomes an unbounded filesystem path
+	// component, object-storage prefix and Prometheus label value, which is a
+	// cheap resource-exhaustion lever (see CWE-770). The 150-byte cap matches
+	// ValidTenantID and the documented tenant naming limitation.
+	if len(id) > 150 {
+		return "", errTenantIDTooLong
+	}
+
 	return id, nil
 }
 

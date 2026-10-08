@@ -746,9 +746,12 @@ instance_limits:
   [max_ingestion_rate: <float> | default = 0]
 
   # Max users that this ingester can hold. Requests from additional users will
-  # be rejected. This limit only works when using blocks engine. 0 = unlimited.
+  # be rejected. This limit only works when using blocks engine. 0 = unlimited
+  # (not recommended: an unbounded tenant count can be used to exhaust ingester
+  # memory/fds/goroutines when an upstream proxy does not restrict the
+  # X-Scope-OrgID header).
   # CLI flag: -ingester.instance-limits.max-tenants
-  [max_tenants: <int> | default = 0]
+  [max_tenants: <int> | default = 10000]
 
   # Max series that this ingester can hold (across all tenants). Requests to
   # create additional series will be rejected. This limit only works when using
