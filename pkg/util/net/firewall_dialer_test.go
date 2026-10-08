@@ -52,6 +52,15 @@ func TestFirewallDialer(t *testing.T) {
 				{"2001:4860:4860::8844", false},    // Google DNS
 				{"::ffff:172.217.168.78", false},   // IPv6 mapped v4 non-private
 				{"::ffff:192.168.0.1", true},       // IPv6 mapped v4 private
+				// Regression coverage for the SSRF denylist gap:
+				// the unspecified address, CGNAT, benchmarking and
+				// interface-local multicast must all be blocked.
+				{"0.0.0.0", true},            // Unspecified IPv4 (kernel resolves to local host)
+				{"::", true},                 // Unspecified IPv6 (kernel resolves to ::1)
+				{"::ffff:0.0.0.0", true},     // IPv4-mapped unspecified
+				{"100.64.0.1", true},         // RFC 6598 CGNAT / managed-k8s pod CIDR
+				{"198.18.0.1", true},         // RFC 2544 benchmarking
+				{"ff01::1", true},            // IPv6 interface-local multicast
 			},
 		},
 		"should support blocking custom CIDRs": {
