@@ -2,6 +2,7 @@
 
 ## master / unreleased
 
+* [CHANGE] Ruler: the cross-tenant `/ruler/rule_groups` endpoint is now authenticated and opt-in. It requires an `X-Scope-OrgID` header and the resolved tenant must appear in the new `-ruler.admin-tenants` list, otherwise the handler returns `403 Forbidden`. By default the list is empty so the endpoint is disabled; this fixes an issue where an unauthenticated caller could dump every tenant's rule groups and enumerate tenant IDs.
   **This release removes support for chunks storage. See below for more.**
 * [CHANGE] Remove support for chunks storage entirely. If you are using chunks storage on a previous version, you must [migrate your data](https://github.com/cortexproject/cortex/blob/v1.11.1/docs/blocks-storage/migrate-from-chunks-to-blocks.md) on version 1.12 or earlier. Before upgrading to this release, you should also remove any deprecated chunks-related configuration, as this release will no longer accept that. The following flags are gone:
   - `-dynamodb.*`

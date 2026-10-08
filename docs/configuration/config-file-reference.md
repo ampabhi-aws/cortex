@@ -1342,6 +1342,13 @@ ring:
 # CLI flag: -ruler.disabled-tenants
 [disabled_tenants: <string> | default = ""]
 
+# Comma separated list of tenant IDs that are allowed to call the cross-tenant
+# /ruler/rule_groups endpoint. If empty (the default), the endpoint responds
+# with HTTP 403 for every caller. This endpoint lists every tenant's rule
+# groups, so it must only be exposed to trusted operators.
+# CLI flag: -ruler.admin-tenants
+[admin_tenants: <string> | default = ""]
+
 # Report the wall time for ruler queries to complete as a per user metric and as
 # an info level log message.
 # CLI flag: -ruler.query-stats-enabled

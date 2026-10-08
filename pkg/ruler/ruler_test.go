@@ -1101,6 +1101,8 @@ type ruleGroupKey struct {
 func TestRuler_ListAllRules(t *testing.T) {
 	store := newMockRuleStore(mockRules)
 	cfg := defaultRulerConfig(t)
+	// Opt the "admin" tenant into the cross-tenant dump endpoint.
+	cfg.AdminTenants = []string{"admin"}
 
 	r := newTestRuler(t, cfg, store, nil)
 	defer services.StopAndAwaitTerminated(context.Background(), r) //nolint:errcheck
@@ -1108,7 +1110,21 @@ func TestRuler_ListAllRules(t *testing.T) {
 	router := mux.NewRouter()
 	router.Path("/ruler/rule_groups").Methods(http.MethodGet).HandlerFunc(r.ListAllRules)
 
-	req := requestFor(t, http.MethodGet, "https://localhost:8080/ruler/rule_groups", nil, "")
+	// 1) No tenant context -> 403 (empty tenant is not in the admin list; in
+	// production the auth middleware would also 401 before the handler runs).
+	reqAnon := requestFor(t, http.MethodGet, "https://localhost:8080/ruler/rule_groups", nil, "")
+	wAnon := httptest.NewRecorder()
+	router.ServeHTTP(wAnon, reqAnon)
+	require.Equal(t, http.StatusForbidden, wAnon.Result().StatusCode)
+
+	// 2) Authenticated non-admin tenant -> 403.
+	reqUser := requestFor(t, http.MethodGet, "https://localhost:8080/ruler/rule_groups", nil, "user1")
+	wUser := httptest.NewRecorder()
+	router.ServeHTTP(wUser, reqUser)
+	require.Equal(t, http.StatusForbidden, wUser.Result().StatusCode)
+
+	// 3) Configured admin tenant -> 200 and the usual cross-tenant payload.
+	req := requestFor(t, http.MethodGet, "https://localhost:8080/ruler/rule_groups", nil, "admin")
 	w := httptest.NewRecorder()
 	router.ServeHTTP(w, req)
 
@@ -1133,6 +1149,25 @@ func TestRuler_ListAllRules(t *testing.T) {
 	expectedResponse, err := yaml.Marshal(gs)
 	require.NoError(t, err)
 	require.YAMLEq(t, string(expectedResponse), string(body))
+}
+
+func TestRuler_ListAllRules_DeniesByDefault(t *testing.T) {
+	store := newMockRuleStore(mockRules)
+	cfg := defaultRulerConfig(t)
+	// No AdminTenants configured: endpoint must fail closed even for an
+	// authenticated caller.
+
+	r := newTestRuler(t, cfg, store, nil)
+	defer services.StopAndAwaitTerminated(context.Background(), r) //nolint:errcheck
+
+	router := mux.NewRouter()
+	router.Path("/ruler/rule_groups").Methods(http.MethodGet).HandlerFunc(r.ListAllRules)
+
+	req := requestFor(t, http.MethodGet, "https://localhost:8080/ruler/rule_groups", nil, "someone")
+	w := httptest.NewRecorder()
+	router.ServeHTTP(w, req)
+
+	require.Equal(t, http.StatusForbidden, w.Result().StatusCode)
 }
 
 type senderFunc func(alerts ...*notifier.Alert)

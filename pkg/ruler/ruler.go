@@ -119,6 +119,12 @@ type Config struct {
 	EnabledTenants  flagext.StringSliceCSV `yaml:"enabled_tenants"`
 	DisabledTenants flagext.StringSliceCSV `yaml:"disabled_tenants"`
 
+	// AdminTenants restricts the cross-tenant /ruler/rule_groups endpoint to the
+	// listed tenant IDs. If empty (the default), the endpoint is disallowed for
+	// every caller and will respond with HTTP 403. Operators who need the dump
+	// must opt in explicitly by listing one or more admin tenant IDs here.
+	AdminTenants flagext.StringSliceCSV `yaml:"admin_tenants"`
+
 	RingCheckPeriod time.Duration `yaml:"-"`
 
 	EnableQueryStats      bool `yaml:"query_stats_enabled"`
@@ -180,6 +186,7 @@ func (cfg *Config) RegisterFlags(f *flag.FlagSet) {
 
 	f.Var(&cfg.EnabledTenants, "ruler.enabled-tenants", "Comma separated list of tenants whose rules this ruler can evaluate. If specified, only these tenants will be handled by ruler, otherwise this ruler can process rules from all tenants. Subject to sharding.")
 	f.Var(&cfg.DisabledTenants, "ruler.disabled-tenants", "Comma separated list of tenants whose rules this ruler cannot evaluate. If specified, a ruler that would normally pick the specified tenant(s) for processing will ignore them instead. Subject to sharding.")
+	f.Var(&cfg.AdminTenants, "ruler.admin-tenants", "Comma separated list of tenant IDs that are allowed to call the cross-tenant /ruler/rule_groups endpoint. If empty (the default), the endpoint responds with HTTP 403 for every caller. This endpoint lists every tenant's rule groups, so it must only be exposed to trusted operators.")
 
 	f.BoolVar(&cfg.EnableQueryStats, "ruler.query-stats-enabled", false, "Report the wall time for ruler queries to complete as a per user metric and as an info level log message.")
 	f.BoolVar(&cfg.DisableRuleGroupLabel, "ruler.disable-rule-group-label", false, "Disable the rule_group label on exported metrics")
@@ -247,6 +254,7 @@ type Ruler struct {
 	rulerSync       *prometheus.CounterVec
 
 	allowedTenants *util.AllowedTenants
+	adminTenants   *util.AllowedTenants
 
 	registry prometheus.Registerer
 	logger   log.Logger
@@ -267,6 +275,9 @@ func newRuler(cfg Config, manager MultiTenantManager, reg prometheus.Registerer,
 		limits:         limits,
 		clientsPool:    clientPool,
 		allowedTenants: util.NewAllowedTenants(cfg.EnabledTenants, cfg.DisabledTenants),
+		// adminTenants is built from an explicit enable list only (no disabled
+		// list) so that an empty configuration denies every caller.
+		adminTenants: util.NewAllowedTenants(cfg.AdminTenants, nil),
 
 		ringCheckErrors: promauto.With(reg).NewCounter(prometheus.CounterOpts{
 			Name: "cortex_ruler_ring_check_errors_total",
@@ -862,6 +873,25 @@ func (r *Ruler) DeleteTenantConfiguration(w http.ResponseWriter, req *http.Reque
 
 func (r *Ruler) ListAllRules(w http.ResponseWriter, req *http.Request) {
 	logger := util_log.WithContext(req.Context(), r.logger)
+
+	// Treat the cross-tenant dump as a privileged operation: require a tenant
+	// to be resolved from the request, and refuse to serve it unless the
+	// operator has explicitly opted that tenant in via -ruler.admin-tenants.
+	// Mirrors the pattern used by DeleteTenantConfiguration above and fails
+	// closed when no admin tenants are configured.
+	userID, err := tenant.TenantID(req.Context())
+	if err != nil {
+		// When Cortex is running, the Auth Middleware checks X-Scope-OrgID and
+		// injects the tenant into the context. Auth Middleware returns 401 if
+		// X-Scope-OrgID is missing, so we do the same here for consistency.
+		http.Error(w, err.Error(), http.StatusUnauthorized)
+		return
+	}
+	if len(r.cfg.AdminTenants) == 0 || !r.adminTenants.IsAllowed(userID) {
+		level.Warn(logger).Log("msg", "rejected cross-tenant /ruler/rule_groups request from non-admin tenant", "user", userID)
+		http.Error(w, "forbidden", http.StatusForbidden)
+		return
+	}
 
 	userIDs, err := r.store.ListAllUsers(req.Context())
 	if err != nil {
