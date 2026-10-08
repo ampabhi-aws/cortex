@@ -789,8 +789,51 @@ func TestValidateAlertmanagerConfig(t *testing.T) {
 
 	for testName, testData := range tests {
 		t.Run(testName, func(t *testing.T) {
-			err := validateAlertmanagerConfig(testData.input)
+			err := validateAlertmanagerConfig(testData.input, nil, "")
 			assert.ErrorIs(t, err, testData.expected)
 		})
 	}
+}
+
+// TestValidateAlertmanagerConfig_EmailReceiverWithFirewall verifies that email receivers
+// are rejected (fail-closed) at config validation time when the tenant has the receivers
+// firewall configured. The vendored prometheus/alertmanager email notifier dials
+// smtp_smarthost with a bare net.Dialer / tls.Dial that bypasses FirewallDialer, so an
+// unvalidated email_configs entry would otherwise let a tenant bypass the firewall.
+func TestValidateAlertmanagerConfig_EmailReceiverWithFirewall(t *testing.T) {
+	emailCfg := &config.Config{
+		Receivers: []*config.Receiver{{
+			Name: "mail",
+			EmailConfigs: []*config.EmailConfig{{
+				To:        "victim@internal.example.com",
+				Smarthost: config.HostPort{Host: "127.0.0.1", Port: "2525"},
+				From:      "attacker@example.com",
+			}},
+		}},
+	}
+
+	t.Run("no limits does not reject email", func(t *testing.T) {
+		err := validateAlertmanagerConfig(emailCfg, nil, "user-1")
+		assert.NoError(t, err)
+	})
+
+	t.Run("firewall disabled does not reject email", func(t *testing.T) {
+		limits := &mockAlertManagerLimits{}
+		err := validateAlertmanagerConfig(emailCfg, limits, "user-1")
+		assert.NoError(t, err)
+	})
+
+	t.Run("block private addresses rejects email", func(t *testing.T) {
+		limits := &mockAlertManagerLimits{receiversBlockPrivateAddresses: true}
+		err := validateAlertmanagerConfig(emailCfg, limits, "user-1")
+		assert.ErrorIs(t, err, errEmailReceiverNotAllowedWithFirewall)
+	})
+
+	t.Run("block CIDR networks rejects email", func(t *testing.T) {
+		cidr := flagext.CIDR{}
+		require.NoError(t, cidr.Set("10.0.0.0/8"))
+		limits := &mockAlertManagerLimits{receiversBlockCIDRNetworks: []flagext.CIDR{cidr}}
+		err := validateAlertmanagerConfig(emailCfg, limits, "user-1")
+		assert.ErrorIs(t, err, errEmailReceiverNotAllowedWithFirewall)
+	})
 }
