@@ -157,6 +157,12 @@ type KVConfig struct {
 	// How much space to use to keep received and sent messages in memory (for troubleshooting).
 	MessageHistoryBufferBytes int `yaml:"message_history_buffer_bytes"`
 
+	// Maximum size (in bytes) of a single KV pair value accepted from a remote
+	// gossip peer. Pairs whose encoded value is larger than this are rejected
+	// before being passed to the codec, preventing memory-exhaustion attacks
+	// that abuse the push/pull or user-message path. 0 disables the limit.
+	MaxReceivedMessageSize int `yaml:"max_received_message_size"`
+
 	TCPTransport TCPTransportConfig `yaml:",inline"`
 
 	// Where to put custom metrics. Metrics are not registered, if this is nil.
@@ -190,6 +196,7 @@ func (cfg *KVConfig) RegisterFlagsWithPrefix(f *flag.FlagSet, prefix string) {
 	f.DurationVar(&cfg.GossipToTheDeadTime, prefix+"memberlist.gossip-to-dead-nodes-time", mlDefaults.GossipToTheDeadTime, "How long to keep gossiping to dead nodes, to give them chance to refute their death.")
 	f.DurationVar(&cfg.DeadNodeReclaimTime, prefix+"memberlist.dead-node-reclaim-time", mlDefaults.DeadNodeReclaimTime, "How soon can dead node's name be reclaimed with new address. 0 to disable.")
 	f.IntVar(&cfg.MessageHistoryBufferBytes, prefix+"memberlist.message-history-buffer-bytes", 0, "How much space to use for keeping received and sent messages in memory for troubleshooting (two buffers). 0 to disable.")
+	f.IntVar(&cfg.MaxReceivedMessageSize, prefix+"memberlist.max-received-message-size", 32*1024*1024, "Maximum size (in bytes) of a single KV pair value accepted from a remote gossip peer, before being passed to the codec. Pairs larger than this are dropped to bound memory allocation on the gossip receive path. 0 to disable.")
 	f.BoolVar(&cfg.EnableCompression, prefix+"memberlist.compression-enabled", mlDefaults.EnableCompression, "Enable message compression. This can be used to reduce bandwidth usage at the cost of slightly more CPU utilization.")
 	f.StringVar(&cfg.AdvertiseAddr, prefix+"memberlist.advertise-addr", mlDefaults.AdvertiseAddr, "Gossip address to advertise to other members in the cluster. Used for NAT traversal.")
 	f.IntVar(&cfg.AdvertisePort, prefix+"memberlist.advertise-port", mlDefaults.AdvertisePort, "Gossip port to advertise to other members in the cluster. Used for NAT traversal.")
@@ -978,6 +985,12 @@ func (m *KV) NotifyMsg(msg []byte) {
 		return
 	}
 
+	if m.cfg.MaxReceivedMessageSize > 0 && len(kvPair.Value) > m.cfg.MaxReceivedMessageSize {
+		level.Warn(m.logger).Log("msg", "rejecting received KV Pair: value exceeds max-received-message-size", "key", kvPair.Key, "value_size", len(kvPair.Value), "limit", m.cfg.MaxReceivedMessageSize)
+		m.numberOfInvalidReceivedMessages.Inc()
+		return
+	}
+
 	codec := m.GetCodec(kvPair.GetCodec())
 	if codec == nil {
 		m.numberOfInvalidReceivedMessages.Inc()
@@ -1154,6 +1167,12 @@ func (m *KV) MergeRemoteState(data []byte, join bool) {
 		codec := m.GetCodec(kvPair.GetCodec())
 		if codec == nil {
 			level.Error(m.logger).Log("msg", "failed to parse remote state: unknown codec for key", "codec", kvPair.GetCodec(), "key", kvPair.GetKey())
+			continue
+		}
+
+		if m.cfg.MaxReceivedMessageSize > 0 && len(kvPair.Value) > m.cfg.MaxReceivedMessageSize {
+			m.numberOfInvalidReceivedMessages.Inc()
+			level.Warn(m.logger).Log("msg", "rejecting KV Pair in remote state: value exceeds max-received-message-size", "key", kvPair.Key, "value_size", len(kvPair.Value), "limit", m.cfg.MaxReceivedMessageSize)
 			continue
 		}
 
