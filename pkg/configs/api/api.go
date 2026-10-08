@@ -20,6 +20,7 @@ import (
 	amconfig "github.com/prometheus/alertmanager/config"
 	amtemplate "github.com/prometheus/alertmanager/template"
 
+	"github.com/cortexproject/cortex/pkg/alertmanager"
 	"github.com/cortexproject/cortex/pkg/configs/db"
 	"github.com/cortexproject/cortex/pkg/configs/userconfig"
 	"github.com/cortexproject/cortex/pkg/tenant"
@@ -230,6 +231,15 @@ func validateAlertmanagerConfig(cfg string, noCfg NotificationsConfig) error {
 		return err
 	}
 
+	// Apply the Cortex-wide structural validation (including the `*_file` ban) that the
+	// Alertmanager API applies. This closes the bypass whereby a tenant could post a
+	// config here with `password_file`/`bearer_token_file`/`credentials_file`/TLS
+	// `ca_file`/`cert_file`/`key_file` and have it reach the alertmanager through the
+	// configdb alert store without ever being validated.
+	if err := alertmanager.ValidateAlertmanagerConfigStruct(amCfg); err != nil {
+		return err
+	}
+
 	for _, recv := range amCfg.Receivers {
 		if noCfg.DisableEmail && len(recv.EmailConfigs) > 0 {
 			return ErrEmailNotificationsAreDisabled
@@ -249,6 +259,12 @@ func validateRulesFiles(c userconfig.Config) error {
 
 func validateTemplateFiles(c userconfig.Config) error {
 	for fn, content := range c.TemplateFiles {
+		// Enforce the same safe-filename rule the Alertmanager apply path enforces so a
+		// template written via the legacy configs API cannot escape the per-tenant
+		// templates directory on disk.
+		if err := alertmanager.ValidateTemplateFilename(fn); err != nil {
+			return err
+		}
 		if _, err := template.New(fn).Funcs(template.FuncMap(amtemplate.DefaultFuncs)).Parse(content); err != nil {
 			return err
 		}

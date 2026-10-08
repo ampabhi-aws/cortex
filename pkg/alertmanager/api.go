@@ -304,6 +304,35 @@ func (am *MultitenantAlertmanager) ListAllConfigs(w http.ResponseWriter, r *http
 	<-done
 }
 
+// ValidateAlertmanagerConfigString parses the given raw Alertmanager configuration string
+// and runs the Cortex-specific structural validation (reflection walk) on it. In particular,
+// it enforces the ban on `*_file` fields in receiver HTTP/TLS configs regardless of which
+// write path produced the configuration.
+//
+// This is exported so other packages (e.g. the legacy configs API) can share the exact same
+// enforcement.
+func ValidateAlertmanagerConfigString(rawCfg string) error {
+	amCfg, err := config.Load(rawCfg)
+	if err != nil {
+		return err
+	}
+	return validateAlertmanagerConfig(amCfg)
+}
+
+// ValidateAlertmanagerConfigStruct runs the Cortex-specific structural validation on an
+// already parsed Alertmanager configuration. Prefer this over ValidateAlertmanagerConfigString
+// when the caller already has the parsed config to avoid double-parsing.
+func ValidateAlertmanagerConfigStruct(cfg *config.Config) error {
+	return validateAlertmanagerConfig(cfg)
+}
+
+// ValidateTemplateFilename validates a template filename and returns an error if it is
+// not safe (e.g. contains path separators). Exported so other packages can share the
+// same enforcement.
+func ValidateTemplateFilename(filename string) error {
+	return validateTemplateFilename(filename)
+}
+
 // validateAlertmanagerConfig recursively scans the input config looking for data types for which
 // we have a specific validation and, whenever encountered, it runs their validation. Returns the
 // first error or nil if validation succeeds.
