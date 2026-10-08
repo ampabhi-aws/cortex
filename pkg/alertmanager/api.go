@@ -304,6 +304,18 @@ func (am *MultitenantAlertmanager) ListAllConfigs(w http.ResponseWriter, r *http
 	<-done
 }
 
+// ValidateAlertmanagerConfig recursively scans the input Alertmanager config and
+// enforces the Cortex-specific restrictions on options that would otherwise allow
+// arbitrary local file reads at notification time (e.g. password_file,
+// bearer_token_file, credentials_file, OAuth2 client_secret_file, TLS *_file,
+// Slack api_url_file, VictorOps api_key_file). It is exported so that other
+// write paths that accept tenant-supplied Alertmanager YAML (such as the legacy
+// configs service) can reuse the exact same blocklist as the supported
+// /api/v1/alerts endpoint.
+func ValidateAlertmanagerConfig(cfg interface{}) error {
+	return validateAlertmanagerConfig(cfg)
+}
+
 // validateAlertmanagerConfig recursively scans the input config looking for data types for which
 // we have a specific validation and, whenever encountered, it runs their validation. Returns the
 // first error or nil if validation succeeds.

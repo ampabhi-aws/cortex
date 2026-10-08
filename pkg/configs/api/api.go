@@ -20,6 +20,7 @@ import (
 	amconfig "github.com/prometheus/alertmanager/config"
 	amtemplate "github.com/prometheus/alertmanager/template"
 
+	"github.com/cortexproject/cortex/pkg/alertmanager"
 	"github.com/cortexproject/cortex/pkg/configs/db"
 	"github.com/cortexproject/cortex/pkg/configs/userconfig"
 	"github.com/cortexproject/cortex/pkg/tenant"
@@ -227,6 +228,19 @@ func (a *API) validateAlertmanagerConfig(w http.ResponseWriter, r *http.Request)
 func validateAlertmanagerConfig(cfg string, noCfg NotificationsConfig) error {
 	amCfg, err := amconfig.Load(cfg)
 	if err != nil {
+		return err
+	}
+
+	// Enforce the same *_file blocklist as the supported Alertmanager API
+	// (pkg/alertmanager/api.go). Without this, tenants writing through the
+	// legacy configs API could smuggle options such as http_config.bearer_token_file,
+	// basic_auth.password_file, authorization.credentials_file, oauth2.client_secret_file,
+	// tls_config.{ca,cert,key}_file, slack api_url_file or victorops api_key_file,
+	// which prometheus/common resolves lazily at notification time and places
+	// in the outbound Authorization/basic-auth headers (or TLS material),
+	// turning a config-write primitive into arbitrary local file read /
+	// credential exfiltration.
+	if err := alertmanager.ValidateAlertmanagerConfig(amCfg); err != nil {
 		return err
 	}
 

@@ -866,6 +866,19 @@ func (am *MultitenantAlertmanager) setConfig(cfg alertspb.AlertConfigDesc) error
 		rawCfg = am.fallbackConfig
 	} else {
 		userAmConfig, err = amconfig.Load(cfg.RawConfig)
+		if err == nil {
+			// Defence in depth: re-apply the same *_file blocklist the write-path
+			// validator enforces, so that configurations entering the store via
+			// backends that bypass the API validator (notably the legacy configdb
+			// alert store, which copies tenant-supplied YAML verbatim from the
+			// configs service, as well as filesystem/bucket backends that may be
+			// seeded out-of-band) still cannot smuggle options that would resolve
+			// to local file reads at notification time.
+			if verr := validateAlertmanagerConfig(userAmConfig); verr != nil {
+				userAmConfig = nil
+				err = verr
+			}
+		}
 		if err != nil && hasExisting {
 			// This means that if a user has a working config and
 			// they submit a broken one, the Manager will keep running the last known
