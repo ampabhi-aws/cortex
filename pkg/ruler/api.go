@@ -288,7 +288,59 @@ var (
 	ErrNoRuleGroups = errors.New("no rule groups found")
 	// ErrBadRuleGroup is returned when the provided rule group can not be unmarshalled
 	ErrBadRuleGroup = errors.New("unable to decoded rule group")
+	// ErrInvalidNamespace is returned when the namespace is unsafe to use as a
+	// filename component (empty, `.`, `..`, too long, or contains disallowed
+	// bytes like NUL).
+	ErrInvalidNamespace = errors.New("invalid namespace: must not be empty, '.', '..', exceed 255 bytes, or contain backslash or NUL bytes")
+	// ErrInvalidRuleGroupName is returned when the rule group name is unsafe.
+	ErrInvalidRuleGroupName = errors.New("invalid rule group name: must not be empty, '.', '..', exceed 255 bytes, or contain path separators or NUL bytes")
 )
+
+// maxRuleNameLen bounds the size (in bytes) of a tenant-supplied namespace or
+// group name. The limit tracks the NAME_MAX of common filesystems (ext4, xfs)
+// so that the mapper can always safely materialize the namespace as a filename
+// without hitting ENAMETOOLONG. url.PathEscape may inflate the on-disk
+// representation; the mapper enforces the stricter encoded-length bound.
+const maxRuleNameLen = 255
+
+// validateRuleGroupName returns an error if the given name is unsafe to use as
+// a filename component. It rejects the empty string, the special directory
+// entries `.` and `..`, names containing NUL or path separators, and names
+// whose byte length exceeds maxRuleNameLen. These checks mirror the
+// Alertmanager multi-tenant template filename validation and prevent one
+// poisoned namespace from disabling an entire tenant's rule evaluation when
+// the mapper tries to write it to disk.
+func validateRuleGroupName(name string) error {
+	if name == "" || name == "." || name == ".." {
+		return ErrInvalidRuleGroupName
+	}
+	if len(name) > maxRuleNameLen {
+		return ErrInvalidRuleGroupName
+	}
+	if strings.ContainsAny(name, "/\\\x00") {
+		return ErrInvalidRuleGroupName
+	}
+	return nil
+}
+
+// validateNamespace returns an error if the given namespace is unsafe to use
+// as a filename component. See validateRuleGroupName for rationale. Unlike
+// validateRuleGroupName this does not reject '/' because the mapper encodes
+// it with url.PathEscape to %2F; however the mapper additionally caps the
+// encoded filename length so overly long or `/`-heavy namespaces are rejected
+// defensively there.
+func validateNamespace(namespace string) error {
+	if namespace == "" || namespace == "." || namespace == ".." {
+		return ErrInvalidNamespace
+	}
+	if len(namespace) > maxRuleNameLen {
+		return ErrInvalidNamespace
+	}
+	if strings.ContainsAny(namespace, "\\\x00") {
+		return ErrInvalidNamespace
+	}
+	return nil
+}
 
 func marshalAndSend(output interface{}, w http.ResponseWriter, logger log.Logger) {
 	d, err := yaml.Marshal(&output)
@@ -336,6 +388,10 @@ func parseNamespace(params map[string]string) (string, error) {
 		return "", err
 	}
 
+	if err := validateNamespace(namespace); err != nil {
+		return "", err
+	}
+
 	return namespace, nil
 }
 
@@ -349,6 +405,10 @@ func parseGroupName(params map[string]string) (string, error) {
 
 	groupName, err := url.PathUnescape(groupName)
 	if err != nil {
+		return "", err
+	}
+
+	if err := validateRuleGroupName(groupName); err != nil {
 		return "", err
 	}
 
@@ -473,6 +533,12 @@ func (a *API) CreateRuleGroup(w http.ResponseWriter, req *http.Request) {
 		}
 
 		http.Error(w, strings.Join(e, ", "), http.StatusBadRequest)
+		return
+	}
+
+	if err := validateRuleGroupName(rg.Name); err != nil {
+		level.Error(logger).Log("msg", "invalid rule group name", "err", err.Error(), "user", userID)
+		http.Error(w, err.Error(), http.StatusBadRequest)
 		return
 	}
 

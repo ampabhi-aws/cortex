@@ -2,9 +2,11 @@ package ruler
 
 import (
 	"crypto/md5"
+	"fmt"
 	"net/url"
 	"path/filepath"
 	"sort"
+	"strings"
 
 	"github.com/go-kit/log"
 	"github.com/go-kit/log/level"
@@ -12,6 +14,13 @@ import (
 	"github.com/spf13/afero"
 	"gopkg.in/yaml.v3"
 )
+
+// maxEncodedFilenameLen bounds the on-disk length of the per-namespace rule
+// file name. Common Linux filesystems cap each path component at 255 bytes
+// (NAME_MAX); enforcing the bound after url.PathEscape (which may expand each
+// byte up to three-fold) prevents one poisoned namespace from aborting the
+// whole tenant's MapRules call with ENAMETOOLONG.
+const maxEncodedFilenameLen = 255
 
 // mapper is designed to enusre the provided rule sets are identical
 // to the on-disk rules tracked by the prometheus manager
@@ -75,20 +84,48 @@ func (m *mapper) MapRules(user string, ruleConfigs map[string][]rulefmt.RuleGrou
 
 	// user rule files will be stored as `/<path>/<userid>/<encoded filename>`
 	path := filepath.Join(m.Path, user)
-	err := m.FS.MkdirAll(path, 0777)
+	err := m.FS.MkdirAll(path, 0755)
 	if err != nil {
 		return false, nil, err
 	}
 
 	// write all rule configs to disk
 	for filename, groups := range ruleConfigs {
+		// Defense in depth: the API layer already rejects namespaces that are
+		// unsafe to materialize as a filename, but the mapper is also used by
+		// other call paths (e.g. loading from the object store at startup) so
+		// we re-check here and skip (rather than abort) any namespace that
+		// cannot be mapped. This prevents one bad object in the rule store
+		// from disabling every rule for the tenant.
+		if err := safeNamespaceForFilename(filename); err != nil {
+			level.Warn(m.logger).Log("msg", "skipping namespace that cannot be mapped to a safe filename", "user", user, "namespace", filename, "err", err)
+			continue
+		}
+
 		// Store the encoded file name to better handle `/` characters
 		encodedFileName := url.PathEscape(filename)
+		if len(encodedFileName) > maxEncodedFilenameLen {
+			level.Warn(m.logger).Log("msg", "skipping namespace whose encoded filename exceeds the filesystem limit", "user", user, "namespace", filename, "encoded_len", len(encodedFileName), "limit", maxEncodedFilenameLen)
+			continue
+		}
 		fullFileName := filepath.Join(path, encodedFileName)
+
+		// Ensure the resulting path still lives inside the tenant directory.
+		// This is belt-and-braces: url.PathEscape rewrites '/', and
+		// safeNamespaceForFilename already rejects '.' / '..', but we assert
+		// the invariant here as the last line of defense before touching the
+		// filesystem.
+		if filepath.Dir(fullFileName) != path {
+			level.Warn(m.logger).Log("msg", "skipping namespace that resolves outside the tenant directory", "user", user, "namespace", filename, "resolved", fullFileName)
+			continue
+		}
 
 		fileUpdated, err := m.writeRuleGroupsIfNewer(groups, fullFileName)
 		if err != nil {
-			return false, nil, err
+			// Do not abort the whole tenant's mapping on a single bad file;
+			// log and continue so the remaining rule groups still get loaded.
+			level.Error(m.logger).Log("msg", "unable to write rule file", "user", user, "namespace", filename, "file", fullFileName, "err", err)
+			continue
 		}
 		filenames = append(filenames, fullFileName)
 		anyUpdated = anyUpdated || fileUpdated
@@ -152,10 +189,28 @@ func (m *mapper) writeRuleGroupsIfNewer(groups []rulefmt.RuleGroup, filename str
 	}
 
 	level.Info(m.logger).Log("msg", "updating rule file", "file", filename)
-	err = afero.WriteFile(m.FS, filename, d, 0777)
+	err = afero.WriteFile(m.FS, filename, d, 0644)
 	if err != nil {
 		return false, err
 	}
 
 	return true, nil
+}
+
+// safeNamespaceForFilename returns an error if the given namespace cannot be
+// safely materialized as a single on-disk path component. It mirrors the
+// validation applied at the HTTP API layer and exists as a defense in depth
+// for namespaces loaded from the rule store (which may predate the API-level
+// check or come from another process).
+func safeNamespaceForFilename(namespace string) error {
+	if namespace == "" {
+		return fmt.Errorf("namespace must not be empty")
+	}
+	if namespace == "." || namespace == ".." {
+		return fmt.Errorf("namespace %q collides with a special directory entry", namespace)
+	}
+	if strings.ContainsAny(namespace, "\\\x00") {
+		return fmt.Errorf("namespace contains disallowed byte (backslash or NUL)")
+	}
+	return nil
 }
