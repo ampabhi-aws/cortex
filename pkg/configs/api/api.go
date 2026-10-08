@@ -1,6 +1,7 @@
 package api
 
 import (
+	"crypto/subtle"
 	"database/sql"
 	"encoding/json"
 	"errors"
@@ -32,9 +33,25 @@ var (
 	ErrWebhookNotificationsAreDisabled = errors.New("webhook notifications are disabled")
 )
 
+// PrivateAPIAuthTokenHeader is the HTTP header that trusted internal callers
+// (e.g. the ruler/alertmanager ConfigDBClient) must present to access the
+// cross-tenant /private/api/prom/configs/* endpoints.
+const PrivateAPIAuthTokenHeader = "X-Cortex-Configs-Private-Token"
+
 // Config configures Configs API
 type Config struct {
 	Notifications NotificationsConfig `yaml:"notifications"`
+
+	// PrivateAPIAuthToken is a shared secret required on the undocumented
+	// /private/api/prom/configs/* endpoints that expose EVERY tenant's
+	// rules and Alertmanager configuration (including receiver
+	// credentials). If this value is empty, the private endpoints are
+	// disabled and return 403 — operators must configure a secret to re-
+	// enable them for the ruler/alertmanager ConfigDBClient. Historically
+	// these endpoints were unauthenticated, which allowed any caller that
+	// could reach the configs HTTP listener (directly or via a gateway
+	// that forwarded unknown paths) to dump every tenant's secrets.
+	PrivateAPIAuthToken string `yaml:"private_api_auth_token"`
 }
 
 // NotificationsConfig configures Alertmanager notifications method.
@@ -47,6 +64,7 @@ type NotificationsConfig struct {
 func (cfg *Config) RegisterFlags(f *flag.FlagSet) {
 	f.BoolVar(&cfg.Notifications.DisableEmail, "configs.notifications.disable-email", false, "Disable Email notifications for Alertmanager.")
 	f.BoolVar(&cfg.Notifications.DisableWebHook, "configs.notifications.disable-webhook", false, "Disable WebHook notifications for Alertmanager.")
+	f.StringVar(&cfg.PrivateAPIAuthToken, "configs.private-api.auth-token", "", "Shared secret required in the "+PrivateAPIAuthTokenHeader+" header on the cross-tenant /private/api/prom/configs/* endpoints. When unset the private endpoints are disabled and return 403; this must be configured (and provided to the ruler/alertmanager ConfigDBClient via -<prefix>configs.private-token) for those components to fetch per-tenant configuration.")
 }
 
 // API implements the configs api.
@@ -263,10 +281,38 @@ type ConfigsView struct {
 	Configs map[string]userconfig.View `json:"configs"`
 }
 
+// isTrustedInternalCaller returns true when the request presents the
+// configured shared-secret token in the PrivateAPIAuthTokenHeader. When no
+// token is configured, all callers are untrusted and the private endpoints
+// are effectively disabled: this is deliberately fail-closed because the
+// handler returns every tenant's Alertmanager configuration (including
+// receiver credentials) and alerting rules.
+func (a *API) isTrustedInternalCaller(r *http.Request) bool {
+	expected := a.cfg.PrivateAPIAuthToken
+	if expected == "" {
+		return false
+	}
+	provided := r.Header.Get(PrivateAPIAuthTokenHeader)
+	if provided == "" {
+		return false
+	}
+	// Constant-time compare to avoid leaking the token via timing.
+	return subtle.ConstantTimeCompare([]byte(provided), []byte(expected)) == 1
+}
+
 func (a *API) getConfigs(w http.ResponseWriter, r *http.Request) {
+	logger := util_log.WithContext(r.Context(), util_log.Logger)
+	if !a.isTrustedInternalCaller(r) {
+		if a.cfg.PrivateAPIAuthToken == "" {
+			level.Warn(logger).Log("msg", "rejecting request to /private/api/prom/configs/*: no configs.private-api.auth-token configured; set this flag and have the ruler/alertmanager ConfigDBClient present the token via "+PrivateAPIAuthTokenHeader)
+		} else {
+			level.Warn(logger).Log("msg", "rejecting unauthenticated request to /private/api/prom/configs/*", "remote", r.RemoteAddr, "path", r.URL.Path)
+		}
+		http.Error(w, "forbidden", http.StatusForbidden)
+		return
+	}
 	var cfgs map[string]userconfig.View
 	var cfgErr error
-	logger := util_log.WithContext(r.Context(), util_log.Logger)
 	rawSince := r.FormValue("since")
 	if rawSince == "" {
 		cfgs, cfgErr = a.db.GetAllConfigs(r.Context())

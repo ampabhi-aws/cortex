@@ -27,17 +27,30 @@ var (
 	errBadURL = errors.New("configs_api_url is not set or valid")
 )
 
+// privateAPIAuthTokenHeader is the HTTP header carrying the shared secret
+// that trusted internal callers (this client) present when requesting the
+// configs service's cross-tenant /private/api/prom/configs/* endpoints.
+// It MUST be kept in sync with pkg/configs/api.PrivateAPIAuthTokenHeader.
+const privateAPIAuthTokenHeader = "X-Cortex-Configs-Private-Token"
+
 // Config says where we can find the ruler userconfig.
 type Config struct {
 	ConfigsAPIURL flagext.URLValue     `yaml:"configs_api_url"`
 	ClientTimeout time.Duration        `yaml:"client_timeout"` // HTTP timeout duration for requests made to the Weave Cloud configs service.
 	TLS           tls_cfg.ClientConfig `yaml:",inline"`
+	// PrivateAPIAuthToken is the shared secret presented in the
+	// X-Cortex-Configs-Private-Token header when calling the configs
+	// service's /private/api/prom/configs/* endpoints. It must match the
+	// -configs.private-api.auth-token value configured on the configs
+	// service; otherwise the server will respond with 403.
+	PrivateAPIAuthToken string `yaml:"private_api_auth_token"`
 }
 
 // RegisterFlagsWithPrefix adds the flags required to config this to the given FlagSet
 func (cfg *Config) RegisterFlagsWithPrefix(prefix string, f *flag.FlagSet) {
 	f.Var(&cfg.ConfigsAPIURL, prefix+"configs.url", "URL of configs API server.")
 	f.DurationVar(&cfg.ClientTimeout, prefix+"configs.client-timeout", 5*time.Second, "Timeout for requests to Weave Cloud configs service.")
+	f.StringVar(&cfg.PrivateAPIAuthToken, prefix+"configs.private-token", "", "Shared secret presented in the "+privateAPIAuthTokenHeader+" header when calling the configs service's /private/api/prom/configs/* endpoints. Must match the -configs.private-api.auth-token value configured on the configs service.")
 	cfg.TLS.RegisterFlagsWithPrefix(prefix+"configs", f)
 }
 
@@ -66,8 +79,9 @@ func New(cfg Config) (*ConfigDBClient, error) {
 	}
 
 	client := &ConfigDBClient{
-		URL:     cfg.ConfigsAPIURL.URL,
-		Timeout: cfg.ClientTimeout,
+		URL:                 cfg.ConfigsAPIURL.URL,
+		Timeout:             cfg.ClientTimeout,
+		PrivateAPIAuthToken: cfg.PrivateAPIAuthToken,
 	}
 
 	tlsConfig, err := cfg.TLS.GetTLSConfig()
@@ -83,9 +97,10 @@ func New(cfg Config) (*ConfigDBClient, error) {
 
 // ConfigDBClient allows retrieving recording and alerting rules from the configs server.
 type ConfigDBClient struct {
-	URL       *url.URL
-	Timeout   time.Duration
-	TLSConfig *tls.Config
+	URL                 *url.URL
+	Timeout             time.Duration
+	TLSConfig           *tls.Config
+	PrivateAPIAuthToken string
 }
 
 // GetRules implements Client
@@ -98,7 +113,7 @@ func (c ConfigDBClient) GetRules(ctx context.Context, since userconfig.ID) (map[
 	var response *ConfigsResponse
 	err := instrument.CollectedRequest(ctx, "GetRules", configsRequestDuration, instrument.ErrorCode, func(ctx context.Context) error {
 		var err error
-		response, err = doRequest(endpoint, c.Timeout, c.TLSConfig, since)
+		response, err = doRequest(endpoint, c.Timeout, c.TLSConfig, c.PrivateAPIAuthToken, since)
 		return err
 	})
 	if err != nil {
@@ -124,13 +139,13 @@ func (c ConfigDBClient) GetAlerts(ctx context.Context, since userconfig.ID) (*Co
 	var response *ConfigsResponse
 	err := instrument.CollectedRequest(ctx, "GetAlerts", configsRequestDuration, instrument.ErrorCode, func(ctx context.Context) error {
 		var err error
-		response, err = doRequest(endpoint, c.Timeout, c.TLSConfig, since)
+		response, err = doRequest(endpoint, c.Timeout, c.TLSConfig, c.PrivateAPIAuthToken, since)
 		return err
 	})
 	return response, err
 }
 
-func doRequest(endpoint string, timeout time.Duration, tlsConfig *tls.Config, since userconfig.ID) (*ConfigsResponse, error) {
+func doRequest(endpoint string, timeout time.Duration, tlsConfig *tls.Config, authToken string, since userconfig.ID) (*ConfigsResponse, error) {
 	req, err := http.NewRequest("GET", endpoint, nil)
 	if err != nil {
 		return nil, err
@@ -142,6 +157,9 @@ func doRequest(endpoint string, timeout time.Duration, tlsConfig *tls.Config, si
 	}
 
 	req.Header.Set("User-Agent", fmt.Sprintf("Cortex/%s", version.Version))
+	if authToken != "" {
+		req.Header.Set(privateAPIAuthTokenHeader, authToken)
+	}
 
 	resp, err := client.Do(req)
 	if err != nil {

@@ -24,6 +24,10 @@ var (
 	counter  int
 )
 
+// testPrivateAPIAuthToken is the shared secret the tests inject into the
+// configs API and present on requests to /private/api/prom/configs/*.
+const testPrivateAPIAuthToken = "test-private-token"
+
 // setup sets up the environment for the tests.
 func setup(t *testing.T) {
 	database = dbtest.Setup(t)
@@ -31,6 +35,7 @@ func setup(t *testing.T) {
 		Notifications: NotificationsConfig{
 			DisableEmail: true,
 		},
+		PrivateAPIAuthToken: testPrivateAPIAuthToken,
 	})
 	counter = 0
 }
@@ -42,6 +47,7 @@ func setupWithEmailEnabled(t *testing.T) {
 		Notifications: NotificationsConfig{
 			DisableEmail: false,
 		},
+		PrivateAPIAuthToken: testPrivateAPIAuthToken,
 	})
 	counter = 0
 }
@@ -56,6 +62,11 @@ func request(t *testing.T, method, urlStr string, body io.Reader) *httptest.Resp
 	w := httptest.NewRecorder()
 	r, err := http.NewRequest(method, urlStr, body)
 	require.NoError(t, err)
+	// The /private/api/prom/configs/* endpoints require a shared-secret
+	// token. Historical tests exercise them without presenting any user
+	// identity, so inject the token the test harness configured on the
+	// API in setup() for every request.
+	r.Header.Set(PrivateAPIAuthTokenHeader, testPrivateAPIAuthToken)
 	app.ServeHTTP(w, r)
 	return w
 }

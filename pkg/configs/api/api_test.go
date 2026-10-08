@@ -4,11 +4,13 @@ import (
 	"encoding/json"
 	"fmt"
 	"net/http"
+	"net/http/httptest"
 	"os"
 	"path"
 	"strings"
 	"testing"
 
+	"github.com/cortexproject/cortex/pkg/configs/db/dbtest"
 	"github.com/cortexproject/cortex/pkg/configs/userconfig"
 
 	"github.com/stretchr/testify/assert"
@@ -220,6 +222,75 @@ func Test_GetConfigs_IncludesNewerConfigsAndExcludesOlder(t *testing.T) {
 		assert.Equal(t, ConfigsView{Configs: map[string]userconfig.View{
 			userID3: config3,
 		}}, found)
+	}
+}
+
+// Test_PrivateAPI_RequiresAuthToken verifies that /private/api/prom/configs/*
+// now refuses unauthenticated callers (no shared-secret token header) with
+// 403 Forbidden and does not leak any config data in the body. This is the
+// regression guard for the pre-fix behaviour where the handler returned
+// every tenant's rules and Alertmanager YAML (receiver credentials) to any
+// caller that could reach the HTTP listener.
+func Test_PrivateAPI_RequiresAuthToken(t *testing.T) {
+	setup(t)
+	defer cleanup(t)
+
+	// Seed data for at least one tenant so a buggy handler would have
+	// something sensitive to return.
+	userID := makeUserID()
+	config := makeConfig()
+	for _, c := range allClients {
+		c.post(t, userID, config)
+	}
+
+	for _, endpoint := range []string{rulesPrivateEndpoint, alertManagerConfigPrivateEndpoint} {
+		// No token: expect 403.
+		w := httptest.NewRecorder()
+		r, err := http.NewRequest("GET", endpoint, nil)
+		require.NoError(t, err)
+		app.ServeHTTP(w, r)
+		assert.Equal(t, http.StatusForbidden, w.Code, endpoint)
+		assert.NotContains(t, w.Body.String(), "\"configs\":", endpoint)
+
+		// Wrong token: still 403.
+		w = httptest.NewRecorder()
+		r, err = http.NewRequest("GET", endpoint, nil)
+		require.NoError(t, err)
+		r.Header.Set(PrivateAPIAuthTokenHeader, "not-the-token")
+		app.ServeHTTP(w, r)
+		assert.Equal(t, http.StatusForbidden, w.Code, endpoint)
+		assert.NotContains(t, w.Body.String(), "\"configs\":", endpoint)
+
+		// Correct token: 200.
+		w = httptest.NewRecorder()
+		r, err = http.NewRequest("GET", endpoint, nil)
+		require.NoError(t, err)
+		r.Header.Set(PrivateAPIAuthTokenHeader, testPrivateAPIAuthToken)
+		app.ServeHTTP(w, r)
+		assert.Equal(t, http.StatusOK, w.Code, endpoint)
+	}
+}
+
+// Test_PrivateAPI_FailsClosedWhenTokenUnset verifies the fail-closed default:
+// if the operator has not configured a token, the private endpoints return
+// 403 for every caller (including those that happen to send the header).
+func Test_PrivateAPI_FailsClosedWhenTokenUnset(t *testing.T) {
+	database = dbtest.Setup(t)
+	app = New(database, Config{})
+	counter = 0
+	defer cleanup(t)
+
+	for _, endpoint := range []string{rulesPrivateEndpoint, alertManagerConfigPrivateEndpoint} {
+		for _, tok := range []string{"", "anything", testPrivateAPIAuthToken} {
+			w := httptest.NewRecorder()
+			r, err := http.NewRequest("GET", endpoint, nil)
+			require.NoError(t, err)
+			if tok != "" {
+				r.Header.Set(PrivateAPIAuthTokenHeader, tok)
+			}
+			app.ServeHTTP(w, r)
+			assert.Equal(t, http.StatusForbidden, w.Code, endpoint, tok)
+		}
 	}
 }
 

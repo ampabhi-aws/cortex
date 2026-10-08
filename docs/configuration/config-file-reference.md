@@ -3008,6 +3008,17 @@ api:
     # Disable WebHook notifications for Alertmanager.
     # CLI flag: -configs.notifications.disable-webhook
     [disable_webhook: <boolean> | default = false]
+
+  # Shared secret required in the X-Cortex-Configs-Private-Token header on
+  # the cross-tenant /private/api/prom/configs/* endpoints. When unset the
+  # private endpoints are disabled and return 403; this must be configured
+  # (and provided to the ruler/alertmanager ConfigDBClient via
+  # -<prefix>configs.private-token) for those components to fetch per-tenant
+  # configuration. These endpoints return every tenant's rules and
+  # Alertmanager configuration (including receiver credentials) and must
+  # never be reachable from tenant-facing ingress.
+  # CLI flag: -configs.private-api.auth-token
+  [private_api_auth_token: <string> | default = ""]
 ```
 
 ### `configstore_config`
