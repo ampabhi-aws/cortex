@@ -275,7 +275,16 @@ func (a *API) RegisterIngester(i Ingester, pushConfig distributor.Config) {
 	a.RegisterRoute("/push", push.Handler(pushConfig.MaxRecvMsgSize, a.sourceIPs, i.Push), true, "POST") // For testing and debugging.
 }
 
-func (a *API) RegisterTenantDeletion(api *purger.TenantDeletionAPI) {
+func (a *API) RegisterTenantDeletion(api *purger.TenantDeletionAPI, cfg purger.Config) {
+	// The tenant deletion endpoint is an admin operation that acts on the tenant
+	// taken from the X-Scope-OrgID header. Because Cortex has no application-layer
+	// admin principal, operators must explicitly opt in to exposing the route;
+	// otherwise it is intentionally not registered. The status endpoint is a
+	// read-only check and is only exposed when the deletion endpoint is enabled,
+	// so a disabled deployment presents a single, consistent surface.
+	if !cfg.EnableTenantDeletionAPI {
+		return
+	}
 	a.RegisterRoute("/purger/delete_tenant", http.HandlerFunc(api.DeleteTenant), true, "POST")
 	a.RegisterRoute("/purger/delete_tenant_status", http.HandlerFunc(api.DeleteTenantStatus), true, "GET")
 }

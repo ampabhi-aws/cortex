@@ -799,6 +799,14 @@ Request deletion of ALL tenant data. Only works with blocks storage. Experimenta
 
 _Requires [authentication](#authentication)._
 
+This is an admin-only operation and is **disabled by default**. To expose it,
+start Cortex with `-purger.enable-tenant-deletion-api=true` (or set
+`purger.enable_tenant_deletion_api: true` in the YAML configuration). Operators
+must additionally gate the route at the deployment layer (reverse proxy or
+network policy) so it is not reachable by tenants, because Cortex has no
+application-layer admin principal and the tenant acted on is taken from the
+`X-Scope-OrgID` request header.
+
 ### Tenant Delete Status
 
 ```
@@ -808,6 +816,9 @@ GET /purger/delete_tenant_status
 Returns status of tenant deletion. Output format to be defined. Experimental.
 
 _Requires [authentication](#authentication)._
+
+Also disabled by default; exposed only when
+`-purger.enable-tenant-deletion-api` is set to `true`.
 
 ## Store-gateway
 
