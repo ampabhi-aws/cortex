@@ -283,13 +283,21 @@ func (a *API) RegisterTenantDeletion(api *purger.TenantDeletionAPI) {
 // RegisterRuler registers routes associated with the Ruler service.
 func (a *API) RegisterRuler(r *ruler.Ruler) {
 	a.indexPage.AddLink(SectionAdminEndpoints, "/ruler/ring", "Ruler Ring Status")
-	a.RegisterRoute("/ruler/ring", r, false, "GET", "POST")
+	// GET /ruler/ring exposes the ruler ring status page and is safe to expose
+	// unauthenticated. POST on the same path is an administrative "forget
+	// instance" operation (see Ring.ServeHTTP in pkg/ring/http.go) that mutates
+	// the shared ring KV; it must be gated by AuthMiddleware so it is only
+	// reachable through the operator-controlled authentication layer and never
+	// anonymously (CWE-306).
+	a.RegisterRoute("/ruler/ring", r, false, "GET")
+	a.RegisterRoute("/ruler/ring", r, true, "POST")
 
 	// Administrative API, uses authentication to inform which user's configuration to delete.
 	a.RegisterRoute("/ruler/delete_tenant_config", http.HandlerFunc(r.DeleteTenantConfiguration), true, "POST")
 
-	// Legacy Ring Route
-	a.RegisterRoute("/ruler_ring", r, false, "GET", "POST")
+	// Legacy Ring Route - same auth split as /ruler/ring above.
+	a.RegisterRoute("/ruler_ring", r, false, "GET")
+	a.RegisterRoute("/ruler_ring", r, true, "POST")
 
 	// List all user rule groups
 	a.RegisterRoute("/ruler/rule_groups", http.HandlerFunc(r.ListAllRules), false, "GET")
