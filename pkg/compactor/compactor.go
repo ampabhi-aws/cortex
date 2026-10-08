@@ -491,7 +491,12 @@ func (c *Compactor) starting(ctx context.Context) error {
 	c.bucketClient = bucketindex.BucketWithGlobalMarkers(c.bucketClient)
 
 	// Create the users scanner.
-	c.usersScanner = cortex_tsdb.NewUsersScanner(c.bucketClient, c.ownUserForCleanUp, c.parentLogger)
+	// The blocks cleaner performs destructive operations (hard-deletes blocks and rewrites
+	// bucket-index.json.gz) under the single-owner invariant. If the ownership check errors
+	// (e.g. during a transient ring/KV flap), every replica would otherwise treat itself as
+	// the owner and concurrently clean the same tenant. Fail closed by skipping the tenant
+	// until the owner can be determined, matching the compaction path's behaviour.
+	c.usersScanner = cortex_tsdb.NewUsersScannerWithPolicy(c.bucketClient, c.ownUserForCleanUp, cortex_tsdb.OnOwnershipErrorSkip, c.parentLogger)
 
 	// Create the blocks cleaner (service).
 	c.blocksCleaner = NewBlocksCleaner(BlocksCleanerConfig{
