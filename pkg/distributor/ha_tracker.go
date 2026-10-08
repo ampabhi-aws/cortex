@@ -6,6 +6,7 @@ import (
 	"flag"
 	"fmt"
 	"math/rand"
+	"net/url"
 	"strings"
 	"sync"
 	"time"
@@ -374,7 +375,11 @@ func (c *haTracker) checkReplica(ctx context.Context, userID, cluster, replica s
 	if !c.cfg.EnableHATracker {
 		return nil
 	}
-	key := fmt.Sprintf("%s/%s", userID, cluster)
+	// Escape the cluster component so a tenant-controlled value can't shape the KV key
+	// path (e.g. inject path traversal segments like "../.." into the Consul HTTP URL).
+	// Length / format validation also runs in Distributor.checkSample, but we defend in
+	// depth here because checkReplica is a public method on the tracker.
+	key := fmt.Sprintf("%s/%s", userID, url.PathEscape(cluster))
 
 	c.electedLock.RLock()
 	entry, ok := c.elected[key]

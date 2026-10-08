@@ -489,6 +489,17 @@ func (d *Distributor) checkSample(ctx context.Context, userID, cluster, replica 
 		return false, nil
 	}
 
+	// Validate the cluster label before it is used as a KV key, metric label, and long-lived
+	// map key. Without this check a tenant can drive unbounded KV / metric / heap growth on
+	// every distributor by sending push requests with oversized or syntactically-exotic cluster
+	// labels (the sample itself may later fail validation, but the HA tracker state is already
+	// created and the rejection does not roll it back). See CWE-770.
+	if len(cluster) > d.limits.MaxLabelValueLength(userID) ||
+		!model.LabelValue(cluster).IsValid() ||
+		strings.ContainsAny(cluster, "/\\") {
+		return false, httpgrpc.Errorf(http.StatusBadRequest, "invalid HA cluster label")
+	}
+
 	// At this point we know we have both HA labels, we should lookup
 	// the cluster/instance here to see if we want to accept this sample.
 	err := d.HATracker.checkReplica(ctx, userID, cluster, replica, time.Now())
