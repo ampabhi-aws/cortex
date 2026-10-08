@@ -20,6 +20,7 @@ import (
 	amconfig "github.com/prometheus/alertmanager/config"
 	amtemplate "github.com/prometheus/alertmanager/template"
 
+	"github.com/cortexproject/cortex/pkg/alertmanager"
 	"github.com/cortexproject/cortex/pkg/configs/db"
 	"github.com/cortexproject/cortex/pkg/configs/userconfig"
 	"github.com/cortexproject/cortex/pkg/tenant"
@@ -230,6 +231,26 @@ func validateAlertmanagerConfig(cfg string, noCfg NotificationsConfig) error {
 		return err
 	}
 
+	// Reuse the modern Alertmanager validation: this is the reflective
+	// deny-list that rejects *_file secret sources (basic_auth.password_file,
+	// authorization.credentials_file, bearer_token_file,
+	// oauth2.client_secret_file, tls_config.*_file, slack_api_url_file,
+	// VictorOps api_key_file). Without it a tenant could point one of these
+	// fields at an operator-side file (e.g. a Kubernetes service-account
+	// token) and have the Alertmanager process read it and ship its contents
+	// to a tenant-controlled receiver.
+	if err := alertmanager.ValidateAlertmanagerConfig(amCfg); err != nil {
+		return err
+	}
+
+	// Reuse the modern template filename validation on any templates
+	// referenced from the Alertmanager config.
+	for _, name := range amCfg.Templates {
+		if err := alertmanager.ValidateTemplateFilename(name); err != nil {
+			return err
+		}
+	}
+
 	for _, recv := range amCfg.Receivers {
 		if noCfg.DisableEmail && len(recv.EmailConfigs) > 0 {
 			return ErrEmailNotificationsAreDisabled
@@ -249,6 +270,12 @@ func validateRulesFiles(c userconfig.Config) error {
 
 func validateTemplateFiles(c userconfig.Config) error {
 	for fn, content := range c.TemplateFiles {
+		// Reject filenames that contain any path component so a tenant cannot
+		// cause the Alertmanager to write template files outside of its own
+		// per-tenant templates directory.
+		if err := alertmanager.ValidateTemplateFilename(fn); err != nil {
+			return err
+		}
 		if _, err := template.New(fn).Funcs(template.FuncMap(amtemplate.DefaultFuncs)).Parse(content); err != nil {
 			return err
 		}

