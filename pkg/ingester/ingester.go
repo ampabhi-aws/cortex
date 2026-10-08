@@ -234,6 +234,7 @@ type userTSDB struct {
 	stateMtx       sync.RWMutex
 	state          tsdbState
 	pushesInFlight sync.WaitGroup // Increased with stateMtx read lock held, only if state == active or activeShipping.
+	readsInFlight  sync.WaitGroup // Increased with stateMtx read lock held, only if state == active, activeShipping or forceCompacting.
 
 	// Used to detect idle TSDBs.
 	lastUpdate atomic.Int64
@@ -1159,6 +1160,35 @@ func (u *userTSDB) releaseAppendLock() {
 	u.pushesInFlight.Done()
 }
 
+// acquireReadLock registers an in-flight read against the TSDB, mirroring
+// acquireAppendLock. It must be released by calling releaseReadLock. Reads
+// are allowed in active, activeShipping and forceCompacting states; any
+// closing/closed state is rejected so that closeAndDeleteUserTSDBIfIdle
+// (and closeAllTSDB on shutdown) can wait for readers to finish before
+// calling userDB.Close() and os.RemoveAll(dir).
+func (u *userTSDB) acquireReadLock() error {
+	u.stateMtx.RLock()
+	defer u.stateMtx.RUnlock()
+
+	switch u.state {
+	case active:
+	case activeShipping:
+	case forceCompacting:
+		// Reads are allowed.
+	case closing:
+		return errors.New("TSDB is closing")
+	default:
+		return errors.New("TSDB is not active")
+	}
+
+	u.readsInFlight.Add(1)
+	return nil
+}
+
+func (u *userTSDB) releaseReadLock() {
+	u.readsInFlight.Done()
+}
+
 // Query implements service.IngesterServer
 func (i *Ingester) Query(ctx context.Context, req *client.QueryRequest) (*client.QueryResponse, error) {
 	if err := i.checkRunning(); err != nil {
@@ -1188,6 +1218,11 @@ func (i *Ingester) Query(ctx context.Context, req *client.QueryRequest) (*client
 	if db == nil {
 		return &client.QueryResponse{}, nil
 	}
+
+	if err := db.acquireReadLock(); err != nil {
+		return nil, status.Error(codes.Unavailable, err.Error())
+	}
+	defer db.releaseReadLock()
 
 	q, err := db.Querier(ctx, int64(from), int64(through))
 	if err != nil {
@@ -1253,6 +1288,11 @@ func (i *Ingester) QueryExemplars(ctx context.Context, req *client.ExemplarQuery
 		return &client.ExemplarQueryResponse{}, nil
 	}
 
+	if err := db.acquireReadLock(); err != nil {
+		return nil, status.Error(codes.Unavailable, err.Error())
+	}
+	defer db.releaseReadLock()
+
 	q, err := db.ExemplarQuerier(ctx)
 	if err != nil {
 		return nil, err
@@ -1302,6 +1342,11 @@ func (i *Ingester) LabelValues(ctx context.Context, req *client.LabelValuesReque
 	if db == nil {
 		return &client.LabelValuesResponse{}, nil
 	}
+
+	if err := db.acquireReadLock(); err != nil {
+		return nil, status.Error(codes.Unavailable, err.Error())
+	}
+	defer db.releaseReadLock()
 
 	mint, maxt, err := metadataQueryRange(startTimestampMs, endTimestampMs, db)
 	if err != nil {
@@ -1364,6 +1409,11 @@ func (i *Ingester) LabelNames(ctx context.Context, req *client.LabelNamesRequest
 		return &client.LabelNamesResponse{}, nil
 	}
 
+	if err := db.acquireReadLock(); err != nil {
+		return nil, status.Error(codes.Unavailable, err.Error())
+	}
+	defer db.releaseReadLock()
+
 	mint, maxt, err := metadataQueryRange(req.StartTimestampMs, req.EndTimestampMs, db)
 	if err != nil {
 		return nil, err
@@ -1425,6 +1475,11 @@ func (i *Ingester) MetricsForLabelMatchers(ctx context.Context, req *client.Metr
 	if db == nil {
 		return &client.MetricsForLabelMatchersResponse{}, nil
 	}
+
+	if err := db.acquireReadLock(); err != nil {
+		return nil, status.Error(codes.Unavailable, err.Error())
+	}
+	defer db.releaseReadLock()
 
 	// Parse the request
 	_, _, matchersSet, err := client.FromMetricsForLabelMatchersRequest(req)
@@ -1553,6 +1608,11 @@ func (i *Ingester) UserStats(ctx context.Context, req *client.UserStatsRequest) 
 		return &client.UserStatsResponse{}, nil
 	}
 
+	if err := db.acquireReadLock(); err != nil {
+		return nil, status.Error(codes.Unavailable, err.Error())
+	}
+	defer db.releaseReadLock()
+
 	return createUserStats(db), nil
 }
 
@@ -1571,9 +1631,15 @@ func (i *Ingester) AllUserStats(_ context.Context, _ *client.UserStatsRequest) (
 		Stats: make([]*client.UserIDStatsResponse, 0, len(users)),
 	}
 	for userID, db := range users {
+		if err := db.acquireReadLock(); err != nil {
+			// Skip TSDBs that are closing/closed so we never dereference a closed Head.
+			continue
+		}
+		stats := createUserStats(db)
+		db.releaseReadLock()
 		response.Stats = append(response.Stats, &client.UserIDStatsResponse{
 			UserId: userID,
-			Data:   createUserStats(db),
+			Data:   stats,
 		})
 	}
 	return response, nil
@@ -1625,6 +1691,11 @@ func (i *Ingester) QueryStream(req *client.QueryRequest, stream client.Ingester_
 	if db == nil {
 		return nil
 	}
+
+	if err := db.acquireReadLock(); err != nil {
+		return status.Error(codes.Unavailable, err.Error())
+	}
+	defer db.releaseReadLock()
 
 	numSamples := 0
 	numSeries := 0
@@ -1918,10 +1989,20 @@ func (i *Ingester) closeAllTSDB() {
 		go func(db *userTSDB) {
 			defer wg.Done()
 
+			// Transition the TSDB out of active before closing so new read RPCs are rejected,
+			// then wait for any in-flight pushes and reads to finish before Close() unmaps
+			// head chunks and closes block readers.
+			if db.casState(active, closing) {
+				db.pushesInFlight.Wait()
+				db.readsInFlight.Wait()
+			}
+
 			if err := db.Close(); err != nil {
 				level.Warn(i.logger).Log("msg", "unable to close TSDB", "err", err, "user", userID)
 				return
 			}
+
+			db.casState(closing, closed)
 
 			// Now that the TSDB has been closed, we should remove it from the
 			// set of open ones. This lock acquisition doesn't deadlock with the
@@ -2288,6 +2369,10 @@ func (i *Ingester) closeAndDeleteUserTSDBIfIdle(userID string) tsdbCloseCheckRes
 	// Make sure we don't ignore any possible inflight pushes.
 	userDB.pushesInFlight.Wait()
 
+	// Wait for in-flight reads too, so no reader can be iterating mmapped chunks
+	// (or holding a querier) when we Close() the TSDB and os.RemoveAll(dir).
+	userDB.readsInFlight.Wait()
+
 	// Verify again, things may have changed during the checks and pushes.
 	tenantDeleted := false
 	if result := userDB.shouldCloseTSDB(i.cfg.BlocksStorageConfig.TSDB.CloseIdleTSDBTimeout); !result.shouldClose() {
@@ -2314,11 +2399,11 @@ func (i *Ingester) closeAndDeleteUserTSDBIfIdle(userID string) tsdbCloseCheckRes
 	// This will prevent going back to "active" state in deferred statement.
 	userDB.casState(closing, closed)
 
-	// Only remove user from TSDBState when everything is cleaned up
-	// This will prevent concurrency problems when cortex are trying to open new TSDB - Ie: New request for a given tenant
-	// came in - while closing the tsdb for the same tenant.
-	// If this happens now, the request will get reject as the push will not be able to acquire the lock as the tsdb will be
-	// in closed state
+	// Only remove user from TSDBState when everything is cleaned up.
+	// New read RPCs that pick up this *userTSDB via getTSDB() are rejected by acquireReadLock
+	// because state == closing/closed; new pushes are rejected by acquireAppendLock for the
+	// same reason. This also prevents concurrency problems with getOrCreateTSDB racing
+	// Close()+os.RemoveAll on the same on-disk directory.
 	defer func() {
 		i.stoppedMtx.Lock()
 		delete(i.TSDBState.dbs, userID)
