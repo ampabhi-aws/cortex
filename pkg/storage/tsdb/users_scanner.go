@@ -44,13 +44,21 @@ func (s *UsersScanner) ScanUsers(ctx context.Context) (users, markedForDeletion 
 
 	// Check users for being owned by instance, and split users into non-deleted and deleted.
 	// We do these checks after listing all users, to improve cacheability of Iter (result is only cached at the end of Iter call).
+	//
+	// We fail CLOSED on both checks: when ownership cannot be determined, or when the tenant
+	// deletion mark cannot be read, the tenant is excluded from the returned lists. This mirrors
+	// the compaction loop (pkg/compactor/compactor.go) and prevents destructive callers (e.g.
+	// BlocksCleaner.cleanUser / deleteUserMarkedForDeletion) from racing on the same tenant
+	// across replicas when the ring is empty, inconsistent, or the token owner is unhealthy.
 	for ix := 0; ix < len(users); {
 		userID := users[ix]
 
 		// Check if it's owned by this instance.
 		owned, err := s.isOwned(userID)
 		if err != nil {
-			level.Warn(s.logger).Log("msg", "unable to check if user is owned by this shard", "user", userID, "err", err)
+			level.Warn(s.logger).Log("msg", "unable to check if user is owned by this shard; skipping it", "user", userID, "err", err)
+			users = append(users[:ix], users[ix+1:]...)
+			continue
 		} else if !owned {
 			users = append(users[:ix], users[ix+1:]...)
 			continue
@@ -58,7 +66,9 @@ func (s *UsersScanner) ScanUsers(ctx context.Context) (users, markedForDeletion 
 
 		deletionMarkExists, err := TenantDeletionMarkExists(ctx, s.bucketClient, userID)
 		if err != nil {
-			level.Warn(s.logger).Log("msg", "unable to check if user is marked for deletion", "user", userID, "err", err)
+			level.Warn(s.logger).Log("msg", "unable to check if user is marked for deletion; skipping it", "user", userID, "err", err)
+			users = append(users[:ix], users[ix+1:]...)
+			continue
 		} else if deletionMarkExists {
 			users = append(users[:ix], users[ix+1:]...)
 			markedForDeletion = append(markedForDeletion, userID)

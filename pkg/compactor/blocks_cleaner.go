@@ -258,7 +258,10 @@ func (c *BlocksCleaner) deleteUserMarkedForDeletion(ctx context.Context, userID 
 		return errors.Wrap(err, "failed to read tenant deletion mark")
 	}
 	if mark == nil {
-		return errors.Wrap(err, "cannot find tenant deletion mark anymore")
+		// A concurrent cleaner (e.g. during ring propagation) may have already removed the
+		// tenant deletion mark. Return an explicit error instead of errors.Wrap(nil, ...),
+		// which would silently return nil and hide the race from the operator.
+		return errors.New("cannot find tenant deletion mark anymore")
 	}
 
 	// If we have just deleted some blocks, update "finished" time. Also update "finished" time if it wasn't set yet, but there are no blocks.
