@@ -15,6 +15,7 @@ import (
 
 	"github.com/cortexproject/cortex/pkg/tenant"
 	"github.com/cortexproject/cortex/pkg/util/concurrency"
+	"github.com/cortexproject/cortex/pkg/util/limiter"
 	"github.com/cortexproject/cortex/pkg/util/spanlogger"
 )
 
@@ -23,6 +24,18 @@ const (
 	retainExistingPrefix = "original_"
 	maxConcurrency       = 16
 )
+
+// QueryLimits is the subset of per-tenant query limits used by the
+// tenant-federation merge queryable to install a single per-request
+// QueryLimiter that is shared across all federated sub-queriers. The concrete
+// implementation is *validation.Overrides; it is accepted as an interface here
+// to avoid an import cycle and to keep the package testable.
+type QueryLimits interface {
+	MaxFetchedSeriesPerQuery(userID string) int
+	MaxFetchedChunkBytesPerQuery(userID string) int
+	MaxChunksPerQuery(userID string) int
+	MaxFetchedDataBytesPerQuery(userID string) int
+}
 
 // NewQueryable returns a queryable that iterates through all the tenant IDs
 // that are part of the request and aggregates the results from each tenant's
@@ -36,15 +49,36 @@ const (
 // If the label "__tenant_id__" is already existing, its value is overwritten
 // by the tenant ID and the previous value is exposed through a new label
 // prefixed with "original_". This behaviour is not implemented recursively.
-func NewQueryable(upstream storage.Queryable, byPassWithSingleQuerier bool) storage.Queryable {
-	return NewMergeQueryable(defaultTenantLabel, tenantQuerierCallback(upstream), byPassWithSingleQuerier)
+//
+// If limits is non-nil, a single QueryLimiter is installed into the request
+// context before the per-tenant sub-queriers are built, so the per-query
+// resource limits (max series, chunk bytes, chunks, data bytes) are enforced
+// per request rather than per tenant.
+func NewQueryable(upstream storage.Queryable, byPassWithSingleQuerier bool, limits QueryLimits) storage.Queryable {
+	return NewMergeQueryable(defaultTenantLabel, tenantQuerierCallback(upstream, limits), byPassWithSingleQuerier)
 }
 
-func tenantQuerierCallback(queryable storage.Queryable) MergeQuerierCallback {
+func tenantQuerierCallback(queryable storage.Queryable, limits QueryLimits) MergeQuerierCallback {
 	return func(ctx context.Context, mint int64, maxt int64) ([]string, []storage.Querier, error) {
 		tenantIDs, err := tenant.TenantIDs(ctx)
 		if err != nil {
 			return nil, nil, err
+		}
+
+		// Install a single per-request QueryLimiter shared across every
+		// federated sub-querier, unless one is already present on the context.
+		// Without this, pkg/querier.NewQueryable allocates a fresh limiter per
+		// tenant, effectively multiplying the configured per-query limits by
+		// the number of federated tenants.
+		if limits != nil && len(tenantIDs) > 0 {
+			if _, ok := limiter.QueryLimiterFromContext(ctx); !ok {
+				ctx = limiter.AddQueryLimiterToContext(ctx, limiter.NewQueryLimiter(
+					minLimit(tenantIDs, limits.MaxFetchedSeriesPerQuery),
+					minLimit(tenantIDs, limits.MaxFetchedChunkBytesPerQuery),
+					minLimit(tenantIDs, limits.MaxChunksPerQuery),
+					minLimit(tenantIDs, limits.MaxFetchedDataBytesPerQuery),
+				))
+			}
 		}
 
 		var queriers = make([]storage.Querier, len(tenantIDs))
@@ -62,6 +96,25 @@ func tenantQuerierCallback(queryable storage.Queryable) MergeQuerierCallback {
 
 		return tenantIDs, queriers, nil
 	}
+}
+
+// minLimit returns the most restrictive non-zero limit across all tenantIDs.
+// A zero value is treated as "unlimited": if every tenant has 0 for the given
+// limit, the result is 0 (unlimited); otherwise the smallest non-zero value is
+// returned. This matches the existing per-query limit semantics in
+// pkg/util/limiter.QueryLimiter.
+func minLimit(tenantIDs []string, lookup func(string) int) int {
+	min := 0
+	for _, id := range tenantIDs {
+		v := lookup(id)
+		if v <= 0 {
+			continue
+		}
+		if min == 0 || v < min {
+			min = v
+		}
+	}
+	return min
 }
 
 // MergeQuerierCallback returns the underlying queriers and their IDs relevant
