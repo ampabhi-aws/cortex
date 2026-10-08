@@ -81,8 +81,9 @@ const (
 )
 
 var (
-	errExemplarRef      = errors.New("exemplars not ingested because series not already present")
-	errIngesterStopping = errors.New("ingester stopping")
+	errExemplarRef                   = errors.New("exemplars not ingested because series not already present")
+	errIngesterStopping              = errors.New("ingester stopping")
+	errSampleTimestampTooFarInFuture = errors.New("sample timestamp too far in future")
 )
 
 // Config for an Ingester.
@@ -306,6 +307,13 @@ func (u *userTSDB) casState(from, to tsdbState) bool {
 	return true
 }
 
+// maxHeadCompactionRanges caps the number of block-range iterations compactHead
+// will perform in a single invocation. This is defence-in-depth against an
+// attacker-controlled far-future sample timestamp that would otherwise force
+// compactHead to iterate across a vast number of 2h ranges and wedge the
+// single shared compactionLoop goroutine (cross-tenant DoS).
+const maxHeadCompactionRanges = 24
+
 // compactHead compacts the Head block at specified block durations avoiding a single huge block.
 func (u *userTSDB) compactHead(blockDuration int64) error {
 	if !u.casState(active, forceCompacting) {
@@ -323,7 +331,21 @@ func (u *userTSDB) compactHead(blockDuration int64) error {
 
 	minTime, maxTime := h.MinTime(), h.MaxTime()
 
-	for (minTime/blockDuration)*blockDuration != (maxTime/blockDuration)*blockDuration {
+	// Clamp maxTime to "now + blockDuration" so a poisoned far-future sample
+	// cannot force this loop to iterate for an unbounded number of ranges.
+	// Only clamp when the ceiling is still above minTime so we never produce an
+	// inverted (maxTime < minTime) range.
+	if blockDuration > 0 {
+		ceiling := time.Now().UnixMilli() + blockDuration
+		if maxTime > ceiling && ceiling > minTime {
+			maxTime = ceiling
+		}
+	}
+
+	for iters := 0; (minTime/blockDuration)*blockDuration != (maxTime/blockDuration)*blockDuration; iters++ {
+		if iters >= maxHeadCompactionRanges {
+			return errors.Errorf("TSDB head spans too many block ranges (minTime=%d maxTime=%d blockDuration=%d); refusing to compact", minTime, maxTime, blockDuration)
+		}
 		// Data in Head spans across multiple block ranges, so we break it into blocks here.
 		// Block max time is exclusive, so we do a -1 here.
 		blockMaxTime := ((minTime/blockDuration)+1)*blockDuration - 1
@@ -333,6 +355,12 @@ func (u *userTSDB) compactHead(blockDuration int64) error {
 
 		// Get current min/max times after compaction.
 		minTime, maxTime = h.MinTime(), h.MaxTime()
+		if blockDuration > 0 {
+			ceiling := time.Now().UnixMilli() + blockDuration
+			if maxTime > ceiling && ceiling > minTime {
+				maxTime = ceiling
+			}
+		}
 	}
 
 	return u.db.CompactHead(tsdb.NewRangeHead(h, minTime, maxTime))
@@ -945,6 +973,7 @@ func (i *Ingester) Push(ctx context.Context, req *cortexpb.WriteRequest) (*corte
 		startAppend               = time.Now()
 		sampleOutOfBoundsCount    = 0
 		sampleOutOfOrderCount     = 0
+		sampleTooFarInFutureCount = 0
 		newValueForTimestampCount = 0
 		perUserSeriesLimitCount   = 0
 		perMetricSeriesLimitCount = 0
@@ -955,6 +984,14 @@ func (i *Ingester) Push(ctx context.Context, req *cortexpb.WriteRequest) (*corte
 			}
 		}
 	)
+
+	// Compute the per-request upper bound for sample timestamps so the ingester
+	// cannot be fed arbitrarily far-future samples (which would otherwise push the
+	// TSDB head MaxTime forward by millennia and wedge head compaction). This is
+	// defence-in-depth: the distributor already enforces the same check for the
+	// /api/v1/push path, but the direct ingester endpoints (/ingester/push,
+	// legacy /push and gRPC cortex.Ingester/Push) bypass the distributor entirely.
+	maxValidTimestamp := startAppend.Add(i.limits.CreationGracePeriod(userID)).UnixMilli()
 
 	// Walk the samples, appending them to the users database
 	app := db.Appender(ctx).(extendedAppender)
@@ -970,6 +1007,20 @@ func (i *Ingester) Push(ctx context.Context, req *cortexpb.WriteRequest) (*corte
 
 		for _, s := range ts.Samples {
 			var err error
+
+			// Reject samples with timestamps too far in the future before they
+			// reach the TSDB appender. Without this, a single poisoned sample can
+			// raise the head MaxTime arbitrarily and cause head compaction to
+			// iterate across an unbounded number of block ranges, wedging the
+			// shared per-ingester compaction loop and causing cross-tenant DoS.
+			if s.TimestampMs > maxValidTimestamp {
+				sampleTooFarInFutureCount++
+				failedSamplesCount++
+				updateFirstPartial(func() error {
+					return makeLimitError(sampleTooFarInFuture, wrappedTSDBIngestErr(errSampleTimestampTooFarInFuture, model.Time(s.TimestampMs), ts.Labels))
+				})
+				continue
+			}
 
 			// If the cached reference exists, we try to use it.
 			if ref != 0 {
@@ -1100,6 +1151,9 @@ func (i *Ingester) Push(ctx context.Context, req *cortexpb.WriteRequest) (*corte
 	}
 	if sampleOutOfOrderCount > 0 {
 		validation.DiscardedSamples.WithLabelValues(sampleOutOfOrder, userID).Add(float64(sampleOutOfOrderCount))
+	}
+	if sampleTooFarInFutureCount > 0 {
+		validation.DiscardedSamples.WithLabelValues(sampleTooFarInFuture, userID).Add(float64(sampleTooFarInFutureCount))
 	}
 	if newValueForTimestampCount > 0 {
 		validation.DiscardedSamples.WithLabelValues(newValueForTimestamp, userID).Add(float64(newValueForTimestampCount))
