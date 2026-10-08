@@ -45,6 +45,7 @@ var (
 	errTLSFileNotAllowed             = errors.New("setting TLS ca_file, cert_file and key_file is not allowed")
 	errSlackAPIURLFileNotAllowed     = errors.New("setting Slack api_url_file and global slack_api_url_file is not allowed")
 	errVictorOpsAPIKeyFileNotAllowed = errors.New("setting VictorOps api_key_file is not allowed")
+	errSNSAmbientCredsNotAllowed     = errors.New("sns_configs require explicit sigv4 access_key/secret_key; profile and role_arn are not allowed")
 )
 
 // UserConfig is used to communicate a users alertmanager configs
@@ -350,6 +351,11 @@ func validateAlertmanagerConfig(cfg interface{}) error {
 		if err := validateVictorOpsConfig(v.Interface().(config.VictorOpsConfig)); err != nil {
 			return err
 		}
+
+	case reflect.TypeOf(config.SNSConfig{}):
+		if err := validateSNSConfig(v.Interface().(config.SNSConfig)); err != nil {
+			return err
+		}
 	}
 
 	// If the input config is a struct, recursively iterate on all fields.
@@ -446,6 +452,23 @@ func validateSlackConfig(cfg config.SlackConfig) error {
 func validateVictorOpsConfig(cfg config.VictorOpsConfig) error {
 	if cfg.APIKeyFile != "" {
 		return errVictorOpsAPIKeyFileNotAllowed
+	}
+	return nil
+}
+
+// validateSNSConfig validates the SNS receiver config and returns an error if it contains
+// settings not allowed by Cortex. Tenant-supplied SNS configs must carry self-contained
+// SigV4 credentials: `profile` and `role_arn` reach into the Cortex process's own
+// filesystem / IAM identity (ambient credential chain) and `access_key`/`secret_key`
+// omission falls back to the AWS SDK default chain. Either case lets a tenant sign
+// requests with the Cortex process's AWS identity and ship them to a tenant-controlled
+// endpoint, so we reject both.
+func validateSNSConfig(cfg config.SNSConfig) error {
+	if cfg.Sigv4.Profile != "" || cfg.Sigv4.RoleARN != "" {
+		return errSNSAmbientCredsNotAllowed
+	}
+	if cfg.Sigv4.AccessKey == "" || string(cfg.Sigv4.SecretKey) == "" {
+		return errSNSAmbientCredsNotAllowed
 	}
 	return nil
 }
