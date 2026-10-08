@@ -795,7 +795,18 @@ The Purger service provides APIs for requesting deletion of tenants.
 POST /purger/delete_tenant
 ```
 
-Request deletion of ALL tenant data. Only works with blocks storage. Experimental.
+Requests deletion of the tenant's **blocks-storage** data only. Experimental.
+
+This endpoint writes a tenant deletion mark to the blocks bucket. The compactor's blocks cleaner then asynchronously deletes the tenant's blocks, and ingesters stop shipping new blocks for this tenant once they observe the mark.
+
+**This endpoint does NOT delete all tenant data.** The following data classes are **not** touched by this endpoint and must be deleted separately if desired:
+
+- **Alertmanager configuration** (which may contain plaintext credentials such as `smtp_auth_password`, `api_key`, bearer tokens, or webhook URLs with embedded secrets): delete via `POST /multitenant_alertmanager/delete_tenant_config`.
+- **Ruler rule groups**: delete via `POST /ruler/delete_tenant_config`.
+- **Ingester-local TSDB/WAL state**: only reclaimed when `-blocks-storage.tsdb.close-idle-tsdb-timeout` is set to a non-zero value (default: `0`, disabled).
+- **Metadata / query-result caches**: evicted by TTL only.
+
+The response body is a JSON object with `tenant_id`, `message`, and a `warning` field that repeats the scope limitation above. The response status is `200 OK` once the blocks-storage deletion mark has been written.
 
 _Requires [authentication](#authentication)._
 
@@ -805,7 +816,19 @@ _Requires [authentication](#authentication)._
 GET /purger/delete_tenant_status
 ```
 
-Returns status of tenant deletion. Output format to be defined. Experimental.
+Returns the status of a tenant's **blocks-storage** deletion. Experimental.
+
+The response is a JSON object:
+
+```json
+{
+  "tenant_id": "<id>",
+  "blocks_deleted": true,
+  "warning": "..."
+}
+```
+
+The `blocks_deleted` field reflects **only** the absence of ULID-named block prefixes under the tenant's prefix in the blocks bucket. It does **not** imply that the tenant's alertmanager configuration, ruler rule groups, ingester-local TSDB/WAL state, or caches have been deleted — those must be verified/deleted via the dedicated endpoints listed under *Tenant Delete Request*. The response always includes a `warning` field repeating this scope limitation.
 
 _Requires [authentication](#authentication)._
 
