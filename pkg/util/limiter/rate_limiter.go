@@ -92,6 +92,15 @@ func (l *RateLimiter) getTenantLimiter(now time.Time, tenantID string) *rate.Lim
 	return entry.limiter
 }
 
+// RemoveTenant removes the limiter entry for the given tenant, if any. It is
+// safe to call for unknown tenants (no-op). This is used by the per-tenant
+// inactive-user cleanup hook so the limiter map stays bounded.
+func (l *RateLimiter) RemoveTenant(tenantID string) {
+	l.tenantsLock.Lock()
+	defer l.tenantsLock.Unlock()
+	delete(l.tenants, tenantID)
+}
+
 func (l *RateLimiter) recheckTenantLimiter(now time.Time, tenantID string) *rate.Limiter {
 	limit := rate.Limit(l.strategy.Limit(tenantID))
 	burst := l.strategy.Burst(tenantID)
