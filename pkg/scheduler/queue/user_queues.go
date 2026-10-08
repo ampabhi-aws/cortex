@@ -32,6 +32,12 @@ type queues struct {
 
 	maxUserQueueSize int
 
+	// Maximum number of concurrent tenant queues. If 0, there is no limit. When the limit is
+	// reached, requests for previously unseen tenants are rejected (the caller returns
+	// ErrTooManyRequests). This bounds global queue memory and metric cardinality that can
+	// otherwise be driven by attacker-chosen tenant IDs on an untrusted gRPC listener.
+	maxTenants int
+
 	// How long to wait before removing a querier which has got disconnected
 	// but hasn't notified about a graceful shutdown.
 	forgetDelay time.Duration
@@ -60,10 +66,20 @@ type userQueue struct {
 }
 
 func newUserQueues(maxUserQueueSize int, forgetDelay time.Duration) *queues {
+	return newUserQueuesWithLimit(maxUserQueueSize, 0, forgetDelay)
+}
+
+// newUserQueuesWithLimit is like newUserQueues but also enforces a cap on the number of
+// concurrent tenant queues. A maxTenants of 0 disables the cap (unlimited).
+func newUserQueuesWithLimit(maxUserQueueSize, maxTenants int, forgetDelay time.Duration) *queues {
+	if maxTenants < 0 {
+		maxTenants = 0
+	}
 	return &queues{
 		userQueues:       map[string]*userQueue{},
 		users:            nil,
 		maxUserQueueSize: maxUserQueueSize,
+		maxTenants:       maxTenants,
 		forgetDelay:      forgetDelay,
 		queriers:         map[string]*querier{},
 		sortedQueriers:   nil,
@@ -106,6 +122,13 @@ func (q *queues) getOrAddQueue(userID string, maxQueriers int) chan Request {
 	uq := q.userQueues[userID]
 
 	if uq == nil {
+		// Enforce a cap on the number of concurrent tenant queues to bound global memory
+		// and per-tenant metric cardinality driven by attacker-chosen tenant IDs. A
+		// maxTenants of 0 disables the cap, preserving the historical (unbounded) behavior.
+		if q.maxTenants > 0 && len(q.userQueues) >= q.maxTenants {
+			return nil
+		}
+
 		uq = &userQueue{
 			ch:    make(chan Request, q.maxUserQueueSize),
 			seed:  util.ShuffleShardSeed(userID, ""),

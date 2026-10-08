@@ -23,7 +23,7 @@ func BenchmarkGetNextRequest(b *testing.B) {
 	queues := make([]*RequestQueue, 0, b.N)
 
 	for n := 0; n < b.N; n++ {
-		queue := NewRequestQueue(maxOutstandingPerTenant, 0,
+		queue := NewRequestQueue(maxOutstandingPerTenant, 0, 0,
 			prometheus.NewGaugeVec(prometheus.GaugeOpts{}, []string{"user"}),
 			prometheus.NewCounterVec(prometheus.CounterOpts{}, []string{"user"}),
 		)
@@ -80,7 +80,7 @@ func BenchmarkQueueRequest(b *testing.B) {
 	requests := make([]string, 0, numTenants)
 
 	for n := 0; n < b.N; n++ {
-		q := NewRequestQueue(maxOutstandingPerTenant, 0,
+		q := NewRequestQueue(maxOutstandingPerTenant, 0, 0,
 			prometheus.NewGaugeVec(prometheus.GaugeOpts{}, []string{"user"}),
 			prometheus.NewCounterVec(prometheus.CounterOpts{}, []string{"user"}),
 		)
@@ -113,7 +113,7 @@ func BenchmarkQueueRequest(b *testing.B) {
 func TestRequestQueue_GetNextRequestForQuerier_ShouldGetRequestAfterReshardingBecauseQuerierHasBeenForgotten(t *testing.T) {
 	const forgetDelay = 3 * time.Second
 
-	queue := NewRequestQueue(1, forgetDelay,
+	queue := NewRequestQueue(1, 0, forgetDelay,
 		prometheus.NewGaugeVec(prometheus.GaugeOpts{}, []string{"user"}),
 		prometheus.NewCounterVec(prometheus.CounterOpts{}, []string{"user"}))
 
@@ -150,4 +150,44 @@ func TestRequestQueue_GetNextRequestForQuerier_ShouldGetRequestAfterReshardingBe
 
 	// We expect that querier-2 got the request only after querier-1 forget delay is passed.
 	assert.GreaterOrEqual(t, waitTime.Milliseconds(), forgetDelay.Milliseconds())
+}
+
+func TestRequestQueue_EnqueueRequest_MaxTenantsCap(t *testing.T) {
+	const maxTenants = 2
+	queue := NewRequestQueue(10, maxTenants, 0,
+		prometheus.NewGaugeVec(prometheus.GaugeOpts{}, []string{"user"}),
+		prometheus.NewCounterVec(prometheus.CounterOpts{}, []string{"user"}))
+
+	ctx := context.Background()
+	require.NoError(t, services.StartAndAwaitRunning(ctx, queue))
+	t.Cleanup(func() {
+		require.NoError(t, services.StopAndAwaitTerminated(ctx, queue))
+	})
+
+	// First two distinct tenants fit.
+	require.NoError(t, queue.EnqueueRequest("tenant-a", "r1", 0, nil))
+	require.NoError(t, queue.EnqueueRequest("tenant-b", "r2", 0, nil))
+
+	// Third distinct tenant is rejected because the global cap is reached.
+	err := queue.EnqueueRequest("tenant-c", "r3", 0, nil)
+	require.ErrorIs(t, err, ErrTooManyRequests)
+
+	// An already-known tenant can still enqueue.
+	require.NoError(t, queue.EnqueueRequest("tenant-a", "r4", 0, nil))
+}
+
+func TestRequestQueue_EnqueueRequest_MaxTenantsZeroMeansUnlimited(t *testing.T) {
+	queue := NewRequestQueue(10, 0, 0,
+		prometheus.NewGaugeVec(prometheus.GaugeOpts{}, []string{"user"}),
+		prometheus.NewCounterVec(prometheus.CounterOpts{}, []string{"user"}))
+
+	ctx := context.Background()
+	require.NoError(t, services.StartAndAwaitRunning(ctx, queue))
+	t.Cleanup(func() {
+		require.NoError(t, services.StopAndAwaitTerminated(ctx, queue))
+	})
+
+	for i := 0; i < 50; i++ {
+		require.NoError(t, queue.EnqueueRequest(fmt.Sprintf("t-%d", i), "req", 0, nil))
+	}
 }
