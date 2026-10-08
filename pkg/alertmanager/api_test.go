@@ -7,6 +7,8 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"reflect"
+	"strings"
 	"testing"
 
 	"github.com/go-kit/log"
@@ -419,6 +421,37 @@ alertmanager_config: |
 			err: errors.Wrap(errVictorOpsAPIKeyFileNotAllowed, "error validating Alertmanager config"),
 		},
 		{
+			name: "Should return error if global opsgenie_api_key_file is set",
+			cfg: `
+alertmanager_config: |
+  global:
+    opsgenie_api_key_file: /secrets
+
+  receivers:
+    - name: default-receiver
+      webhook_configs:
+        - url: http://localhost
+
+  route:
+    receiver: 'default-receiver'
+`,
+			err: errors.Wrap(errOpsGenieAPIKeyFileNotAllowed, "error validating Alertmanager config"),
+		},
+		{
+			name: "Should return error if OpsGenie api_key_file is set",
+			cfg: `
+alertmanager_config: |
+  receivers:
+    - name: default-receiver
+      opsgenie_configs:
+        - api_key_file: /secrets
+
+  route:
+    receiver: 'default-receiver'
+`,
+			err: errors.Wrap(errOpsGenieAPIKeyFileNotAllowed, "error validating Alertmanager config"),
+		},
+		{
 			name: "should return error if template is wrong",
 			cfg: `
 alertmanager_config: |
@@ -792,5 +825,51 @@ func TestValidateAlertmanagerConfig(t *testing.T) {
 			err := validateAlertmanagerConfig(testData.input)
 			assert.ErrorIs(t, err, testData.expected)
 		})
+	}
+}
+
+// TestValidateAlertmanagerConfig_RejectsAllFileSuffixFields walks the vendored
+// Alertmanager config structs (GlobalConfig and every notifier config type) and
+// asserts that validateAlertmanagerConfig rejects every string-valued field
+// whose yaml tag ends in "_file". This is a defense-in-depth regression guard:
+// if upstream Alertmanager introduces a new *_file option on a notifier, this
+// test fails until the structural rule in validateAlertmanagerConfig keeps
+// catching it (or an explicit allow decision is made).
+func TestValidateAlertmanagerConfig_RejectsAllFileSuffixFields(t *testing.T) {
+	// Each entry is a prototype of a vendored Alertmanager config struct that
+	// participates in the reflective validator (either directly or because it
+	// is reachable from the loaded config tree).
+	candidates := []interface{}{
+		config.GlobalConfig{},
+		config.SlackConfig{},
+		config.VictorOpsConfig{},
+		config.OpsGenieConfig{},
+		config.EmailConfig{},
+		config.PagerdutyConfig{},
+		config.PushoverConfig{},
+		config.WebhookConfig{},
+		config.WechatConfig{},
+	}
+
+	for _, proto := range candidates {
+		protoType := reflect.TypeOf(proto)
+		for i := 0; i < protoType.NumField(); i++ {
+			field := protoType.Field(i)
+			name := strings.Split(field.Tag.Get("yaml"), ",")[0]
+			if !strings.HasSuffix(name, "_file") {
+				continue
+			}
+			if field.Type.Kind() != reflect.String {
+				continue
+			}
+
+			t.Run(fmt.Sprintf("%s.%s", protoType.Name(), name), func(t *testing.T) {
+				// Build a fresh value and set the *_file field to a non-empty path.
+				val := reflect.New(protoType).Elem()
+				val.FieldByIndex(field.Index).SetString("/etc/some-secret")
+				err := validateAlertmanagerConfig(val.Interface())
+				require.Error(t, err, "expected %s.%s=/etc/some-secret to be rejected but validation passed", protoType.Name(), name)
+			})
+		}
 	}
 }
