@@ -141,6 +141,15 @@ func (kvs *KVInitService) ServeHTTP(w http.ResponseWriter, req *http.Request) {
 		}
 
 		if len(req.Form[deleteMessagesParam]) > 0 && req.Form[deleteMessagesParam][0] == "true" {
+			// This action mutates server state, so require POST to avoid being
+			// triggerable via a cross-site GET (e.g. <img src="...?deleteMessages=true">)
+			// loaded in an operator's browser, which would silently erase the
+			// in-memory gossip message history.
+			if req.Method != http.MethodPost {
+				http.Error(w, "deleteMessages requires POST", http.StatusMethodNotAllowed)
+				return
+			}
+
 			kv.deleteSentReceivedMessages()
 
 			// Redirect back.
@@ -225,9 +234,12 @@ func viewKey(w http.ResponseWriter, store map[string]valueDesc, key string, form
 }
 
 func formatValue(w http.ResponseWriter, val interface{}, format string) {
-
-	w.WriteHeader(200)
-	w.Header().Add("content-type", "text/plain")
+	// Headers must be set before WriteHeader is called, otherwise net/http
+	// discards them and the client content-sniffs the body. We also cannot
+	// change the status after this point, so error paths below can only write
+	// the error into the body of the already-committed 200 response.
+	w.Header().Set("Content-Type", "text/plain; charset=utf-8")
+	w.WriteHeader(http.StatusOK)
 
 	switch format {
 	case "json", "json-pretty":
@@ -238,7 +250,9 @@ func formatValue(w http.ResponseWriter, val interface{}, format string) {
 
 		err := enc.Encode(val)
 		if err != nil {
-			http.Error(w, err.Error(), http.StatusInternalServerError)
+			// Status/headers have already been sent above, so we can only
+			// append the error to the response body.
+			_, _ = fmt.Fprintf(w, "\nfailed to encode value: %v\n", err)
 		}
 
 	default:
@@ -360,7 +374,10 @@ const pageContent = `
 
 		<h2>Received Messages</h2>
 
-		<a href="?deleteMessages=true">Delete All Messages (received and sent)</a>
+		<form method="POST" action="" style="display:inline">
+			<input type="hidden" name="deleteMessages" value="true">
+			<button type="submit">Delete All Messages (received and sent)</button>
+		</form>
 
 		<table width="100%" border="1">
 			<thead>
@@ -396,7 +413,10 @@ const pageContent = `
 
 		<h2>Sent Messages</h2>
 
-		<a href="?deleteMessages=true">Delete All Messages (received and sent)</a>
+		<form method="POST" action="" style="display:inline">
+			<input type="hidden" name="deleteMessages" value="true">
+			<button type="submit">Delete All Messages (received and sent)</button>
+		</form>
 
 		<table width="100%" border="1">
 			<thead>
