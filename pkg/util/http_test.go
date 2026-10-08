@@ -17,6 +17,7 @@ import (
 
 	"github.com/cortexproject/cortex/pkg/cortexpb"
 	"github.com/cortexproject/cortex/pkg/util"
+	"github.com/cortexproject/cortex/pkg/util/flagext"
 	util_log "github.com/cortexproject/cortex/pkg/util/log"
 )
 
@@ -218,4 +219,34 @@ func (b bytesBuffered) BytesBuffer() *bytes.Buffer {
 func TestIsRequestBodyTooLargeRegression(t *testing.T) {
 	_, err := io.ReadAll(http.MaxBytesReader(httptest.NewRecorder(), io.NopCloser(bytes.NewReader([]byte{1, 2, 3, 4})), 1))
 	assert.True(t, util.IsRequestBodyTooLarge(err))
+}
+
+func TestBasicAuth_PasswordRedactedInYAML(t *testing.T) {
+	ba := util.BasicAuth{
+		Username: "someuser",
+		Password: flagext.Secret{Value: "SuperSecret123"},
+	}
+
+	out, err := yaml.Marshal(ba)
+	require.NoError(t, err)
+	// The actual secret must never appear in the serialised form.
+	assert.NotContains(t, string(out), "SuperSecret123",
+		"basic_auth_password must not be marshalled in cleartext, got: %s", string(out))
+	// It must be marshalled as the redaction marker used by flagext.Secret.
+	assert.Contains(t, string(out), "basic_auth_password: '********'",
+		"expected flagext.Secret redaction marker, got: %s", string(out))
+}
+
+func TestBasicAuth_IsEnabled(t *testing.T) {
+	// Enabled when a password is configured even without a username.
+	ba := util.BasicAuth{Password: flagext.Secret{Value: "s3cret"}}
+	assert.True(t, ba.IsEnabled())
+
+	// Enabled when only a username is configured.
+	ba = util.BasicAuth{Username: "u"}
+	assert.True(t, ba.IsEnabled())
+
+	// Disabled when neither username nor password are configured.
+	ba = util.BasicAuth{}
+	assert.False(t, ba.IsEnabled())
 }
