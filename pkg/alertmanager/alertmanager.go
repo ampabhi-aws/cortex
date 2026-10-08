@@ -312,6 +312,12 @@ func clusterWait(position func() int, timeout time.Duration) func() time.Duratio
 func (am *Alertmanager) ApplyConfig(userID string, conf *config.Config, rawCfg string) error {
 	templateFiles := make([]string, len(conf.Templates))
 	for i, t := range conf.Templates {
+		// Re-validate the filename coming from the alert store before using it.
+		// The HTTP config API applies validateTemplateFilename up front, but the
+		// store->disk path must not trust store content more than API input.
+		if err := validateTemplateFilename(t); err != nil {
+			return err
+		}
 		templateFilepath, err := safeTemplateFilepath(filepath.Join(am.cfg.TenantDataDir, templatesDir), t)
 		if err != nil {
 			return err

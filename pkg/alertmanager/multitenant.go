@@ -822,6 +822,13 @@ func (am *MultitenantAlertmanager) setConfig(cfg alertspb.AlertConfigDesc) error
 	}
 
 	for _, tmpl := range cfg.Templates {
+		// Re-validate the filename coming from the alert store before using it.
+		// The HTTP config API applies validateTemplateFilename up front, but the
+		// store->disk path must not trust store content more than API input.
+		if err := validateTemplateFilename(tmpl.Filename); err != nil {
+			return err
+		}
+
 		templateFilePath, err := safeTemplateFilepath(userTemplateDir, tmpl.Filename)
 		if err != nil {
 			return err
@@ -1311,6 +1318,13 @@ func validateTemplateFilename(filename string) error {
 // This function also performs a security check to make sure the provided templateName
 // doesn't contain a relative path escaping the provided dir.
 func safeTemplateFilepath(dir, templateName string) (string, error) {
+	// Reject any template name that is not a bare file name. This is the
+	// primary fence against path traversal and must be applied on every
+	// code path (API and store->disk), not only in the HTTP config API.
+	if err := validateTemplateFilename(templateName); err != nil {
+		return "", err
+	}
+
 	// We expect all template files to be stored and referenced within the provided directory.
 	containerDir, err := filepath.Abs(dir)
 	if err != nil {
@@ -1324,9 +1338,15 @@ func safeTemplateFilepath(dir, templateName string) (string, error) {
 	}
 
 	// Ensure the actual path of the template is within the expected directory.
-	// This check is a counter-measure to make sure the tenant is not trying to
-	// escape its own directory on disk.
-	if !strings.HasPrefix(actualPath, containerDir) {
+	// This check is a boundary-aware counter-measure to make sure the tenant
+	// is not trying to escape its own directory on disk. Using strings.HasPrefix
+	// without a trailing path separator would incorrectly accept sibling
+	// directories whose names share a prefix with containerDir (e.g.
+	// "/data/t/templatesX" would be accepted when containerDir is
+	// "/data/t/templates"). We therefore use filepath.Rel to enforce a true
+	// child-of relationship.
+	rel, err := filepath.Rel(containerDir, actualPath)
+	if err != nil || rel == "." || rel == ".." || strings.HasPrefix(rel, ".."+string(os.PathSeparator)) {
 		return "", fmt.Errorf("invalid template name %q: the template filepath is escaping the per-tenant local directory", templateName)
 	}
 

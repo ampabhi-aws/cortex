@@ -1966,7 +1966,27 @@ func TestSafeTemplateFilepath(t *testing.T) {
 		"should fail if the provided template is escaping the dir": {
 			dir:         "/data/tenant",
 			template:    "../test.tmpl",
-			expectedErr: errors.New(`invalid template name "../test.tmpl": the template filepath is escaping the per-tenant local directory`),
+			expectedErr: errors.New(`invalid template name "../test.tmpl": the template name cannot contain any path`),
+		},
+		"should fail if the provided template escapes the templates dir into a sibling prefix dir": {
+			dir:         "/data/tenant/templates",
+			template:    "../templatesX/evil",
+			expectedErr: errors.New(`invalid template name "../templatesX/evil": the template name cannot contain any path`),
+		},
+		"should fail if the provided template contains nested path components": {
+			dir:         "/data/tenant/templates",
+			template:    "a/b/c",
+			expectedErr: errors.New(`invalid template name "a/b/c": the template name cannot contain any path`),
+		},
+		"should fail if the provided template resolves to the container dir itself": {
+			dir:         "/data/tenant/templates",
+			template:    "../templates",
+			expectedErr: errors.New(`invalid template name "../templates": the template name cannot contain any path`),
+		},
+		"should fail if the provided template cleans back into the container dir": {
+			dir:         "/data/tenant/templates",
+			template:    "templates../..",
+			expectedErr: errors.New(`invalid template name "templates../..": the template name cannot contain any path`),
 		},
 	}
 
