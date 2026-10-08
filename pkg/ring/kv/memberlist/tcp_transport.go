@@ -20,9 +20,21 @@ import (
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/promauto"
 	"go.uber.org/atomic"
+	"golang.org/x/net/netutil"
 
 	"github.com/cortexproject/cortex/pkg/util/flagext"
 	cortextls "github.com/cortexproject/cortex/pkg/util/tls"
+)
+
+// Default limits for the inbound TCP transport. These values are chosen to
+// be large enough that normal gossip traffic is never affected, while small
+// enough to prevent an unauthenticated remote peer from exhausting memory,
+// file descriptors, or goroutines on the receiving process.
+const (
+	defaultMaxPacketSize            = 16 << 20 // 16 MiB
+	defaultPacketReadTimeout        = 10 * time.Second
+	defaultMaxConcurrentConnections = 1000
+	defaultPacketChBufferSize       = 16
 )
 
 type messageType uint8
@@ -50,6 +62,22 @@ type TCPTransportConfig struct {
 	// Timeout for writing packet data. Zero = no timeout.
 	PacketWriteTimeout time.Duration `yaml:"packet_write_timeout"`
 
+	// Timeout for reading an inbound packet (whole message). Zero = no timeout.
+	// This bounds how long an unauthenticated remote peer can hold an accepted
+	// socket open while reading from it.
+	PacketReadTimeout time.Duration `yaml:"packet_read_timeout"`
+
+	// Maximum size (in bytes) accepted for a single inbound packet body.
+	// Packets larger than this are dropped. Zero disables the limit (not
+	// recommended).
+	MaxPacketSize int `yaml:"max_packet_size"`
+
+	// Maximum number of concurrently-accepted TCP connections on the gossip
+	// listener. Additional accepted connections block in the kernel accept
+	// queue until an existing handler returns. Zero disables the limit (not
+	// recommended).
+	MaxConcurrentConnections int `yaml:"max_concurrent_connections"`
+
 	// Transport logs lot of messages at debug level, so it deserves an extra flag for turning it on
 	TransportDebug bool `yaml:"-"`
 
@@ -72,6 +100,9 @@ func (cfg *TCPTransportConfig) RegisterFlagsWithPrefix(f *flag.FlagSet, prefix s
 	f.IntVar(&cfg.BindPort, prefix+"memberlist.bind-port", 7946, "Port to listen on for gossip messages.")
 	f.DurationVar(&cfg.PacketDialTimeout, prefix+"memberlist.packet-dial-timeout", 5*time.Second, "Timeout used when connecting to other nodes to send packet.")
 	f.DurationVar(&cfg.PacketWriteTimeout, prefix+"memberlist.packet-write-timeout", 5*time.Second, "Timeout for writing 'packet' data.")
+	f.DurationVar(&cfg.PacketReadTimeout, prefix+"memberlist.packet-read-timeout", defaultPacketReadTimeout, "Timeout for reading an inbound 'packet' from a remote peer. Zero disables the timeout (not recommended: an idle peer can pin a goroutine and file descriptor indefinitely).")
+	f.IntVar(&cfg.MaxPacketSize, prefix+"memberlist.max-packet-size", defaultMaxPacketSize, "Maximum size (in bytes) of an inbound memberlist packet body. Larger packets are dropped. Zero disables the limit (not recommended).")
+	f.IntVar(&cfg.MaxConcurrentConnections, prefix+"memberlist.max-concurrent-connections", defaultMaxConcurrentConnections, "Maximum number of concurrently-accepted TCP connections on the gossip listener. Zero disables the limit (not recommended).")
 	f.BoolVar(&cfg.TransportDebug, prefix+"memberlist.transport-debug", false, "Log debug transport messages. Note: global log.level must be at debug level as well.")
 
 	f.BoolVar(&cfg.TLSEnabled, prefix+"memberlist.tls-enabled", false, "Enable TLS on the memberlist transport layer.")
@@ -100,13 +131,14 @@ type TCPTransport struct {
 	outgoingStreams      prometheus.Counter
 	outgoingStreamErrors prometheus.Counter
 
-	receivedPackets       prometheus.Counter
-	receivedPacketsBytes  prometheus.Counter
-	receivedPacketsErrors prometheus.Counter
-	sentPackets           prometheus.Counter
-	sentPacketsBytes      prometheus.Counter
-	sentPacketsErrors     prometheus.Counter
-	unknownConnections    prometheus.Counter
+	receivedPackets        prometheus.Counter
+	receivedPacketsBytes   prometheus.Counter
+	receivedPacketsErrors  prometheus.Counter
+	receivedPacketsDropped prometheus.Counter
+	sentPackets            prometheus.Counter
+	sentPacketsBytes       prometheus.Counter
+	sentPacketsErrors      prometheus.Counter
+	unknownConnections     prometheus.Counter
 }
 
 // NewTCPTransport returns a new tcp-based transport with the given configuration. On
@@ -119,9 +151,13 @@ func NewTCPTransport(config TCPTransportConfig, logger log.Logger) (*TCPTranspor
 	// Build out the new transport.
 	var ok bool
 	t := TCPTransport{
-		cfg:      config,
-		logger:   log.With(logger, "component", "memberlist TCPTransport"),
-		packetCh: make(chan *memberlist.Packet),
+		cfg:    config,
+		logger: log.With(logger, "component", "memberlist TCPTransport"),
+		// Give packetCh a small buffer so that a slow memberlist merge loop
+		// cannot pin reader goroutines (and the memory of their decoded
+		// packets) indefinitely. If the buffer is full we drop packets with
+		// a dedicated counter instead of blocking.
+		packetCh: make(chan *memberlist.Packet, defaultPacketChBufferSize),
 		connCh:   make(chan net.Conn),
 	}
 
@@ -162,14 +198,22 @@ func NewTCPTransport(config TCPTransportConfig, logger log.Logger) (*TCPTranspor
 			}
 		}
 
-		t.tcpListeners = append(t.tcpListeners, tcpLn)
-
 		// If the config port given was zero, use the first TCP listener
 		// to pick an available port and then apply that to everything
-		// else.
+		// else. We do this *before* wrapping with LimitListener because
+		// netutil.LimitListener returns an unexported wrapper type.
 		if port == 0 {
 			port = tcpLn.Addr().(*net.TCPAddr).Port
 		}
+
+		// Cap the number of concurrently-accepted connections so an
+		// unauthenticated remote peer cannot exhaust goroutines/FDs by
+		// opening many idle connections (slowloris).
+		if config.MaxConcurrentConnections > 0 {
+			tcpLn = netutil.LimitListener(tcpLn, config.MaxConcurrentConnections)
+		}
+
+		t.tcpListeners = append(t.tcpListeners, tcpLn)
 	}
 
 	// Fire them up now that we've been able to create them all.
@@ -245,6 +289,19 @@ func (t *TCPTransport) handleConnection(conn net.Conn) {
 		}
 	}()
 
+	// Always bound how long an unauthenticated peer can hold the socket
+	// before any bytes are read. A client that connects and never sends a
+	// byte would otherwise pin this goroutine and the associated file
+	// descriptor forever (slowloris). For the "stream" path we clear the
+	// deadline before handing the connection off to memberlist, which
+	// installs its own deadline from TCPTimeout.
+	if t.cfg.PacketReadTimeout > 0 {
+		if err := conn.SetDeadline(time.Now().Add(t.cfg.PacketReadTimeout)); err != nil {
+			level.Warn(t.logger).Log("msg", "failed to set read deadline on inbound connection", "err", err, "remote", conn.RemoteAddr())
+			return
+		}
+	}
+
 	// let's read first byte, and determine what to do about this connection
 	msgType := []byte{0}
 	_, err := io.ReadFull(conn, msgType)
@@ -255,6 +312,17 @@ func (t *TCPTransport) handleConnection(conn net.Conn) {
 
 	if messageType(msgType[0]) == stream {
 		t.incomingStreams.Inc()
+
+		// Clear the read deadline we installed above: memberlist's stream
+		// handler installs its own deadline from TCPTimeout on each read
+		// and expects the connection to be usable for longer than our
+		// per-packet timeout.
+		if t.cfg.PacketReadTimeout > 0 {
+			if err := conn.SetDeadline(time.Time{}); err != nil {
+				level.Warn(t.logger).Log("msg", "failed to clear read deadline on inbound stream connection", "err", err, "remote", conn.RemoteAddr())
+				return
+			}
+		}
 
 		// hand over this connection to memberlist
 		closeConn = false
@@ -280,11 +348,23 @@ func (t *TCPTransport) handleConnection(conn net.Conn) {
 			return
 		}
 
-		// read the rest to buffer -- this is the "packet" itself
-		buf, err := io.ReadAll(conn)
+		// Bound the packet body. We use io.LimitReader with maxPacketSize+1
+		// so we can detect oversized packets (len(buf) > maxPacketSize)
+		// without allocating more than one extra byte.
+		var bodyReader io.Reader = conn
+		if t.cfg.MaxPacketSize > 0 {
+			bodyReader = io.LimitReader(conn, int64(t.cfg.MaxPacketSize)+1)
+		}
+		buf, err := io.ReadAll(bodyReader)
 		if err != nil {
 			t.receivedPacketsErrors.Inc()
 			level.Warn(t.logger).Log("msg", "error while reading packet data", "err", err, "remote", conn.RemoteAddr())
+			return
+		}
+
+		if t.cfg.MaxPacketSize > 0 && len(buf) > t.cfg.MaxPacketSize {
+			t.receivedPacketsErrors.Inc()
+			level.Warn(t.logger).Log("msg", "packet too large, dropping", "max_packet_size", t.cfg.MaxPacketSize, "remote", conn.RemoteAddr())
 			return
 		}
 
@@ -308,10 +388,21 @@ func (t *TCPTransport) handleConnection(conn net.Conn) {
 
 		t.receivedPacketsBytes.Add(float64(len(buf)))
 
-		t.packetCh <- &memberlist.Packet{
+		// Non-blocking send: if the memberlist packet loop can't keep up
+		// we drop this packet rather than pin this reader goroutine (and
+		// the memory of the decoded packet) waiting on the channel.
+		// memberlist's packet transport is defined to be unreliable, so a
+		// dropped packet is a legitimate outcome; peers will retransmit.
+		pkt := &memberlist.Packet{
 			Buf:       buf,
 			From:      addr(addrBuf),
 			Timestamp: time.Now(),
+		}
+		select {
+		case t.packetCh <- pkt:
+		default:
+			t.receivedPacketsDropped.Inc()
+			level.Warn(t.logger).Log("msg", "dropping received packet: packet channel full", "remote", conn.RemoteAddr())
 		}
 	} else {
 		t.unknownConnections.Inc()
@@ -604,6 +695,13 @@ func (t *TCPTransport) registerMetrics(registerer prometheus.Registerer) {
 		Subsystem: subsystem,
 		Name:      "packets_received_errors_total",
 		Help:      "Number of errors when receiving memberlist packets",
+	})
+
+	t.receivedPacketsDropped = promauto.With(registerer).NewCounter(prometheus.CounterOpts{
+		Namespace: t.cfg.MetricsNamespace,
+		Subsystem: subsystem,
+		Name:      "packets_received_dropped_total",
+		Help:      "Number of received memberlist packets that were dropped because the packet channel was full.",
 	})
 
 	t.sentPackets = promauto.With(registerer).NewCounter(prometheus.CounterOpts{
