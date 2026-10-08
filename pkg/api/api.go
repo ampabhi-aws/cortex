@@ -5,7 +5,9 @@ import (
 	"flag"
 	"net/http"
 	"path"
+	"strconv"
 	"strings"
+	"sync/atomic"
 
 	"github.com/NYTimes/gziphandler"
 	"github.com/felixge/fgprof"
@@ -219,7 +221,46 @@ func (a *API) RegisterAPI(httpPathPrefix string, actualCfg interface{}, defaultC
 
 	a.RegisterRoute("/config", a.cfg.configHandler(actualCfg, defaultCfg), false, "GET")
 	a.RegisterRoute("/", indexHandler(httpPathPrefix, a.indexPage), false, "GET")
-	a.RegisterRoute("/debug/fgprof", fgprof.Handler(), false, "GET")
+	// /debug/fgprof samples via runtime.GoroutineProfile() which performs a
+	// stop-the-world pause. The upstream handler accepts an unbounded
+	// "seconds" query parameter and has no concurrency guard, so an
+	// unauthenticated attacker could use it as a CPU-exhaustion lever against
+	// every Cortex component. We require authentication and wrap the handler
+	// to clamp the duration and allow only a single concurrent profile.
+	a.RegisterRoute("/debug/fgprof", boundedFgprofHandler(fgprofMaxSeconds), true, "GET")
+}
+
+// fgprofMaxSeconds caps the duration of a single /debug/fgprof request. 30s
+// matches the handler's default when no "seconds" parameter is supplied.
+const fgprofMaxSeconds = 30
+
+// fgprofInFlight ensures only one /debug/fgprof profile runs at a time; a
+// stop-the-world sampler already saturates the process it runs against, and
+// without this guard N concurrent requests multiply the cost by N.
+var fgprofInFlight int32
+
+// boundedFgprofHandler wraps fgprof.Handler() with a concurrency guard and a
+// clamp on the attacker-controlled "seconds" query parameter. The clamp is
+// applied by rewriting r.URL.RawQuery so the inner handler observes the
+// capped value when it parses the request.
+func boundedFgprofHandler(maxSeconds int) http.Handler {
+	inner := fgprof.Handler()
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if !atomic.CompareAndSwapInt32(&fgprofInFlight, 0, 1) {
+			http.Error(w, "fgprof profiling already in use", http.StatusTooManyRequests)
+			return
+		}
+		defer atomic.StoreInt32(&fgprofInFlight, 0)
+
+		q := r.URL.Query()
+		if s := q.Get("seconds"); s != "" {
+			if v, err := strconv.Atoi(s); err == nil && v > maxSeconds {
+				q.Set("seconds", strconv.Itoa(maxSeconds))
+				r.URL.RawQuery = q.Encode()
+			}
+		}
+		inner.ServeHTTP(w, r)
+	})
 }
 
 // RegisterRuntimeConfig registers the endpoints associates with the runtime configuration
