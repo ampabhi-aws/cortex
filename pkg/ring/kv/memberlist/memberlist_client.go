@@ -4,12 +4,14 @@ import (
 	"bytes"
 	"context"
 	"crypto/rand"
+	"encoding/base64"
 	"encoding/binary"
 	"errors"
 	"flag"
 	"fmt"
 	"math"
 	mathrand "math/rand"
+	"os"
 	"strings"
 	"sync"
 	"time"
@@ -157,6 +159,25 @@ type KVConfig struct {
 	// How much space to use to keep received and sent messages in memory (for troubleshooting).
 	MessageHistoryBufferBytes int `yaml:"message_history_buffer_bytes"`
 
+	// SecretKey, if non-empty, enables memberlist's authenticated encryption
+	// (AES-GCM) on every packet and stream. All members of the cluster MUST
+	// configure the same key. The key material is interpreted as raw bytes
+	// (16, 24 or 32 bytes to select AES-128/192/256); if the value is a
+	// base64 string that decodes to one of those lengths it is base64
+	// decoded first. Without this (and without a mutually-authenticated TLS
+	// listener), any host that can reach the gossip port is treated as a
+	// trusted peer and can read/poison the KV store.
+	SecretKey flagext.Secret `yaml:"secret_key"`
+
+	// SecretKeyFile is an alternative to SecretKey that reads the key from
+	// a file (so it does not have to appear in command-line / YAML).
+	SecretKeyFile string `yaml:"secret_key_file"`
+
+	// Defence-in-depth caps applied in the ring merge layer. 0 disables the
+	// corresponding cap.
+	MaxTokensPerInstance int `yaml:"max_tokens_per_instance"`
+	MaxInstancesPerRing  int `yaml:"max_instances_per_ring"`
+
 	TCPTransport TCPTransportConfig `yaml:",inline"`
 
 	// Where to put custom metrics. Metrics are not registered, if this is nil.
@@ -193,12 +214,54 @@ func (cfg *KVConfig) RegisterFlagsWithPrefix(f *flag.FlagSet, prefix string) {
 	f.BoolVar(&cfg.EnableCompression, prefix+"memberlist.compression-enabled", mlDefaults.EnableCompression, "Enable message compression. This can be used to reduce bandwidth usage at the cost of slightly more CPU utilization.")
 	f.StringVar(&cfg.AdvertiseAddr, prefix+"memberlist.advertise-addr", mlDefaults.AdvertiseAddr, "Gossip address to advertise to other members in the cluster. Used for NAT traversal.")
 	f.IntVar(&cfg.AdvertisePort, prefix+"memberlist.advertise-port", mlDefaults.AdvertisePort, "Gossip port to advertise to other members in the cluster. Used for NAT traversal.")
+	f.Var(&cfg.SecretKey, prefix+"memberlist.secret-key", "Shared secret for the memberlist gossip transport. When set, every packet/stream is authenticated and encrypted with AES-GCM (16, 24 or 32 bytes selects AES-128/192/256; base64 is also accepted). All members of the cluster must use the same key. If empty and no mutually-authenticated TLS is configured, any peer that can reach the gossip port is trusted.")
+	f.StringVar(&cfg.SecretKeyFile, prefix+"memberlist.secret-key-file", "", "Path to a file containing the shared secret for the memberlist gossip transport. Mutually exclusive with -memberlist.secret-key.")
+	f.IntVar(&cfg.MaxTokensPerInstance, prefix+"memberlist.max-tokens-per-instance", 2048, "Maximum number of tokens accepted per instance when merging a gossiped ring. Entries whose token count exceeds this cap are rejected. 0 disables the cap. Defence in depth against a hostile peer injecting a single instance that covers the whole hash space.")
+	f.IntVar(&cfg.MaxInstancesPerRing, prefix+"memberlist.max-instances-per-ring", 8192, "Maximum total number of instances accepted per ring when merging a gossiped update. New instances beyond this cap are rejected. 0 disables the cap.")
 
 	cfg.TCPTransport.RegisterFlagsWithPrefix(f, prefix)
 }
 
 func (cfg *KVConfig) RegisterFlags(f *flag.FlagSet) {
 	cfg.RegisterFlagsWithPrefix(f, "")
+}
+
+// resolveSecretKey returns the raw AES key bytes to use for memberlist
+// authenticated encryption, resolved from SecretKey or SecretKeyFile. If both
+// are empty an empty slice is returned (encryption disabled). The key material
+// is interpreted as raw bytes of length 16/24/32; if it is a base64 string that
+// decodes to one of those lengths the base64 decoding is used instead so
+// operators can safely place the key on a command line.
+func (cfg *KVConfig) resolveSecretKey() ([]byte, error) {
+	var raw []byte
+	switch {
+	case cfg.SecretKey.Value != "" && cfg.SecretKeyFile != "":
+		return nil, errors.New("memberlist.secret-key and memberlist.secret-key-file are mutually exclusive")
+	case cfg.SecretKey.Value != "":
+		raw = []byte(cfg.SecretKey.Value)
+	case cfg.SecretKeyFile != "":
+		b, err := os.ReadFile(cfg.SecretKeyFile)
+		if err != nil {
+			return nil, fmt.Errorf("failed to read memberlist secret key file %q: %v", cfg.SecretKeyFile, err)
+		}
+		raw = bytes.TrimSpace(b)
+	default:
+		return nil, nil
+	}
+
+	if l := len(raw); l == 16 || l == 24 || l == 32 {
+		return raw, nil
+	}
+	// Try base64 (standard and raw) as a convenience for keys supplied as
+	// text on command lines or in YAML.
+	for _, enc := range []*base64.Encoding{base64.StdEncoding, base64.RawStdEncoding, base64.URLEncoding, base64.RawURLEncoding} {
+		if decoded, err := enc.DecodeString(string(raw)); err == nil {
+			if l := len(decoded); l == 16 || l == 24 || l == 32 {
+				return decoded, nil
+			}
+		}
+	}
+	return nil, fmt.Errorf("memberlist secret key must be 16, 24 or 32 bytes (optionally base64-encoded); got %d bytes", len(raw))
 }
 
 func generateRandomSuffix(logger log.Logger) string {
@@ -397,6 +460,26 @@ func (m *KV) buildMemberlistConfig() (*memberlist.Config, error) {
 
 	mlCfg.LogOutput = newMemberlistLoggerAdapter(m.logger, false)
 	mlCfg.Transport = tr
+
+	// Enable memberlist's built-in authenticated encryption if a shared
+	// secret is configured. AES-GCM authenticates every packet and stream,
+	// so forged or unauthenticated gossip is rejected before it ever reaches
+	// the KV delegate.
+	secretKey, err := m.cfg.resolveSecretKey()
+	if err != nil {
+		return nil, err
+	}
+	if len(secretKey) > 0 {
+		kr, err := memberlist.NewKeyring(nil, secretKey)
+		if err != nil {
+			return nil, fmt.Errorf("invalid memberlist secret key: %v", err)
+		}
+		mlCfg.Keyring = kr
+		mlCfg.GossipVerifyIncoming = true
+		mlCfg.GossipVerifyOutgoing = true
+	} else if !m.cfg.TCPTransport.TLSEnabled {
+		level.Warn(m.logger).Log("msg", "memberlist gossip transport is unauthenticated: no secret key and no TLS client auth configured. Any host that can reach the gossip port can read/poison the KV store. Set -memberlist.secret-key or -memberlist.tls-enabled with -memberlist.tls-server-ca-path.")
+	}
 
 	// Memberlist uses UDPBufferSize to figure out how many messages it can put into single "packet".
 	// As we don't use UDP for sending packets, we can use higher value here.

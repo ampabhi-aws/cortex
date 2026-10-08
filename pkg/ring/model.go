@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"sort"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/gogo/protobuf/proto"
@@ -28,6 +29,33 @@ func ProtoDescFactory() proto.Message {
 // GetCodec returns the codec used to encode and decode data being put by ring.
 func GetCodec() codec.Codec {
 	return codec.NewProtoCodec("ringDesc", ProtoDescFactory)
+}
+
+// Defence-in-depth caps applied when merging gossiped ring state.
+//
+// Without peer authentication on the memberlist transport, a hostile peer can
+// push an InstanceDesc that claims a huge number of tokens or push thousands of
+// instances into the ring. These caps limit the blast radius of such a push
+// even if authentication is somehow bypassed. Values can be adjusted by an
+// operator through SetMergeLimits (0 disables the corresponding cap).
+var (
+	ringMaxTokensPerInstance int64 = 2048
+	ringMaxInstancesPerRing  int64 = 8192
+)
+
+// SetMergeLimits adjusts the defence-in-depth caps applied by mergeWithTime.
+// A value of 0 disables the corresponding cap. Negative values are ignored.
+func SetMergeLimits(maxTokensPerInstance, maxInstancesPerRing int) {
+	if maxTokensPerInstance >= 0 {
+		atomic.StoreInt64(&ringMaxTokensPerInstance, int64(maxTokensPerInstance))
+	}
+	if maxInstancesPerRing >= 0 {
+		atomic.StoreInt64(&ringMaxInstancesPerRing, int64(maxInstancesPerRing))
+	}
+}
+
+func getMergeLimits() (maxTokens, maxInstances int) {
+	return int(atomic.LoadInt64(&ringMaxTokensPerInstance)), int(atomic.LoadInt64(&ringMaxInstancesPerRing))
 }
 
 // NewDesc returns an empty ring.Desc
@@ -206,6 +234,8 @@ func (d *Desc) mergeWithTime(mergeable memberlist.Mergeable, localCAS bool, now 
 	thisIngesterMap := d.Ingesters
 	otherIngesterMap := other.Ingesters
 
+	maxTokens, maxInstances := getMergeLimits()
+
 	var updated []string
 	tokensChanged := false
 
@@ -214,10 +244,19 @@ func (d *Desc) mergeWithTime(mergeable memberlist.Mergeable, localCAS bool, now 
 		if oing.Timestamp > maxFutureLimit {
 			return nil, fmt.Errorf("ingester %s timestamp in the future, expected max of %d, got %d", name, maxFutureLimit, oing.Timestamp)
 		}
+		if maxTokens > 0 && len(oing.Tokens) > maxTokens {
+			return nil, fmt.Errorf("ingester %s token count %d exceeds max %d", name, len(oing.Tokens), maxTokens)
+		}
 
 		ting := thisIngesterMap[name]
 		// ting.Timestamp will be 0, if there was no such ingester in our version
 		if oing.Timestamp > ting.Timestamp {
+			// Reject new instances once the ring is at the configured cap.
+			// Updates to instances already in the ring are always permitted so
+			// that LEFT/heartbeat changes can propagate.
+			if maxInstances > 0 && ting.Timestamp == 0 && len(thisIngesterMap) >= maxInstances {
+				return nil, fmt.Errorf("refusing to add ingester %s: ring already has %d instances (cap %d)", name, len(thisIngesterMap), maxInstances)
+			}
 			if !tokensEqual(ting.Tokens, oing.Tokens) {
 				tokensChanged = true
 			}

@@ -660,6 +660,11 @@ func (t *Cortex) initMemberlistKV() (services.Service, error) {
 	t.MemberlistKV = memberlist.NewKVInitService(&t.Cfg.MemberlistKV, util_log.Logger, dnsProvider, reg)
 	t.API.RegisterMemberlistKV(t.MemberlistKV)
 
+	// Apply defence-in-depth caps on gossiped ring merges. Without peer
+	// authentication on the memberlist transport, these bound the blast
+	// radius of a hostile peer that is able to connect to the gossip port.
+	ring.SetMergeLimits(t.Cfg.MemberlistKV.MaxTokensPerInstance, t.Cfg.MemberlistKV.MaxInstancesPerRing)
+
 	// Update the config.
 	t.Cfg.Distributor.DistributorRing.KVStore.MemberlistKV = t.MemberlistKV.GetMemberlistKV
 	t.Cfg.Ingester.LifecyclerConfig.RingConfig.KVStore.MemberlistKV = t.MemberlistKV.GetMemberlistKV

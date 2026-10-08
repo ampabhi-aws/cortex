@@ -4,10 +4,12 @@ import (
 	"bytes"
 	"crypto/md5"
 	"crypto/tls"
+	"crypto/x509"
 	"flag"
 	"fmt"
 	"io"
 	"net"
+	"os"
 	"strings"
 	"sync"
 	"time"
@@ -59,6 +61,16 @@ type TCPTransportConfig struct {
 
 	TLSEnabled bool                   `yaml:"tls_enabled"`
 	TLS        cortextls.ClientConfig `yaml:",inline"`
+
+	// TLSServerCAPath is the path to the CA used to authenticate inbound peer
+	// certificates on the memberlist TLS listener. When set together with
+	// TLSEnabled the listener REQUIRES and VERIFIES client certificates
+	// (mutual TLS). Without this, Go's crypto/tls defaults to NoClientCert
+	// which does NOT authenticate inbound peers and leaves the gossip
+	// transport open to any host that can reach the port. If this is empty,
+	// the ClientConfig CAPath (shared with outbound dials) is used as the
+	// trusted set of client CAs.
+	TLSServerCAPath string `yaml:"tls_server_ca_path"`
 }
 
 func (cfg *TCPTransportConfig) RegisterFlags(f *flag.FlagSet) {
@@ -74,7 +86,8 @@ func (cfg *TCPTransportConfig) RegisterFlagsWithPrefix(f *flag.FlagSet, prefix s
 	f.DurationVar(&cfg.PacketWriteTimeout, prefix+"memberlist.packet-write-timeout", 5*time.Second, "Timeout for writing 'packet' data.")
 	f.BoolVar(&cfg.TransportDebug, prefix+"memberlist.transport-debug", false, "Log debug transport messages. Note: global log.level must be at debug level as well.")
 
-	f.BoolVar(&cfg.TLSEnabled, prefix+"memberlist.tls-enabled", false, "Enable TLS on the memberlist transport layer.")
+	f.BoolVar(&cfg.TLSEnabled, prefix+"memberlist.tls-enabled", false, "Enable TLS on the memberlist transport layer. Note: TLS only authenticates inbound peers if a trusted client CA is configured via -memberlist.tls-server-ca-path or -memberlist.tls-ca-path (the listener then requires and verifies client certificates).")
+	f.StringVar(&cfg.TLSServerCAPath, prefix+"memberlist.tls-server-ca-path", "", "Path to the CA bundle used to verify inbound peer certificates on the memberlist TLS listener. When set (together with -memberlist.tls-enabled), the listener REQUIRES and VERIFIES client certificates. If empty, the value of -memberlist.tls-ca-path is used instead so TLS does authenticate peers by default.")
 	cfg.TLS.RegisterFlagsWithPrefix(prefix+"memberlist", f)
 }
 
@@ -126,10 +139,15 @@ func NewTCPTransport(config TCPTransportConfig, logger log.Logger) (*TCPTranspor
 	}
 
 	var err error
+	var serverTLSConfig *tls.Config
 	if config.TLSEnabled {
 		t.tlsConfig, err = config.TLS.GetTLSConfig()
 		if err != nil {
 			return nil, errors.Wrap(err, "unable to create TLS config")
+		}
+		serverTLSConfig, err = buildServerTLSConfig(t.tlsConfig, config.TLSServerCAPath, config.TLS.CAPath)
+		if err != nil {
+			return nil, errors.Wrap(err, "unable to create memberlist server TLS config")
 		}
 	}
 
@@ -151,7 +169,7 @@ func NewTCPTransport(config TCPTransportConfig, logger log.Logger) (*TCPTranspor
 
 		var tcpLn net.Listener
 		if config.TLSEnabled {
-			tcpLn, err = tls.Listen("tcp", tcpAddr.String(), t.tlsConfig)
+			tcpLn, err = tls.Listen("tcp", tcpAddr.String(), serverTLSConfig)
 			if err != nil {
 				return nil, errors.Wrapf(err, "failed to start TLS TCP listener on %q port %d", addr, port)
 			}
@@ -180,6 +198,49 @@ func NewTCPTransport(config TCPTransportConfig, logger log.Logger) (*TCPTranspor
 
 	ok = true
 	return &t, nil
+}
+
+// buildServerTLSConfig turns the memberlist outbound (client) TLS config into
+// a config suitable for the inbound listener.
+//
+// cortex's ClientConfig.GetTLSConfig() never sets ClientCAs or ClientAuth, so
+// feeding its result straight into tls.Listen leaves ClientAuth at Go's
+// NoClientCert default: any client with no certificate completes the handshake
+// and is treated as a trusted gossip peer. This helper fixes that by cloning
+// the TLS config, moving the trusted CA pool into ClientCAs, and requiring the
+// peer to present a certificate signed by one of those CAs.
+func buildServerTLSConfig(clientCfg *tls.Config, serverCAPath, fallbackCAPath string) (*tls.Config, error) {
+	if clientCfg == nil {
+		return nil, errors.New("client TLS config is nil")
+	}
+
+	caPath := serverCAPath
+	if caPath == "" {
+		caPath = fallbackCAPath
+	}
+	if caPath == "" {
+		return nil, errors.New("memberlist TLS listener requires a client CA (configure -memberlist.tls-server-ca-path or -memberlist.tls-ca-path): without one, Go defaults to NoClientCert and any peer is accepted")
+	}
+
+	caPEM, err := os.ReadFile(caPath)
+	if err != nil {
+		return nil, errors.Wrapf(err, "failed to read memberlist peer CA bundle %q", caPath)
+	}
+	caPool := x509.NewCertPool()
+	if ok := caPool.AppendCertsFromPEM(caPEM); !ok {
+		return nil, errors.Errorf("failed to parse memberlist peer CA bundle %q", caPath)
+	}
+
+	srvCfg := clientCfg.Clone()
+	srvCfg.ClientCAs = caPool
+	srvCfg.ClientAuth = tls.RequireAndVerifyClientCert
+	if srvCfg.MinVersion < tls.VersionTLS12 {
+		srvCfg.MinVersion = tls.VersionTLS12
+	}
+	// ServerName is only meaningful for outbound dials; clear it so that we
+	// do not accidentally require inbound peers to present it.
+	srvCfg.ServerName = ""
+	return srvCfg, nil
 }
 
 // tcpListen is a long running goroutine that accepts incoming TCP connections
