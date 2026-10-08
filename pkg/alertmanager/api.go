@@ -8,6 +8,7 @@ import (
 	"os"
 	"path/filepath"
 	"reflect"
+	"regexp"
 
 	"github.com/go-kit/log"
 	"github.com/go-kit/log/level"
@@ -40,11 +41,19 @@ const (
 )
 
 var (
-	errPasswordFileNotAllowed        = errors.New("setting password_file, bearer_token_file and credentials_file is not allowed")
-	errOAuth2SecretFileNotAllowed    = errors.New("setting OAuth2 client_secret_file is not allowed")
-	errTLSFileNotAllowed             = errors.New("setting TLS ca_file, cert_file and key_file is not allowed")
-	errSlackAPIURLFileNotAllowed     = errors.New("setting Slack api_url_file and global slack_api_url_file is not allowed")
-	errVictorOpsAPIKeyFileNotAllowed = errors.New("setting VictorOps api_key_file is not allowed")
+	errPasswordFileNotAllowed          = errors.New("setting password_file, bearer_token_file and credentials_file is not allowed")
+	errOAuth2SecretFileNotAllowed      = errors.New("setting OAuth2 client_secret_file is not allowed")
+	errTLSFileNotAllowed               = errors.New("setting TLS ca_file, cert_file and key_file is not allowed")
+	errSlackAPIURLFileNotAllowed       = errors.New("setting Slack api_url_file and global slack_api_url_file is not allowed")
+	errVictorOpsAPIKeyFileNotAllowed   = errors.New("setting VictorOps api_key_file is not allowed")
+	errSNSAmbientCredentialsNotAllowed = errors.New("sns_configs require explicit sigv4 access_key and secret_key")
+	errSNSProfileNotAllowed            = errors.New("setting sns sigv4 profile is not allowed")
+	errSNSRoleARNNotAllowed            = errors.New("setting sns sigv4 role_arn is not allowed")
+	errSNSAPIURLNotAllowed             = errors.New("sns_configs api_url must be empty or a public AWS SNS endpoint (https://sns.<region>.amazonaws.com)")
+
+	// snsAPIURLAllowed matches public AWS SNS endpoints only. Empty api_url is
+	// also permitted (the SDK then uses the default endpoint for the region).
+	snsAPIURLAllowed = regexp.MustCompile(`^https://sns\.[a-z0-9-]+\.amazonaws\.com/?$`)
 )
 
 // UserConfig is used to communicate a users alertmanager configs
@@ -350,6 +359,11 @@ func validateAlertmanagerConfig(cfg interface{}) error {
 		if err := validateVictorOpsConfig(v.Interface().(config.VictorOpsConfig)); err != nil {
 			return err
 		}
+
+	case reflect.TypeOf(config.SNSConfig{}):
+		if err := validateSNSConfig(v.Interface().(config.SNSConfig)); err != nil {
+			return err
+		}
 	}
 
 	// If the input config is a struct, recursively iterate on all fields.
@@ -446,6 +460,37 @@ func validateSlackConfig(cfg config.SlackConfig) error {
 func validateVictorOpsConfig(cfg config.VictorOpsConfig) error {
 	if cfg.APIKeyFile != "" {
 		return errVictorOpsAPIKeyFileNotAllowed
+	}
+	return nil
+}
+
+// validateSNSConfig validates the SNS config and returns an error if it contains
+// settings that would make Cortex sign requests with its own cloud identity
+// (confused deputy / credential disclosure) or redirect them to a tenant-chosen host.
+func validateSNSConfig(cfg config.SNSConfig) error {
+	// Reject tenant-selected profiles: these would resolve against any
+	// ~/.aws/credentials file mounted into the Alertmanager container, letting
+	// the tenant pick which operator identity to sign with.
+	if cfg.Sigv4.Profile != "" {
+		return errSNSProfileNotAllowed
+	}
+	// Reject tenant-selected role_arn: this would make Cortex call sts:AssumeRole
+	// under its own identity against an arbitrary role, leaking the cluster's
+	// trust relationships.
+	if cfg.Sigv4.RoleARN != "" {
+		return errSNSRoleARNNotAllowed
+	}
+	// Require the tenant to bring its own credentials: otherwise the notifier
+	// signs with the Cortex pod's IAM identity via the AWS default credential chain.
+	if cfg.Sigv4.AccessKey == "" || string(cfg.Sigv4.SecretKey) == "" {
+		return errSNSAmbientCredentialsNotAllowed
+	}
+	// Restrict api_url to the public AWS SNS endpoints so a tenant cannot
+	// redirect operator-signed requests to an attacker-controlled host. An empty
+	// value falls back to the SDK's default endpoint for the configured region
+	// and is also permitted.
+	if cfg.APIUrl != "" && !snsAPIURLAllowed.MatchString(cfg.APIUrl) {
+		return errSNSAPIURLNotAllowed
 	}
 	return nil
 }
