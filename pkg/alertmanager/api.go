@@ -8,6 +8,7 @@ import (
 	"os"
 	"path/filepath"
 	"reflect"
+	"strings"
 
 	"github.com/go-kit/log"
 	"github.com/go-kit/log/level"
@@ -40,12 +41,39 @@ const (
 )
 
 var (
-	errPasswordFileNotAllowed        = errors.New("setting password_file, bearer_token_file and credentials_file is not allowed")
-	errOAuth2SecretFileNotAllowed    = errors.New("setting OAuth2 client_secret_file is not allowed")
-	errTLSFileNotAllowed             = errors.New("setting TLS ca_file, cert_file and key_file is not allowed")
-	errSlackAPIURLFileNotAllowed     = errors.New("setting Slack api_url_file and global slack_api_url_file is not allowed")
-	errVictorOpsAPIKeyFileNotAllowed = errors.New("setting VictorOps api_key_file is not allowed")
+	errPasswordFileNotAllowed         = errors.New("setting password_file, bearer_token_file and credentials_file is not allowed")
+	errOAuth2SecretFileNotAllowed     = errors.New("setting OAuth2 client_secret_file is not allowed")
+	errTLSFileNotAllowed              = errors.New("setting TLS ca_file, cert_file and key_file is not allowed")
+	errSlackAPIURLFileNotAllowed      = errors.New("setting Slack api_url_file and global slack_api_url_file is not allowed")
+	errVictorOpsAPIKeyFileNotAllowed  = errors.New("setting VictorOps api_key_file is not allowed")
+	errOpsGenieAPIKeyFileNotAllowed   = errors.New("setting OpsGenie api_key_file and global opsgenie_api_key_file is not allowed")
+	errUnregisteredFileFieldNotAllowed = errors.New("setting *_file fields is not allowed")
 )
+
+// allowedFileFieldNames enumerates every string field whose YAML tag ends in
+// `_file` (or whose Go name ends in `File`) that has a dedicated validator
+// covering it. Any *_file field reached by validateAlertmanagerConfig that is
+// not present here will be rejected unconditionally so that a vendor bump
+// introducing a new file-reading field cannot silently escape validation.
+var allowedFileFieldNames = map[string]struct{}{
+	// commoncfg.HTTPClientConfig / BasicAuth / Authorization / OAuth2 — covered by validateReceiverHTTPConfig.
+	"password_file":      {},
+	"bearer_token_file":  {},
+	"credentials_file":   {},
+	"client_secret_file": {},
+	// commoncfg.TLSConfig — covered by validateReceiverTLSConfig.
+	"ca_file":   {},
+	"cert_file": {},
+	"key_file":  {},
+	// GlobalConfig / SlackConfig — covered by validateGlobalConfig / validateSlackConfig.
+	"slack_api_url_file": {},
+	"api_url_file":       {},
+	// GlobalConfig / OpsGenieConfig — covered by validateGlobalConfig / validateOpsGenieConfig.
+	"opsgenie_api_key_file": {},
+	// VictorOpsConfig.APIKeyFile and OpsGenieConfig.APIKeyFile share the same
+	// yaml tag and are each covered by their dedicated validators.
+	"api_key_file": {},
+}
 
 // UserConfig is used to communicate a users alertmanager configs
 type UserConfig struct {
@@ -350,6 +378,11 @@ func validateAlertmanagerConfig(cfg interface{}) error {
 		if err := validateVictorOpsConfig(v.Interface().(config.VictorOpsConfig)); err != nil {
 			return err
 		}
+
+	case reflect.TypeOf(config.OpsGenieConfig{}):
+		if err := validateOpsGenieConfig(v.Interface().(config.OpsGenieConfig)); err != nil {
+			return err
+		}
 	}
 
 	// If the input config is a struct, recursively iterate on all fields.
@@ -357,6 +390,21 @@ func validateAlertmanagerConfig(cfg interface{}) error {
 		for i := 0; i < t.NumField(); i++ {
 			field := t.Field(i)
 			fieldValue := v.FieldByIndex(field.Index)
+
+			// Fail-closed guard: any non-empty exported string-kind field whose
+			// YAML tag ends in `_file` (or whose Go name ends in `File`) must
+			// have a dedicated validator in allowedFileFieldNames. This
+			// prevents a future upstream dependency bump from silently
+			// introducing a new local-file-reading field that bypasses the
+			// per-type validators above (same class of bug as CVE-2021-36157).
+			if field.IsExported() && fieldValue.Kind() == reflect.String && fieldValue.Len() > 0 {
+				yamlName := yamlFieldName(field)
+				if isFileField(field, yamlName) {
+					if _, ok := allowedFileFieldNames[yamlName]; !ok {
+						return errors.Wrapf(errUnregisteredFileFieldNotAllowed, "field %q (yaml: %q) on %s", field.Name, yamlName, t.String())
+					}
+				}
+			}
 
 			// Skip any field value which can't be converted to interface (eg. primitive types).
 			if fieldValue.CanInterface() {
@@ -429,7 +477,49 @@ func validateGlobalConfig(cfg config.GlobalConfig) error {
 	if cfg.SlackAPIURLFile != "" {
 		return errSlackAPIURLFileNotAllowed
 	}
+	if cfg.OpsGenieAPIKeyFile != "" {
+		return errOpsGenieAPIKeyFileNotAllowed
+	}
 	return nil
+}
+
+// validateOpsGenieConfig validates the OpsGenie config and returns an error if
+// it contains settings not allowed by Cortex.
+func validateOpsGenieConfig(cfg config.OpsGenieConfig) error {
+	if cfg.APIKeyFile != "" {
+		return errOpsGenieAPIKeyFileNotAllowed
+	}
+	return nil
+}
+
+// yamlFieldName returns the YAML name of a struct field. It parses the `yaml`
+// struct tag the same way gopkg.in/yaml.v2 does (name is first comma-separated
+// token). If there is no yaml tag it falls back to the Go field name.
+func yamlFieldName(field reflect.StructField) string {
+	tag := field.Tag.Get("yaml")
+	if tag == "" || tag == "-" {
+		return field.Name
+	}
+	if idx := strings.Index(tag, ","); idx >= 0 {
+		tag = tag[:idx]
+	}
+	if tag == "" {
+		return field.Name
+	}
+	return tag
+}
+
+// isFileField reports whether a struct field looks like a local-file reference
+// based on its YAML tag or Go name. We treat both forms as suspicious because
+// upstream code sometimes omits the yaml tag.
+func isFileField(field reflect.StructField, yamlName string) bool {
+	if strings.HasSuffix(yamlName, "_file") {
+		return true
+	}
+	if strings.HasSuffix(field.Name, "File") {
+		return true
+	}
+	return false
 }
 
 // validateSlackConfig validates the Slack config and returns an error if it contains
