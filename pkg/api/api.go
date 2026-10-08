@@ -18,6 +18,7 @@ import (
 	"github.com/cortexproject/cortex/pkg/alertmanager"
 	"github.com/cortexproject/cortex/pkg/alertmanager/alertmanagerpb"
 	"github.com/cortexproject/cortex/pkg/compactor"
+	configAPI "github.com/cortexproject/cortex/pkg/configs/api"
 	"github.com/cortexproject/cortex/pkg/cortexpb"
 	"github.com/cortexproject/cortex/pkg/distributor"
 	"github.com/cortexproject/cortex/pkg/distributor/distributorpb"
@@ -322,6 +323,37 @@ func (a *API) RegisterRulerAPI(r *ruler.API) {
 	a.RegisterRoute(path.Join(a.cfg.LegacyHTTPPrefix, "/rules/{namespace}"), http.HandlerFunc(r.CreateRuleGroup), true, "POST")
 	a.RegisterRoute(path.Join(a.cfg.LegacyHTTPPrefix, "/rules/{namespace}/{groupName}"), http.HandlerFunc(r.DeleteRuleGroup), true, "DELETE")
 	a.RegisterRoute(path.Join(a.cfg.LegacyHTTPPrefix, "/rules/{namespace}"), http.HandlerFunc(r.DeleteNamespace), true, "DELETE")
+}
+
+// RegisterConfigsAPI registers the (legacy) configs service routes through
+// the auth-aware API layer so that:
+//
+//   - Per-tenant routes (`/`, `/api/prom/configs/*`) are wrapped by the
+//     configured AuthMiddleware, which populates the tenant identity in the
+//     request context. The handlers derive the tenant from that context
+//     instead of from the raw caller-supplied `X-Scope-OrgID` header, so
+//     the `-auth.enabled=false` invariant (tenant forced to `fake`, see
+//     pkg/util/fakeauth/fake_auth.go) applies to these endpoints like every
+//     other tenant endpoint.
+//
+//   - Cross-tenant "private" routes (`/private/api/prom/configs/*`) that dump
+//     every tenant's rules / Alertmanager configuration -- including embedded
+//     receiver secrets -- are registered without the tenant auth middleware,
+//     matching the project's documented pattern for operator-only endpoints
+//     such as `/multitenant_alertmanager/configs` and `/ruler/rule_groups`.
+//     These endpoints MUST NOT be exposed to end users: operators are expected
+//     to restrict `/private/*` at the gateway or serve the configs service on
+//     a separate internal listener. Attaching the tenant auth middleware here
+//     would be actively dangerous because the handler ignores tenant identity
+//     entirely, so a syntactically-valid `X-Scope-OrgID` header would be
+//     accepted as sufficient to receive the full cross-tenant dump.
+func (a *API) RegisterConfigsAPI(c *configAPI.API) {
+	for _, r := range c.TenantRoutes() {
+		a.RegisterRoute(r.Path, r.Handler, true, r.Method)
+	}
+	for _, r := range c.CrossTenantRoutes() {
+		a.RegisterRoute(r.Path, r.Handler, false, r.Method)
+	}
 }
 
 // RegisterRing registers the ring UI page associated with the distributor for writes.

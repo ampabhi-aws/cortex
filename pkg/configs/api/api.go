@@ -81,12 +81,23 @@ func (a *API) admin(w http.ResponseWriter, r *http.Request) {
 `)
 }
 
-// RegisterRoutes registers the configs API HTTP routes with the provided Router.
-func (a *API) RegisterRoutes(r *mux.Router) {
-	for _, route := range []struct {
-		name, method, path string
-		handler            http.HandlerFunc
-	}{
+// Route describes a single configs HTTP route. Exposed so the auth-aware
+// api.API layer can wrap each handler with the appropriate middleware (tenant
+// routes get the per-request auth middleware; cross-tenant "private" routes
+// must be gated as operator-only administrative endpoints).
+type Route struct {
+	Name    string
+	Method  string
+	Path    string
+	Handler http.HandlerFunc
+}
+
+// TenantRoutes returns the per-tenant configs routes. These are safe to serve
+// to end users once wrapped by the auth middleware: handlers derive the tenant
+// identity from the request context (populated by the middleware), not from a
+// raw caller-supplied header.
+func (a *API) TenantRoutes() []Route {
+	return []Route{
 		{"root", "GET", "/", a.admin},
 		// Dedicated APIs for updating rules config. In the future, these *must*
 		// be used.
@@ -99,17 +110,39 @@ func (a *API) RegisterRoutes(r *mux.Router) {
 		{"validate_alertmanager_config", "POST", "/api/prom/configs/alertmanager/validate", a.validateAlertmanagerConfig},
 		{"deactivate_config", "DELETE", "/api/prom/configs/deactivate", a.deactivateConfig},
 		{"restore_config", "POST", "/api/prom/configs/restore", a.restoreConfig},
-		// Internal APIs.
+	}
+}
+
+// CrossTenantRoutes returns the cross-tenant ("private" / operator-only)
+// configs routes. These dump every tenant's rules / alertmanager configuration
+// -- including embedded receiver secrets -- and must be served either on a
+// separate internal listener or gated behind an operator credential at the
+// api.API layer. Never register these with the per-tenant auth middleware:
+// the handler ignores tenant identity, so wrapping with the standard tenant
+// auth would give any caller with a syntactically-valid X-Scope-OrgID header
+// an unauthenticated cross-tenant dump.
+func (a *API) CrossTenantRoutes() []Route {
+	return []Route{
 		{"private_get_rules", "GET", "/private/api/prom/configs/rules", a.getConfigs},
 		{"private_get_alertmanager_config", "GET", "/private/api/prom/configs/alertmanager", a.getConfigs},
-	} {
-		r.Handle(route.path, route.handler).Methods(route.method).Name(route.name)
+	}
+}
+
+// RegisterRoutes registers the configs API HTTP routes with the provided
+// Router. It is retained for in-process use (notably by the API's own
+// http.Handler, used in unit tests) where the mux is private and middleware is
+// unnecessary. Production code should prefer the api.API layer, which wraps
+// TenantRoutes with the auth middleware and gates CrossTenantRoutes as
+// operator-only.
+func (a *API) RegisterRoutes(r *mux.Router) {
+	for _, route := range append(a.TenantRoutes(), a.CrossTenantRoutes()...) {
+		r.Handle(route.Path, route.Handler).Methods(route.Method).Name(route.Name)
 	}
 }
 
 // getConfig returns the request configuration.
 func (a *API) getConfig(w http.ResponseWriter, r *http.Request) {
-	userID, _, err := tenant.ExtractTenantIDFromHTTPRequest(r)
+	userID, err := tenant.TenantID(r.Context())
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusUnauthorized)
 		return
@@ -147,7 +180,7 @@ func (a *API) getConfig(w http.ResponseWriter, r *http.Request) {
 }
 
 func (a *API) setConfig(w http.ResponseWriter, r *http.Request) {
-	userID, _, err := tenant.ExtractTenantIDFromHTTPRequest(r)
+	userID, err := tenant.TenantID(r.Context())
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusUnauthorized)
 		return
@@ -297,7 +330,7 @@ func (a *API) getConfigs(w http.ResponseWriter, r *http.Request) {
 }
 
 func (a *API) deactivateConfig(w http.ResponseWriter, r *http.Request) {
-	userID, _, err := tenant.ExtractTenantIDFromHTTPRequest(r)
+	userID, err := tenant.TenantID(r.Context())
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusUnauthorized)
 		return
@@ -319,7 +352,7 @@ func (a *API) deactivateConfig(w http.ResponseWriter, r *http.Request) {
 }
 
 func (a *API) restoreConfig(w http.ResponseWriter, r *http.Request) {
-	userID, _, err := tenant.ExtractTenantIDFromHTTPRequest(r)
+	userID, err := tenant.TenantID(r.Context())
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusUnauthorized)
 		return
