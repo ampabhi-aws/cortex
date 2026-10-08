@@ -321,6 +321,16 @@ func (s resultsCache) isAtModifierCachable(ctx context.Context, r tripperware.Re
 	if !strings.Contains(query, "@") {
 		return true
 	}
+	// Belt-and-braces: if the query text still contains an unresolved
+	// start()/end() @-modifier by the time it reaches the results cache,
+	// refuse to cache the response. Otherwise the resolved timestamp is
+	// pinned to start/end at the sub-request level by the querier, but the
+	// cache key only captures the (bucketed) start, so two requests with
+	// different exact starts in the same split interval could share one
+	// entry evaluated at a different instant than requested.
+	if strings.Contains(query, "start()") || strings.Contains(query, "end()") {
+		return false
+	}
 	expr, err := parser.ParseExpr(query)
 	if err != nil {
 		// We are being pessimistic in such cases.

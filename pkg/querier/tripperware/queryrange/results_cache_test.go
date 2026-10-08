@@ -420,7 +420,7 @@ func TestShouldCache(t *testing.T) {
 			name:     "@ modifier on vector selector with start() before maxCacheTime",
 			request:  &PrometheusRequest{Query: "metric @ start()", Start: 100000, End: 200000},
 			input:    tripperware.Response(&PrometheusResponse{}),
-			expected: true,
+			expected: false,
 		},
 		{
 			name:     "@ modifier on vector selector with end() after maxCacheTime",
@@ -457,7 +457,7 @@ func TestShouldCache(t *testing.T) {
 			name:     "@ modifier on matrix selector with start() before maxCacheTime",
 			request:  &PrometheusRequest{Query: "rate(metric[5m] @ start())", Start: 100000, End: 200000},
 			input:    tripperware.Response(&PrometheusResponse{}),
-			expected: true,
+			expected: false,
 		},
 		{
 			name:     "@ modifier on matrix selector with end() after maxCacheTime",
@@ -494,7 +494,7 @@ func TestShouldCache(t *testing.T) {
 			name:     "@ modifier on subqueries with start() before maxCacheTime",
 			request:  &PrometheusRequest{Query: "sum_over_time(rate(metric[1m])[10m:1m] @ start())", Start: 100000, End: 200000},
 			input:    tripperware.Response(&PrometheusResponse{}),
-			expected: true,
+			expected: false,
 		},
 		{
 			name:     "@ modifier on subqueries with end() after maxCacheTime",
