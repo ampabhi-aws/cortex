@@ -11,6 +11,8 @@ import (
 	"github.com/weaveworks/common/httpgrpc"
 
 	"github.com/cortexproject/cortex/pkg/querier/tripperware"
+	"github.com/cortexproject/cortex/pkg/tenant"
+	"github.com/cortexproject/cortex/pkg/util/validation"
 )
 
 type IntervalFn func(r tripperware.Request) time.Duration
@@ -49,6 +51,22 @@ func (s splitByInterval) Do(ctx context.Context, r tripperware.Request) (tripper
 	if err != nil {
 		return nil, err
 	}
+
+	// Bound the derived work: reject requests that would fan out to more
+	// sub-requests than the per-tenant MaxQuerySplits allows. This is enforced
+	// before the sub-requests are dispatched so that a single small request
+	// cannot amplify into thousands of scheduler enqueues / querier executions
+	// (CWE-770 / CWE-840).
+	tenantIDs, err := tenant.TenantIDs(ctx)
+	if err != nil {
+		return nil, httpgrpc.Errorf(http.StatusBadRequest, err.Error())
+	}
+	if maxSplits := validation.SmallestPositiveIntPerTenant(tenantIDs, s.limits.MaxQuerySplits); maxSplits > 0 && len(reqs) > maxSplits {
+		return nil, httpgrpc.Errorf(http.StatusBadRequest,
+			"query would be split into %d sub-queries, limit is %d; reduce the time range or increase the split interval",
+			len(reqs), maxSplits)
+	}
+
 	s.splitByCounter.Add(float64(len(reqs)))
 
 	reqResps, err := tripperware.DoRequests(ctx, s.next, reqs, s.limits)

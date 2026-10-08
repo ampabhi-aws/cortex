@@ -77,6 +77,7 @@ type Limits struct {
 	MaxQueryLookback             model.Duration `yaml:"max_query_lookback" json:"max_query_lookback"`
 	MaxQueryLength               model.Duration `yaml:"max_query_length" json:"max_query_length"`
 	MaxQueryParallelism          int            `yaml:"max_query_parallelism" json:"max_query_parallelism"`
+	MaxQuerySplits               int            `yaml:"max_query_splits" json:"max_query_splits"`
 	MaxCacheFreshness            model.Duration `yaml:"max_cache_freshness" json:"max_cache_freshness"`
 	MaxQueriersPerTenant         int            `yaml:"max_queriers_per_tenant" json:"max_queriers_per_tenant"`
 	QueryVerticalShardSize       int            `yaml:"query_vertical_shard_size" json:"query_vertical_shard_size" doc:"hidden"`
@@ -153,9 +154,11 @@ func (l *Limits) RegisterFlags(f *flag.FlagSet) {
 	f.IntVar(&l.MaxFetchedSeriesPerQuery, "querier.max-fetched-series-per-query", 0, "The maximum number of unique series for which a query can fetch samples from each ingesters and blocks storage. This limit is enforced in the querier, ruler and store-gateway. 0 to disable")
 	f.IntVar(&l.MaxFetchedChunkBytesPerQuery, "querier.max-fetched-chunk-bytes-per-query", 0, "Deprecated (user max-fetched-data-bytes-per-query instead): The maximum size of all chunks in bytes that a query can fetch from each ingester and storage. This limit is enforced in the querier, ruler and store-gateway. 0 to disable.")
 	f.IntVar(&l.MaxFetchedDataBytesPerQuery, "querier.max-fetched-data-bytes-per-query", 0, "The maximum combined size of all data that a query can fetch from each ingester and storage. This limit is enforced in the querier and ruler for `query`, `query_range` and `series` APIs. 0 to disable.")
+	_ = l.MaxQueryLength.Set("721h")
 	f.Var(&l.MaxQueryLength, "store.max-query-length", "Limit the query time range (end - start time). This limit is enforced in the query-frontend (on the received query) and in the querier (on the query possibly split by the query-frontend). 0 to disable.")
 	f.Var(&l.MaxQueryLookback, "querier.max-query-lookback", "Limit how long back data (series and metadata) can be queried, up until <lookback> duration ago. This limit is enforced in the query-frontend, querier and ruler. If the requested time range is outside the allowed range, the request will not fail but will be manipulated to only query data within the allowed time range. 0 to disable.")
 	f.IntVar(&l.MaxQueryParallelism, "querier.max-query-parallelism", 14, "Maximum number of split queries will be scheduled in parallel by the frontend.")
+	f.IntVar(&l.MaxQuerySplits, "querier.max-query-splits", 1000, "Maximum number of sub-requests a query can be split into by the query-frontend's split-by-interval middleware. Requests that would produce more splits are rejected with HTTP 400 before being dispatched to queriers, bounding the amplification caused by split-by-interval. 0 to disable.")
 	_ = l.MaxCacheFreshness.Set("1m")
 	f.Var(&l.MaxCacheFreshness, "frontend.max-cache-freshness", "Most recent allowed cacheable result per-tenant, to prevent caching very recent results that might still be in flux.")
 	f.IntVar(&l.MaxQueriersPerTenant, "frontend.max-queriers-per-tenant", 0, "Maximum number of queriers that can handle requests for a single tenant. If set to 0 or value higher than number of available queriers, *all* queriers will handle requests for the tenant. Each frontend (or query-scheduler, if used) will select the same set of queriers for the same tenant (given that all queriers are connected to all frontends / query-schedulers). This option only works with queriers connecting to the query-frontend / query-scheduler, not when using downstream URL.")
@@ -444,6 +447,12 @@ func (o *Overrides) QueryVerticalShardSize(userID string) int {
 // frontend will process in parallel.
 func (o *Overrides) MaxQueryParallelism(userID string) int {
 	return o.getOverridesForUser(userID).MaxQueryParallelism
+}
+
+// MaxQuerySplits returns the maximum number of sub-requests the split-by-interval
+// middleware is allowed to produce for a single query. A value <= 0 disables the limit.
+func (o *Overrides) MaxQuerySplits(userID string) int {
+	return o.getOverridesForUser(userID).MaxQuerySplits
 }
 
 // EnforceMetricName whether to enforce the presence of a metric name.
