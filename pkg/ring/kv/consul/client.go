@@ -2,6 +2,7 @@ package consul
 
 import (
 	"context"
+	"crypto/tls"
 	"errors"
 	"flag"
 	"fmt"
@@ -20,6 +21,7 @@ import (
 	"github.com/cortexproject/cortex/pkg/ring/kv/codec"
 	"github.com/cortexproject/cortex/pkg/util/backoff"
 	"github.com/cortexproject/cortex/pkg/util/flagext"
+	cortextls "github.com/cortexproject/cortex/pkg/util/tls"
 )
 
 const (
@@ -46,6 +48,9 @@ type Config struct {
 	ConsistentReads   bool           `yaml:"consistent_reads"`
 	WatchKeyRateLimit float64        `yaml:"watch_rate_limit"` // Zero disables rate limit
 	WatchKeyBurstSize int            `yaml:"watch_burst_size"` // Burst when doing rate-limit, defaults to 1
+
+	EnableTLS bool                   `yaml:"tls_enabled"`
+	TLS       cortextls.ClientConfig `yaml:",inline"`
 
 	// Used in tests only.
 	MaxCasRetries int           `yaml:"-"`
@@ -78,16 +83,43 @@ func (cfg *Config) RegisterFlags(f *flag.FlagSet, prefix string) {
 	f.BoolVar(&cfg.ConsistentReads, prefix+"consul.consistent-reads", false, "Enable consistent reads to Consul.")
 	f.Float64Var(&cfg.WatchKeyRateLimit, prefix+"consul.watch-rate-limit", 1, "Rate limit when watching key or prefix in Consul, in requests per second. 0 disables the rate limit.")
 	f.IntVar(&cfg.WatchKeyBurstSize, prefix+"consul.watch-burst-size", 1, "Burst size used in rate limit. Values less than 1 are treated as 1.")
+	f.BoolVar(&cfg.EnableTLS, prefix+"consul.tls-enabled", false, "Enable TLS when talking to Consul. If set, the client uses HTTPS and will verify the server certificate using the configured TLS CA/cert/key.")
+	cfg.TLS.RegisterFlagsWithPrefix(prefix+"consul", f)
 }
 
 // NewClient returns a new Client.
 func NewClient(cfg Config, codec codec.Codec, logger log.Logger, registerer prometheus.Registerer) (*Client, error) {
+	// Fail closed: never send the Consul ACL token over an unencrypted connection.
+	if !cfg.EnableTLS && cfg.ACLToken.Value != "" {
+		return nil, errors.New("consul ACL token must not be used without consul.tls-enabled; refusing to send credentials over an unencrypted connection")
+	}
+	// Fail closed: TLS material configured but TLS is disabled.
+	if !cfg.EnableTLS && (cfg.TLS.CertPath != "" || cfg.TLS.KeyPath != "" || cfg.TLS.CAPath != "" || cfg.TLS.ServerName != "") {
+		return nil, errors.New("consul TLS flags are set but consul.tls-enabled is false; refusing to use an insecure connection")
+	}
+
+	scheme := "http"
+	var tlsCfg *tls.Config
+	if cfg.EnableTLS {
+		scheme = "https"
+		var err error
+		tlsCfg, err = cfg.TLS.GetTLSConfig()
+		if err != nil {
+			return nil, fmt.Errorf("unable to initialise TLS configuration for consul: %w", err)
+		}
+	}
+
+	transport := cleanhttp.DefaultPooledTransport()
+	if tlsCfg != nil {
+		transport.TLSClientConfig = tlsCfg
+	}
+
 	client, err := consul.NewClient(&consul.Config{
 		Address: cfg.Host,
 		Token:   cfg.ACLToken.Value,
-		Scheme:  "http",
+		Scheme:  scheme,
 		HttpClient: &http.Client{
-			Transport: cleanhttp.DefaultPooledTransport(),
+			Transport: transport,
 			// See https://blog.cloudflare.com/the-complete-guide-to-golang-net-http-timeouts/
 			Timeout: cfg.HTTPClientTimeout,
 		},

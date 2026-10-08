@@ -58,6 +58,12 @@ func (cfg *Config) Validate(log log.Logger) error {
 	default:
 		return errors.Errorf("unsupported compression type: %s", cfg.GRPCCompression)
 	}
+
+	// Fail closed: if any TLS material is configured but tls_enabled is false,
+	// refuse to start rather than silently sending traffic in plaintext.
+	if !cfg.TLSEnabled && (cfg.TLS.CertPath != "" || cfg.TLS.KeyPath != "" || cfg.TLS.CAPath != "" || cfg.TLS.ServerName != "") {
+		return errors.New("TLS flags are set but tls_enabled is false; refusing to use an insecure connection")
+	}
 	return nil
 }
 

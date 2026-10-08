@@ -79,6 +79,14 @@ func (cfg *Config) GetTLS() (*tls.Config, error) {
 
 // New makes a new Client.
 func New(cfg Config, codec codec.Codec, logger log.Logger) (*Client, error) {
+	// Fail closed: never send etcd auth credentials over an unencrypted connection.
+	if !cfg.EnableTLS && cfg.Password != "" {
+		return nil, errors.New("etcd username/password must not be used without etcd.tls-enabled; refusing to send credentials over an unencrypted connection")
+	}
+	// Fail closed: TLS material configured but TLS is disabled.
+	if !cfg.EnableTLS && (cfg.TLS.CertPath != "" || cfg.TLS.KeyPath != "" || cfg.TLS.CAPath != "" || cfg.TLS.ServerName != "") {
+		return nil, errors.New("etcd TLS flags are set but etcd.tls-enabled is false; refusing to use an insecure connection")
+	}
 	tlsConfig, err := cfg.GetTLS()
 	if err != nil {
 		return nil, errors.Wrapf(err, "unable to initialise TLS configuration for etcd")
