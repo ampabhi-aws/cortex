@@ -3,9 +3,12 @@ package api
 import (
 	"context"
 	"flag"
+	"fmt"
 	"net/http"
 	"path"
+	"strconv"
 	"strings"
+	"sync/atomic"
 
 	"github.com/NYTimes/gziphandler"
 	"github.com/felixge/fgprof"
@@ -219,7 +222,46 @@ func (a *API) RegisterAPI(httpPathPrefix string, actualCfg interface{}, defaultC
 
 	a.RegisterRoute("/config", a.cfg.configHandler(actualCfg, defaultCfg), false, "GET")
 	a.RegisterRoute("/", indexHandler(httpPathPrefix, a.indexPage), false, "GET")
-	a.RegisterRoute("/debug/fgprof", fgprof.Handler(), false, "GET")
+	// The fgprof handler is wrapped by boundedProfiler to cap the
+	// attacker-controlled profiling duration and limit concurrency to a single
+	// in-flight profile. The upstream handler only rejects seconds<=0 and
+	// ignores r.Context(), which allows a cheap unauthenticated request to pin
+	// a 99 Hz stop-the-world goroutine profiler for arbitrarily long and to
+	// amplify stop-the-world pauses via concurrent requests. See
+	// vendor/github.com/felixge/fgprof/handler.go and fgprof.go.
+	a.RegisterRoute("/debug/fgprof", boundedProfiler(fgprof.Handler()), false, "GET")
+}
+
+// boundedProfiler wraps a profiling handler so that:
+//   - the ?seconds= query parameter is capped at maxProfileSeconds, and
+//   - at most one profile may be in flight at any time.
+//
+// This mitigates CWE-770 (Allocation of Resources Without Limits or Throttling)
+// on /debug/fgprof: the upstream fgprof handler validates only that seconds>0
+// and does not honour request cancellation, so without this wrapper a single
+// unauthenticated GET can start a 99 Hz runtime.GoroutineProfile sampler that
+// runs for an attacker-chosen duration, and multiple concurrent requests
+// multiply the per-tick stop-the-world cost.
+const maxProfileSeconds = 30
+
+var profilerInFlight int32
+
+func boundedProfiler(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if s := r.URL.Query().Get("seconds"); s != "" {
+			n, err := strconv.Atoi(s)
+			if err != nil || n <= 0 || n > maxProfileSeconds {
+				http.Error(w, fmt.Sprintf("seconds must be an integer in 1..%d", maxProfileSeconds), http.StatusBadRequest)
+				return
+			}
+		}
+		if !atomic.CompareAndSwapInt32(&profilerInFlight, 0, 1) {
+			http.Error(w, "profile already in progress", http.StatusTooManyRequests)
+			return
+		}
+		defer atomic.StoreInt32(&profilerInFlight, 0)
+		next.ServeHTTP(w, r)
+	})
 }
 
 // RegisterRuntimeConfig registers the endpoints associates with the runtime configuration
