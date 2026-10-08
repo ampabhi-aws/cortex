@@ -6,9 +6,11 @@ import (
 	"flag"
 	"fmt"
 	"math/rand"
+	"runtime/debug"
 	"strings"
 	"sync"
 	"time"
+	"unicode/utf8"
 
 	"github.com/go-kit/log"
 	"github.com/go-kit/log/level"
@@ -43,6 +45,24 @@ func ProtoReplicaDescFactory() proto.Message {
 // NewReplicaDesc returns an empty *distributor.ReplicaDesc.
 func NewReplicaDesc() *ReplicaDesc {
 	return &ReplicaDesc{}
+}
+
+// isValidHAClusterLabel enforces the same syntactic constraints that
+// Distributor.checkSample applies to the ingress path, so that any KV
+// entry replayed through the watch callback — including entries written
+// by an older build or by another distributor — is also safe to feed
+// into Prometheus WithLabelValues.
+func isValidHAClusterLabel(cluster string) bool {
+	if cluster == "" {
+		return false
+	}
+	if !utf8.ValidString(cluster) {
+		return false
+	}
+	if strings.ContainsAny(cluster, "/\\\n\r\x00") {
+		return false
+	}
+	return true
 }
 
 // HATrackerConfig contains the configuration require to
@@ -216,6 +236,18 @@ func (c *haTracker) loop(ctx context.Context) error {
 	// The KVStore config we gave when creating c should have contained a prefix,
 	// which would have given us a prefixed KVStore client. So, we can pass empty string here.
 	c.client.WatchPrefix(ctx, "", func(key string, value interface{}) bool {
+		// Defence in depth: the key is reconstructed from raw KV-store bytes
+		// (which, with the etcd backend, pass through as-is) and the metric
+		// label-value validator in client_golang panics on invalid UTF-8.
+		// A single malformed KV entry must never terminate the distributor
+		// goroutine running under services.BasicService (which has no recover).
+		defer func() {
+			if r := recover(); r != nil {
+				level.Error(c.logger).Log("msg", "recovered from panic in HA tracker watch callback",
+					"key", key, "panic", fmt.Sprintf("%v", r), "stack", string(debug.Stack()))
+			}
+		}()
+
 		replica := value.(*ReplicaDesc)
 		segments := strings.SplitN(key, "/", 2)
 
@@ -226,6 +258,15 @@ func (c *haTracker) loop(ctx context.Context) error {
 
 		user := segments[0]
 		cluster := segments[1]
+
+		// Skip keys whose parsed cluster is not a safe metric label value.
+		// A poisoned KV entry (non-UTF-8, embedded NUL/newline/CR) would
+		// otherwise panic WithLabelValues below.
+		if !isValidHAClusterLabel(cluster) {
+			level.Warn(c.logger).Log("msg", "skipping HA tracker KV entry with invalid cluster label",
+				"user", user)
+			return true
+		}
 
 		c.electedLock.Lock()
 		defer c.electedLock.Unlock()
@@ -247,7 +288,11 @@ func (c *haTracker) loop(ctx context.Context) error {
 
 		elected, exists := c.elected[key]
 		if replica.Replica != elected.Replica {
-			c.electedReplicaChanges.WithLabelValues(user, cluster).Inc()
+			if m, err := c.electedReplicaChanges.GetMetricWithLabelValues(user, cluster); err == nil {
+				m.Inc()
+			} else {
+				level.Warn(c.logger).Log("msg", "skipping HA tracker metric for invalid label value", "err", err)
+			}
 		}
 		if !exists {
 			if c.clusters[user] == nil {
@@ -256,7 +301,11 @@ func (c *haTracker) loop(ctx context.Context) error {
 			c.clusters[user][cluster] = struct{}{}
 		}
 		c.elected[key] = *replica
-		c.electedReplicaTimestamp.WithLabelValues(user, cluster).Set(float64(replica.ReceivedAt / 1000))
+		if m, err := c.electedReplicaTimestamp.GetMetricWithLabelValues(user, cluster); err == nil {
+			m.Set(float64(replica.ReceivedAt / 1000))
+		} else {
+			level.Warn(c.logger).Log("msg", "skipping HA tracker metric for invalid label value", "err", err)
+		}
 		c.electedReplicaPropagationTime.Observe(time.Since(timestamp.Time(replica.ReceivedAt)).Seconds())
 		return true
 	})
@@ -396,7 +445,11 @@ func (c *haTracker) checkReplica(ctx context.Context, userID, cluster, replica s
 	}
 
 	err := c.checkKVStore(ctx, key, replica, now)
-	c.kvCASCalls.WithLabelValues(userID, cluster).Inc()
+	if m, metricErr := c.kvCASCalls.GetMetricWithLabelValues(userID, cluster); metricErr == nil {
+		m.Inc()
+	} else {
+		level.Warn(c.logger).Log("msg", "skipping HA tracker kv_cas_total metric for invalid label value", "err", metricErr)
+	}
 	if err != nil {
 		// The callback within checkKVStore will return a replicasNotMatchError if the sample is being deduped,
 		// otherwise there may have been an actual error CAS'ing that we should log.
