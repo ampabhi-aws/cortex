@@ -683,6 +683,7 @@ func (rt *oauth2RoundTripper) RoundTrip(req *http.Request) (*http.Response, erro
 			return &http.Transport{
 				TLSClientConfig:       tlsConfig,
 				Proxy:                 http.ProxyURL(rt.config.ProxyURL.URL),
+				DialContext:           rt.opts.dialContextFunc,
 				DisableKeepAlives:     !rt.opts.keepAlivesEnabled,
 				MaxIdleConns:          20,
 				MaxIdleConnsPerHost:   1, // see https://github.com/golang/go/issues/13801
