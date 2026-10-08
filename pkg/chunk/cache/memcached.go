@@ -2,9 +2,9 @@ package cache
 
 import (
 	"context"
+	"crypto/sha256"
 	"encoding/hex"
 	"flag"
-	"hash/fnv"
 	"sync"
 	"time"
 
@@ -265,10 +265,18 @@ func (c *Memcached) Stop() {
 }
 
 // HashKey hashes key into something you can store in memcached.
+//
+// It returns a 128-bit (32 hex character) prefix of a SHA-256 digest of the
+// input. SHA-256 is collision- and preimage-resistant, so an attacker cannot
+// construct a second input (for example a crafted PromQL query) that maps to
+// another tenant's cache slot. The previous implementation used a 64-bit
+// FNV-1a digest which, in the shared results cache, allowed cross-tenant
+// cache destruction by targeted second-preimage collisions and also made
+// accidental collisions likely at large working-set sizes.
 func HashKey(key string) string {
-	hasher := fnv.New64a()
-	_, _ = hasher.Write([]byte(key)) // This'll never error.
-
-	// Hex because memcache errors for the bytes produced by the hash.
-	return hex.EncodeToString(hasher.Sum(nil))
+	sum := sha256.Sum256([]byte(key))
+	// 128 bits is wide enough to make both targeted and birthday collisions
+	// infeasible, while keeping the stored key short (hex-encoded because
+	// memcached rejects some raw byte values in keys).
+	return hex.EncodeToString(sum[:16])
 }
