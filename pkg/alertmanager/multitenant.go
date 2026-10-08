@@ -219,6 +219,13 @@ type Limits interface {
 	// AlertmanagerMaxAlertsSizeBytes returns total max size of alerts that tenant can have active at the same time. 0 = no limit.
 	// Size of the alert is computed from alert labels, annotations and generator URL.
 	AlertmanagerMaxAlertsSizeBytes(tenant string) int
+
+	// AlertmanagerMaxReceivers returns the maximum number of receivers a tenant can have in its uploaded config. 0 = no limit.
+	AlertmanagerMaxReceivers(tenant string) int
+
+	// AlertmanagerMaxIntegrationsPerConfig returns the maximum total number of integration entries
+	// (webhook_configs, email_configs, ...) summed across all receivers in the tenant's config. 0 = no limit.
+	AlertmanagerMaxIntegrationsPerConfig(tenant string) int
 }
 
 // A MultitenantAlertmanager manages Alertmanager instances for multiple
