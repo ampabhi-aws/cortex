@@ -28,6 +28,20 @@ import (
 const (
 	maxCasRetries              = 10          // max retries in CAS operation
 	noChangeDetectedRetrySleep = time.Second // how long to sleep after no change was detected in CAS
+
+	// defaultMaxUnknownStoreKeys is the default bound on the number of keys the memberlist
+	// KV will accept from gossip for which no local client has registered interest.
+	// Defence-in-depth against unauthenticated remote peers injecting attacker-chosen keys
+	// into the store (see CWE-770). The value is small enough to prevent abuse but large
+	// enough to accommodate initial state sync races where push/pull from a peer arrives
+	// before every local component has registered its ring key via WatchKey/CAS/Get.
+	// A value of 0 means "reject every unknown key"; a negative value disables the cap.
+	defaultMaxUnknownStoreKeys = 128
+
+	// unknownKeyMetricLabel is used instead of the attacker-controlled remote key when a
+	// gossip message creates an entry under a key no local client has registered. This
+	// bounds Prometheus label cardinality on vectors that key by store-key.
+	unknownKeyMetricLabel = "__unknown__"
 )
 
 // Client implements kv.Client interface, by using memberlist.KV
@@ -151,6 +165,13 @@ type KVConfig struct {
 	// Remove LEFT ingesters from ring after this timeout.
 	LeftIngestersTimeout time.Duration `yaml:"left_ingesters_timeout"`
 
+	// MaxUnknownStoreKeys limits the number of keys in the local KV store that no local
+	// client has registered interest in. Entries for such keys are created from gossip
+	// messages received from the network, so an unauthenticated peer with reachability to
+	// the gossip port could otherwise create unbounded entries. 0 disables accepting any
+	// unknown gossiped keys; a negative value disables the cap (legacy behaviour).
+	MaxUnknownStoreKeys int `yaml:"max_unknown_store_keys"`
+
 	// Timeout used when leaving the memberlist cluster.
 	LeaveTimeout time.Duration `yaml:"leave_timeout"`
 
@@ -183,6 +204,7 @@ func (cfg *KVConfig) RegisterFlagsWithPrefix(f *flag.FlagSet, prefix string) {
 	f.BoolVar(&cfg.AbortIfJoinFails, prefix+"memberlist.abort-if-join-fails", true, "If this node fails to join memberlist cluster, abort.")
 	f.DurationVar(&cfg.RejoinInterval, prefix+"memberlist.rejoin-interval", 0, "If not 0, how often to rejoin the cluster. Occasional rejoin can help to fix the cluster split issue, and is harmless otherwise. For example when using only few components as a seed nodes (via -memberlist.join), then it's recommended to use rejoin. If -memberlist.join points to dynamic service that resolves to all gossiping nodes (eg. Kubernetes headless service), then rejoin is not needed.")
 	f.DurationVar(&cfg.LeftIngestersTimeout, prefix+"memberlist.left-ingesters-timeout", 5*time.Minute, "How long to keep LEFT ingesters in the ring.")
+	f.IntVar(&cfg.MaxUnknownStoreKeys, prefix+"memberlist.max-unknown-store-keys", defaultMaxUnknownStoreKeys, "Maximum number of KV store keys accepted from gossip for which no local client has registered interest (via Get/CAS/WatchKey/List/WatchPrefix). Caps resource exhaustion from an unauthenticated peer injecting attacker-chosen keys. 0 rejects all unknown keys; a negative value disables the cap (legacy behaviour).")
 	f.DurationVar(&cfg.LeaveTimeout, prefix+"memberlist.leave-timeout", 5*time.Second, "Timeout for leaving memberlist cluster.")
 	f.DurationVar(&cfg.GossipInterval, prefix+"memberlist.gossip-interval", mlDefaults.GossipInterval, "How often to gossip.")
 	f.IntVar(&cfg.GossipNodes, prefix+"memberlist.gossip-nodes", mlDefaults.GossipNodes, "How many nodes to gossip to.")
@@ -234,6 +256,14 @@ type KV struct {
 	// KV Store.
 	storeMu sync.Mutex
 	store   map[string]valueDesc
+
+	// Set of keys that a local client has registered interest in via Get/CAS/WatchKey/List.
+	// Gossiped KV updates for keys not in this set (and not matching any entry in
+	// knownKeyPrefixes) are treated as untrusted: they are capped by
+	// cfg.MaxUnknownStoreKeys, are not used as Prometheus label values, and are not
+	// re-broadcast to the rest of the cluster. Protected by storeMu.
+	knownKeys        map[string]struct{}
+	knownKeyPrefixes map[string]struct{}
 
 	// Codec registry
 	codecs map[string]codec.Codec
@@ -328,6 +358,12 @@ var (
 	errVersionMismatch  = errors.New("version mismatch")
 	errNoChangeDetected = errors.New("no change detected")
 	errTooManyRetries   = errors.New("too many retries")
+
+	// errUnknownKey is returned when a gossip message tries to create a new entry under a
+	// key that no local client has registered interest in, and the cap on such unknown
+	// keys has been reached (or is zero). The caller must treat this as a parse/merge
+	// failure and not re-broadcast the message.
+	errUnknownKey = errors.New("gossiped KV key is not locally known")
 )
 
 // NewKV creates new gossip-based KV service. Note that service needs to be started, until then it doesn't initialize
@@ -344,12 +380,14 @@ func NewKV(cfg KVConfig, logger log.Logger, dnsProvider DNSProvider, registerer 
 		registerer: registerer,
 		provider:   dnsProvider,
 
-		store:          make(map[string]valueDesc),
-		codecs:         make(map[string]codec.Codec),
-		watchers:       make(map[string][]chan string),
-		prefixWatchers: make(map[string][]chan string),
-		shutdown:       make(chan struct{}),
-		maxCasRetries:  maxCasRetries,
+		store:            make(map[string]valueDesc),
+		knownKeys:        make(map[string]struct{}),
+		knownKeyPrefixes: make(map[string]struct{}),
+		codecs:           make(map[string]codec.Codec),
+		watchers:         make(map[string][]chan string),
+		prefixWatchers:   make(map[string][]chan string),
+		shutdown:         make(chan struct{}),
+		maxCasRetries:    maxCasRetries,
 	}
 
 	mlkv.createAndRegisterMetrics()
@@ -510,6 +548,69 @@ func (m *KV) GetCodec(codecID string) codec.Codec {
 	return m.codecs[codecID]
 }
 
+// markKeyKnown records that a local client has registered interest in the given key,
+// allowing it to be freely created and updated by gossip messages that arrive later.
+// Must be called without storeMu held.
+func (m *KV) markKeyKnown(key string) {
+	if key == "" {
+		return
+	}
+	m.storeMu.Lock()
+	defer m.storeMu.Unlock()
+	if m.knownKeys == nil {
+		m.knownKeys = make(map[string]struct{})
+	}
+	m.knownKeys[key] = struct{}{}
+}
+
+// markPrefixKnown records that a local client watches an entire prefix of keys. Any
+// gossiped key under this prefix is treated as locally-known.
+// Must be called without storeMu held.
+func (m *KV) markPrefixKnown(prefix string) {
+	m.storeMu.Lock()
+	defer m.storeMu.Unlock()
+	if m.knownKeyPrefixes == nil {
+		m.knownKeyPrefixes = make(map[string]struct{})
+	}
+	m.knownKeyPrefixes[prefix] = struct{}{}
+}
+
+// isKnownKeyLocked reports whether the given key has been registered by a local client
+// (directly, by prefix, or because it already lives in the store from a local CAS).
+// Must be called with storeMu held.
+func (m *KV) isKnownKeyLocked(key string) bool {
+	if _, ok := m.knownKeys[key]; ok {
+		return true
+	}
+	for p := range m.knownKeyPrefixes {
+		if p == "" || strings.HasPrefix(key, p) {
+			return true
+		}
+	}
+	return false
+}
+
+// isKnownKey reports whether the given key has been registered by a local client.
+// Takes the store lock; must be called without storeMu held.
+func (m *KV) isKnownKey(key string) bool {
+	m.storeMu.Lock()
+	defer m.storeMu.Unlock()
+	return m.isKnownKeyLocked(key)
+}
+
+// countUnknownKeysLocked returns the number of entries currently in the store whose key
+// is not locally known. Used to enforce cfg.MaxUnknownStoreKeys.
+// Must be called with storeMu held.
+func (m *KV) countUnknownKeysLocked() int {
+	n := 0
+	for k := range m.store {
+		if !m.isKnownKeyLocked(k) {
+			n++
+		}
+	}
+	return n
+}
+
 // GetListeningPort returns port used for listening for memberlist communication. Useful when BindPort is set to 0.
 // This call is only valid after KV service has been started.
 func (m *KV) GetListeningPort() int {
@@ -643,6 +744,14 @@ func (m *KV) List(prefix string) []string {
 	m.storeMu.Lock()
 	defer m.storeMu.Unlock()
 
+	// A local caller listing keys under a prefix is expressing interest in all current and
+	// future keys under that prefix; treat them as locally-known so gossip updates for
+	// those keys are no longer counted against the unknown-key cap.
+	if m.knownKeyPrefixes == nil {
+		m.knownKeyPrefixes = make(map[string]struct{})
+	}
+	m.knownKeyPrefixes[prefix] = struct{}{}
+
 	var keys []string
 	for k := range m.store {
 		if strings.HasPrefix(k, prefix) {
@@ -662,6 +771,12 @@ func (m *KV) Get(key string, codec codec.Codec) (interface{}, error) {
 // Returns current value with removed tombstones.
 func (m *KV) get(key string, codec codec.Codec) (out interface{}, version uint, err error) {
 	m.storeMu.Lock()
+	// A local caller reading a key is expressing interest in it; mark as locally-known so
+	// gossip updates for the key are not treated as untrusted.
+	if m.knownKeys == nil {
+		m.knownKeys = make(map[string]struct{})
+	}
+	m.knownKeys[key] = struct{}{}
 	v := m.store[key].Clone()
 	m.storeMu.Unlock()
 
@@ -681,6 +796,10 @@ func (m *KV) get(key string, codec codec.Codec) (out interface{}, version uint, 
 func (m *KV) WatchKey(ctx context.Context, key string, codec codec.Codec, f func(interface{}) bool) {
 	// keep one extra notification, to avoid missing notification if we're busy running the function
 	w := make(chan string, 1)
+
+	// A local watcher is a local expression of interest in this key; mark it as
+	// locally-known so gossip updates for the key are not treated as untrusted.
+	m.markKeyKnown(key)
 
 	// register watcher
 	m.watchersMu.Lock()
@@ -728,6 +847,11 @@ func (m *KV) WatchKey(ctx context.Context, key string, codec codec.Codec, f func
 func (m *KV) WatchPrefix(ctx context.Context, prefix string, codec codec.Codec, f func(string, interface{}) bool) {
 	// we use bigger buffer here, since keys are interesting and we don't want to lose them.
 	w := make(chan string, 16)
+
+	// A local prefix watcher is a local expression of interest in every key under this
+	// prefix; mark the prefix as known so gossip updates for its keys are not treated as
+	// untrusted.
+	m.markPrefixKnown(prefix)
 
 	// register watcher
 	m.watchersMu.Lock()
@@ -905,7 +1029,7 @@ func (m *KV) trySingleCas(key string, codec codec.Codec, f func(in interface{}) 
 
 	// To support detection of removed items from value, we will only allow CAS operation to
 	// succeed if version hasn't changed, i.e. state hasn't changed since running 'f'.
-	change, newver, err := m.mergeValueForKey(key, r, ver, codec)
+	change, newver, err := m.mergeValueForKey(key, r, ver, codec, false /* fromRemote */)
 	if err == errVersionMismatch {
 		return nil, 0, retry, err
 	}
@@ -986,7 +1110,7 @@ func (m *KV) NotifyMsg(msg []byte) {
 	}
 
 	// we have a ring update! Let's merge it with our version of the ring for given key
-	mod, version, err := m.mergeBytesValueForKey(kvPair.Key, kvPair.Value, codec)
+	mod, version, err := m.mergeBytesValueForKey(kvPair.Key, kvPair.Value, codec, true /* fromRemote */)
 
 	changes := []string(nil)
 	if mod != nil {
@@ -1002,12 +1126,23 @@ func (m *KV) NotifyMsg(msg []byte) {
 	})
 
 	if err != nil {
-		level.Error(m.logger).Log("msg", "failed to store received value", "key", kvPair.Key, "err", err)
+		if err == errUnknownKey {
+			m.numberOfInvalidReceivedMessages.Inc()
+			level.Warn(m.logger).Log("msg", "ignoring gossiped KV update for key not registered by any local client", "key", kvPair.Key)
+		} else {
+			level.Error(m.logger).Log("msg", "failed to store received value", "key", kvPair.Key, "err", err)
+		}
 	} else if version > 0 {
 		m.notifyWatchers(kvPair.Key)
 
-		// Don't resend original message, but only changes.
-		m.broadcastNewValue(kvPair.Key, mod, version, codec)
+		// Only re-broadcast changes for keys this node participates in. Re-broadcasting a
+		// value for a key that was created solely from an unverified remote message
+		// amplifies attacker traffic cluster-wide and is not needed because any legitimate
+		// peer will have received the same original message directly via gossip.
+		if m.isKnownKey(kvPair.Key) {
+			// Don't resend original message, but only changes.
+			m.broadcastNewValue(kvPair.Key, mod, version, codec)
+		}
 	}
 }
 
@@ -1158,7 +1293,7 @@ func (m *KV) MergeRemoteState(data []byte, join bool) {
 		}
 
 		// we have both key and value, try to merge it with our state
-		change, newver, err := m.mergeBytesValueForKey(kvPair.Key, kvPair.Value, codec)
+		change, newver, err := m.mergeBytesValueForKey(kvPair.Key, kvPair.Value, codec, true /* fromRemote */)
 
 		changes := []string(nil)
 		if change != nil {
@@ -1174,10 +1309,18 @@ func (m *KV) MergeRemoteState(data []byte, join bool) {
 		})
 
 		if err != nil {
-			level.Error(m.logger).Log("msg", "failed to store received value", "key", kvPair.Key, "err", err)
+			if err == errUnknownKey {
+				m.numberOfInvalidReceivedMessages.Inc()
+				level.Warn(m.logger).Log("msg", "ignoring gossiped KV update for key not registered by any local client", "key", kvPair.Key)
+			} else {
+				level.Error(m.logger).Log("msg", "failed to store received value", "key", kvPair.Key, "err", err)
+			}
 		} else if newver > 0 {
 			m.notifyWatchers(kvPair.Key)
-			m.broadcastNewValue(kvPair.Key, change, newver, codec)
+			// Only re-broadcast for keys this node participates in; see NotifyMsg.
+			if m.isKnownKey(kvPair.Key) {
+				m.broadcastNewValue(kvPair.Key, change, newver, codec)
+			}
 		}
 	}
 
@@ -1186,7 +1329,7 @@ func (m *KV) MergeRemoteState(data []byte, join bool) {
 	}
 }
 
-func (m *KV) mergeBytesValueForKey(key string, incomingData []byte, codec codec.Codec) (Mergeable, uint, error) {
+func (m *KV) mergeBytesValueForKey(key string, incomingData []byte, codec codec.Codec, fromRemote bool) (Mergeable, uint, error) {
 	decodedValue, err := codec.Decode(incomingData)
 	if err != nil {
 		return nil, 0, fmt.Errorf("failed to decode value: %v", err)
@@ -1197,25 +1340,44 @@ func (m *KV) mergeBytesValueForKey(key string, incomingData []byte, codec codec.
 		return nil, 0, fmt.Errorf("expected Mergeable, got: %T", decodedValue)
 	}
 
-	return m.mergeValueForKey(key, incomingValue, 0, codec)
+	return m.mergeValueForKey(key, incomingValue, 0, codec, fromRemote)
 }
 
 // Merges incoming value with value we have in our store. Returns "a change" that can be sent to other
 // cluster members to update their state, and new version of the value.
 // If CAS version is specified, then merging will fail if state has changed already, and errVersionMismatch is reported.
 // If no modification occurred, new version is 0.
-func (m *KV) mergeValueForKey(key string, incomingValue Mergeable, casVersion uint, codec codec.Codec) (Mergeable, uint, error) {
+//
+// fromRemote must be true when the incoming value originated from a gossip message
+// (NotifyMsg / MergeRemoteState). In that case the key must be locally-known or must
+// fit under cfg.MaxUnknownStoreKeys, otherwise the merge is refused as
+// errUnknownKey. Local operations (CAS) pass fromRemote=false and are not subject to
+// the allowlist (they implicitly register the key as locally-known).
+func (m *KV) mergeValueForKey(key string, incomingValue Mergeable, casVersion uint, codec codec.Codec, fromRemote bool) (Mergeable, uint, error) {
 	m.storeMu.Lock()
 	defer m.storeMu.Unlock()
 
 	// Note that we do not take a deep copy of curr.value here, it is modified in-place.
 	// This is safe because the entire function runs under the store lock; we do not return
 	// the full state anywhere as is done elsewhere (i.e. Get/WatchKey/CAS).
-	curr := m.store[key]
+	curr, exists := m.store[key]
 	// if casVersion is 0, then there was no previous value, so we will just do normal merge, without localCAS flag set.
 	if casVersion > 0 && curr.version != casVersion {
 		return nil, 0, errVersionMismatch
 	}
+
+	keyKnown := m.isKnownKeyLocked(key)
+
+	// Reject gossiped updates that would create a brand-new entry for a key no local
+	// client has registered interest in, when the configured cap on such entries has
+	// been reached. This caps the resource exhaustion from an unauthenticated peer
+	// injecting attacker-chosen keys into the store (see CWE-770).
+	if fromRemote && !keyKnown && !exists {
+		if m.cfg.MaxUnknownStoreKeys >= 0 && m.countUnknownKeysLocked() >= m.cfg.MaxUnknownStoreKeys {
+			return nil, 0, errUnknownKey
+		}
+	}
+
 	result, change, err := computeNewValue(incomingValue, curr.value, casVersion > 0)
 	if err != nil {
 		return nil, 0, err
@@ -1229,8 +1391,15 @@ func (m *KV) mergeValueForKey(key string, incomingValue Mergeable, casVersion ui
 	if m.cfg.LeftIngestersTimeout > 0 {
 		limit := time.Now().Add(-m.cfg.LeftIngestersTimeout)
 		total, removed := result.RemoveTombstones(limit)
-		m.storeTombstones.WithLabelValues(key).Set(float64(total))
-		m.storeRemovedTombstones.WithLabelValues(key).Add(float64(removed))
+		// Avoid using an attacker-controlled remote key as a Prometheus label value
+		// (unbounded cardinality). Entries for unknown keys are grouped under a single
+		// synthetic label so operators can still see that unknown traffic exists.
+		label := key
+		if !keyKnown {
+			label = unknownKeyMetricLabel
+		}
+		m.storeTombstones.WithLabelValues(label).Set(float64(total))
+		m.storeRemovedTombstones.WithLabelValues(label).Add(float64(removed))
 
 		// Remove tombstones from change too. If change turns out to be empty after this,
 		// we don't need to gossip the change. However, the local value will be always be updated.
@@ -1249,6 +1418,16 @@ func (m *KV) mergeValueForKey(key string, incomingValue Mergeable, casVersion ui
 		value:   result,
 		version: newVersion,
 		codecID: codec.CodecID(),
+	}
+
+	// A successful local CAS implicitly registers interest in this key. Doing it here
+	// (rather than only in get/WatchKey) catches the common case where a component
+	// creates a key purely via CAS without ever reading it back first.
+	if !fromRemote {
+		if m.knownKeys == nil {
+			m.knownKeys = make(map[string]struct{})
+		}
+		m.knownKeys[key] = struct{}{}
 	}
 
 	// The "changes" returned by Merge() can contain references to the "result"
