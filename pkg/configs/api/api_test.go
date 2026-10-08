@@ -91,6 +91,45 @@ func Test_PostConfig_Anonymous(t *testing.T) {
 	}
 }
 
+// The /private/* endpoints must refuse unauthenticated callers so that an
+// attacker with network access to the shared HTTP listener cannot dump every
+// tenant's rules or Alertmanager configuration.
+func Test_GetAllConfigs_RefusesMissingToken(t *testing.T) {
+	setup(t)
+	defer cleanup(t)
+
+	for _, c := range allClients {
+		w := requestWithoutInternalToken(t, "GET", c.PrivateEndpoint)
+		assert.Equal(t, http.StatusForbidden, w.Code,
+			"anonymous callers must be refused on %s", c.PrivateEndpoint)
+	}
+}
+
+// Requests with the wrong shared secret must also be refused.
+func Test_GetAllConfigs_RefusesWrongToken(t *testing.T) {
+	setup(t)
+	defer cleanup(t)
+
+	for _, c := range allClients {
+		w := requestWithInternalToken(t, "GET", c.PrivateEndpoint, "not-the-right-token")
+		assert.Equal(t, http.StatusForbidden, w.Code,
+			"callers with a bad token must be refused on %s", c.PrivateEndpoint)
+	}
+}
+
+// With EnableInternalAPI=false (the default), the /private/* routes must
+// behave as if they do not exist, even when a token is presented.
+func Test_GetAllConfigs_HiddenWhenInternalAPIDisabled(t *testing.T) {
+	setupInternalAPIDisabled(t)
+	defer cleanup(t)
+
+	for _, c := range allClients {
+		w := requestWithInternalToken(t, "GET", c.PrivateEndpoint, testInternalAPIToken)
+		assert.Equal(t, http.StatusNotFound, w.Code,
+			"/private/* must return 404 when internal API is disabled on %s", c.PrivateEndpoint)
+	}
+}
+
 // Posting to a configuration sets it so that you can get it again.
 func Test_PostConfig_CreatesConfig(t *testing.T) {
 	setup(t)

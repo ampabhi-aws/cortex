@@ -1,6 +1,7 @@
 package api
 
 import (
+	"crypto/subtle"
 	"database/sql"
 	"encoding/json"
 	"errors"
@@ -24,8 +25,15 @@ import (
 	"github.com/cortexproject/cortex/pkg/configs/userconfig"
 	"github.com/cortexproject/cortex/pkg/tenant"
 	"github.com/cortexproject/cortex/pkg/util"
+	"github.com/cortexproject/cortex/pkg/util/flagext"
 	util_log "github.com/cortexproject/cortex/pkg/util/log"
 )
+
+// authHeader is the HTTP header used to carry the internal API shared-secret
+// bearer token on requests to the /private/* endpoints.
+const authHeader = "Authorization"
+
+const bearerPrefix = "Bearer "
 
 var (
 	ErrEmailNotificationsAreDisabled   = errors.New("email notifications are disabled")
@@ -35,6 +43,21 @@ var (
 // Config configures Configs API
 type Config struct {
 	Notifications NotificationsConfig `yaml:"notifications"`
+
+	// EnableInternalAPI opts in to serving the /private/api/prom/configs/*
+	// cross-tenant endpoints. These endpoints expose every tenant's rules and
+	// Alertmanager configuration (which embeds notification secrets) and MUST
+	// NOT be reachable from untrusted callers. When false (the default) the
+	// handlers reply with 404 so that even if the route is registered on the
+	// shared HTTP listener it cannot be used to dump cross-tenant data.
+	EnableInternalAPI bool `yaml:"enable_internal_api"`
+
+	// InternalAPIToken is a shared secret that callers of the /private/* endpoints
+	// must present in the Authorization header as `Bearer <token>`. When set,
+	// requests without a matching bearer token are rejected with 403, even if
+	// EnableInternalAPI is true. In-cluster callers (the ruler/alertmanager
+	// configdb clients) must be configured with the same secret.
+	InternalAPIToken flagext.Secret `yaml:"internal_api_token"`
 }
 
 // NotificationsConfig configures Alertmanager notifications method.
@@ -47,6 +70,8 @@ type NotificationsConfig struct {
 func (cfg *Config) RegisterFlags(f *flag.FlagSet) {
 	f.BoolVar(&cfg.Notifications.DisableEmail, "configs.notifications.disable-email", false, "Disable Email notifications for Alertmanager.")
 	f.BoolVar(&cfg.Notifications.DisableWebHook, "configs.notifications.disable-webhook", false, "Disable WebHook notifications for Alertmanager.")
+	f.BoolVar(&cfg.EnableInternalAPI, "configs.enable-internal-api", false, "Enable the deprecated cross-tenant /private/api/prom/configs/* endpoints used by the legacy configdb ruler/alertmanager clients. These endpoints expose every tenant's rules and Alertmanager configuration (including notification secrets) and MUST only be served on an internal-only listener. Disabled by default: when disabled the endpoints return 404.")
+	f.Var(&cfg.InternalAPIToken, "configs.internal-api-token", "Shared secret required in the Authorization: Bearer <token> header to call the /private/api/prom/configs/* endpoints. If empty, the endpoints are refused (403) when -configs.enable-internal-api is true. The configdb client must be configured with the same secret via -<prefix>configs.internal-api-token.")
 }
 
 // API implements the configs api.
@@ -264,6 +289,14 @@ type ConfigsView struct {
 }
 
 func (a *API) getConfigs(w http.ResponseWriter, r *http.Request) {
+	// The /private/api/prom/configs/* endpoints return every tenant's rules
+	// and Alertmanager configuration (which embeds Slack/PagerDuty/webhook
+	// secrets and SMTP passwords). They must not be served unless explicitly
+	// enabled, and must authenticate the internal caller.
+	if !a.authenticateInternalCaller(w, r) {
+		return
+	}
+
 	var cfgs map[string]userconfig.View
 	var cfgErr error
 	logger := util_log.WithContext(r.Context(), util_log.Logger)
@@ -345,6 +378,34 @@ const (
 	FormatJSON    = "json"
 	FormatYAML    = "yaml"
 )
+
+// authenticateInternalCaller enforces that callers of the /private/* endpoints
+// are explicitly enabled and present the configured shared-secret bearer token.
+// It writes the HTTP error response and returns false when the request is
+// refused; callers should return immediately in that case.
+func (a *API) authenticateInternalCaller(w http.ResponseWriter, r *http.Request) bool {
+	if !a.cfg.EnableInternalAPI {
+		http.Error(w, "not found", http.StatusNotFound)
+		return false
+	}
+	expected := a.cfg.InternalAPIToken.Value
+	if expected == "" {
+		http.Error(w, "forbidden", http.StatusForbidden)
+		return false
+	}
+	auth := r.Header.Get(authHeader)
+	if !strings.HasPrefix(auth, bearerPrefix) {
+		http.Error(w, "forbidden", http.StatusForbidden)
+		return false
+	}
+	provided := strings.TrimPrefix(auth, bearerPrefix)
+	// Use a constant-time comparison to avoid leaking the secret via timing.
+	if subtle.ConstantTimeCompare([]byte(provided), []byte(expected)) != 1 {
+		http.Error(w, "forbidden", http.StatusForbidden)
+		return false
+	}
+	return true
+}
 
 func parseConfigFormat(v string, defaultFormat string) string {
 	if v == "" {
