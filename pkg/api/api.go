@@ -53,6 +53,14 @@ type Config struct {
 	LegacyHTTPPrefix   string               `yaml:"-"`
 	HTTPAuthMiddleware middleware.Interface `yaml:"-"`
 
+	// HTTPAdminMiddleware is an additional authorization middleware that MUST
+	// authenticate an operator (e.g. mTLS client cert, static token, or
+	// loopback-only listener) before admin/cluster-wide handlers are served.
+	// If nil, admin routes registered via RegisterAdminRoute are not exposed
+	// (fail closed) so misconfiguration cannot leak cross-tenant data on the
+	// tenant-facing listener.
+	HTTPAdminMiddleware middleware.Interface `yaml:"-"`
+
 	// This allows downstream projects to wrap the distributor push function
 	// and access the deserialized write requests before/after they are pushed.
 	DistributorPushWrapper DistributorPushWrapper `yaml:"-"`
@@ -91,6 +99,7 @@ func (cfg *Config) wrapDistributorPush(d *distributor.Distributor) push.Func {
 
 type API struct {
 	AuthMiddleware       middleware.Interface
+	AdminMiddleware      middleware.Interface
 	cfg                  Config
 	server               *server.Server
 	logger               log.Logger
@@ -114,12 +123,13 @@ func New(cfg Config, serverCfg server.Config, s *server.Server, logger log.Logge
 	}
 
 	api := &API{
-		cfg:            cfg,
-		AuthMiddleware: cfg.HTTPAuthMiddleware,
-		server:         s,
-		logger:         logger,
-		sourceIPs:      sourceIPs,
-		indexPage:      newIndexPageContent(),
+		cfg:             cfg,
+		AuthMiddleware:  cfg.HTTPAuthMiddleware,
+		AdminMiddleware: cfg.HTTPAdminMiddleware,
+		server:          s,
+		logger:          logger,
+		sourceIPs:       sourceIPs,
+		indexPage:       newIndexPageContent(),
 	}
 
 	// If no authentication middleware is present in the config, use the default authentication middleware.
@@ -158,6 +168,34 @@ func (a *API) RegisterRoute(path string, handler http.Handler, auth bool, method
 	a.server.HTTP.Path(path).Methods(methods...).Handler(handler)
 }
 
+// RegisterAdminRoute registers a route that returns cluster- or tenant-wide
+// state (i.e. data that does not belong to a single tenant). The handler is
+// wrapped by AdminMiddleware, which MUST authenticate an operator (for
+// example via mTLS client certificates, a static token, or by restricting
+// the handler to a dedicated loopback/admin listener).
+//
+// If no AdminMiddleware is configured, the route is NOT registered (fail
+// closed), so that cluster/tenant-wide dumps cannot be served on the
+// tenant-facing listener by accident. This is important for endpoints such
+// as /multitenant_alertmanager/configs and /ruler/rule_groups which would
+// otherwise expose every tenant's Alertmanager configuration (SMTP
+// passwords, Slack/PagerDuty/OpsGenie keys, bearer tokens) and the full
+// tenant inventory to anyone able to reach the HTTP listener.
+func (a *API) RegisterAdminRoute(path string, handler http.Handler, method string, methods ...string) {
+	if a.AdminMiddleware == nil {
+		level.Warn(a.logger).Log(
+			"msg", "admin route not registered: no admin auth configured (set -api.http-admin-middleware or bind admin routes to a separate listener)",
+			"path", path,
+		)
+		return
+	}
+	// auth=false because RegisterRoute's AuthMiddleware only extracts the
+	// caller-supplied X-Scope-OrgID into the request context, which is
+	// meaningless for cross-tenant admin handlers. AdminMiddleware is the
+	// real authorization gate for these routes.
+	a.RegisterRoute(path, a.AdminMiddleware.Wrap(handler), false, method, methods...)
+}
+
 func (a *API) RegisterRoutesWithPrefix(prefix string, handler http.Handler, auth bool, methods ...string) {
 	level.Debug(a.logger).Log("msg", "api: registering route", "methods", strings.Join(methods, ","), "prefix", prefix, "auth", auth)
 	if auth {
@@ -187,7 +225,7 @@ func (a *API) RegisterAlertmanager(am *alertmanager.MultitenantAlertmanager, tar
 	a.indexPage.AddLink(SectionAdminEndpoints, "/multitenant_alertmanager/ring", "Alertmanager Ring Status")
 	// Ensure this route is registered before the prefixed AM route
 	a.RegisterRoute("/multitenant_alertmanager/status", am.GetStatusHandler(), false, "GET")
-	a.RegisterRoute("/multitenant_alertmanager/configs", http.HandlerFunc(am.ListAllConfigs), false, "GET")
+	a.RegisterAdminRoute("/multitenant_alertmanager/configs", http.HandlerFunc(am.ListAllConfigs), "GET")
 	a.RegisterRoute("/multitenant_alertmanager/ring", http.HandlerFunc(am.RingHandler), false, "GET", "POST")
 	a.RegisterRoute("/multitenant_alertmanager/delete_tenant_config", http.HandlerFunc(am.DeleteUserConfig), true, "POST")
 
@@ -292,7 +330,7 @@ func (a *API) RegisterRuler(r *ruler.Ruler) {
 	a.RegisterRoute("/ruler_ring", r, false, "GET", "POST")
 
 	// List all user rule groups
-	a.RegisterRoute("/ruler/rule_groups", http.HandlerFunc(r.ListAllRules), false, "GET")
+	a.RegisterAdminRoute("/ruler/rule_groups", http.HandlerFunc(r.ListAllRules), "GET")
 
 	ruler.RegisterRulerServer(a.server.GRPC, r)
 }
