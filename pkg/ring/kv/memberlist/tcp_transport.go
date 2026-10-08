@@ -59,6 +59,12 @@ type TCPTransportConfig struct {
 
 	TLSEnabled bool                   `yaml:"tls_enabled"`
 	TLS        cortextls.ClientConfig `yaml:",inline"`
+
+	// MaxPacketSize caps the number of bytes read from a single incoming
+	// "packet" connection on the memberlist TCP transport, before any
+	// decoding or digest check happens. Oversized packets are discarded.
+	// 0 disables the limit (not recommended on untrusted networks).
+	MaxPacketSize int `yaml:"max_packet_size"`
 }
 
 func (cfg *TCPTransportConfig) RegisterFlags(f *flag.FlagSet) {
@@ -75,6 +81,7 @@ func (cfg *TCPTransportConfig) RegisterFlagsWithPrefix(f *flag.FlagSet, prefix s
 	f.BoolVar(&cfg.TransportDebug, prefix+"memberlist.transport-debug", false, "Log debug transport messages. Note: global log.level must be at debug level as well.")
 
 	f.BoolVar(&cfg.TLSEnabled, prefix+"memberlist.tls-enabled", false, "Enable TLS on the memberlist transport layer.")
+	f.IntVar(&cfg.MaxPacketSize, prefix+"memberlist.max-packet-size", 10*1024*1024, "Maximum size (in bytes) read from a single incoming memberlist 'packet' connection. Packets larger than this are discarded to bound memory allocation on the transport receive path. 0 to disable.")
 	cfg.TLS.RegisterFlagsWithPrefix(prefix+"memberlist", f)
 }
 
@@ -280,11 +287,25 @@ func (t *TCPTransport) handleConnection(conn net.Conn) {
 			return
 		}
 
-		// read the rest to buffer -- this is the "packet" itself
-		buf, err := io.ReadAll(conn)
+		// read the rest to buffer -- this is the "packet" itself.
+		// Cap the read with io.LimitReader so a malicious peer cannot force
+		// unbounded allocation by streaming arbitrarily large packet bodies.
+		var packetReader io.Reader = conn
+		if t.cfg.MaxPacketSize > 0 {
+			// +1 so we can detect packets that exceed the limit instead of
+			// silently truncating them.
+			packetReader = io.LimitReader(conn, int64(t.cfg.MaxPacketSize)+1)
+		}
+		buf, err := io.ReadAll(packetReader)
 		if err != nil {
 			t.receivedPacketsErrors.Inc()
 			level.Warn(t.logger).Log("msg", "error while reading packet data", "err", err, "remote", conn.RemoteAddr())
+			return
+		}
+
+		if t.cfg.MaxPacketSize > 0 && len(buf) > t.cfg.MaxPacketSize {
+			t.receivedPacketsErrors.Inc()
+			level.Warn(t.logger).Log("msg", "packet exceeds max-packet-size, dropping", "size", len(buf), "limit", t.cfg.MaxPacketSize, "remote", conn.RemoteAddr())
 			return
 		}
 
