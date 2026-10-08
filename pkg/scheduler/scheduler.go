@@ -83,6 +83,14 @@ type Config struct {
 	MaxOutstandingPerTenant int               `yaml:"max_outstanding_requests_per_tenant"`
 	QuerierForgetDelay      time.Duration     `yaml:"querier_forget_delay"`
 	GRPCClientConfig        grpcclient.Config `yaml:"grpc_client_config" doc:"description=This configures the gRPC client used to report errors back to the query-frontend."`
+
+	// InternalGRPCAuthToken is the shared secret attached to outgoing error
+	// notifications dialled back to the caller-supplied frontendAddress. It
+	// is populated from api.internal-grpc-auth-token by pkg/cortex/modules.go
+	// so that an attacker who impersonates a frontend cannot cause the
+	// scheduler to make an authenticated outbound connection to an arbitrary
+	// host (the token identifies this scheduler to legitimate frontends).
+	InternalGRPCAuthToken string `yaml:"-"`
 }
 
 func (cfg *Config) RegisterFlags(f *flag.FlagSet) {
@@ -442,6 +450,17 @@ func (s *Scheduler) forwardRequestToQuerier(querier schedulerpb.SchedulerForQuer
 }
 
 func (s *Scheduler) forwardErrorToFrontend(ctx context.Context, req *schedulerRequest, requestErr error) {
+	// Refuse to dial frontend addresses that are not currently known to this
+	// scheduler. The connectedFrontends map is populated only when a frontend
+	// has gone through frontendConnected (and, when configured, presented the
+	// shared-secret auth token). This stops an attacker from using the
+	// forwardErrorToFrontend path to make the scheduler open gRPC
+	// connections to arbitrary hosts of its choosing.
+	if !s.isConnectedFrontend(req.frontendAddress) {
+		level.Warn(s.log).Log("msg", "refusing to forward error to unknown frontend address", "frontend", req.frontendAddress, "requestErr", requestErr)
+		return
+	}
+
 	opts, err := s.cfg.GRPCClientConfig.DialOption([]grpc.UnaryClientInterceptor{
 		otgrpc.OpenTracingClientInterceptor(opentracing.GlobalTracer()),
 		middleware.ClientUserHeaderInterceptor},
@@ -476,6 +495,14 @@ func (s *Scheduler) forwardErrorToFrontend(ctx context.Context, req *schedulerRe
 		level.Warn(s.log).Log("msg", "failed to forward error to frontend", "frontend", req.frontendAddress, "err", err, "requestErr", requestErr)
 		return
 	}
+}
+
+func (s *Scheduler) isConnectedFrontend(address string) bool {
+	s.connectedFrontendsMu.Lock()
+	defer s.connectedFrontendsMu.Unlock()
+
+	cf, ok := s.connectedFrontends[address]
+	return ok && cf != nil && cf.connections > 0
 }
 
 func (s *Scheduler) isRunningOrStopping() bool {
