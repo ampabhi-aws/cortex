@@ -19,6 +19,8 @@ import (
 	otlog "github.com/opentracing/opentracing-go/log"
 	yaml "gopkg.in/yaml.v2"
 	yamlv3 "gopkg.in/yaml.v3"
+
+	util_math "github.com/cortexproject/cortex/pkg/util/math"
 )
 
 const messageSizeLargerErrFmt = "received message larger than max (%d vs %d)"
@@ -193,6 +195,14 @@ func decompressRequest(reader io.Reader, expectedSize, maxSize int, compression 
 	return
 }
 
+// maxBufferPrealloc caps how much we pre-allocate from the caller-supplied
+// expectedSize hint (which, for HTTP handlers, comes from the untrusted
+// Content-Length header). bytes.Buffer will still grow organically to fit
+// data that actually arrives (bounded by io.LimitReader below), but a lying
+// Content-Length can no longer force a large allocation before any body byte
+// has been read.
+const maxBufferPrealloc = 1 << 20 // 1 MiB
+
 func decompressFromReader(reader io.Reader, expectedSize, maxSize int, compression CompressionType, sp opentracing.Span) ([]byte, error) {
 	var (
 		buf  bytes.Buffer
@@ -200,7 +210,9 @@ func decompressFromReader(reader io.Reader, expectedSize, maxSize int, compressi
 		err  error
 	)
 	if expectedSize > 0 {
-		buf.Grow(expectedSize + bytes.MinRead) // extra space guarantees no reallocation
+		// Clamp the untrusted hint: only pre-allocate a small, bounded amount
+		// and let bytes.Buffer grow organically with data that actually arrives.
+		buf.Grow(util_math.Min(expectedSize, maxBufferPrealloc) + bytes.MinRead)
 	}
 	// Read from LimitReader with limit max+1. So if the underlying
 	// reader is over limit, the result will be bigger than max.

@@ -22,6 +22,9 @@ func RemoteReadHandler(q storage.Queryable, logger log.Logger) http.Handler {
 		ctx := r.Context()
 		var req client.ReadRequest
 		logger := util_log.WithContext(r.Context(), logger)
+		// Cap the body itself, independently of the (untrusted) Content-Length
+		// header, so a lying header cannot force a large pre-allocation.
+		r.Body = http.MaxBytesReader(w, r.Body, int64(maxRemoteReadQuerySize)+1)
 		if err := util.ParseProtoReader(ctx, r.Body, int(r.ContentLength), maxRemoteReadQuerySize, &req, util.RawSnappy); err != nil {
 			level.Error(logger).Log("msg", "failed to parse proto", "err", err.Error())
 			http.Error(w, err.Error(), http.StatusBadRequest)
