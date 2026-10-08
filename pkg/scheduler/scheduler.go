@@ -279,7 +279,10 @@ func (s *Scheduler) enqueueRequest(frontendContext context.Context, frontendAddr
 	tracer := opentracing.GlobalTracer()
 	parentSpanContext, err := httpgrpcutil.GetParentSpanForRequest(tracer, msg.HttpRequest)
 	if err != nil {
-		return err
+		// Malformed tracing metadata on inbound HTTP requests is tenant-controlled
+		// and must not fail the enqueue. Log at debug and proceed without a parent span.
+		level.Debug(s.log).Log("msg", "ignoring malformed tracing headers", "err", err)
+		parentSpanContext = nil
 	}
 
 	userID := msg.GetUserID()

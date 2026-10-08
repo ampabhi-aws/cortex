@@ -3,6 +3,7 @@ package v2
 import (
 	"context"
 	"net/http"
+	"runtime/debug"
 	"sync"
 	"time"
 
@@ -198,6 +199,15 @@ func (w *frontendSchedulerWorker) stop() {
 }
 
 func (w *frontendSchedulerWorker) runOne(ctx context.Context, client schedulerpb.SchedulerForFrontendClient) {
+	// Defence in depth: recover from any unexpected panic in the scheduler worker
+	// goroutine so a single bad message cannot bring down the whole query-frontend
+	// process. Panics in another goroutine cannot be recovered elsewhere.
+	defer func() {
+		if p := recover(); p != nil {
+			level.Error(w.log).Log("msg", "recovered panic in scheduler worker", "panic", p, "stack", string(debug.Stack()))
+		}
+	}()
+
 	backoffConfig := backoff.Config{
 		MinBackoff: 50 * time.Millisecond,
 		MaxBackoff: 1 * time.Second,
@@ -288,10 +298,19 @@ func (w *frontendSchedulerWorker) schedulerLoop(loop schedulerpb.SchedulerForFro
 
 			case schedulerpb.ERROR:
 				req.enqueue <- enqueueResult{status: waitForResponse}
+				// Use the error message the scheduler actually sent. `err` is
+				// provably nil at this point (both non-nil error paths above
+				// return), so calling err.Error() would panic on a nil error
+				// interface. Fall back to a static message if the scheduler did
+				// not populate resp.Error.
+				msg := resp.Error
+				if msg == "" {
+					msg = "failed to enqueue request to query-scheduler"
+				}
 				req.response <- &frontendv2pb.QueryResultRequest{
 					HttpResponse: &httpgrpc.HTTPResponse{
 						Code: http.StatusInternalServerError,
-						Body: []byte(err.Error()),
+						Body: []byte(msg),
 					},
 				}
 

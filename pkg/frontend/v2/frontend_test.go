@@ -92,6 +92,41 @@ func sendResponseWithDelay(f *Frontend, delay time.Duration, userID string, quer
 	})
 }
 
+func TestFrontendEnqueueErrorFromScheduler(t *testing.T) {
+	// Regression test for the nil-pointer dereference in the ERROR branch of
+	// schedulerLoop: previously the body was built from err.Error() where err
+	// was guaranteed to be nil, panicking the whole query-frontend process.
+	// The fix must use the scheduler-supplied Error field and must not panic.
+	const (
+		errMsg = "boom"
+		userID = "test"
+	)
+
+	f, _ := setupFrontend(t, func(f *Frontend, msg *schedulerpb.FrontendToScheduler) *schedulerpb.SchedulerToFrontend {
+		return &schedulerpb.SchedulerToFrontend{Status: schedulerpb.ERROR, Error: errMsg}
+	})
+
+	resp, err := f.RoundTripGRPC(user.InjectOrgID(context.Background(), userID), &httpgrpc.HTTPRequest{})
+	require.NoError(t, err)
+	require.Equal(t, int32(500), resp.Code)
+	require.Equal(t, []byte(errMsg), resp.Body)
+}
+
+func TestFrontendEnqueueErrorFromSchedulerEmptyMessage(t *testing.T) {
+	// If the scheduler returns ERROR with an empty Error field, the frontend
+	// must fall back to a static message rather than sending an empty body.
+	const userID = "test"
+
+	f, _ := setupFrontend(t, func(f *Frontend, msg *schedulerpb.FrontendToScheduler) *schedulerpb.SchedulerToFrontend {
+		return &schedulerpb.SchedulerToFrontend{Status: schedulerpb.ERROR}
+	})
+
+	resp, err := f.RoundTripGRPC(user.InjectOrgID(context.Background(), userID), &httpgrpc.HTTPRequest{})
+	require.NoError(t, err)
+	require.Equal(t, int32(500), resp.Code)
+	require.NotEmpty(t, resp.Body)
+}
+
 func TestFrontendBasicWorkflow(t *testing.T) {
 	const (
 		body   = "all fine here"
