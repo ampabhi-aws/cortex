@@ -2,6 +2,8 @@
 
 ## master / unreleased
 
+* [BUGFIX] Compactor: Narrow the shuffle-sharding visit-marker TOCTOU window by (a) returning an error from `markBlocksVisited` and skipping groups whose marker upload failed, (b) re-reading markers immediately after upload and skipping the group when another compactor's lease is visible, and (c) terminating the visit-marker heartbeat when it has been unable to refresh the lease for longer than `blockVisitMarkerTimeout/2` so another compactor is not kept out by a stale lease. Shuffle-sharding compaction now fails fast on lease loss instead of silently racing.
+
   **This release removes support for chunks storage. See below for more.**
 * [CHANGE] Remove support for chunks storage entirely. If you are using chunks storage on a previous version, you must [migrate your data](https://github.com/cortexproject/cortex/blob/v1.11.1/docs/blocks-storage/migrate-from-chunks-to-blocks.md) on version 1.12 or earlier. Before upgrading to this release, you should also remove any deprecated chunks-related configuration, as this release will no longer accept that. The following flags are gone:
   - `-dynamodb.*`
