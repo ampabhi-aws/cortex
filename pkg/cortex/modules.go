@@ -5,6 +5,7 @@ import (
 	"flag"
 	"fmt"
 	"net/http"
+	"path"
 
 	"github.com/go-kit/log"
 	"github.com/go-kit/log/level"
@@ -302,16 +303,20 @@ func (t *Cortex) initQuerier() (serv services.Service, err error) {
 	)
 
 	// If the querier is running standalone without the query-frontend or query-scheduler, we must register it's internal
-	// HTTP handler externally and provide the external Cortex Server HTTP handler to the frontend worker
-	// to ensure requests it processes use the default middleware instrumentation.
+	// HTTP handler externally and keep the worker on the query-only router (not the full external HTTP mux). Serving
+	// worker requests via the external mux would expose auth=false admin routes (/config, /debug/pprof/*,
+	// /ingester/ring, /runtime_config, ...) to anyone who can reach the scheduler/frontend gRPC port, because the
+	// scheduler enqueues attacker-controlled method/URL/headers verbatim.
 	if !t.Cfg.isModuleEnabled(QueryFrontend) && !t.Cfg.isModuleEnabled(QueryScheduler) && !t.Cfg.isModuleEnabled(All) {
-		// First, register the internal querier handler with the external HTTP server
+		// Register the internal querier handler with the external HTTP server for real HTTP clients.
 		t.API.RegisterQueryAPI(internalQuerierRouter)
 
-		// Second, set the http.Handler that the frontend worker will use to process requests to point to
-		// the external HTTP server. This will allow the querier to consolidate query metrics both external
-		// and internal using the default instrumentation when running as a standalone service.
-		internalQuerierRouter = t.Server.HTTPServer.Handler
+		// Keep the worker on the query-only router, wrapped with the same tracing middleware used in the
+		// microservices branch so instrumentation is consistent. Do NOT hand the full external mux to the
+		// worker: that would let a scheduler peer reach admin routes on this process.
+		internalQuerierRouter = nethttp.MiddlewareFunc(opentracing.GlobalTracer(), internalQuerierRouter.ServeHTTP, nethttp.OperationNameFunc(func(r *http.Request) string {
+			return "internalQuerier"
+		}))
 	} else {
 		// Single binary mode requires a query frontend endpoint for the worker. If no frontend and scheduler endpoint
 		// is configured, Cortex will default to using frontend on localhost on it's own GRPC listening port.
@@ -342,7 +347,33 @@ func (t *Cortex) initQuerier() (serv services.Service, err error) {
 	}
 
 	t.Cfg.Worker.MaxConcurrentRequests = t.Cfg.Querier.MaxConcurrent
+
+	// Populate the worker allowlist from the configured Prometheus/legacy API prefixes. This is a
+	// defence-in-depth control: an untrusted scheduler/frontend peer can enqueue arbitrary
+	// method/URL/headers, and the worker rejects anything that does not fall under these prefixes
+	// before dispatching it to the local HTTP handler.
+	t.Cfg.Worker.AllowedPathPrefixes = buildWorkerAllowedPrefixes(t.Cfg.API.PrometheusHTTPPrefix, t.Cfg.API.LegacyHTTPPrefix)
+
 	return querier_worker.NewQuerierWorker(t.Cfg.Worker, httpgrpc_server.NewServer(internalQuerierRouter), util_log.Logger, prometheus.DefaultRegisterer)
+}
+
+// buildWorkerAllowedPrefixes constructs the URL path prefix allowlist used by the querier worker
+// to filter requests pushed by an upstream query-frontend or query-scheduler. We only allow the
+// configured Prometheus and legacy API prefixes (joined with /api/v1/), which cover every route
+// RegisterQueryAPI exposes. Empty prefixes are skipped. A trailing slash is appended so that a
+// prefix of "/prometheus" does not match an unrelated route like "/prometheus-admin".
+func buildWorkerAllowedPrefixes(prefixes ...string) []string {
+	seen := map[string]struct{}{}
+	out := make([]string, 0, len(prefixes))
+	for _, p := range prefixes {
+		joined := path.Join("/", p, "/api/v1") + "/"
+		if _, ok := seen[joined]; ok {
+			continue
+		}
+		seen[joined] = struct{}{}
+		out = append(out, joined)
+	}
+	return out
 }
 
 func (t *Cortex) initStoreQueryables() (services.Service, error) {

@@ -31,11 +31,25 @@ type Config struct {
 	QuerierID string `yaml:"id"`
 
 	GRPCClientConfig grpcclient.Config `yaml:"grpc_client_config"`
+
+	// AllowedPathPrefixes restricts the URL path prefixes a worker will dispatch to the local HTTP
+	// handler. Requests coming off the (unauthenticated) scheduler/frontend worker protocol are not
+	// trusted: an upstream peer can enqueue arbitrary method/URL/headers. Limiting the dispatchable
+	// paths to the configured Prometheus/legacy API prefixes prevents reaching auth=false admin routes
+	// (e.g. /config, /debug/pprof/*, /ingester/ring, /runtime_config, /services, /memberlist) that may
+	// be exposed on the same mux. Populated by the Cortex module system; defaults are safe for the
+	// standard Prometheus and legacy prefixes.
+	AllowedPathPrefixes []string `yaml:"-"`
 }
 
 func (cfg *Config) RegisterFlags(f *flag.FlagSet) {
 	f.StringVar(&cfg.SchedulerAddress, "querier.scheduler-address", "", "Hostname (and port) of scheduler that querier will periodically resolve, connect to and receive queries from. Only one of -querier.frontend-address or -querier.scheduler-address can be set. If neither is set, queries are only received via HTTP endpoint.")
 	f.StringVar(&cfg.FrontendAddress, "querier.frontend-address", "", "Address of query frontend service, in host:port format. If -querier.scheduler-address is set as well, querier will use scheduler instead. Only one of -querier.frontend-address or -querier.scheduler-address can be set. If neither is set, queries are only received via HTTP endpoint.")
+
+	// Default allowlist covers the standard Prometheus and legacy API prefixes used by RegisterQueryAPI.
+	// If an operator changes the HTTP prefixes they are rewritten in the Cortex module system before this
+	// slice is observed by the worker; this flag default is only the fallback.
+	cfg.AllowedPathPrefixes = []string{"/prometheus/api/v1/", "/api/prom/api/v1/", "/api/v1/"}
 
 	f.DurationVar(&cfg.DNSLookupPeriod, "querier.dns-lookup-period", 10*time.Second, "How often to query DNS for query-frontend or query-scheduler address.")
 
