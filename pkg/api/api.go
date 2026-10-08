@@ -48,6 +48,12 @@ type Config struct {
 	AlertmanagerHTTPPrefix string `yaml:"alertmanager_http_prefix"`
 	PrometheusHTTPPrefix   string `yaml:"prometheus_http_prefix"`
 
+	// AdminAuth configures authentication for cluster-mutating admin HTTP
+	// methods (POST on the ring status pages). The default policy is deny:
+	// EnableAdminEndpoints must be flipped and at least one authenticator
+	// configured for POST to be registered.
+	AdminAuth AdminAuthConfig `yaml:"admin_auth,omitempty"`
+
 	// The following configs are injected by the upstream caller.
 	ServerPrefix       string               `yaml:"-"`
 	LegacyHTTPPrefix   string               `yaml:"-"`
@@ -78,6 +84,9 @@ func (cfg *Config) RegisterFlags(f *flag.FlagSet) {
 func (cfg *Config) RegisterFlagsWithPrefix(prefix string, f *flag.FlagSet) {
 	f.StringVar(&cfg.AlertmanagerHTTPPrefix, prefix+"http.alertmanager-http-prefix", "/alertmanager", "HTTP URL path under which the Alertmanager ui and api will be served.")
 	f.StringVar(&cfg.PrometheusHTTPPrefix, prefix+"http.prometheus-http-prefix", "/prometheus", "HTTP URL path under which the Prometheus api will be served.")
+	f.BoolVar(&cfg.AdminAuth.EnableAdminEndpoints, prefix+"api.enable-admin-endpoints", false, "Enable mutating admin HTTP methods (the forget POST on all ring status pages). Default false; when false the mutating method is not registered. When true, at least one of -api.admin-auth-token or -api.admin-allowed-source-cidrs MUST be configured.")
+	f.StringVar(&cfg.AdminAuth.AdminAuthToken, prefix+"api.admin-auth-token", "", "Shared secret bearer token required on mutating admin requests. Required unless an operator-managed source-CIDR allowlist is configured.")
+	f.StringVar(&cfg.AdminAuth.AdminAllowedSourceCIDRs, prefix+"api.admin-allowed-source-cidrs", "", "Comma-separated list of CIDR ranges allowed to issue mutating admin requests. Combined with the bearer token check when both are set.")
 }
 
 // Push either wraps the distributor push function as configured or returns the distributor push directly.
@@ -91,6 +100,7 @@ func (cfg *Config) wrapDistributorPush(d *distributor.Distributor) push.Func {
 
 type API struct {
 	AuthMiddleware       middleware.Interface
+	AdminAuthMiddleware  middleware.Interface
 	cfg                  Config
 	server               *server.Server
 	logger               log.Logger
@@ -130,7 +140,28 @@ func New(cfg Config, serverCfg server.Config, s *server.Server, logger log.Logge
 		api.HTTPHeaderMiddleware = &HTTPHeaderMiddleware{TargetHeaders: cfg.HTTPRequestHeadersToLog}
 	}
 
+	adminAuth, err := newAdminAuthMiddleware(cfg.AdminAuth)
+	if err != nil {
+		return nil, err
+	}
+	api.AdminAuthMiddleware = adminAuth
+
 	return api, nil
+}
+
+// registerRingRoutes registers a ring status page: GET is always registered
+// as a read-only, unauthenticated route; POST (the cluster-mutating forget
+// method) is only registered when admin endpoints are enabled, and is
+// wrapped in the operator-configured admin authenticator plus an
+// Origin/Referer check (see adminAuthMiddleware). This splits the
+// previously-combined GET,POST registration that allowed any unauthenticated
+// network peer or any cross-origin form POST to remove instances from the
+// shared ring KV.
+func (a *API) registerRingRoutes(path string, handler http.Handler) {
+	a.RegisterRoute(path, handler, false, "GET")
+	if a.cfg.AdminAuth.EnableAdminEndpoints {
+		a.RegisterRoute(path, a.AdminAuthMiddleware.Wrap(handler), false, "POST")
+	}
 }
 
 // RegisterRoute registers a single route enforcing HTTP methods. A single
@@ -188,7 +219,7 @@ func (a *API) RegisterAlertmanager(am *alertmanager.MultitenantAlertmanager, tar
 	// Ensure this route is registered before the prefixed AM route
 	a.RegisterRoute("/multitenant_alertmanager/status", am.GetStatusHandler(), false, "GET")
 	a.RegisterRoute("/multitenant_alertmanager/configs", http.HandlerFunc(am.ListAllConfigs), false, "GET")
-	a.RegisterRoute("/multitenant_alertmanager/ring", http.HandlerFunc(am.RingHandler), false, "GET", "POST")
+	a.registerRingRoutes("/multitenant_alertmanager/ring", http.HandlerFunc(am.RingHandler))
 	a.RegisterRoute("/multitenant_alertmanager/delete_tenant_config", http.HandlerFunc(am.DeleteUserConfig), true, "POST")
 
 	// UI components lead to a large number of routes to support, utilize a path prefix instead
@@ -240,7 +271,7 @@ func (a *API) RegisterDistributor(d *distributor.Distributor, pushConfig distrib
 	a.indexPage.AddLink(SectionAdminEndpoints, "/distributor/all_user_stats", "Usage Statistics")
 	a.indexPage.AddLink(SectionAdminEndpoints, "/distributor/ha_tracker", "HA Tracking Status")
 
-	a.RegisterRoute("/distributor/ring", d, false, "GET", "POST")
+	a.registerRingRoutes("/distributor/ring", d)
 	a.RegisterRoute("/distributor/all_user_stats", http.HandlerFunc(d.AllUserStatsHandler), false, "GET")
 	a.RegisterRoute("/distributor/ha_tracker", d.HATracker, false, "GET")
 
@@ -283,13 +314,13 @@ func (a *API) RegisterTenantDeletion(api *purger.TenantDeletionAPI) {
 // RegisterRuler registers routes associated with the Ruler service.
 func (a *API) RegisterRuler(r *ruler.Ruler) {
 	a.indexPage.AddLink(SectionAdminEndpoints, "/ruler/ring", "Ruler Ring Status")
-	a.RegisterRoute("/ruler/ring", r, false, "GET", "POST")
+	a.registerRingRoutes("/ruler/ring", r)
 
 	// Administrative API, uses authentication to inform which user's configuration to delete.
 	a.RegisterRoute("/ruler/delete_tenant_config", http.HandlerFunc(r.DeleteTenantConfiguration), true, "POST")
 
 	// Legacy Ring Route
-	a.RegisterRoute("/ruler_ring", r, false, "GET", "POST")
+	a.registerRingRoutes("/ruler_ring", r)
 
 	// List all user rule groups
 	a.RegisterRoute("/ruler/rule_groups", http.HandlerFunc(r.ListAllRules), false, "GET")
@@ -327,10 +358,10 @@ func (a *API) RegisterRulerAPI(r *ruler.API) {
 // RegisterRing registers the ring UI page associated with the distributor for writes.
 func (a *API) RegisterRing(r *ring.Ring) {
 	a.indexPage.AddLink(SectionAdminEndpoints, "/ingester/ring", "Ingester Ring Status")
-	a.RegisterRoute("/ingester/ring", r, false, "GET", "POST")
+	a.registerRingRoutes("/ingester/ring", r)
 
 	// Legacy Route
-	a.RegisterRoute("/ring", r, false, "GET", "POST")
+	a.registerRingRoutes("/ring", r)
 }
 
 // RegisterStoreGateway registers the ring UI page associated with the store-gateway.
@@ -338,13 +369,13 @@ func (a *API) RegisterStoreGateway(s *storegateway.StoreGateway) {
 	storegatewaypb.RegisterStoreGatewayServer(a.server.GRPC, s)
 
 	a.indexPage.AddLink(SectionAdminEndpoints, "/store-gateway/ring", "Store Gateway Ring")
-	a.RegisterRoute("/store-gateway/ring", http.HandlerFunc(s.RingHandler), false, "GET", "POST")
+	a.registerRingRoutes("/store-gateway/ring", http.HandlerFunc(s.RingHandler))
 }
 
 // RegisterCompactor registers the ring UI page associated with the compactor.
 func (a *API) RegisterCompactor(c *compactor.Compactor) {
 	a.indexPage.AddLink(SectionAdminEndpoints, "/compactor/ring", "Compactor Ring Status")
-	a.RegisterRoute("/compactor/ring", http.HandlerFunc(c.RingHandler), false, "GET", "POST")
+	a.registerRingRoutes("/compactor/ring", http.HandlerFunc(c.RingHandler))
 }
 
 type Distributor interface {
