@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"net/http"
+	"strings"
 	"time"
 
 	"github.com/go-kit/log"
@@ -130,6 +131,18 @@ func (sp *schedulerProcessor) querierLoop(c schedulerpb.SchedulerForQuerier_Quer
 			// We need to inject user into context for sending response back.
 			ctx := user.InjectOrgID(ctx, request.UserID)
 
+			// Bind the executed tenant to the tenant that the scheduler queued the
+			// request under. The HTTP request body is forwarded verbatim from the
+			// scheduler (which in turn received it from a frontend); any caller
+			// that can speak the scheduler's gRPC loop could otherwise set an
+			// arbitrary X-Scope-OrgID header on the embedded HTTPRequest and have
+			// the querier execute the query as a different tenant (confused
+			// deputy). Overwrite — not merge — the X-Scope-OrgID header on the
+			// embedded httpgrpc.HTTPRequest with the scheduler-provided UserID
+			// before invoking the handler so the executed tenant always matches
+			// the queued tenant.
+			overwriteOrgIDHeader(request.HttpRequest, request.UserID)
+
 			tracer := opentracing.GlobalTracer()
 			// Ignore errors here. If we cannot get parent span, we just don't create new one.
 			parentSpanContext, _ := httpgrpcutil.GetParentSpanForRequest(tracer, request.HttpRequest)
@@ -149,6 +162,35 @@ func (sp *schedulerProcessor) querierLoop(c schedulerpb.SchedulerForQuerier_Quer
 			}
 		}()
 	}
+}
+
+// overwriteOrgIDHeader removes any caller-supplied X-Scope-OrgID headers from
+// the embedded httpgrpc.HTTPRequest and replaces them with a single header
+// containing the trusted userID that the scheduler queued the request under.
+// This prevents a cross-tenant confused-deputy attack where an attacker that
+// can reach the scheduler's gRPC loop queues a request under one tenant but
+// embeds an X-Scope-OrgID header for another tenant inside the HTTPRequest.
+func overwriteOrgIDHeader(req *httpgrpc.HTTPRequest, userID string) {
+	if req == nil {
+		return
+	}
+	// Drop every existing X-Scope-OrgID header (case-insensitive, matching the
+	// behaviour of weaveworks/common's httpgrpc server which lowercases header
+	// names when copying them into the synthetic http.Request).
+	filtered := req.Headers[:0]
+	for _, h := range req.Headers {
+		if h == nil {
+			continue
+		}
+		if strings.EqualFold(h.Key, user.OrgIDHeaderName) {
+			continue
+		}
+		filtered = append(filtered, h)
+	}
+	req.Headers = append(filtered, &httpgrpc.Header{
+		Key:    user.OrgIDHeaderName,
+		Values: []string{userID},
+	})
 }
 
 func (sp *schedulerProcessor) runRequest(ctx context.Context, logger log.Logger, queryID uint64, frontendAddress string, statsEnabled bool, request *httpgrpc.HTTPRequest) {
