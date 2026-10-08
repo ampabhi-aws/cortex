@@ -114,6 +114,19 @@ type Alertmanager struct {
 	configHashMetric prometheus.Gauge
 
 	rateLimitedNotifications *prometheus.CounterVec
+
+	// rateLimiters holds the per-integration-type notification rate limiters
+	// for this tenant. Keeping them on the Alertmanager (which is itself
+	// per-tenant) ensures that:
+	//   1. all integration *instances* of the same type share a single token
+	//      bucket (the documented per-user semantics), rather than each
+	//      webhook_configs[] / email_configs[] etc. entry getting its own
+	//      independent limiter, and
+	//   2. the limiter state survives ApplyConfig reloads, so a tenant
+	//      cannot reset the burst bucket by repeatedly re-uploading a
+	//      trivially-modified configuration.
+	rateLimitersMtx sync.Mutex
+	rateLimiters    map[string]*rate.Limiter
 }
 
 var (
@@ -360,7 +373,11 @@ func (am *Alertmanager) ApplyConfig(userID string, conf *config.Config, rawCfg s
 				integration: integrationName,
 			}
 
-			return newRateLimitedNotifier(notifier, rl, 10*time.Second, am.rateLimitedNotifications.WithLabelValues(integrationName))
+			// Reuse a single limiter per (tenant, integration type), so that
+			// multiple integration instances of the same type share one bucket
+			// and the bucket is not reset on config reload.
+			limiter := am.limiterFor(integrationName, rl)
+			return newRateLimitedNotifierWithLimiter(notifier, rl, limiter, 10*time.Second, am.rateLimitedNotifications.WithLabelValues(integrationName))
 		}
 		return notifier
 	})
@@ -570,6 +587,24 @@ func (p firewallDialerConfigProvider) BlockCIDRNetworks() []flagext.CIDR {
 
 func (p firewallDialerConfigProvider) BlockPrivateAddresses() bool {
 	return p.limits.AlertmanagerReceiversBlockPrivateAddresses(p.userID)
+}
+
+// limiterFor returns the shared *rate.Limiter for the given integration type
+// for this tenant, creating it on first use. The limiter is persistent across
+// ApplyConfig calls so that config reloads do not reset the token bucket.
+func (am *Alertmanager) limiterFor(integration string, rl rateLimits) *rate.Limiter {
+	am.rateLimitersMtx.Lock()
+	defer am.rateLimitersMtx.Unlock()
+
+	if am.rateLimiters == nil {
+		am.rateLimiters = map[string]*rate.Limiter{}
+	}
+	if l, ok := am.rateLimiters[integration]; ok {
+		return l
+	}
+	l := rate.NewLimiter(rl.RateLimit(), rl.Burst())
+	am.rateLimiters[integration] = l
+	return l
 }
 
 type tenantRateLimits struct {
