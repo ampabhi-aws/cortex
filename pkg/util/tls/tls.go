@@ -73,8 +73,24 @@ func (cfg *ClientConfig) GetTLSConfig() (*tls.Config, error) {
 	return config, nil
 }
 
+// Validate verifies that the ClientConfig is internally consistent with the
+// enabled flag. In particular, it fails closed when TLS material has been
+// configured but TLS has not been enabled: without this check, every caller
+// of GetGRPCDialOptions / GetTLSConfig would silently fall back to plaintext,
+// discarding the operator-supplied certificates. Returning an error here is
+// the single enforcement point every caller inherits.
+func (cfg *ClientConfig) Validate(enabled bool) error {
+	if !enabled && (cfg.CertPath != "" || cfg.KeyPath != "" || cfg.CAPath != "" || cfg.ServerName != "" || cfg.InsecureSkipVerify) {
+		return errors.New("TLS options were configured but TLS is not enabled: set the matching .tls-enabled flag or remove the TLS options")
+	}
+	return nil
+}
+
 // GetGRPCDialOptions creates GRPC DialOptions for TLS
 func (cfg *ClientConfig) GetGRPCDialOptions(enabled bool) ([]grpc.DialOption, error) {
+	if err := cfg.Validate(enabled); err != nil {
+		return nil, err
+	}
 	if !enabled {
 		return []grpc.DialOption{grpc.WithTransportCredentials(insecure.NewCredentials())}, nil
 	}

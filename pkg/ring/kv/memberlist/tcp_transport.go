@@ -78,6 +78,14 @@ func (cfg *TCPTransportConfig) RegisterFlagsWithPrefix(f *flag.FlagSet, prefix s
 	cfg.TLS.RegisterFlagsWithPrefix(prefix+"memberlist", f)
 }
 
+// Validate fails closed if TLS material has been configured without the
+// matching -memberlist.tls-enabled flag. Without this check the transport
+// would silently use net.ListenTCP and dial plaintext, dropping the
+// operator-supplied certificates.
+func (cfg *TCPTransportConfig) Validate() error {
+	return cfg.TLS.Validate(cfg.TLSEnabled)
+}
+
 // TCPTransport is a memberlist.Transport implementation that uses TCP for both packet and stream
 // operations ("packet" and "stream" are terms used by memberlist).
 // It uses a new TCP connections for each operation. There is no connection reuse.
@@ -112,6 +120,9 @@ type TCPTransport struct {
 // NewTCPTransport returns a new tcp-based transport with the given configuration. On
 // success all the network listeners will be created and listening.
 func NewTCPTransport(config TCPTransportConfig, logger log.Logger) (*TCPTransport, error) {
+	if err := config.Validate(); err != nil {
+		return nil, errors.Wrap(err, "invalid memberlist TCP transport config")
+	}
 	if len(config.BindAddrs) == 0 {
 		config.BindAddrs = []string{zeroZeroZeroZero}
 	}

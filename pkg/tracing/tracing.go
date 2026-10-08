@@ -65,6 +65,9 @@ func (c *Config) Validate() error {
 		if c.Otel.OltpEndpoint == "" {
 			return errors.New("oltp-endpoint must be defined when using otel exporter")
 		}
+		if err := c.Otel.TLS.Validate(c.Otel.TLSEnabled); err != nil {
+			return errors.Wrap(err, "invalid tracing OTLP TLS config")
+		}
 	}
 
 	return nil

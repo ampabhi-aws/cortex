@@ -5,8 +5,11 @@ import (
 	"time"
 
 	"github.com/go-kit/log"
+	"github.com/go-kit/log/level"
 	middleware "github.com/grpc-ecosystem/go-grpc-middleware"
 	"github.com/pkg/errors"
+	"github.com/prometheus/client_golang/prometheus"
+	"github.com/prometheus/client_golang/prometheus/promauto"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/encoding/gzip"
 	"google.golang.org/grpc/keepalive"
@@ -15,6 +18,13 @@ import (
 	"github.com/cortexproject/cortex/pkg/util/grpcencoding/snappy"
 	"github.com/cortexproject/cortex/pkg/util/tls"
 )
+
+// clientTLSEnabledGauge exposes whether TLS is enabled for each gRPC client.
+// Operators can alert on unexpectedly plaintext inter-component links.
+var clientTLSEnabledGauge = promauto.With(prometheus.DefaultRegisterer).NewGaugeVec(prometheus.GaugeOpts{
+	Name: "cortex_client_tls_enabled",
+	Help: "Whether TLS is enabled for a Cortex gRPC client, labelled by the client's flag prefix. 1 if enabled, 0 otherwise.",
+}, []string{"client"})
 
 // Config for a gRPC client.
 type Config struct {
@@ -29,6 +39,11 @@ type Config struct {
 
 	TLSEnabled bool             `yaml:"tls_enabled"`
 	TLS        tls.ClientConfig `yaml:",inline"`
+
+	// prefix is the flag prefix used when this Config was registered. It is
+	// used purely for diagnostics (log context, metric labels) and has no
+	// effect on behaviour. Unexported so it is never marshaled.
+	prefix string
 }
 
 // RegisterFlags registers flags.
@@ -38,6 +53,7 @@ func (cfg *Config) RegisterFlags(f *flag.FlagSet) {
 
 // RegisterFlagsWithPrefix registers flags with prefix.
 func (cfg *Config) RegisterFlagsWithPrefix(prefix string, f *flag.FlagSet) {
+	cfg.prefix = prefix
 	f.IntVar(&cfg.MaxRecvMsgSize, prefix+".grpc-max-recv-msg-size", 100<<20, "gRPC client max receive message size (bytes).")
 	f.IntVar(&cfg.MaxSendMsgSize, prefix+".grpc-max-send-msg-size", 16<<20, "gRPC client max send message size (bytes).")
 	f.StringVar(&cfg.GRPCCompression, prefix+".grpc-compression", "", "Use compression when sending messages. Supported values are: 'gzip', 'snappy' and '' (disable compression)")
@@ -58,6 +74,30 @@ func (cfg *Config) Validate(log log.Logger) error {
 	default:
 		return errors.Errorf("unsupported compression type: %s", cfg.GRPCCompression)
 	}
+
+	// Fail closed when TLS material has been configured but TLS is not
+	// enabled: silently falling back to plaintext would be an invisible
+	// downgrade of inter-component security.
+	if err := cfg.TLS.Validate(cfg.TLSEnabled); err != nil {
+		return errors.Wrapf(err, "invalid TLS config for gRPC client %q", cfg.prefix)
+	}
+
+	// Record the effective TLS state so operators can alert on unexpectedly
+	// plaintext inter-component links. Also emit a warning when a client is
+	// configured without TLS so the condition is not completely invisible.
+	clientLabel := cfg.prefix
+	if clientLabel == "" {
+		clientLabel = "unknown"
+	}
+	if cfg.TLSEnabled {
+		clientTLSEnabledGauge.WithLabelValues(clientLabel).Set(1)
+	} else {
+		clientTLSEnabledGauge.WithLabelValues(clientLabel).Set(0)
+		if log != nil {
+			level.Warn(log).Log("msg", "gRPC client configured without TLS; inter-component traffic will be plaintext", "client", clientLabel)
+		}
+	}
+
 	return nil
 }
 
