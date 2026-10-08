@@ -117,19 +117,19 @@ func (m *KV) createAndRegisterMetrics() {
 		"Number of values in KV Store",
 		nil, nil)
 
-	m.storeTombstones = promauto.With(m.registerer).NewGaugeVec(prometheus.GaugeOpts{
+	m.storeTombstones = promauto.With(m.registerer).NewGauge(prometheus.GaugeOpts{
 		Namespace: m.cfg.MetricsNamespace,
 		Subsystem: subsystem,
 		Name:      "kv_store_value_tombstones",
 		Help:      "Number of tombstones currently present in KV store values",
-	}, []string{"key"})
+	})
 
-	m.storeRemovedTombstones = promauto.With(m.registerer).NewCounterVec(prometheus.CounterOpts{
+	m.storeRemovedTombstones = promauto.With(m.registerer).NewCounter(prometheus.CounterOpts{
 		Namespace: m.cfg.MetricsNamespace,
 		Subsystem: subsystem,
 		Name:      "kv_store_value_tombstones_removed_total",
 		Help:      "Total number of tombstones which have been removed from KV store values",
-	}, []string{"key"})
+	})
 
 	m.memberlistMembersCount = promauto.With(m.registerer).NewGaugeFunc(prometheus.GaugeOpts{
 		Namespace: m.cfg.MetricsNamespace,
