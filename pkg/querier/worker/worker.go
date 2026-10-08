@@ -16,6 +16,7 @@ import (
 
 	"github.com/cortexproject/cortex/pkg/util"
 	"github.com/cortexproject/cortex/pkg/util/grpcclient"
+	"github.com/cortexproject/cortex/pkg/util/schedulerauth"
 	"github.com/cortexproject/cortex/pkg/util/services"
 )
 
@@ -31,6 +32,12 @@ type Config struct {
 	QuerierID string `yaml:"id"`
 
 	GRPCClientConfig grpcclient.Config `yaml:"grpc_client_config"`
+
+	// InternalGRPCAuthToken is the shared secret attached to outgoing calls
+	// on the internal query-scheduler / query-frontend control plane. It is
+	// populated from api.internal-grpc-auth-token by pkg/cortex/modules.go so
+	// a single top-level flag controls both client and server behaviour.
+	InternalGRPCAuthToken string `yaml:"-"`
 }
 
 func (cfg *Config) RegisterFlags(f *flag.FlagSet) {
@@ -259,7 +266,20 @@ func (w *querierWorker) resetConcurrency() {
 
 func (w *querierWorker) connect(ctx context.Context, address string) (*grpc.ClientConn, error) {
 	// Because we only use single long-running method, it doesn't make sense to inject user ID, send over tracing or add metrics.
-	opts, err := w.cfg.GRPCClientConfig.DialOption(nil, nil)
+	var unary []grpc.UnaryClientInterceptor
+	var stream []grpc.StreamClientInterceptor
+	if w.cfg.InternalGRPCAuthToken != "" {
+		// Attach the internal scheduler/frontend auth token on every call so
+		// the server can enforce it on the Process / QuerierLoop /
+		// NotifyQuerierShutdown methods (exempt from the tenant-header auth
+		// middleware). Both interceptors must be chained via DialOption
+		// because grpcclient.Config.DialOption already installs a single
+		// grpc.With{Unary,Stream}Interceptor that would otherwise overwrite
+		// anything appended afterwards.
+		unary = append(unary, schedulerauth.UnaryClientInterceptor(w.cfg.InternalGRPCAuthToken))
+		stream = append(stream, schedulerauth.StreamClientInterceptor(w.cfg.InternalGRPCAuthToken))
+	}
+	opts, err := w.cfg.GRPCClientConfig.DialOption(unary, stream)
 	if err != nil {
 		return nil, err
 	}

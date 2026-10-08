@@ -342,6 +342,7 @@ func (t *Cortex) initQuerier() (serv services.Service, err error) {
 	}
 
 	t.Cfg.Worker.MaxConcurrentRequests = t.Cfg.Querier.MaxConcurrent
+	t.Cfg.Worker.InternalGRPCAuthToken = t.Cfg.API.InternalGRPCAuthToken
 	return querier_worker.NewQuerierWorker(t.Cfg.Worker, httpgrpc_server.NewServer(internalQuerierRouter), util_log.Logger, prometheus.DefaultRegisterer)
 }
 
@@ -472,6 +473,7 @@ func (t *Cortex) initQueryFrontendTripperware() (serv services.Service, err erro
 }
 
 func (t *Cortex) initQueryFrontend() (serv services.Service, err error) {
+	t.Cfg.Frontend.FrontendV2.InternalGRPCAuthToken = t.Cfg.API.InternalGRPCAuthToken
 	roundTripper, frontendV1, frontendV2, err := frontend.InitFrontend(t.Cfg.Frontend, t.Overrides, t.Cfg.Server.GRPCListenPort, util_log.Logger, prometheus.DefaultRegisterer)
 	if err != nil {
 		return nil, err
@@ -683,6 +685,7 @@ func (t *Cortex) initTenantDeletionAPI() (services.Service, error) {
 }
 
 func (t *Cortex) initQueryScheduler() (services.Service, error) {
+	t.Cfg.QueryScheduler.InternalGRPCAuthToken = t.Cfg.API.InternalGRPCAuthToken
 	s, err := scheduler.NewScheduler(t.Cfg.QueryScheduler, t.Overrides, util_log.Logger, prometheus.DefaultRegisterer)
 	if err != nil {
 		return nil, errors.Wrap(err, "query-scheduler init")

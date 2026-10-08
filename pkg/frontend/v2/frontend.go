@@ -40,6 +40,12 @@ type Config struct {
 	// If set, address is not computed from interfaces.
 	Addr string `yaml:"address" doc:"hidden"`
 	Port int    `doc:"hidden"`
+
+	// InternalGRPCAuthToken is the shared secret attached to outgoing gRPC
+	// calls on the internal query-scheduler control plane (FrontendLoop). It
+	// is populated from api.internal-grpc-auth-token by pkg/cortex/modules.go
+	// so a single top-level flag controls both client and server behaviour.
+	InternalGRPCAuthToken string `yaml:"-"`
 }
 
 func (cfg *Config) RegisterFlags(f *flag.FlagSet) {

@@ -16,6 +16,7 @@ import (
 	"github.com/cortexproject/cortex/pkg/scheduler/schedulerpb"
 	"github.com/cortexproject/cortex/pkg/util"
 	"github.com/cortexproject/cortex/pkg/util/backoff"
+	"github.com/cortexproject/cortex/pkg/util/schedulerauth"
 	"github.com/cortexproject/cortex/pkg/util/services"
 )
 
@@ -128,7 +129,19 @@ func (f *frontendSchedulerWorkers) getWorkersCount() int {
 
 func (f *frontendSchedulerWorkers) connectToScheduler(ctx context.Context, address string) (*grpc.ClientConn, error) {
 	// Because we only use single long-running method, it doesn't make sense to inject user ID, send over tracing or add metrics.
-	opts, err := f.cfg.GRPCClientConfig.DialOption(nil, nil)
+	var unary []grpc.UnaryClientInterceptor
+	var stream []grpc.StreamClientInterceptor
+	if f.cfg.InternalGRPCAuthToken != "" {
+		// Attach the shared secret on every call so the scheduler can enforce
+		// it on FrontendLoop (exempt from the tenant-header auth middleware).
+		// Both interceptors must be passed via DialOption because
+		// grpcclient.Config.DialOption installs a single
+		// grpc.With{Unary,Stream}Interceptor that would otherwise overwrite
+		// anything appended afterwards.
+		unary = append(unary, schedulerauth.UnaryClientInterceptor(f.cfg.InternalGRPCAuthToken))
+		stream = append(stream, schedulerauth.StreamClientInterceptor(f.cfg.InternalGRPCAuthToken))
+	}
+	opts, err := f.cfg.GRPCClientConfig.DialOption(unary, stream)
 	if err != nil {
 		return nil, err
 	}

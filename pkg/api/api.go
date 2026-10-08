@@ -65,12 +65,28 @@ type Config struct {
 
 	// Allows and is used to configure the addition of HTTP Header fields to logs
 	HTTPRequestHeadersToLog flagext.StringSlice `yaml:"http_request_headers_to_log"`
+
+	// InternalGRPCAuthToken is an optional shared secret used to authenticate
+	// callers of the internal query-scheduler / query-frontend gRPC control
+	// plane (SchedulerForFrontend/FrontendLoop,
+	// SchedulerForQuerier/QuerierLoop, SchedulerForQuerier/NotifyQuerierShutdown,
+	// Frontend/Process and Frontend/NotifyClientShutdown). These methods are
+	// intentionally exempted from the tenant-header auth interceptor because a
+	// single stream multiplexes multiple tenants; when they are reachable from
+	// untrusted networks they can be abused to execute queries as any tenant,
+	// read any tenant's queries, or forge query results. Setting a non-empty
+	// value here (identical on every scheduler, every query-frontend and every
+	// querier) causes the server-side interceptors to require the secret and
+	// the client-side interceptors to attach it. Empty value preserves the
+	// historical behaviour (relying on network isolation and/or gRPC mTLS).
+	InternalGRPCAuthToken string `yaml:"internal_grpc_auth_token"`
 }
 
 // RegisterFlags adds the flags required to config this to the given FlagSet.
 func (cfg *Config) RegisterFlags(f *flag.FlagSet) {
 	f.BoolVar(&cfg.ResponseCompression, "api.response-compression-enabled", false, "Use GZIP compression for API responses. Some endpoints serve large YAML or JSON blobs which can benefit from compression.")
 	f.Var(&cfg.HTTPRequestHeadersToLog, "api.http-request-headers-to-log", "Which HTTP Request headers to add to logs")
+	f.StringVar(&cfg.InternalGRPCAuthToken, "api.internal-grpc-auth-token", "", "Optional shared secret used to authenticate the internal query-scheduler and query-frontend gRPC control plane (SchedulerForFrontend/FrontendLoop, SchedulerForQuerier/QuerierLoop, SchedulerForQuerier/NotifyQuerierShutdown, Frontend/Process, Frontend/NotifyClientShutdown). When set, must be identical on every query-scheduler, query-frontend and querier. Empty value keeps the historical behaviour (relying on network isolation and/or gRPC mTLS).")
 	cfg.RegisterFlagsWithPrefix("", f)
 }
 

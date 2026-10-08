@@ -59,6 +59,7 @@ import (
 	"github.com/cortexproject/cortex/pkg/util/modules"
 	"github.com/cortexproject/cortex/pkg/util/process"
 	"github.com/cortexproject/cortex/pkg/util/runtimeconfig"
+	"github.com/cortexproject/cortex/pkg/util/schedulerauth"
 	"github.com/cortexproject/cortex/pkg/util/services"
 	"github.com/cortexproject/cortex/pkg/util/validation"
 )
@@ -348,6 +349,19 @@ func New(cfg Config) (*Cortex, error) {
 			"/schedulerpb.SchedulerForQuerier/QuerierLoop",
 			"/schedulerpb.SchedulerForQuerier/NotifyQuerierShutdown",
 		})
+
+	// Install the shared-secret auth interceptors for the internal query-scheduler
+	// / query-frontend control-plane streams. These methods are exempt from the
+	// tenant-header auth middleware above (a single stream multiplexes requests
+	// for many tenants). When -api.internal-grpc-auth-token is set, the server
+	// requires the matching secret in gRPC metadata on those methods, which
+	// prevents arbitrary network clients from registering as a fake frontend or
+	// a fake querier. When unset the interceptors are no-ops to preserve the
+	// historical behaviour of relying on network isolation / gRPC mTLS.
+	cfg.Server.GRPCMiddleware = append(cfg.Server.GRPCMiddleware,
+		schedulerauth.UnaryServerInterceptor(cfg.API.InternalGRPCAuthToken, schedulerauth.GuardedServerMethods))
+	cfg.Server.GRPCStreamMiddleware = append(cfg.Server.GRPCStreamMiddleware,
+		schedulerauth.StreamServerInterceptor(cfg.API.InternalGRPCAuthToken, schedulerauth.GuardedServerMethods))
 
 	cortex := &Cortex{
 		Cfg: cfg,
