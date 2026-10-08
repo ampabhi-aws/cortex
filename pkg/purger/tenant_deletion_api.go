@@ -62,12 +62,42 @@ func (api *TenantDeletionAPI) DeleteTenant(w http.ResponseWriter, r *http.Reques
 
 	level.Info(api.logger).Log("msg", "tenant deletion mark in blocks storage created", "user", userID)
 
-	w.WriteHeader(http.StatusOK)
+	resp := DeleteTenantResponse{
+		TenantID: userID,
+		Message:  "tenant deletion mark written to blocks storage; blocks will be deleted asynchronously by the compactor and ingesters will stop shipping blocks for this tenant",
+		Warning:  tenantDeletionScopeWarning,
+	}
+	util.WriteJSONResponse(w, resp)
+}
+
+// tenantDeletionScopeWarning is returned by both DeleteTenant and
+// DeleteTenantStatus so operators (and compliance workflows) are not misled
+// into believing that /purger/delete_tenant deletes all tenant data. The
+// endpoint only drives the blocks-storage deletion path; alertmanager
+// configuration and ruler rule groups must be deleted via their own
+// dedicated endpoints.
+const tenantDeletionScopeWarning = "POST /purger/delete_tenant only requests deletion of blocks-storage data for the tenant. " +
+	"Alertmanager configuration (which may contain plaintext credentials such as smtp_auth_password, api_key or webhook tokens) " +
+	"must be deleted separately via POST /multitenant_alertmanager/delete_tenant_config. " +
+	"Ruler rule groups must be deleted separately via POST /ruler/delete_tenant_config. " +
+	"Ingester-local TSDB/WAL state for this tenant is only reclaimed when -blocks-storage.tsdb.close-idle-tsdb-timeout is set to a non-zero value. " +
+	"The blocks_deleted field in /purger/delete_tenant_status reflects only the absence of ULID-named block prefixes in the blocks bucket " +
+	"and does NOT imply that other data classes have been destroyed."
+
+type DeleteTenantResponse struct {
+	TenantID string `json:"tenant_id"`
+	Message  string `json:"message"`
+	Warning  string `json:"warning"`
 }
 
 type DeleteTenantStatusResponse struct {
 	TenantID      string `json:"tenant_id"`
 	BlocksDeleted bool   `json:"blocks_deleted"`
+	// Warning explains that BlocksDeleted does not imply overall tenant
+	// deletion: alertmanager configs, ruler rule groups and ingester-local
+	// state are not considered here and must be deleted via their own
+	// endpoints. See tenantDeletionScopeWarning for details.
+	Warning string `json:"warning"`
 }
 
 func (api *TenantDeletionAPI) DeleteTenantStatus(w http.ResponseWriter, r *http.Request) {
@@ -80,6 +110,7 @@ func (api *TenantDeletionAPI) DeleteTenantStatus(w http.ResponseWriter, r *http.
 
 	result := DeleteTenantStatusResponse{}
 	result.TenantID = userID
+	result.Warning = tenantDeletionScopeWarning
 	result.BlocksDeleted, err = api.isBlocksForUserDeleted(ctx, userID)
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
