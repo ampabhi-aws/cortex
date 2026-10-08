@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"net/http"
 	"sync"
+	"time"
 
 	"github.com/go-kit/log"
 	"github.com/go-kit/log/level"
@@ -12,6 +13,7 @@ import (
 	"github.com/pkg/errors"
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/promauto"
+	"github.com/prometheus/common/model"
 	"github.com/prometheus/prometheus/config"
 	"github.com/prometheus/prometheus/model/rulefmt"
 	"github.com/prometheus/prometheus/notifier"
@@ -45,9 +47,15 @@ type DefaultMultiTenantManager struct {
 	configUpdatesTotal            *prometheus.CounterVec
 	registry                      prometheus.Registerer
 	logger                        log.Logger
+
+	// Per-tenant limits used for admission and defensive clamping of
+	// tenant-controlled fields on rule groups (e.g. evaluation Interval).
+	// Optional: when nil, no per-tenant admission limits are enforced beyond
+	// the structural checks in ValidateRuleGroup.
+	limits RulesLimits
 }
 
-func NewDefaultMultiTenantManager(cfg Config, managerFactory ManagerFactory, reg prometheus.Registerer, logger log.Logger) (*DefaultMultiTenantManager, error) {
+func NewDefaultMultiTenantManager(cfg Config, managerFactory ManagerFactory, reg prometheus.Registerer, logger log.Logger, limits RulesLimits) (*DefaultMultiTenantManager, error) {
 	ncfg, err := buildNotifierConfig(&cfg)
 	if err != nil {
 		return nil, err
@@ -88,6 +96,7 @@ func NewDefaultMultiTenantManager(cfg Config, managerFactory ManagerFactory, reg
 		}, []string{"user"}),
 		registry: reg,
 		logger:   logger,
+		limits:   limits,
 	}, nil
 }
 
@@ -123,9 +132,28 @@ func (r *DefaultMultiTenantManager) SyncRuleGroups(ctx context.Context, ruleGrou
 // syncRulesToManager maps the rule files to disk, detects any changes and will create/update the
 // the users Prometheus Rules Manager.
 func (r *DefaultMultiTenantManager) syncRulesToManager(ctx context.Context, user string, groups rulespb.RuleGroupList) {
+	// Defensively clamp per-group evaluation intervals so that previously stored
+	// rule groups cannot bypass the admission-time check in ValidateRuleGroup.
+	// A tenant-controlled interval well below the configured minimum would
+	// otherwise be used verbatim by the vendored Prometheus manager as the
+	// group ticker period and could monopolise the shared ruler/PromQL engine.
+	formatted := groups.Formatted()
+	if r.limits != nil {
+		if minInterval := r.limits.RulerMinRuleEvaluationInterval(user); minInterval > 0 {
+			for ns := range formatted {
+				for i := range formatted[ns] {
+					if iv := time.Duration(formatted[ns][i].Interval); iv != 0 && iv < minInterval {
+						level.Warn(r.logger).Log("msg", "clamping rule group evaluation interval below configured minimum", "user", user, "namespace", ns, "group", formatted[ns][i].Name, "interval", iv, "min", minInterval)
+						formatted[ns][i].Interval = model.Duration(minInterval)
+					}
+				}
+			}
+		}
+	}
+
 	// Map the files to disk and return the file names to be passed to the users manager if they
 	// have been updated
-	update, files, err := r.mapper.MapRules(user, groups.Formatted())
+	update, files, err := r.mapper.MapRules(user, formatted)
 	if err != nil {
 		r.lastReloadSuccessful.WithLabelValues(user).Set(0)
 		level.Error(r.logger).Log("msg", "unable to map rule files", "user", user, "err", err)
@@ -267,7 +295,7 @@ func (r *DefaultMultiTenantManager) Stop() {
 	r.mapper.cleanup()
 }
 
-func (*DefaultMultiTenantManager) ValidateRuleGroup(g rulefmt.RuleGroup) []error {
+func (r *DefaultMultiTenantManager) ValidateRuleGroup(userID string, g rulefmt.RuleGroup) []error {
 	var errs []error
 
 	if g.Name == "" {
@@ -278,6 +306,19 @@ func (*DefaultMultiTenantManager) ValidateRuleGroup(g rulefmt.RuleGroup) []error
 	if len(g.Rules) == 0 {
 		errs = append(errs, fmt.Errorf("invalid rules config: rule group '%s' has no rules", g.Name))
 		return errs
+	}
+
+	// Enforce a per-tenant minimum rule-group evaluation interval. A tenant
+	// can otherwise supply an arbitrarily small Interval (e.g. 1ms) which
+	// becomes the group ticker period in the vendored Prometheus rules
+	// manager, exhausting the shared ruler's CPU/goroutines and PromQL
+	// concurrency and starving other tenants' alert/recording evaluations.
+	if r.limits != nil {
+		if minInterval := r.limits.RulerMinRuleEvaluationInterval(userID); minInterval > 0 {
+			if g.Interval != 0 && time.Duration(g.Interval) < minInterval {
+				errs = append(errs, fmt.Errorf("invalid rules config: rule group '%s' interval %s is below the minimum allowed %s", g.Name, time.Duration(g.Interval), minInterval))
+			}
+		}
 	}
 
 	for i, r := range g.Rules {
