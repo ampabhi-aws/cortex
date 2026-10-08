@@ -29,13 +29,20 @@ var response = `{
 `
 
 func TestDoRequest(t *testing.T) {
+	const testToken = "test-private-token"
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		// The configs service's /private endpoints now require the shared
+		// secret in a header; the client is responsible for presenting it.
+		if r.Header.Get(privateAPIAuthTokenHeader) != testToken {
+			http.Error(w, "forbidden", http.StatusForbidden)
+			return
+		}
 		_, err := w.Write([]byte(response))
 		require.NoError(t, err)
 	}))
 	defer server.Close()
 
-	resp, err := doRequest(server.URL, 1*time.Second, nil, 0)
+	resp, err := doRequest(server.URL, 1*time.Second, nil, testToken, 0)
 	assert.Nil(t, err)
 
 	expected := ConfigsResponse{Configs: map[string]userconfig.View{
