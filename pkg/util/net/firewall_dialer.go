@@ -34,6 +34,12 @@ func (d *FirewallDialer) DialContext(ctx context.Context, network, address strin
 	return d.parent.DialContext(ctx, network, address)
 }
 
+// Enabled returns whether the firewall is actively blocking any addresses
+// (either private/loopback/link-local addresses or operator-configured CIDRs).
+func (d *FirewallDialer) Enabled() bool {
+	return d.cfgProvider.BlockPrivateAddresses() || len(d.cfgProvider.BlockCIDRNetworks()) > 0
+}
+
 func (d *FirewallDialer) control(_, address string, _ syscall.RawConn) error {
 	blockPrivateAddresses := d.cfgProvider.BlockPrivateAddresses()
 	blockCIDRNetworks := d.cfgProvider.BlockCIDRNetworks()
@@ -69,6 +75,20 @@ func (d *FirewallDialer) control(_, address string, _ syscall.RawConn) error {
 
 func isLocal(ip net.IP) bool {
 	return ip.IsLoopback() || ip.IsLinkLocalUnicast() || ip.IsLinkLocalMulticast()
+}
+
+// IsLocal reports whether ip is a loopback or link-local address.
+// Exposed so callers performing upload-time validation can reuse the same
+// predicate the FirewallDialer applies at connect time.
+func IsLocal(ip net.IP) bool {
+	return isLocal(ip)
+}
+
+// IsPrivate reports whether ip is a private address, matching the predicate
+// used by the FirewallDialer. Exposed so callers performing upload-time
+// validation can reuse the same predicate.
+func IsPrivate(ip net.IP) bool {
+	return isPrivate(ip)
 }
 
 // isPrivate reports whether ip is a private address, according to

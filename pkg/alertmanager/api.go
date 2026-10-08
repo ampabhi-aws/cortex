@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
 	"os"
 	"path/filepath"
@@ -22,6 +23,7 @@ import (
 	"github.com/cortexproject/cortex/pkg/util"
 	"github.com/cortexproject/cortex/pkg/util/concurrency"
 	util_log "github.com/cortexproject/cortex/pkg/util/log"
+	util_net "github.com/cortexproject/cortex/pkg/util/net"
 )
 
 const (
@@ -45,6 +47,7 @@ var (
 	errTLSFileNotAllowed             = errors.New("setting TLS ca_file, cert_file and key_file is not allowed")
 	errSlackAPIURLFileNotAllowed     = errors.New("setting Slack api_url_file and global slack_api_url_file is not allowed")
 	errVictorOpsAPIKeyFileNotAllowed = errors.New("setting VictorOps api_key_file is not allowed")
+	errEmailSmarthostBlocked         = errors.New("SMTP smarthost resolves to a blocked address (private, loopback, link-local or operator-blocked CIDR)")
 )
 
 // UserConfig is used to communicate a users alertmanager configs
@@ -186,7 +189,7 @@ func validateUserConfig(logger log.Logger, cfg alertspb.AlertConfigDesc, limits 
 	}
 
 	// Validate the config recursively scanning it.
-	if err := validateAlertmanagerConfig(amCfg); err != nil {
+	if err := validateAlertmanagerConfig(amCfg, limits, user); err != nil {
 		return err
 	}
 
@@ -307,7 +310,7 @@ func (am *MultitenantAlertmanager) ListAllConfigs(w http.ResponseWriter, r *http
 // validateAlertmanagerConfig recursively scans the input config looking for data types for which
 // we have a specific validation and, whenever encountered, it runs their validation. Returns the
 // first error or nil if validation succeeds.
-func validateAlertmanagerConfig(cfg interface{}) error {
+func validateAlertmanagerConfig(cfg interface{}, limits Limits, user string) error {
 	v := reflect.ValueOf(cfg)
 	t := v.Type()
 
@@ -327,7 +330,7 @@ func validateAlertmanagerConfig(cfg interface{}) error {
 	// At this point the value can't be a pointer anymore.
 	switch t {
 	case reflect.TypeOf(config.GlobalConfig{}):
-		if err := validateGlobalConfig(v.Interface().(config.GlobalConfig)); err != nil {
+		if err := validateGlobalConfig(v.Interface().(config.GlobalConfig), limits, user); err != nil {
 			return err
 		}
 
@@ -350,6 +353,11 @@ func validateAlertmanagerConfig(cfg interface{}) error {
 		if err := validateVictorOpsConfig(v.Interface().(config.VictorOpsConfig)); err != nil {
 			return err
 		}
+
+	case reflect.TypeOf(config.EmailConfig{}):
+		if err := validateEmailConfig(v.Interface().(config.EmailConfig), limits, user); err != nil {
+			return err
+		}
 	}
 
 	// If the input config is a struct, recursively iterate on all fields.
@@ -360,7 +368,7 @@ func validateAlertmanagerConfig(cfg interface{}) error {
 
 			// Skip any field value which can't be converted to interface (eg. primitive types).
 			if fieldValue.CanInterface() {
-				if err := validateAlertmanagerConfig(fieldValue.Interface()); err != nil {
+				if err := validateAlertmanagerConfig(fieldValue.Interface(), limits, user); err != nil {
 					return err
 				}
 			}
@@ -373,7 +381,7 @@ func validateAlertmanagerConfig(cfg interface{}) error {
 
 			// Skip any field value which can't be converted to interface (eg. primitive types).
 			if fieldValue.CanInterface() {
-				if err := validateAlertmanagerConfig(fieldValue.Interface()); err != nil {
+				if err := validateAlertmanagerConfig(fieldValue.Interface(), limits, user); err != nil {
 					return err
 				}
 			}
@@ -386,7 +394,7 @@ func validateAlertmanagerConfig(cfg interface{}) error {
 
 			// Skip any field value which can't be converted to interface (eg. primitive types).
 			if fieldValue.CanInterface() {
-				if err := validateAlertmanagerConfig(fieldValue.Interface()); err != nil {
+				if err := validateAlertmanagerConfig(fieldValue.Interface(), limits, user); err != nil {
 					return err
 				}
 			}
@@ -425,9 +433,17 @@ func validateReceiverTLSConfig(cfg commoncfg.TLSConfig) error {
 
 // validateGlobalConfig validates the Global config and returns an error if it contains
 // settings now allowed by Cortex.
-func validateGlobalConfig(cfg config.GlobalConfig) error {
+func validateGlobalConfig(cfg config.GlobalConfig, limits Limits, user string) error {
 	if cfg.SlackAPIURLFile != "" {
 		return errSlackAPIURLFileNotAllowed
+	}
+	// Validate the global SMTP smarthost, if set. The receivers firewall only
+	// covers HTTP-based integrations, so we also enforce an upload-time check on
+	// smarthost addresses as defense in depth.
+	if cfg.SMTPSmarthost.Host != "" {
+		if err := validateSmarthost(cfg.SMTPSmarthost.Host, limits, user); err != nil {
+			return err
+		}
 	}
 	return nil
 }
@@ -446,6 +462,62 @@ func validateSlackConfig(cfg config.SlackConfig) error {
 func validateVictorOpsConfig(cfg config.VictorOpsConfig) error {
 	if cfg.APIKeyFile != "" {
 		return errVictorOpsAPIKeyFileNotAllowed
+	}
+	return nil
+}
+
+// validateEmailConfig validates the Email config and returns an error if its
+// smarthost resolves to a private/loopback/link-local address or an operator
+// blocked CIDR. Upload-time validation alone is insufficient (DNS rebinding
+// and TOCTOU), so this is complemented by refusing to build email
+// integrations while the receivers firewall is enabled (see
+// buildReceiverIntegrations).
+func validateEmailConfig(cfg config.EmailConfig, limits Limits, user string) error {
+	if cfg.Smarthost.Host == "" {
+		return nil
+	}
+	return validateSmarthost(cfg.Smarthost.Host, limits, user)
+}
+
+// validateSmarthost rejects a smarthost whose host is (or resolves to) a
+// private, loopback, link-local or operator-blocked address. The predicates
+// are the same as those enforced at connect time by the FirewallDialer.
+func validateSmarthost(host string, limits Limits, user string) error {
+	if limits == nil || user == "" {
+		return nil
+	}
+
+	blockPrivate := limits.AlertmanagerReceiversBlockPrivateAddresses(user)
+	blockCIDRs := limits.AlertmanagerReceiversBlockCIDRNetworks(user)
+
+	// Skip any check if the firewall is not configured for this tenant.
+	if !blockPrivate && len(blockCIDRs) == 0 {
+		return nil
+	}
+
+	var ips []net.IP
+	if ip := net.ParseIP(host); ip != nil {
+		ips = []net.IP{ip}
+	} else {
+		resolved, err := net.LookupIP(host)
+		if err != nil {
+			// If the hostname cannot be resolved at upload time we cannot be sure it
+			// is safe. Reject it so that the operator (or the tenant) must use an
+			// address we can validate.
+			return errors.Wrapf(errEmailSmarthostBlocked, "unable to resolve smarthost %q", host)
+		}
+		ips = resolved
+	}
+
+	for _, ip := range ips {
+		if blockPrivate && (util_net.IsPrivate(ip) || util_net.IsLocal(ip)) {
+			return errors.Wrapf(errEmailSmarthostBlocked, "smarthost %q resolves to %s", host, ip)
+		}
+		for _, cidr := range blockCIDRs {
+			if cidr.Value.Contains(ip) {
+				return errors.Wrapf(errEmailSmarthostBlocked, "smarthost %q resolves to %s (blocked by CIDR %s)", host, ip, cidr.Value.String())
+			}
+		}
 	}
 	return nil
 }

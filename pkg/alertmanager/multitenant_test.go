@@ -560,6 +560,86 @@ receivers:
 	}
 }
 
+// TestMultitenantAlertmanager_FirewallShouldBlockEmailReceiverWhenEnabled asserts
+// that email receivers are refused when the receivers firewall is enabled, because
+// the upstream email notifier dials the SMTP smarthost with a bare net.Dialer that
+// does not run the firewall's net.Dialer.Control hook (see pkg/util/net/firewall_dialer.go).
+func TestMultitenantAlertmanager_FirewallShouldBlockEmailReceiverWhenEnabled(t *testing.T) {
+	const alertmanagerCfg = `
+global:
+  smtp_require_tls: false
+  smtp_from: probe@example.com
+
+route:
+  receiver: email
+  group_wait: 0s
+  group_interval: 1s
+
+receivers:
+  - name: email
+    email_configs:
+      - to: probe@example.com
+        smarthost: smtp.example.com:2525
+`
+
+	for _, firewallEnabled := range []bool{true, false} {
+		firewallEnabled := firewallEnabled
+
+		t.Run(fmt.Sprintf("receiver=email firewall enabled=%v", firewallEnabled), func(t *testing.T) {
+			t.Parallel()
+
+			ctx := context.Background()
+			userID := "user-1"
+
+			// Store the alertmanager config in the bucket.
+			store := prepareInMemoryAlertStore()
+			require.NoError(t, store.SetAlertConfig(ctx, alertspb.AlertConfigDesc{
+				User:      userID,
+				RawConfig: alertmanagerCfg,
+			}))
+
+			// Prepare the alertmanager config.
+			cfg := mockAlertmanagerConfig(t)
+
+			// Prepare the limits config.
+			var limits validation.Limits
+			flagext.DefaultValues(&limits)
+			limits.AlertmanagerReceiversBlockPrivateAddresses = firewallEnabled
+
+			overrides, err := validation.NewOverrides(limits, nil)
+			require.NoError(t, err)
+
+			// Start the alertmanager.
+			reg := prometheus.NewPedanticRegistry()
+			logs := &concurrency.SyncBuffer{}
+			logger := log.NewLogfmtLogger(logs)
+			am, err := createMultitenantAlertmanager(cfg, nil, nil, store, nil, overrides, logger, reg)
+			require.NoError(t, err)
+			require.NoError(t, services.StartAndAwaitRunning(ctx, am))
+			t.Cleanup(func() {
+				require.NoError(t, services.StopAndAwaitTerminated(ctx, am))
+			})
+
+			// The config loads successfully in both cases (buildReceiverIntegrations
+			// surfaces per-receiver errors internally), but when the firewall is enabled
+			// we must have refused to build the email integration and logged a warning.
+			assert.NoError(t, testutil.GatherAndCompare(reg, bytes.NewBufferString(`
+	# HELP cortex_alertmanager_config_last_reload_successful Boolean set to 1 whenever the last configuration reload attempt was successful.
+	# TYPE cortex_alertmanager_config_last_reload_successful gauge
+	cortex_alertmanager_config_last_reload_successful{user="user-1"} 1
+`), "cortex_alertmanager_config_last_reload_successful"))
+
+			if firewallEnabled {
+				assert.Contains(t, logs.String(), "email receiver is not supported when the receivers firewall is enabled")
+			} else {
+				assert.NotContains(t, logs.String(), "email receiver is not supported when the receivers firewall is enabled")
+			}
+
+			t.Logf("Alertmanager logs:\n%s", logs.String())
+		})
+	}
+}
+
 func TestMultitenantAlertmanager_migrateStateFilesToPerTenantDirectories(t *testing.T) {
 	ctx := context.Background()
 
@@ -2124,11 +2204,11 @@ func (m *mockAlertManagerLimits) AlertmanagerMaxTemplateSize(tenant string) int 
 }
 
 func (m *mockAlertManagerLimits) AlertmanagerReceiversBlockCIDRNetworks(user string) []flagext.CIDR {
-	panic("implement me")
+	return nil
 }
 
 func (m *mockAlertManagerLimits) AlertmanagerReceiversBlockPrivateAddresses(user string) bool {
-	panic("implement me")
+	return false
 }
 
 func (m *mockAlertManagerLimits) NotificationRateLimit(_ string, integration string) rate.Limit {
