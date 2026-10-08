@@ -1172,6 +1172,17 @@ func (am *MultitenantAlertmanager) UpdateState(ctx context.Context, part *cluste
 		}, nil
 	}
 
+	// Reject keys that are not one of the two legitimate per-tenant state keys
+	// before passing the (otherwise caller-controlled) Part down into the merge
+	// path. This prevents an attacker who can reach the inter-replica gRPC port
+	// from using the key field as an unbounded Prometheus label value / heap sink.
+	if part == nil || (part.Key != "nfl:"+userID && part.Key != "sil:"+userID) {
+		return &alertmanagerpb.UpdateStateResponse{
+			Status: alertmanagerpb.MERGE_ERROR,
+			Error:  "invalid key",
+		}, nil
+	}
+
 	if err = userAM.mergePartialExternalState(part); err != nil {
 		return &alertmanagerpb.UpdateStateResponse{
 			Status: alertmanagerpb.MERGE_ERROR,
