@@ -45,6 +45,7 @@ var (
 	errTLSFileNotAllowed             = errors.New("setting TLS ca_file, cert_file and key_file is not allowed")
 	errSlackAPIURLFileNotAllowed     = errors.New("setting Slack api_url_file and global slack_api_url_file is not allowed")
 	errVictorOpsAPIKeyFileNotAllowed = errors.New("setting VictorOps api_key_file is not allowed")
+	errSNSAmbientCredsNotAllowed     = errors.New("sns_configs require explicit sigv4 access_key and secret_key; sigv4 profile and role_arn are not allowed")
 )
 
 // UserConfig is used to communicate a users alertmanager configs
@@ -350,6 +351,11 @@ func validateAlertmanagerConfig(cfg interface{}) error {
 		if err := validateVictorOpsConfig(v.Interface().(config.VictorOpsConfig)); err != nil {
 			return err
 		}
+
+	case reflect.TypeOf(config.SNSConfig{}):
+		if err := validateSNSConfig(v.Interface().(config.SNSConfig)); err != nil {
+			return err
+		}
 	}
 
 	// If the input config is a struct, recursively iterate on all fields.
@@ -446,6 +452,23 @@ func validateSlackConfig(cfg config.SlackConfig) error {
 func validateVictorOpsConfig(cfg config.VictorOpsConfig) error {
 	if cfg.APIKeyFile != "" {
 		return errVictorOpsAPIKeyFileNotAllowed
+	}
+	return nil
+}
+
+// validateSNSConfig validates the SNS config and returns an error if it would
+// cause Cortex's ambient AWS identity (process env vars, shared credentials file
+// via a tenant-chosen profile, IRSA/EC2 instance role) to be used to sign
+// tenant-controlled SNS requests. A tenant-authored sns_configs entry must
+// provide its own static credentials via sigv4.access_key and sigv4.secret_key
+// and must not select a local AWS profile or request Cortex to sts:AssumeRole
+// into a tenant-supplied role_arn.
+func validateSNSConfig(cfg config.SNSConfig) error {
+	if cfg.Sigv4.Profile != "" || cfg.Sigv4.RoleARN != "" {
+		return errSNSAmbientCredsNotAllowed
+	}
+	if cfg.Sigv4.AccessKey == "" || cfg.Sigv4.SecretKey == "" {
+		return errSNSAmbientCredsNotAllowed
 	}
 	return nil
 }
