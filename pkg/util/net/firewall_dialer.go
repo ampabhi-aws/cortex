@@ -54,17 +54,31 @@ func (d *FirewallDialer) control(_, address string, _ syscall.RawConn) error {
 		return errBlockedAddress
 	}
 
-	if blockPrivateAddresses && (isPrivate(ip) || isLocal(ip)) {
+	if IsBlockedIP(ip, blockPrivateAddresses, blockCIDRNetworks) {
 		return errBlockedAddress
 	}
 
+	return nil
+}
+
+// IsBlockedIP returns true if ip should be rejected by the firewall policy
+// described by (blockPrivateAddresses, blockCIDRNetworks). It implements the
+// same predicate as the FirewallDialer control hook so that callers which must
+// enforce the firewall outside of the net.Dialer Control callback (for
+// example, config validation) stay in sync with the socket-level enforcement.
+func IsBlockedIP(ip net.IP, blockPrivateAddresses bool, blockCIDRNetworks []flagext.CIDR) bool {
+	if ip == nil {
+		return false
+	}
+	if blockPrivateAddresses && (isPrivate(ip) || isLocal(ip)) {
+		return true
+	}
 	for _, cidr := range blockCIDRNetworks {
 		if cidr.Value.Contains(ip) {
-			return errBlockedAddress
+			return true
 		}
 	}
-
-	return nil
+	return false
 }
 
 func isLocal(ip net.IP) bool {

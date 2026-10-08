@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
 	"os"
 	"path/filepath"
@@ -22,6 +23,7 @@ import (
 	"github.com/cortexproject/cortex/pkg/util"
 	"github.com/cortexproject/cortex/pkg/util/concurrency"
 	util_log "github.com/cortexproject/cortex/pkg/util/log"
+	util_net "github.com/cortexproject/cortex/pkg/util/net"
 )
 
 const (
@@ -45,6 +47,8 @@ var (
 	errTLSFileNotAllowed             = errors.New("setting TLS ca_file, cert_file and key_file is not allowed")
 	errSlackAPIURLFileNotAllowed     = errors.New("setting Slack api_url_file and global slack_api_url_file is not allowed")
 	errVictorOpsAPIKeyFileNotAllowed = errors.New("setting VictorOps api_key_file is not allowed")
+	errSMTPSmarthostNotResolvable    = errors.New("unable to resolve smtp_smarthost")
+	errSMTPSmarthostBlocked          = errors.New("smtp_smarthost resolves to a blocked address")
 )
 
 // UserConfig is used to communicate a users alertmanager configs
@@ -187,6 +191,19 @@ func validateUserConfig(logger log.Logger, cfg alertspb.AlertConfigDesc, limits 
 
 	// Validate the config recursively scanning it.
 	if err := validateAlertmanagerConfig(amCfg); err != nil {
+		return err
+	}
+
+	// The receivers firewall (-alertmanager.receivers-firewall-block-*) is
+	// enforced in net.Dialer.Control for all HTTP-based receiver integrations,
+	// but the vendored email notifier dials smtp_smarthost directly with a bare
+	// net.Dialer and no Control hook, bypassing the firewall (SSRF). Until the
+	// email notifier accepts a DialContextFunc, validate the smarthost against
+	// the same firewall predicate here so email receivers cannot be used to
+	// reach blocked addresses (e.g. cloud metadata, loopback admin ports,
+	// private CIDRs). This fails closed: if a smarthost cannot be resolved
+	// while the firewall is enabled, the config is rejected.
+	if err := validateEmailSmarthosts(amCfg, limits, user); err != nil {
 		return err
 	}
 
@@ -446,6 +463,74 @@ func validateSlackConfig(cfg config.SlackConfig) error {
 func validateVictorOpsConfig(cfg config.VictorOpsConfig) error {
 	if cfg.APIKeyFile != "" {
 		return errVictorOpsAPIKeyFileNotAllowed
+	}
+	return nil
+}
+
+// validateEmailSmarthosts rejects an Alertmanager config whose global or
+// per-receiver smtp_smarthost resolves to an address blocked by the tenant's
+// receivers firewall. It is a fail-closed companion to the FirewallDialer:
+// since the vendored email notifier does not use a DialContextFunc, the
+// socket-level firewall never runs for email, so we enforce the same
+// predicate on the configured smarthost at config-upload time.
+//
+// If the firewall is not enabled for the user, no check is performed. If the
+// firewall is enabled and the smarthost host is a hostname, we require it to
+// resolve so that we can inspect every resolved IP; refusing to validate is
+// safer than silently permitting it (a hostname pointing at the metadata
+// service IP would otherwise sneak past). Note: this check remains racy under
+// DNS rebinding; the robust fix is to wire a DialContextFunc into the email
+// notifier. See the referenced finding for details.
+func validateEmailSmarthosts(cfg *config.Config, limits Limits, user string) error {
+	if cfg == nil || limits == nil {
+		return nil
+	}
+	blockPrivate := limits.AlertmanagerReceiversBlockPrivateAddresses(user)
+	blockCIDRs := limits.AlertmanagerReceiversBlockCIDRNetworks(user)
+	if !blockPrivate && len(blockCIDRs) == 0 {
+		return nil
+	}
+
+	check := func(hp config.HostPort) error {
+		if hp.Host == "" {
+			return nil
+		}
+		// If the host is already a literal IP, skip resolution.
+		if ip := net.ParseIP(hp.Host); ip != nil {
+			if util_net.IsBlockedIP(ip, blockPrivate, blockCIDRs) {
+				return errSMTPSmarthostBlocked
+			}
+			return nil
+		}
+		ips, err := net.LookupIP(hp.Host)
+		if err != nil || len(ips) == 0 {
+			return errSMTPSmarthostNotResolvable
+		}
+		for _, ip := range ips {
+			if util_net.IsBlockedIP(ip, blockPrivate, blockCIDRs) {
+				return errSMTPSmarthostBlocked
+			}
+		}
+		return nil
+	}
+
+	if cfg.Global != nil {
+		if err := check(cfg.Global.SMTPSmarthost); err != nil {
+			return err
+		}
+	}
+	for _, rcv := range cfg.Receivers {
+		if rcv == nil {
+			continue
+		}
+		for _, ec := range rcv.EmailConfigs {
+			if ec == nil {
+				continue
+			}
+			if err := check(ec.Smarthost); err != nil {
+				return err
+			}
+		}
 	}
 	return nil
 }
