@@ -83,6 +83,15 @@ func (t *SingleResolver) TenantID(ctx context.Context) (string, error) {
 		return "", err
 	}
 
+	// Reject empty tenant IDs. The upstream weaveworks/common
+	// user.ExtractFromGRPCRequest helper accepts a present-but-empty
+	// x-scope-orgid metadata value, so we must reject it here (and in
+	// ValidTenantID) to avoid an empty tenant ID resolving to the shared
+	// per-tenant namespace root.
+	if err := ValidTenantID(id); err != nil {
+		return "", err
+	}
+
 	if containsUnsafePathSegments(id) {
 		return "", errInvalidTenantID
 	}
@@ -131,6 +140,10 @@ func (t *MultiResolver) TenantIDs(ctx context.Context) ([]string, error) {
 
 	orgIDs := strings.Split(orgID, tenantIDsLabelSeparator)
 	for _, orgID := range orgIDs {
+		// ValidTenantID also rejects empty tenant IDs, which is what
+		// prevents a header like "|", "a|", "|a" or "a||b" from being
+		// silently normalised into a tenant-ID list that includes the
+		// empty (root-namespace) tenant.
 		if err := ValidTenantID(orgID); err != nil {
 			return nil, err
 		}
