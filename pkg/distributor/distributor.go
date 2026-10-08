@@ -412,6 +412,13 @@ func (d *Distributor) cleanupInactiveUser(userID string) {
 	}
 
 	validation.DeletePerUserValidationMetrics(userID, d.log)
+
+	// Reclaim the per-tenant rate limiter entry. Without this, the limiter
+	// map grows unbounded with any tenant ID ever observed on the push path
+	// (keyed by the attacker-controllable X-Scope-OrgID header), while every
+	// other per-tenant structure in the distributor is already bounded by
+	// this cleanup hook.
+	d.ingestionRateLimiter.RemoveTenant(userID)
 }
 
 // Called after distributor is asked to stop via StopAsync.

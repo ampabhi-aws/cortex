@@ -65,6 +65,43 @@ func TestRateLimiter_AllowN(t *testing.T) {
 	assert.Equal(t, true, limiter.AllowN(now.Add(time.Second), "tenant-2", 2))
 }
 
+func TestRateLimiter_RemoveTenant(t *testing.T) {
+	strategy := &staticLimitStrategy{tenants: map[string]struct {
+		limit float64
+		burst int
+	}{
+		"tenant-1": {limit: 10, burst: 20},
+		"tenant-2": {limit: 20, burst: 40},
+	}}
+
+	limiter := NewRateLimiter(strategy, 10*time.Second)
+	now := time.Now()
+
+	// Create entries for both tenants.
+	assert.Equal(t, true, limiter.AllowN(now, "tenant-1", 1))
+	assert.Equal(t, true, limiter.AllowN(now, "tenant-2", 1))
+
+	limiter.tenantsLock.RLock()
+	assert.Len(t, limiter.tenants, 2)
+	limiter.tenantsLock.RUnlock()
+
+	// Removing a tenant drops its entry; removing an unknown tenant is a no-op.
+	limiter.RemoveTenant("tenant-1")
+	limiter.RemoveTenant("does-not-exist")
+
+	limiter.tenantsLock.RLock()
+	_, ok1 := limiter.tenants["tenant-1"]
+	_, ok2 := limiter.tenants["tenant-2"]
+	assert.False(t, ok1)
+	assert.True(t, ok2)
+	limiter.tenantsLock.RUnlock()
+
+	// A subsequent request for the removed tenant re-creates its entry with
+	// a fresh full bucket (same semantics as the first-ever request).
+	assert.Equal(t, true, limiter.AllowN(now, "tenant-1", 20))
+	assert.Equal(t, false, limiter.AllowN(now, "tenant-1", 1))
+}
+
 func BenchmarkRateLimiter_CustomMultiTenant(b *testing.B) {
 	strategy := &increasingLimitStrategy{}
 	limiter := NewRateLimiter(strategy, 10*time.Second)
