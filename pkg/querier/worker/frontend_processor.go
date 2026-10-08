@@ -26,10 +26,11 @@ var (
 
 func newFrontendProcessor(cfg Config, handler RequestHandler, log log.Logger) processor {
 	return &frontendProcessor{
-		log:            log,
-		handler:        handler,
-		maxMessageSize: cfg.GRPCClientConfig.MaxSendMsgSize,
-		querierID:      cfg.QuerierID,
+		log:                 log,
+		handler:             handler,
+		maxMessageSize:      cfg.GRPCClientConfig.MaxSendMsgSize,
+		querierID:           cfg.QuerierID,
+		allowedPathPrefixes: cfg.AllowedPathPrefixes,
 	}
 }
 
@@ -38,6 +39,10 @@ type frontendProcessor struct {
 	handler        RequestHandler
 	maxMessageSize int
 	querierID      string
+
+	// allowedPathPrefixes is the defence-in-depth allowlist enforced before dispatching requests
+	// received from the (potentially unauthenticated) frontend to the local HTTP handler.
+	allowedPathPrefixes []string
 
 	log log.Logger
 }
@@ -120,14 +125,27 @@ func (fp *frontendProcessor) runRequest(ctx context.Context, request *httpgrpc.H
 		stats, ctx = querier_stats.ContextWithEmptyStats(ctx)
 	}
 
-	response, err := fp.handler.Handle(ctx, request)
-	if err != nil {
-		var ok bool
-		response, ok = httpgrpc.HTTPResponseFromError(err)
-		if !ok {
-			response = &httpgrpc.HTTPResponse{
-				Code: http.StatusInternalServerError,
-				Body: []byte(err.Error()),
+	var response *httpgrpc.HTTPResponse
+	if rejected := validateAndSanitizeWorkerRequest(request, fp.allowedPathPrefixes); rejected != nil {
+		var method, requrl string
+		if request != nil {
+			method = request.Method
+			requrl = request.Url
+		}
+		level.Warn(fp.log).Log("msg", "rejected worker request: not permitted",
+			"method", method, "url", requrl, "code", rejected.Code)
+		response = rejected
+	} else {
+		var err error
+		response, err = fp.handler.Handle(ctx, request)
+		if err != nil {
+			var ok bool
+			response, ok = httpgrpc.HTTPResponseFromError(err)
+			if !ok {
+				response = &httpgrpc.HTTPResponse{
+					Code: http.StatusInternalServerError,
+					Body: []byte(err.Error()),
+				}
 			}
 		}
 	}

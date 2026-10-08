@@ -32,11 +32,12 @@ import (
 
 func newSchedulerProcessor(cfg Config, handler RequestHandler, log log.Logger, reg prometheus.Registerer) (*schedulerProcessor, []services.Service) {
 	p := &schedulerProcessor{
-		log:            log,
-		handler:        handler,
-		maxMessageSize: cfg.GRPCClientConfig.MaxSendMsgSize,
-		querierID:      cfg.QuerierID,
-		grpcConfig:     cfg.GRPCClientConfig,
+		log:                 log,
+		handler:             handler,
+		maxMessageSize:      cfg.GRPCClientConfig.MaxSendMsgSize,
+		querierID:           cfg.QuerierID,
+		grpcConfig:          cfg.GRPCClientConfig,
+		allowedPathPrefixes: cfg.AllowedPathPrefixes,
 
 		frontendClientRequestDuration: promauto.With(reg).NewHistogramVec(prometheus.HistogramOpts{
 			Name:    "cortex_querier_query_frontend_request_duration_seconds",
@@ -67,6 +68,10 @@ type schedulerProcessor struct {
 	grpcConfig     grpcclient.Config
 	maxMessageSize int
 	querierID      string
+
+	// allowedPathPrefixes is the defence-in-depth allowlist enforced before dispatching requests
+	// received from the (potentially unauthenticated) scheduler to the local HTTP handler.
+	allowedPathPrefixes []string
 
 	frontendPool                  *client.Pool
 	frontendClientRequestDuration *prometheus.HistogramVec
@@ -157,14 +162,27 @@ func (sp *schedulerProcessor) runRequest(ctx context.Context, logger log.Logger,
 		stats, ctx = querier_stats.ContextWithEmptyStats(ctx)
 	}
 
-	response, err := sp.handler.Handle(ctx, request)
-	if err != nil {
-		var ok bool
-		response, ok = httpgrpc.HTTPResponseFromError(err)
-		if !ok {
-			response = &httpgrpc.HTTPResponse{
-				Code: http.StatusInternalServerError,
-				Body: []byte(err.Error()),
+	var response *httpgrpc.HTTPResponse
+	if rejected := validateAndSanitizeWorkerRequest(request, sp.allowedPathPrefixes); rejected != nil {
+		var method, requrl string
+		if request != nil {
+			method = request.Method
+			requrl = request.Url
+		}
+		level.Warn(logger).Log("msg", "rejected worker request: not permitted",
+			"frontend", frontendAddress, "method", method, "url", requrl, "code", rejected.Code)
+		response = rejected
+	} else {
+		var err error
+		response, err = sp.handler.Handle(ctx, request)
+		if err != nil {
+			var ok bool
+			response, ok = httpgrpc.HTTPResponseFromError(err)
+			if !ok {
+				response = &httpgrpc.HTTPResponse{
+					Code: http.StatusInternalServerError,
+					Body: []byte(err.Error()),
+				}
 			}
 		}
 	}
