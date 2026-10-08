@@ -5,6 +5,7 @@ import (
 	"errors"
 	"net/http"
 	"strings"
+	"unicode/utf8"
 
 	"github.com/weaveworks/common/user"
 )
@@ -74,7 +75,10 @@ func containsUnsafePathSegments(id string) bool {
 	return strings.ContainsAny(id, "\\/")
 }
 
-var errInvalidTenantID = errors.New("invalid tenant ID")
+var (
+	errInvalidTenantID         = errors.New("invalid tenant ID")
+	errInvalidTenantIDEncoding = errors.New("invalid tenant ID: not valid UTF-8")
+)
 
 func (t *SingleResolver) TenantID(ctx context.Context) (string, error) {
 	//lint:ignore faillint wrapper around upstream method
@@ -85,6 +89,29 @@ func (t *SingleResolver) TenantID(ctx context.Context) (string, error) {
 
 	if containsUnsafePathSegments(id) {
 		return "", errInvalidTenantID
+	}
+
+	// Reject tenant IDs that are not valid UTF-8. The tenant ID is used as a
+	// Prometheus metric label value in many places (e.g. the ruler and
+	// alertmanager sync loops, the query-scheduler queue), and
+	// client_golang's *Vec.WithLabelValues panics on non-UTF-8 label values.
+	// Such a panic in a background service goroutine or gRPC handler is not
+	// recovered and terminates the process, which — combined with the
+	// ruler/alertmanager persisting the poisoned tenant ID in their store —
+	// can create a permanent cluster-wide crash loop. The MultiResolver code
+	// path already rejects these via ValidTenantID (which ranges over runes
+	// and therefore sees U+FFFD for invalid bytes); apply the same minimum
+	// safety check here.
+	if !utf8.ValidString(id) {
+		return "", errInvalidTenantIDEncoding
+	}
+
+	// Enforce the documented 150-character tenant ID length limit so that an
+	// attacker-controlled X-Scope-OrgID header cannot be used to inject
+	// multi-kilobyte values as object-store key prefixes, local directory
+	// names, results-cache keys or unbounded-cardinality metric labels.
+	if len(id) > 150 {
+		return "", errTenantIDTooLong
 	}
 
 	return id, nil
