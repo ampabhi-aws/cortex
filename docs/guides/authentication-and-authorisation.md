@@ -51,3 +51,23 @@ This can help to run Cortex in a trusted environment where you want to separate 
 into distinct namespaces by some criteria (e.g. teams, applications, etc).
 
 Be advised that **cortex-tenant** is a third-party community project and it's not maintained by Cortex team.
+
+### Admin endpoints that must be blocked at the gateway
+
+Cortex ships a number of admin / debug HTTP endpoints that are reachable on the
+same HTTP listener as the tenant data plane. These endpoints are **not**
+authenticated by Cortex itself and must be blocked at your reverse proxy /
+ingress for every caller except trusted operators:
+
+* `/ring`, `/ingester/ring`, `/distributor/ring`, `/ruler/ring`, `/ruler_ring`,
+  `/compactor/ring`, `/store-gateway/ring`, `/multitenant_alertmanager/ring` -
+  read-only ring status pages.
+* `/ingester/flush`, `/flush`, `/ingester/shutdown`, `/shutdown` - destructive
+  ingester admin operations.
+
+The destructive ring "forget" operation is now served on a separate route
+(`/<component>/ring/forget`), is gated by the `-ring.enable-forget-endpoint`
+opt-in flag (default: `false`), and is placed behind Cortex's auth middleware
+so that your reverse proxy's authentication is always exercised before a ring
+mutation is accepted. Operators should still restrict
+`/<component>/ring/forget` to trusted principals at the gateway.
