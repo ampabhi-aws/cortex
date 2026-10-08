@@ -215,6 +215,32 @@ func TestFrontendFailedCancellation(t *testing.T) {
 	})
 }
 
+func TestFrontendSchedulerErrorStatusHasErrorBody(t *testing.T) {
+	const (
+		errorBody = "boom"
+		userID    = "test"
+	)
+
+	// Reply to the first ENQUEUE with Status=ERROR and the error carried in the
+	// SchedulerToFrontend.Error field. The frontend worker must forward that
+	// error back as the HTTP 500 body without panicking on a nil `err` value.
+	replied := atomic.NewBool(false)
+	f, _ := setupFrontend(t, func(f *Frontend, msg *schedulerpb.FrontendToScheduler) *schedulerpb.SchedulerToFrontend {
+		if msg.Type != schedulerpb.ENQUEUE {
+			return &schedulerpb.SchedulerToFrontend{Status: schedulerpb.OK}
+		}
+		if replied.CAS(false, true) {
+			return &schedulerpb.SchedulerToFrontend{Status: schedulerpb.ERROR, Error: errorBody}
+		}
+		return &schedulerpb.SchedulerToFrontend{Status: schedulerpb.OK}
+	})
+
+	resp, err := f.RoundTripGRPC(user.InjectOrgID(context.Background(), userID), &httpgrpc.HTTPRequest{})
+	require.NoError(t, err)
+	require.Equal(t, int32(500), resp.Code)
+	require.Equal(t, []byte(errorBody), resp.Body)
+}
+
 type mockScheduler struct {
 	t *testing.T
 	f *Frontend

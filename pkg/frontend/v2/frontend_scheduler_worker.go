@@ -198,6 +198,15 @@ func (w *frontendSchedulerWorker) stop() {
 }
 
 func (w *frontendSchedulerWorker) runOne(ctx context.Context, client schedulerpb.SchedulerForFrontendClient) {
+	// Protect the worker goroutine from an unexpected panic (e.g. caused by a
+	// malformed scheduler reply) so one bad interaction cannot terminate the
+	// query-frontend process.
+	defer func() {
+		if r := recover(); r != nil {
+			level.Error(w.log).Log("msg", "recovered from panic in frontend scheduler worker", "panic", r, "addr", w.schedulerAddr)
+		}
+	}()
+
 	backoffConfig := backoff.Config{
 		MinBackoff: 50 * time.Millisecond,
 		MaxBackoff: 1 * time.Second,
@@ -291,7 +300,7 @@ func (w *frontendSchedulerWorker) schedulerLoop(loop schedulerpb.SchedulerForFro
 				req.response <- &frontendv2pb.QueryResultRequest{
 					HttpResponse: &httpgrpc.HTTPResponse{
 						Code: http.StatusInternalServerError,
-						Body: []byte(err.Error()),
+						Body: []byte(resp.GetError()),
 					},
 				}
 
