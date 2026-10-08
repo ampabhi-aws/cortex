@@ -19,9 +19,19 @@ import (
 	otlog "github.com/opentracing/opentracing-go/log"
 	yaml "gopkg.in/yaml.v2"
 	yamlv3 "gopkg.in/yaml.v3"
+
+	util_math "github.com/cortexproject/cortex/pkg/util/math"
 )
 
 const messageSizeLargerErrFmt = "received message larger than max (%d vs %d)"
+
+// maxPreallocSize caps the up-front allocation performed when a client
+// supplies an expected (Content-Length) size. The bytes.Buffer backing the
+// decompressed body still grows on demand as data actually arrives, so a
+// lying Content-Length cannot force a large allocation before any body byte
+// has been read. 1 MiB is enough to avoid reallocation churn for typical
+// remote-write requests.
+const maxPreallocSize = 1 << 20
 
 // IsRequestBodyTooLarge returns true if the error is "http: request body too large".
 func IsRequestBodyTooLarge(err error) bool {
@@ -199,8 +209,11 @@ func decompressFromReader(reader io.Reader, expectedSize, maxSize int, compressi
 		body []byte
 		err  error
 	)
+	// Only pre-allocate a bounded amount; bytes.Buffer grows on demand as data
+	// actually arrives, so an attacker-declared Content-Length cannot force a
+	// large eager allocation. See maxPreallocSize for the rationale.
 	if expectedSize > 0 {
-		buf.Grow(expectedSize + bytes.MinRead) // extra space guarantees no reallocation
+		buf.Grow(util_math.Min(expectedSize, maxPreallocSize) + bytes.MinRead)
 	}
 	// Read from LimitReader with limit max+1. So if the underlying
 	// reader is over limit, the result will be bigger than max.
