@@ -7,6 +7,7 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"reflect"
 	"testing"
 
 	"github.com/go-kit/log"
@@ -419,6 +420,38 @@ alertmanager_config: |
 			err: errors.Wrap(errVictorOpsAPIKeyFileNotAllowed, "error validating Alertmanager config"),
 		},
 		{
+			name: "Should return error if global opsgenie_api_key_file is set",
+			cfg: `
+alertmanager_config: |
+  global:
+    opsgenie_api_key_file: /secrets
+
+  receivers:
+    - name: default-receiver
+      webhook_configs:
+        - url: http://localhost
+
+  route:
+    receiver: 'default-receiver'
+`,
+			err: errors.Wrap(errOpsGenieAPIKeyFileNotAllowed, "error validating Alertmanager config"),
+		},
+		{
+			name: "Should return error if OpsGenie api_key_file is set",
+			cfg: `
+alertmanager_config: |
+  receivers:
+    - name: default-receiver
+      opsgenie_configs:
+        - api_key_file: /secrets
+          api_key: my-key
+
+  route:
+    receiver: 'default-receiver'
+`,
+			err: errors.Wrap(errOpsGenieAPIKeyFileNotAllowed, "error validating Alertmanager config"),
+		},
+		{
 			name: "should return error if template is wrong",
 			cfg: `
 alertmanager_config: |
@@ -785,6 +818,18 @@ func TestValidateAlertmanagerConfig(t *testing.T) {
 			},
 			expected: errTLSFileNotAllowed,
 		},
+		"OpsGenieConfig with api_key_file": {
+			input: config.OpsGenieConfig{
+				APIKeyFile: "/secrets",
+			},
+			expected: errOpsGenieAPIKeyFileNotAllowed,
+		},
+		"GlobalConfig with opsgenie_api_key_file": {
+			input: config.GlobalConfig{
+				OpsGenieAPIKeyFile: "/secrets",
+			},
+			expected: errOpsGenieAPIKeyFileNotAllowed,
+		},
 	}
 
 	for testName, testData := range tests {
@@ -792,5 +837,50 @@ func TestValidateAlertmanagerConfig(t *testing.T) {
 			err := validateAlertmanagerConfig(testData.input)
 			assert.ErrorIs(t, err, testData.expected)
 		})
+	}
+}
+
+// TestValidateAlertmanagerConfig_AllFileFieldsCovered reflects over
+// config.Config and ensures that every string field whose YAML tag ends in
+// `_file` (or whose Go name ends in `File`) is explicitly registered in
+// allowedFileFieldNames. If a dependency bump introduces a new *_file field,
+// this test fails until a dedicated validator (and allow-list entry) is added,
+// preventing silent regressions of the OpsGenie-class gap (CVE-2021-36157).
+func TestValidateAlertmanagerConfig_AllFileFieldsCovered(t *testing.T) {
+	seen := map[reflect.Type]struct{}{}
+	var missing []string
+	var walk func(t reflect.Type)
+	walk = func(ty reflect.Type) {
+		if ty == nil {
+			return
+		}
+		if _, ok := seen[ty]; ok {
+			return
+		}
+		seen[ty] = struct{}{}
+		switch ty.Kind() {
+		case reflect.Ptr, reflect.Slice, reflect.Array, reflect.Map, reflect.Chan:
+			walk(ty.Elem())
+		case reflect.Struct:
+			for i := 0; i < ty.NumField(); i++ {
+				f := ty.Field(i)
+				if !f.IsExported() {
+					continue
+				}
+				if f.Type.Kind() == reflect.String {
+					yamlName := yamlFieldName(f)
+					if isFileField(f, yamlName) {
+						if _, ok := allowedFileFieldNames[yamlName]; !ok {
+							missing = append(missing, fmt.Sprintf("%s.%s (yaml:%q)", ty.String(), f.Name, yamlName))
+						}
+					}
+				}
+				walk(f.Type)
+			}
+		}
+	}
+	walk(reflect.TypeOf(config.Config{}))
+	if len(missing) > 0 {
+		t.Fatalf("found *_file fields with no registered validation (add a dedicated validator and allow-list entry): %v", missing)
 	}
 }
