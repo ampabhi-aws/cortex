@@ -31,11 +31,9 @@ func TestUsersScanner_ScanUsers_ShouldReturnedOwnedUsersOnly(t *testing.T) {
 
 }
 
-func TestUsersScanner_ScanUsers_ShouldReturnUsersForWhichOwnerCheckOrTenantDeletionCheckFailed(t *testing.T) {
-	expected := []string{"user-1", "user-2"}
-
+func TestUsersScanner_ScanUsers_ShouldSkipUsersForWhichOwnerCheckOrTenantDeletionCheckFailed(t *testing.T) {
 	bucketClient := &bucket.ClientMock{}
-	bucketClient.MockIter("", expected, nil)
+	bucketClient.MockIter("", []string{"user-1", "user-2"}, nil)
 	bucketClient.MockExists(path.Join("user-1", TenantDeletionMarkPath), false, nil)
 	bucketClient.MockExists(path.Join("user-2", TenantDeletionMarkPath), false, errors.New("fail"))
 
@@ -46,6 +44,27 @@ func TestUsersScanner_ScanUsers_ShouldReturnUsersForWhichOwnerCheckOrTenantDelet
 	s := NewUsersScanner(bucketClient, isOwned, log.NewNopLogger())
 	actual, deleted, err := s.ScanUsers(context.Background())
 	require.NoError(t, err)
-	assert.Equal(t, expected, actual)
+	// Fail CLOSED: when ownership cannot be determined, the tenant must not be returned
+	// as owned (otherwise destructive callers like BlocksCleaner would race across replicas
+	// whenever the ring is empty, inconsistent, or an owner is unhealthy).
+	assert.Empty(t, actual)
+	assert.Empty(t, deleted)
+}
+
+func TestUsersScanner_ScanUsers_ShouldSkipUserWhenTenantDeletionCheckFails(t *testing.T) {
+	bucketClient := &bucket.ClientMock{}
+	bucketClient.MockIter("", []string{"user-1", "user-2"}, nil)
+	bucketClient.MockExists(path.Join("user-1", TenantDeletionMarkPath), false, nil)
+	bucketClient.MockExists(path.Join("user-2", TenantDeletionMarkPath), false, errors.New("fail"))
+
+	isOwned := func(userID string) (bool, error) {
+		return true, nil
+	}
+
+	s := NewUsersScanner(bucketClient, isOwned, log.NewNopLogger())
+	actual, deleted, err := s.ScanUsers(context.Background())
+	require.NoError(t, err)
+	// user-2 should be skipped because its tenant deletion mark could not be read.
+	assert.Equal(t, []string{"user-1"}, actual)
 	assert.Empty(t, deleted)
 }
