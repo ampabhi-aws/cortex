@@ -419,6 +419,135 @@ alertmanager_config: |
 			err: errors.Wrap(errVictorOpsAPIKeyFileNotAllowed, "error validating Alertmanager config"),
 		},
 		{
+			name: "Should return error if SNS receiver omits sigv4 access_key/secret_key",
+			cfg: `
+alertmanager_config: |
+  receivers:
+    - name: default-receiver
+      sns_configs:
+        - target_arn: example-target
+          sigv4:
+            region: example-region
+
+  route:
+    receiver: 'default-receiver'
+`,
+			err: errors.Wrap(errSNSCredentialsRequired, "error validating Alertmanager config"),
+		},
+		{
+			name: "Should return error if SNS receiver sets sigv4.role_arn",
+			cfg: `
+alertmanager_config: |
+  receivers:
+    - name: default-receiver
+      sns_configs:
+        - target_arn: example-target
+          sigv4:
+            region: example-region
+            access_key: fake-access
+            secret_key: fake-secret
+            role_arn: example-role
+
+  route:
+    receiver: 'default-receiver'
+`,
+			err: errors.Wrap(errSNSRoleARNNotAllowed, "error validating Alertmanager config"),
+		},
+		{
+			name: "Should return error if SNS receiver sets sigv4.profile",
+			cfg: `
+alertmanager_config: |
+  receivers:
+    - name: default-receiver
+      sns_configs:
+        - target_arn: example-target
+          sigv4:
+            region: example-region
+            access_key: fake-access
+            secret_key: fake-secret
+            profile: my-profile
+
+  route:
+    receiver: 'default-receiver'
+`,
+			err: errors.Wrap(errSNSProfileNotAllowed, "error validating Alertmanager config"),
+		},
+		{
+			name: "Should return error if SNS receiver api_url is not https",
+			cfg: `
+alertmanager_config: |
+  receivers:
+    - name: default-receiver
+      sns_configs:
+        - target_arn: example-target
+          api_url: http://sns.example-region.amazonaws.com/
+          sigv4:
+            region: example-region
+            access_key: fake-access
+            secret_key: fake-secret
+
+  route:
+    receiver: 'default-receiver'
+`,
+			err: errors.Wrap(errSNSAPIURLScheme, "error validating Alertmanager config"),
+		},
+		{
+			name: "Should return error if SNS receiver api_url host is not an AWS endpoint",
+			cfg: `
+alertmanager_config: |
+  receivers:
+    - name: default-receiver
+      sns_configs:
+        - target_arn: example-target
+          api_url: https://attacker.example/
+          sigv4:
+            region: example-region
+            access_key: fake-access
+            secret_key: fake-secret
+
+  route:
+    receiver: 'default-receiver'
+`,
+			err: errors.Wrap(errSNSAPIURLHostNotAllowed, "error validating Alertmanager config"),
+		},
+		{
+			name: "Should accept SNS receiver with sigv4 credentials and default api_url",
+			cfg: `
+alertmanager_config: |
+  receivers:
+    - name: default-receiver
+      sns_configs:
+        - target_arn: example-target
+          sigv4:
+            region: example-region
+            access_key: fake-access
+            secret_key: fake-secret
+
+  route:
+    receiver: 'default-receiver'
+`,
+			err: nil,
+		},
+		{
+			name: "Should accept SNS receiver with sigv4 credentials and allowed AWS api_url",
+			cfg: `
+alertmanager_config: |
+  receivers:
+    - name: default-receiver
+      sns_configs:
+        - target_arn: example-target
+          api_url: https://sns.example-region.amazonaws.com/
+          sigv4:
+            region: example-region
+            access_key: fake-access
+            secret_key: fake-secret
+
+  route:
+    receiver: 'default-receiver'
+`,
+			err: nil,
+		},
+		{
 			name: "should return error if template is wrong",
 			cfg: `
 alertmanager_config: |

@@ -5,9 +5,11 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"net/url"
 	"os"
 	"path/filepath"
 	"reflect"
+	"strings"
 
 	"github.com/go-kit/log"
 	"github.com/go-kit/log/level"
@@ -45,6 +47,12 @@ var (
 	errTLSFileNotAllowed             = errors.New("setting TLS ca_file, cert_file and key_file is not allowed")
 	errSlackAPIURLFileNotAllowed     = errors.New("setting Slack api_url_file and global slack_api_url_file is not allowed")
 	errVictorOpsAPIKeyFileNotAllowed = errors.New("setting VictorOps api_key_file is not allowed")
+	errSNSCredentialsRequired        = errors.New("sns receiver requires sigv4.access_key and sigv4.secret_key")
+	errSNSRoleARNNotAllowed          = errors.New("sns receiver sigv4.role_arn is not allowed")
+	errSNSProfileNotAllowed          = errors.New("sns receiver sigv4.profile is not allowed")
+	errSNSAPIURLScheme               = errors.New("sns receiver api_url must use https")
+	errSNSAPIURLInvalid              = errors.New("sns receiver api_url is invalid")
+	errSNSAPIURLHostNotAllowed       = errors.New("sns receiver api_url host is not an allowed AWS SNS endpoint")
 )
 
 // UserConfig is used to communicate a users alertmanager configs
@@ -350,6 +358,11 @@ func validateAlertmanagerConfig(cfg interface{}) error {
 		if err := validateVictorOpsConfig(v.Interface().(config.VictorOpsConfig)); err != nil {
 			return err
 		}
+
+	case reflect.TypeOf(config.SNSConfig{}):
+		if err := validateSNSConfig(v.Interface().(config.SNSConfig)); err != nil {
+			return err
+		}
 	}
 
 	// If the input config is a struct, recursively iterate on all fields.
@@ -448,4 +461,51 @@ func validateVictorOpsConfig(cfg config.VictorOpsConfig) error {
 		return errVictorOpsAPIKeyFileNotAllowed
 	}
 	return nil
+}
+
+// validateSNSConfig validates the SNS config and returns an error if it contains settings
+// that would allow a tenant to piggyback on Cortex's ambient AWS credentials or steer
+// SigV4-signed requests to a tenant-controlled host.
+//
+// Tenant-authored sns_configs are untrusted: the vendored notifier falls back to the
+// Alertmanager process's default AWS credential chain (env vars, shared profile, IMDS,
+// ECS task role, IRSA) whenever both sigv4.access_key and sigv4.secret_key are empty,
+// and it uses tenant-controlled sigv4.role_arn / sigv4.profile / api_url to redirect
+// identity selection and SigV4-signed traffic. See
+// vendor/github.com/prometheus/alertmanager/notify/sns/sns.go createSNSClient.
+func validateSNSConfig(cfg config.SNSConfig) error {
+	if cfg.Sigv4.RoleARN != "" {
+		return errSNSRoleARNNotAllowed
+	}
+	if cfg.Sigv4.Profile != "" {
+		return errSNSProfileNotAllowed
+	}
+	if cfg.Sigv4.AccessKey == "" || cfg.Sigv4.SecretKey == "" {
+		return errSNSCredentialsRequired
+	}
+	if cfg.APIUrl != "" {
+		u, err := url.Parse(cfg.APIUrl)
+		if err != nil || u.Host == "" {
+			return errSNSAPIURLInvalid
+		}
+		if !strings.EqualFold(u.Scheme, "https") {
+			return errSNSAPIURLScheme
+		}
+		if !isAllowedSNSHost(u.Hostname()) {
+			return errSNSAPIURLHostNotAllowed
+		}
+	}
+	return nil
+}
+
+// isAllowedSNSHost returns true if host is a public AWS SNS endpoint host.
+// This prevents a tenant from pointing api_url at an attacker-controlled server and
+// receiving a SigV4-signed request that discloses the operator's AWS identity.
+func isAllowedSNSHost(host string) bool {
+	h := strings.ToLower(host)
+	// sns.<region>.amazonaws.com, sns.<region>.amazonaws.com.cn, sns-fips.<region>.amazonaws.com
+	if strings.HasPrefix(h, "sns.") || strings.HasPrefix(h, "sns-fips.") {
+		return strings.HasSuffix(h, ".amazonaws.com") || strings.HasSuffix(h, ".amazonaws.com.cn")
+	}
+	return false
 }
