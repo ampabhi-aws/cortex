@@ -17,6 +17,15 @@ var (
 	expectedSamplesPerSeries   = 10
 	expectedExemplarsPerSeries = 1
 
+	// maxTimeseriesPerRequest bounds the number of repeated Timeseries (and
+	// Metadata) entries accepted in a single remote-write request, independent
+	// of the raw byte size cap. This prevents an attacker from amplifying a
+	// small (snappy-compressed) upload into gigabytes of eagerly pre-allocated
+	// heap by sending millions of empty 2-byte submessages (each of which
+	// otherwise triggers a ~936 B TimeSeries pool allocation). A value of 0
+	// disables the limit.
+	maxTimeseriesPerRequest = 100000
+
 	/*
 		We cannot pool these as pointer-to-slice because the place we use them is in WriteRequest which is generated from Protobuf
 		and we don't have an option to make it a pointer. There is overhead here 24 bytes of garbage every time a PreallocTimeseries
@@ -48,6 +57,7 @@ func (PreallocConfig) RegisterFlags(f *flag.FlagSet) {
 	f.IntVar(&expectedTimeseries, "ingester-client.expected-timeseries", expectedTimeseries, "Expected number of timeseries per request, used for preallocations.")
 	f.IntVar(&expectedLabels, "ingester-client.expected-labels", expectedLabels, "Expected number of labels per timeseries, used for preallocations.")
 	f.IntVar(&expectedSamplesPerSeries, "ingester-client.expected-samples-per-series", expectedSamplesPerSeries, "Expected number of samples per timeseries, used for preallocations.")
+	f.IntVar(&maxTimeseriesPerRequest, "distributor.max-timeseries-per-request", maxTimeseriesPerRequest, "Maximum number of timeseries (and metadata entries) accepted in a single write request. Guards the unmarshal path against allocation-amplification attacks that pack millions of empty repeated entries into a small snappy-compressed body. 0 disables the limit.")
 }
 
 // PreallocWriteRequest is a WriteRequest which preallocs slices on Unmarshal.
@@ -56,9 +66,33 @@ type PreallocWriteRequest struct {
 }
 
 // Unmarshal implements proto.Message.
+//
+// It enforces maxTimeseriesPerRequest both as a cheap pre-check against the
+// decoded body length (each repeated entry on the wire costs at least 2 bytes,
+// so len(dAtA)/2 is an upper bound on the entry count) and as a post-parse
+// check on the materialised slices. The pre-check lets us reject obvious
+// bombs before any pool allocation happens; the post-parse check catches
+// requests whose entries are large enough to pass the pre-check but still
+// exceed the configured count.
 func (p *PreallocWriteRequest) Unmarshal(dAtA []byte) error {
+	if maxTimeseriesPerRequest > 0 && len(dAtA)/2 > maxTimeseriesPerRequest {
+		return fmt.Errorf("too many series in write request: body of %d bytes could encode more than %d entries", len(dAtA), maxTimeseriesPerRequest)
+	}
 	p.Timeseries = PreallocTimeseriesSliceFromPool()
-	return p.WriteRequest.Unmarshal(dAtA)
+	if err := p.WriteRequest.Unmarshal(dAtA); err != nil {
+		return err
+	}
+	if maxTimeseriesPerRequest > 0 && (len(p.Timeseries) > maxTimeseriesPerRequest || len(p.Metadata) > maxTimeseriesPerRequest) {
+		n := len(p.Timeseries)
+		if len(p.Metadata) > n {
+			n = len(p.Metadata)
+		}
+		ReuseSlice(p.Timeseries)
+		p.Timeseries = nil
+		p.Metadata = nil
+		return fmt.Errorf("too many series or metadata entries in write request (%d > %d)", n, maxTimeseriesPerRequest)
+	}
+	return nil
 }
 
 // PreallocTimeseries is a TimeSeries which preallocs slices on Unmarshal.
@@ -67,7 +101,18 @@ type PreallocTimeseries struct {
 }
 
 // Unmarshal implements proto.Message.
+//
+// For zero-length submessages we skip the pool allocation entirely: a 2-byte
+// "0a 00" wire entry would otherwise take a *TimeSeries from the pool whose
+// New eagerly allocates ~936 bytes of label/sample/exemplar backing arrays.
+// Repeated empty entries were the amplification lever behind CWE-770 remote-
+// write bombs. A sentinel empty TimeSeries is still assigned so downstream
+// code sees a non-nil TimeSeries that validation will treat as empty.
 func (p *PreallocTimeseries) Unmarshal(dAtA []byte) error {
+	if len(dAtA) == 0 {
+		p.TimeSeries = &TimeSeries{}
+		return nil
+	}
 	p.TimeSeries = TimeseriesFromPool()
 	return p.TimeSeries.Unmarshal(dAtA)
 }
@@ -290,6 +335,9 @@ func TimeseriesFromPool() *TimeSeries {
 
 // ReuseTimeseries puts the timeseries back into a sync.Pool for reuse.
 func ReuseTimeseries(ts *TimeSeries) {
+	if ts == nil {
+		return
+	}
 	// Name and Value may point into a large gRPC buffer, so clear the reference to allow GC
 	for i := 0; i < len(ts.Labels); i++ {
 		ts.Labels[i].Name = ""
@@ -305,5 +353,11 @@ func ReuseTimeseries(ts *TimeSeries) {
 		}
 	}
 	ts.Exemplars = ts.Exemplars[:0]
+	// Avoid polluting the pool with zero-capacity sentinel TimeSeries created
+	// by PreallocTimeseries.Unmarshal for empty wire entries. Only recycle
+	// objects that still carry pre-sized backing arrays.
+	if cap(ts.Labels) == 0 && cap(ts.Samples) == 0 && cap(ts.Exemplars) == 0 {
+		return
+	}
 	timeSeriesPool.Put(ts)
 }
