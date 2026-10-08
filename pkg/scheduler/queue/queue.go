@@ -61,9 +61,9 @@ type RequestQueue struct {
 	discardedRequests *prometheus.CounterVec // Per user.
 }
 
-func NewRequestQueue(maxOutstandingPerTenant int, forgetDelay time.Duration, queueLength *prometheus.GaugeVec, discardedRequests *prometheus.CounterVec) *RequestQueue {
+func NewRequestQueue(maxOutstandingPerTenant, maxTenants int, forgetDelay time.Duration, queueLength *prometheus.GaugeVec, discardedRequests *prometheus.CounterVec) *RequestQueue {
 	q := &RequestQueue{
-		queues:                  newUserQueues(maxOutstandingPerTenant, forgetDelay),
+		queues:                  newUserQueuesWithLimit(maxOutstandingPerTenant, maxTenants, forgetDelay),
 		connectedQuerierWorkers: atomic.NewInt32(0),
 		queueLength:             queueLength,
 		discardedRequests:       discardedRequests,
@@ -90,8 +90,13 @@ func (q *RequestQueue) EnqueueRequest(userID string, req Request, maxQueriers in
 
 	queue := q.queues.getOrAddQueue(userID, maxQueriers)
 	if queue == nil {
-		// This can only happen if userID is "".
-		return errors.New("no queue found")
+		// getOrAddQueue returns nil either because userID is empty (a bug in the caller)
+		// or because the global tenant-queue cap has been reached. In both cases we must
+		// not allocate a new per-tenant metric series — doing so from this path is what
+		// enabled attacker-driven metric-cardinality growth. Account the drop against a
+		// bounded reserved label so operators still have visibility.
+		q.discardedRequests.WithLabelValues("__over_limit__").Inc()
+		return ErrTooManyRequests
 	}
 
 	select {

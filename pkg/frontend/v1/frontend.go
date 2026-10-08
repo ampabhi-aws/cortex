@@ -32,12 +32,14 @@ var (
 // Config for a Frontend.
 type Config struct {
 	MaxOutstandingPerTenant int           `yaml:"max_outstanding_per_tenant"`
+	MaxTenants              int           `yaml:"max_tenants"`
 	QuerierForgetDelay      time.Duration `yaml:"querier_forget_delay"`
 }
 
 // RegisterFlags adds the flags required to config this to the given FlagSet.
 func (cfg *Config) RegisterFlags(f *flag.FlagSet) {
 	f.IntVar(&cfg.MaxOutstandingPerTenant, "querier.max-outstanding-requests-per-tenant", 100, "Maximum number of outstanding requests per tenant per frontend; requests beyond this error with HTTP 429.")
+	f.IntVar(&cfg.MaxTenants, "querier.max-tenants", 0, "Maximum number of concurrent tenant queues the query-frontend will hold. 0 = no limit. When reached, enqueue requests for previously unseen tenants are rejected with HTTP 429.")
 	f.DurationVar(&cfg.QuerierForgetDelay, "query-frontend.querier-forget-delay", 0, "If a querier disconnects without sending notification about graceful shutdown, the query-frontend will keep the querier in the tenant's shard until the forget delay has passed. This feature is useful to reduce the blast radius when shuffle-sharding is enabled.")
 }
 
@@ -100,7 +102,7 @@ func New(cfg Config, limits Limits, log log.Logger, registerer prometheus.Regist
 		}),
 	}
 
-	f.requestQueue = queue.NewRequestQueue(cfg.MaxOutstandingPerTenant, cfg.QuerierForgetDelay, f.queueLength, f.discardedRequests)
+	f.requestQueue = queue.NewRequestQueue(cfg.MaxOutstandingPerTenant, cfg.MaxTenants, cfg.QuerierForgetDelay, f.queueLength, f.discardedRequests)
 	f.activeUsers = util.NewActiveUsersCleanupWithDefaultValues(f.cleanupInactiveUserMetrics)
 
 	var err error
