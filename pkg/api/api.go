@@ -5,7 +5,10 @@ import (
 	"flag"
 	"net/http"
 	"path"
+	"strconv"
 	"strings"
+	"sync/atomic"
+	"time"
 
 	"github.com/NYTimes/gziphandler"
 	"github.com/felixge/fgprof"
@@ -219,7 +222,50 @@ func (a *API) RegisterAPI(httpPathPrefix string, actualCfg interface{}, defaultC
 
 	a.RegisterRoute("/config", a.cfg.configHandler(actualCfg, defaultCfg), false, "GET")
 	a.RegisterRoute("/", indexHandler(httpPathPrefix, a.indexPage), false, "GET")
-	a.RegisterRoute("/debug/fgprof", fgprof.Handler(), false, "GET")
+	a.RegisterRoute("/debug/fgprof", boundedFgprof(fgprof.Handler()), false, "GET")
+}
+
+// maxProfileSeconds caps the duration of a single /debug/fgprof request.
+// The vendored fgprof handler accepts an arbitrary positive `seconds` query
+// parameter and starts a 99 Hz stop-the-world goroutine sampler for that
+// duration without observing the request context. Without an upper bound,
+// a single unauthenticated request can pin a Cortex process into O(#goroutines)
+// STW pauses for an attacker-chosen period, injecting latency across every
+// tenant served by that instance. See CWE-770.
+const maxProfileSeconds = 60
+
+// fgprofInFlight guards against multiple concurrent profiling sessions so a
+// handful of requests cannot compound the per-tick STW cost on the process.
+var fgprofInFlight int32
+
+// boundedFgprof wraps the fgprof.Handler to:
+//  1. clamp the `seconds` query parameter to [1, maxProfileSeconds];
+//  2. allow only one in-flight profile at a time;
+//  3. apply a hard context deadline so the handler cannot outrun its bound.
+//
+// The underlying fgprof handler still uses time.Sleep rather than observing
+// r.Context(), so the context deadline is primarily defensive; the hard cap
+// on `seconds` is what actually bounds the work.
+func boundedFgprof(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if !atomic.CompareAndSwapInt32(&fgprofInFlight, 0, 1) {
+			http.Error(w, "profile already in progress", http.StatusTooManyRequests)
+			return
+		}
+		defer atomic.StoreInt32(&fgprofInFlight, 0)
+
+		if s := r.URL.Query().Get("seconds"); s != "" {
+			n, err := strconv.Atoi(s)
+			if err != nil || n <= 0 || n > maxProfileSeconds {
+				http.Error(w, "seconds must be in the range 1..60", http.StatusBadRequest)
+				return
+			}
+		}
+
+		ctx, cancel := context.WithTimeout(r.Context(), maxProfileSeconds*time.Second)
+		defer cancel()
+		next.ServeHTTP(w, r.WithContext(ctx))
+	})
 }
 
 // RegisterRuntimeConfig registers the endpoints associates with the runtime configuration
