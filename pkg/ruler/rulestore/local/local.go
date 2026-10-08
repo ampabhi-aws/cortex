@@ -5,6 +5,7 @@ import (
 	"flag"
 	"os"
 	"path/filepath"
+	"strings"
 
 	"github.com/pkg/errors"
 	promRules "github.com/prometheus/prometheus/rules"
@@ -168,7 +169,20 @@ func (l *Client) loadAllRulesGroupsForUser(ctx context.Context, userID string) (
 }
 
 func (l *Client) loadAllRulesGroupsForUserAndNamespace(_ context.Context, userID string, namespace string) (rulespb.RuleGroupList, error) {
-	filename := filepath.Join(l.cfg.Directory, userID, namespace)
+	root, err := filepath.Abs(filepath.Join(l.cfg.Directory, userID))
+	if err != nil {
+		return nil, errors.Wrap(err, "unable to resolve rule store root")
+	}
+	filename, err := filepath.Abs(filepath.Join(root, namespace))
+	if err != nil {
+		return nil, errors.Wrap(err, "unable to resolve rule file path")
+	}
+	// Ensure the resolved path is contained within the tenant's directory so a
+	// path-traversal namespace (e.g. "../other-tenant/rules.yaml") cannot escape
+	// into another tenant's rule store or an arbitrary location on disk.
+	if filename != root && !strings.HasPrefix(filename, root+string(os.PathSeparator)) {
+		return nil, errors.New("invalid namespace")
+	}
 
 	rulegroups, allErrors := l.loader.Load(filename)
 	if len(allErrors) > 0 {
