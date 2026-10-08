@@ -4,6 +4,7 @@ import (
 	"context"
 	"flag"
 	"io"
+	"net"
 	"net/http"
 	"sync"
 	"time"
@@ -19,6 +20,7 @@ import (
 	"github.com/weaveworks/common/middleware"
 	"github.com/weaveworks/common/user"
 	"google.golang.org/grpc"
+	"google.golang.org/grpc/peer"
 
 	"github.com/cortexproject/cortex/pkg/frontend/v2/frontendv2pb"
 	"github.com/cortexproject/cortex/pkg/scheduler/queue"
@@ -83,11 +85,13 @@ type Config struct {
 	MaxOutstandingPerTenant int               `yaml:"max_outstanding_requests_per_tenant"`
 	QuerierForgetDelay      time.Duration     `yaml:"querier_forget_delay"`
 	GRPCClientConfig        grpcclient.Config `yaml:"grpc_client_config" doc:"description=This configures the gRPC client used to report errors back to the query-frontend."`
+	ValidateFrontendAddress bool              `yaml:"validate_frontend_address"`
 }
 
 func (cfg *Config) RegisterFlags(f *flag.FlagSet) {
 	f.IntVar(&cfg.MaxOutstandingPerTenant, "query-scheduler.max-outstanding-requests-per-tenant", 100, "Maximum number of outstanding requests per tenant per query-scheduler. In-flight requests above this limit will fail with HTTP response status code 429.")
 	f.DurationVar(&cfg.QuerierForgetDelay, "query-scheduler.querier-forget-delay", 0, "If a querier disconnects without sending notification about graceful shutdown, the query-scheduler will keep the querier in the tenant's shard until the forget delay has passed. This feature is useful to reduce the blast radius when shuffle-sharding is enabled.")
+	f.BoolVar(&cfg.ValidateFrontendAddress, "query-scheduler.validate-frontend-address", false, "If true, require the frontend address announced in the FrontendLoop INIT message to resolve to the same host as the authenticated gRPC peer. This mitigates an unauthenticated SSRF / cross-tenant exfiltration primitive where a network peer could cause the scheduler and querier to dial an attacker-chosen host:port as the query result callback. Enable this when the scheduler gRPC port is not otherwise authenticated with mTLS (-server.grpc-tls-client-auth=RequireAndVerifyClientCert) and strongly isolated at the network layer.")
 	cfg.GRPCClientConfig.RegisterFlagsWithPrefix("query-scheduler.grpc-client-config", f)
 }
 
@@ -234,6 +238,18 @@ func (s *Scheduler) frontendConnected(frontend schedulerpb.SchedulerForFrontend_
 	}
 	if msg.Type != schedulerpb.INIT || msg.FrontendAddress == "" {
 		return "", nil, errors.New("no frontend address")
+	}
+
+	// When enabled, validate the caller-supplied FrontendAddress against the actual
+	// gRPC peer address. This prevents an attacker who can reach the scheduler's
+	// gRPC port from registering an arbitrary callback host:port that the scheduler
+	// (forwardErrorToFrontend) and the querier (frontendPool.GetClientFor) will dial
+	// and send query results to.
+	if s.cfg.ValidateFrontendAddress {
+		if err := validateFrontendAddressAgainstPeer(frontend.Context(), msg.FrontendAddress); err != nil {
+			level.Warn(s.log).Log("msg", "rejecting frontend connection: frontend address does not match peer", "frontend", msg.FrontendAddress, "err", err)
+			return "", nil, err
+		}
 	}
 
 	s.connectedFrontendsMu.Lock()
@@ -525,4 +541,52 @@ func (s *Scheduler) getConnectedFrontendClientsMetric() float64 {
 	}
 
 	return float64(count)
+}
+
+// validateFrontendAddressAgainstPeer ensures that the host part of the
+// caller-supplied frontendAddress refers to the same host as the authenticated
+// gRPC peer. The caller may supply the peer's IP literal, a hostname that
+// resolves to it, or omit the host (empty host, e.g. ":9095"), in which case
+// the peer IP is implied.
+func validateFrontendAddressAgainstPeer(ctx context.Context, frontendAddress string) error {
+	p, ok := peer.FromContext(ctx)
+	if !ok || p == nil || p.Addr == nil {
+		return errors.New("unable to determine gRPC peer address for frontend")
+	}
+	peerHost, _, err := net.SplitHostPort(p.Addr.String())
+	if err != nil {
+		return errors.Wrap(err, "invalid gRPC peer address")
+	}
+	peerIP := net.ParseIP(peerHost)
+	if peerIP == nil {
+		return errors.Errorf("invalid gRPC peer IP %q", peerHost)
+	}
+
+	frontendHost, _, err := net.SplitHostPort(frontendAddress)
+	if err != nil {
+		return errors.Wrap(err, "invalid frontend address")
+	}
+	if frontendHost == "" {
+		// Empty host means the peer IP is implied; accept it.
+		return nil
+	}
+
+	if ip := net.ParseIP(frontendHost); ip != nil {
+		if ip.Equal(peerIP) {
+			return nil
+		}
+		return errors.Errorf("frontend address %q does not match gRPC peer %q", frontendAddress, peerIP.String())
+	}
+
+	// Hostname: resolve and check whether any resolved IP matches the peer.
+	resolved, err := net.DefaultResolver.LookupIPAddr(ctx, frontendHost)
+	if err != nil {
+		return errors.Wrapf(err, "cannot resolve frontend host %q", frontendHost)
+	}
+	for _, a := range resolved {
+		if a.IP.Equal(peerIP) {
+			return nil
+		}
+	}
+	return errors.Errorf("frontend address %q does not resolve to gRPC peer %q", frontendAddress, peerIP.String())
 }
