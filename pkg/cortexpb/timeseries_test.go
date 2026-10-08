@@ -64,3 +64,48 @@ func TestTimeseriesFromPool(t *testing.T) {
 		assert.Len(t, reused.Samples, 0)
 	})
 }
+
+func TestPreallocTimeseriesUnmarshal_EmptyEntrySkipsPool(t *testing.T) {
+	// A zero-length wire entry must NOT eagerly allocate ~936 bytes of
+	// label/sample/exemplar backing arrays via the pool. This guards against
+	// the remote-write allocation-amplification bomb (CWE-770).
+	var p PreallocTimeseries
+	require.NoError(t, p.Unmarshal(nil))
+	require.NotNil(t, p.TimeSeries)
+	assert.Equal(t, 0, cap(p.TimeSeries.Labels))
+	assert.Equal(t, 0, cap(p.TimeSeries.Samples))
+	assert.Equal(t, 0, cap(p.TimeSeries.Exemplars))
+}
+
+func TestPreallocWriteRequestUnmarshal_RejectsPreCheck(t *testing.T) {
+	orig := maxTimeseriesPerRequest
+	t.Cleanup(func() { maxTimeseriesPerRequest = orig })
+	maxTimeseriesPerRequest = 10
+
+	// Each repeated entry costs at least 2 bytes on the wire, so a body of
+	// 2*(max+1)+1 bytes could encode more than max entries and must be
+	// rejected before any parsing happens.
+	body := make([]byte, 2*(maxTimeseriesPerRequest+1)+1)
+	var p PreallocWriteRequest
+	err := p.Unmarshal(body)
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "too many series")
+}
+
+func TestPreallocWriteRequestUnmarshal_DisabledByZero(t *testing.T) {
+	orig := maxTimeseriesPerRequest
+	t.Cleanup(func() { maxTimeseriesPerRequest = orig })
+	maxTimeseriesPerRequest = 0
+
+	// Even a large body with many empty entries is accepted when the limit
+	// is disabled (operator opt-out).
+	n := 1000
+	body := make([]byte, 0, n*2)
+	for i := 0; i < n; i++ {
+		body = append(body, 0x0a, 0x00)
+	}
+	var p PreallocWriteRequest
+	require.NoError(t, p.Unmarshal(body))
+	assert.Len(t, p.Timeseries, n)
+	ReuseSlice(p.Timeseries)
+}
