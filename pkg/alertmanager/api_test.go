@@ -19,7 +19,6 @@ import (
 	"github.com/stretchr/testify/require"
 	"github.com/thanos-io/objstore"
 	"github.com/weaveworks/common/user"
-	"gopkg.in/yaml.v2"
 
 	"github.com/cortexproject/cortex/pkg/alertmanager/alertspb"
 	"github.com/cortexproject/cortex/pkg/alertmanager/alertstore/bucketclient"
@@ -681,7 +680,18 @@ receivers:
 
 	router := mux.NewRouter()
 	router.Path("/multitenant_alertmanager/configs").Methods(http.MethodGet).HandlerFunc(am.ListAllConfigs)
+
+	// Without X-Scope-OrgID the admin endpoint must reject the request:
+	// the cross-tenant dump is no longer served completely unauthenticated.
+	{
+		req := httptest.NewRequest("GET", "https://localhost:8080/multitenant_alertmanager/configs", nil)
+		w := httptest.NewRecorder()
+		router.ServeHTTP(w, req)
+		require.Equal(t, http.StatusUnauthorized, w.Result().StatusCode)
+	}
+
 	req := httptest.NewRequest("GET", "https://localhost:8080/multitenant_alertmanager/configs", nil)
+	req = req.WithContext(user.InjectOrgID(req.Context(), "admin"))
 	w := httptest.NewRecorder()
 	router.ServeHTTP(w, req)
 
@@ -690,9 +700,63 @@ receivers:
 	require.Equal(t, "application/yaml", resp.Header.Get("Content-Type"))
 	body, err := io.ReadAll(resp.Body)
 	require.NoError(t, err)
-	old, err := yaml.Marshal(testCases)
+	// We no longer compare the raw YAML byte-for-byte: the response is the
+	// re-marshaled, secret-redacted representation. Instead verify that
+	// every seeded tenant key is present in the multi-document stream.
+	bodyStr := string(body)
+	for user := range testCases {
+		require.Contains(t, bodyStr, user+":")
+	}
+}
+
+func TestAMConfigListUserConfig_RedactsSecrets(t *testing.T) {
+	const cfgWithSecrets = `
+global:
+  resolve_timeout: 5m
+  smtp_auth_password: 'SECRET-SMTP-PASSWORD'
+  slack_api_url: 'https://hooks.slack.com/services/T000/B000/SECRET-SLACK-TOKEN'
+route:
+  receiver: webhook1
+receivers:
+- name: webhook1
+  webhook_configs:
+  - url: https://example.com/webhook?token=SECRET-WEBHOOK-TOKEN
+`
+
+	storage := objstore.NewInMemBucket()
+	alertStore := bucketclient.NewBucketAlertStore(storage, nil, log.NewNopLogger())
+	require.NoError(t, alertStore.SetAlertConfig(context.Background(), alertspb.AlertConfigDesc{
+		User:      "user1",
+		RawConfig: cfgWithSecrets,
+	}))
+
+	reg := prometheus.NewPedanticRegistry()
+	cfg := mockAlertmanagerConfig(t)
+	am, err := createMultitenantAlertmanager(cfg, nil, nil, alertStore, nil, nil, log.NewNopLogger(), reg)
 	require.NoError(t, err)
-	require.YAMLEq(t, string(old), string(body))
+	require.NoError(t, services.StartAndAwaitRunning(context.Background(), am))
+	defer services.StopAndAwaitTerminated(context.Background(), am) //nolint:errcheck
+	require.NoError(t, am.loadAndSyncConfigs(context.Background(), reasonPeriodic))
+
+	router := mux.NewRouter()
+	router.Path("/multitenant_alertmanager/configs").Methods(http.MethodGet).HandlerFunc(am.ListAllConfigs)
+
+	req := httptest.NewRequest("GET", "https://localhost:8080/multitenant_alertmanager/configs", nil)
+	req = req.WithContext(user.InjectOrgID(req.Context(), "admin"))
+	w := httptest.NewRecorder()
+	router.ServeHTTP(w, req)
+
+	resp := w.Result()
+	require.Equal(t, http.StatusOK, resp.StatusCode)
+	body, err := io.ReadAll(resp.Body)
+	require.NoError(t, err)
+
+	// The response must not echo any of the plaintext secrets back.
+	require.NotContains(t, string(body), "SECRET-SMTP-PASSWORD")
+	require.NotContains(t, string(body), "SECRET-SLACK-TOKEN")
+	require.NotContains(t, string(body), "SECRET-WEBHOOK-TOKEN")
+	// And it must contain the redaction sentinel in the alertmanager_config.
+	require.Contains(t, string(body), "<secret>")
 }
 
 func TestValidateAlertmanagerConfig(t *testing.T) {

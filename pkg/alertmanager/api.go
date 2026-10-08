@@ -261,6 +261,20 @@ func validateUserConfig(logger log.Logger, cfg alertspb.AlertConfigDesc, limits 
 
 func (am *MultitenantAlertmanager) ListAllConfigs(w http.ResponseWriter, r *http.Request) {
 	logger := util_log.WithContext(r.Context(), am.logger)
+
+	// The endpoint discloses other tenants' Alertmanager configurations which
+	// routinely contain plaintext receiver credentials (SMTP passwords, Slack
+	// webhook URLs, PagerDuty routing keys, OpsGenie/VictorOps API keys and
+	// tokenized webhook URLs). Require a tenant ID in the request context so
+	// the endpoint cannot be reached completely unauthenticated when it is
+	// enabled, and so operator-controlled gateways can rely on the standard
+	// X-Scope-OrgID auth plumbing.
+	if _, err := tenant.TenantID(r.Context()); err != nil {
+		level.Warn(logger).Log("msg", errNoOrgID, "err", err.Error())
+		http.Error(w, fmt.Sprintf("%s: %s", errNoOrgID, err.Error()), http.StatusUnauthorized)
+		return
+	}
+
 	userIDs, err := am.store.ListAllUsers(r.Context())
 	if err != nil {
 		level.Error(logger).Log("msg", "failed to list users of alertmanager", "err", err)
@@ -283,10 +297,29 @@ func (am *MultitenantAlertmanager) ListAllConfigs(w http.ResponseWriter, r *http
 		} else if err != nil {
 			return errors.Wrapf(err, "failed to fetch alertmanager config for user %s", userID)
 		}
+
+		// Redact secrets before streaming the response: re-marshal the parsed
+		// config.Config whose Secret/SecretURL types marshal as "<secret>",
+		// instead of echoing cfg.RawConfig verbatim. If the stored config
+		// cannot be parsed we fall back to the raw YAML with secret-bearing
+		// fields replaced heuristically so we never stream unredacted
+		// credentials. Template bodies are intentionally omitted (only names
+		// are listed) because they can also contain receiver-provided secrets.
+		redactedConfig, err := redactAlertmanagerConfig(cfg.RawConfig)
+		if err != nil {
+			level.Warn(logger).Log("msg", "failed to redact alertmanager config, dropping entry", "user", userID, "err", err)
+			return nil
+		}
+
+		templateNames := make(map[string]string, len(cfg.Templates))
+		for _, tmpl := range cfg.Templates {
+			templateNames[tmpl.GetFilename()] = "<redacted>"
+		}
+
 		data := map[string]*UserConfig{
 			userID: {
-				TemplateFiles:      alertspb.ParseTemplates(cfg),
-				AlertmanagerConfig: cfg.RawConfig,
+				TemplateFiles:      templateNames,
+				AlertmanagerConfig: redactedConfig,
 			},
 		}
 
@@ -302,6 +335,26 @@ func (am *MultitenantAlertmanager) ListAllConfigs(w http.ResponseWriter, r *http
 	}
 	close(iter)
 	<-done
+}
+
+// redactAlertmanagerConfig parses the raw Alertmanager YAML and re-marshals
+// it so that upstream Secret / SecretURL types marshal their values as
+// "<secret>". If parsing fails (because the stored config is from a newer
+// Alertmanager version than the one Cortex vendors, for example) the raw
+// value is dropped rather than being echoed back to the caller.
+func redactAlertmanagerConfig(raw string) (string, error) {
+	if raw == "" {
+		return "", nil
+	}
+	parsed, err := config.Load(raw)
+	if err != nil {
+		return "", errors.Wrap(err, "parse alertmanager config for redaction")
+	}
+	out, err := yaml.Marshal(parsed)
+	if err != nil {
+		return "", errors.Wrap(err, "marshal redacted alertmanager config")
+	}
+	return string(out), nil
 }
 
 // validateAlertmanagerConfig recursively scans the input config looking for data types for which

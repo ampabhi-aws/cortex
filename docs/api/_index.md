@@ -444,7 +444,15 @@ Displays a web page with the ruler hash ring status, including the state, health
 GET /ruler/rule_groups
 ```
 
-List all tenant rules. This endpoint is not part of ruler-API and is always available regardless of whether ruler-API is enabled or not. It should not be exposed to end users. This endpoint returns a YAML dictionary with all the rule groups for each tenant and `200` status code on success.
+List all tenant rules. This cross-tenant admin endpoint is **disabled by
+default** and must be explicitly opted in via
+`-api.ruler-admin-api-enabled=true` (or the equivalent YAML
+`api.enable_ruler_admin_api: true`). Even when enabled it is served behind
+the authentication middleware, so an `X-Scope-OrgID` header is required.
+**The endpoint must still be blocked at the reverse proxy / gateway for
+untrusted callers.** It is not part of the ruler-API and should not be
+exposed to end users. This endpoint returns a YAML dictionary with all the
+rule groups for each tenant and `200` status code on success.
 
 ### List rules
 
@@ -684,7 +692,19 @@ Displays a web page with the current status of the Alertmanager, including the A
 GET /multitenant_alertmanager/configs
 ```
 
-List all Alertmanager configurations. This endpoint is not part of alertmanager-API and is always available regardless of whether alertmanager-API is enabled or not. It should not be exposed to end users. This endpoint returns a YAML dictionary with all the Alertmanager configurations and `200` status code on success.
+List all Alertmanager configurations. This cross-tenant admin endpoint is
+**disabled by default** and must be explicitly opted in via
+`-api.alertmanager-admin-api-enabled=true` (or the equivalent YAML
+`api.enable_alertmanager_admin_api: true`). Even when enabled it is served
+behind the authentication middleware (so an `X-Scope-OrgID` header is
+required) and the handler re-marshals every tenant's parsed configuration so
+that Prometheus `Secret` / `SecretURL` fields are rendered as `<secret>`
+instead of the raw credential; template bodies are stripped and only the
+template file names are returned. **The endpoint must still be blocked at
+the reverse proxy / gateway for untrusted callers.** It is not part of the
+alertmanager-API and should not be exposed to end users. This endpoint
+returns a YAML dictionary with all the Alertmanager configurations and
+`200` status code on success.
 
 ### Alertmanager ring status
 

@@ -48,6 +48,16 @@ type Config struct {
 	AlertmanagerHTTPPrefix string `yaml:"alertmanager_http_prefix"`
 	PrometheusHTTPPrefix   string `yaml:"prometheus_http_prefix"`
 
+	// EnableAlertmanagerAdminAPI gates the cross-tenant
+	// `GET /multitenant_alertmanager/configs` admin endpoint. It is disabled
+	// by default; even when enabled the route is served behind authentication
+	// middleware and the handler itself still enforces tenant scoping.
+	EnableAlertmanagerAdminAPI bool `yaml:"enable_alertmanager_admin_api"`
+
+	// EnableRulerAdminAPI gates the cross-tenant `GET /ruler/rule_groups`
+	// admin endpoint on the same terms as EnableAlertmanagerAdminAPI.
+	EnableRulerAdminAPI bool `yaml:"enable_ruler_admin_api"`
+
 	// The following configs are injected by the upstream caller.
 	ServerPrefix       string               `yaml:"-"`
 	LegacyHTTPPrefix   string               `yaml:"-"`
@@ -78,6 +88,8 @@ func (cfg *Config) RegisterFlags(f *flag.FlagSet) {
 func (cfg *Config) RegisterFlagsWithPrefix(prefix string, f *flag.FlagSet) {
 	f.StringVar(&cfg.AlertmanagerHTTPPrefix, prefix+"http.alertmanager-http-prefix", "/alertmanager", "HTTP URL path under which the Alertmanager ui and api will be served.")
 	f.StringVar(&cfg.PrometheusHTTPPrefix, prefix+"http.prometheus-http-prefix", "/prometheus", "HTTP URL path under which the Prometheus api will be served.")
+	f.BoolVar(&cfg.EnableAlertmanagerAdminAPI, prefix+"api.alertmanager-admin-api-enabled", false, "Enable the cross-tenant 'GET /multitenant_alertmanager/configs' admin endpoint. When disabled (default) the endpoint is not registered. When enabled the endpoint is served behind the auth middleware and the handler itself requires X-Scope-OrgID and redacts secrets. The endpoint must still be blocked at the gateway for untrusted callers.")
+	f.BoolVar(&cfg.EnableRulerAdminAPI, prefix+"api.ruler-admin-api-enabled", false, "Enable the cross-tenant 'GET /ruler/rule_groups' admin endpoint. When disabled (default) the endpoint is not registered. When enabled the endpoint is served behind the auth middleware and requires X-Scope-OrgID. The endpoint must still be blocked at the gateway for untrusted callers.")
 }
 
 // Push either wraps the distributor push function as configured or returns the distributor push directly.
@@ -187,7 +199,14 @@ func (a *API) RegisterAlertmanager(am *alertmanager.MultitenantAlertmanager, tar
 	a.indexPage.AddLink(SectionAdminEndpoints, "/multitenant_alertmanager/ring", "Alertmanager Ring Status")
 	// Ensure this route is registered before the prefixed AM route
 	a.RegisterRoute("/multitenant_alertmanager/status", am.GetStatusHandler(), false, "GET")
-	a.RegisterRoute("/multitenant_alertmanager/configs", http.HandlerFunc(am.ListAllConfigs), false, "GET")
+	// The cross-tenant Alertmanager admin configs endpoint is only registered
+	// when the operator has explicitly opted in. When registered it is served
+	// behind the auth middleware (so a tenant ID is required) and the handler
+	// itself redacts secrets and omits template bodies; see
+	// MultitenantAlertmanager.ListAllConfigs.
+	if a.cfg.EnableAlertmanagerAdminAPI {
+		a.RegisterRoute("/multitenant_alertmanager/configs", http.HandlerFunc(am.ListAllConfigs), true, "GET")
+	}
 	a.RegisterRoute("/multitenant_alertmanager/ring", http.HandlerFunc(am.RingHandler), false, "GET", "POST")
 	a.RegisterRoute("/multitenant_alertmanager/delete_tenant_config", http.HandlerFunc(am.DeleteUserConfig), true, "POST")
 
@@ -291,8 +310,12 @@ func (a *API) RegisterRuler(r *ruler.Ruler) {
 	// Legacy Ring Route
 	a.RegisterRoute("/ruler_ring", r, false, "GET", "POST")
 
-	// List all user rule groups
-	a.RegisterRoute("/ruler/rule_groups", http.HandlerFunc(r.ListAllRules), false, "GET")
+	// List all user rule groups. Only registered when explicitly opted in and
+	// always served behind the auth middleware; the handler itself requires
+	// X-Scope-OrgID. See Ruler.ListAllRules.
+	if a.cfg.EnableRulerAdminAPI {
+		a.RegisterRoute("/ruler/rule_groups", http.HandlerFunc(r.ListAllRules), true, "GET")
+	}
 
 	ruler.RegisterRulerServer(a.server.GRPC, r)
 }
