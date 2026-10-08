@@ -261,6 +261,17 @@ func validateUserConfig(logger log.Logger, cfg alertspb.AlertConfigDesc, limits 
 
 func (am *MultitenantAlertmanager) ListAllConfigs(w http.ResponseWriter, r *http.Request) {
 	logger := util_log.WithContext(r.Context(), am.logger)
+
+	// This endpoint returns every tenant's Alertmanager configuration (including
+	// inline receiver credentials) and is intended for cluster operators only.
+	// It must be explicitly opted into via -alertmanager.enable-list-all-configs
+	// so that it is not accidentally exposed on the tenant-facing listener.
+	if !am.cfg.EnableListAllConfigs {
+		level.Warn(logger).Log("msg", "refusing to serve /multitenant_alertmanager/configs: endpoint is disabled; enable it with -alertmanager.enable-list-all-configs=true and only expose it on an operator-only path")
+		http.Error(w, "the /multitenant_alertmanager/configs endpoint is disabled; set -alertmanager.enable-list-all-configs=true to enable it on operator-only paths", http.StatusNotFound)
+		return
+	}
+
 	userIDs, err := am.store.ListAllUsers(r.Context())
 	if err != nil {
 		level.Error(logger).Log("msg", "failed to list users of alertmanager", "err", err)
@@ -286,7 +297,7 @@ func (am *MultitenantAlertmanager) ListAllConfigs(w http.ResponseWriter, r *http
 		data := map[string]*UserConfig{
 			userID: {
 				TemplateFiles:      alertspb.ParseTemplates(cfg),
-				AlertmanagerConfig: cfg.RawConfig,
+				AlertmanagerConfig: redactAlertmanagerConfig(cfg.RawConfig, logger),
 			},
 		}
 
@@ -448,4 +459,104 @@ func validateVictorOpsConfig(cfg config.VictorOpsConfig) error {
 		return errVictorOpsAPIKeyFileNotAllowed
 	}
 	return nil
+}
+
+// redactedSecretValue is the placeholder written in place of inline
+// credentials when serving the admin cross-tenant config dump. It matches the
+// value used by flagext.Secret.MarshalYAML.
+const redactedSecretValue = "********"
+
+// secretKeyNames are YAML keys whose scalar values must be redacted before
+// being echoed back to an admin caller of GET /multitenant_alertmanager/configs.
+// They cover the common receiver credential and webhook fields in a tenant's
+// Alertmanager YAML (Slack, PagerDuty, OpsGenie, VictorOps, webhook, SMTP, HTTP
+// client auth). The scanner mandated this set.
+var secretKeyNames = map[string]struct{}{
+	// Slack / webhook / OpsGenie / VictorOps / PagerDuty API URLs.
+	"api_url":              {},
+	"slack_api_url":        {},
+	"opsgenie_api_url":     {},
+	"victorops_api_url":    {},
+	"pagerduty_url":        {},
+	"url":                  {},
+	"webhook_url":          {},
+	// Routing / service / API keys.
+	"api_key":              {},
+	"opsgenie_api_key":     {},
+	"victorops_api_key":    {},
+	"routing_key":          {},
+	"service_key":          {},
+	// HTTP client / SMTP / OAuth2 / generic auth secrets.
+	"auth_password":        {},
+	"auth_secret":          {},
+	"api_secret":           {},
+	"bearer_token":         {},
+	"password":             {},
+	"client_secret":        {},
+	"smtp_auth_password":   {},
+	"smtp_auth_secret":     {},
+}
+
+// redactAlertmanagerConfig parses a tenant's raw Alertmanager YAML and
+// replaces the scalar value of any key in secretKeyNames with "********" so
+// that cross-tenant admin dumps do not leak receiver credentials. If parsing
+// fails the raw config is replaced wholesale by the redacted placeholder,
+// never echoed verbatim (fail closed).
+func redactAlertmanagerConfig(raw string, logger log.Logger) string {
+	if raw == "" {
+		return raw
+	}
+	var root yaml.MapSlice
+	if err := yaml.Unmarshal([]byte(raw), &root); err != nil {
+		level.Warn(logger).Log("msg", "failed to parse alertmanager config for redaction; returning fully-redacted placeholder", "err", err)
+		return redactedSecretValue
+	}
+	redacted := redactYAMLSecrets(root).(yaml.MapSlice)
+	out, err := yaml.Marshal(redacted)
+	if err != nil {
+		level.Warn(logger).Log("msg", "failed to re-marshal redacted alertmanager config; returning fully-redacted placeholder", "err", err)
+		return redactedSecretValue
+	}
+	return string(out)
+}
+
+// redactYAMLSecrets walks a yaml.MapSlice / []interface{} tree and replaces
+// the scalar value of any key listed in secretKeyNames with the redacted
+// placeholder.
+func redactYAMLSecrets(node interface{}) interface{} {
+	switch v := node.(type) {
+	case yaml.MapSlice:
+		for i, item := range v {
+			if key, ok := item.Key.(string); ok {
+				if _, isSecret := secretKeyNames[key]; isSecret {
+					if item.Value != nil && item.Value != "" {
+						v[i].Value = redactedSecretValue
+						continue
+					}
+				}
+			}
+			v[i].Value = redactYAMLSecrets(item.Value)
+		}
+		return v
+	case []interface{}:
+		for i, item := range v {
+			v[i] = redactYAMLSecrets(item)
+		}
+		return v
+	case map[interface{}]interface{}:
+		for k, val := range v {
+			if key, ok := k.(string); ok {
+				if _, isSecret := secretKeyNames[key]; isSecret {
+					if val != nil && val != "" {
+						v[k] = redactedSecretValue
+						continue
+					}
+				}
+			}
+			v[k] = redactYAMLSecrets(val)
+		}
+		return v
+	default:
+		return v
+	}
 }

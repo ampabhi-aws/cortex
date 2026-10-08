@@ -670,6 +670,7 @@ receivers:
 	// Create the Multitenant Alertmanager.
 	reg := prometheus.NewPedanticRegistry()
 	cfg := mockAlertmanagerConfig(t)
+	cfg.EnableListAllConfigs = true
 	am, err := createMultitenantAlertmanager(cfg, nil, nil, alertStore, nil, nil, log.NewNopLogger(), reg)
 	require.NoError(t, err)
 	require.NoError(t, services.StartAndAwaitRunning(context.Background(), am))
@@ -690,9 +691,74 @@ receivers:
 	require.Equal(t, "application/yaml", resp.Header.Get("Content-Type"))
 	body, err := io.ReadAll(resp.Body)
 	require.NoError(t, err)
-	old, err := yaml.Marshal(testCases)
+	// The admin dump endpoint must redact inline receiver credentials — `url` under
+	// `webhook_configs` is one of the fields covered by secretKeyNames.
+	expected := map[string]*UserConfig{
+		"user1": {
+			AlertmanagerConfig: `
+global:
+  resolve_timeout: 5m
+route:
+  receiver: route1
+  group_by:
+  - '...'
+  continue: false
+receivers:
+- name: route1
+  webhook_configs:
+  - send_resolved: true
+    http_config: {}
+    url: '********'
+    max_alerts: 0
+`,
+		},
+		"user2": {
+			AlertmanagerConfig: `
+global:
+  resolve_timeout: 5m
+route:
+  receiver: route1
+  group_by:
+  - '...'
+  continue: false
+receivers:
+- name: route1
+  webhook_configs:
+  - send_resolved: true
+    http_config: {}
+    url: '********'
+    max_alerts: 0
+`,
+		},
+	}
+	old, err := yaml.Marshal(expected)
 	require.NoError(t, err)
 	require.YAMLEq(t, string(old), string(body))
+}
+
+// TestAMConfigListUserConfigDisabledByDefault asserts that the cross-tenant
+// admin dump endpoint is gated behind -alertmanager.enable-list-all-configs
+// and returns 404 Not Found when the flag is left at its default (false).
+func TestAMConfigListUserConfigDisabledByDefault(t *testing.T) {
+	storage := objstore.NewInMemBucket()
+	alertStore := bucketclient.NewBucketAlertStore(storage, nil, log.NewNopLogger())
+
+	reg := prometheus.NewPedanticRegistry()
+	cfg := mockAlertmanagerConfig(t)
+	// EnableListAllConfigs intentionally left at its false default.
+	am, err := createMultitenantAlertmanager(cfg, nil, nil, alertStore, nil, nil, log.NewNopLogger(), reg)
+	require.NoError(t, err)
+	require.NoError(t, services.StartAndAwaitRunning(context.Background(), am))
+	defer services.StopAndAwaitTerminated(context.Background(), am) //nolint:errcheck
+
+	router := mux.NewRouter()
+	router.Path("/multitenant_alertmanager/configs").Methods(http.MethodGet).HandlerFunc(am.ListAllConfigs)
+	req := httptest.NewRequest("GET", "https://localhost:8080/multitenant_alertmanager/configs", nil)
+	w := httptest.NewRecorder()
+	router.ServeHTTP(w, req)
+
+	resp := w.Result()
+	require.Equal(t, http.StatusNotFound, resp.StatusCode)
 }
 
 func TestValidateAlertmanagerConfig(t *testing.T) {
