@@ -16,11 +16,18 @@ import (
 	"github.com/prometheus/prometheus/config"
 	"github.com/prometheus/prometheus/discovery"
 	"github.com/prometheus/prometheus/discovery/dns"
+	"github.com/prometheus/prometheus/model/labels"
+	"github.com/prometheus/prometheus/model/relabel"
 	"github.com/prometheus/prometheus/notifier"
 
 	"github.com/cortexproject/cortex/pkg/util"
 	"github.com/cortexproject/cortex/pkg/util/tls"
 )
+
+// tenantLabel is the reserved alert label used to carry the trusted
+// (server-authored) tenant identity on the notification path. It mirrors
+// the convention used by Cortex's tenant-federation querier.
+const tenantLabel = "__tenant_id__"
 
 type NotifierConfig struct {
 	TLS       tls.ClientConfig `yaml:",inline"`
@@ -88,7 +95,16 @@ func (rn *rulerNotifier) stop() {
 
 // Builds a Prometheus config.Config from a ruler.Config with just the required
 // options to configure notifications to Alertmanager.
-func buildNotifierConfig(rulerConfig *Config) (*config.Config, error) {
+//
+// If userID is non-empty, an alert relabel rule is added that unconditionally
+// stamps the trusted tenant identifier into every outgoing alert as the
+// reserved tenantLabel, so Alertmanager receivers can rely on it for
+// provenance even when the downstream Alertmanager does not understand the
+// X-Scope-OrgID header. For every operator-configured external label, an
+// unconditional relabel is also appended, promoting operator labels from
+// upstream Prometheus' soft defaults to authoritative values that cannot be
+// shadowed by tenant-authored rule labels.
+func buildNotifierConfig(rulerConfig *Config, userID string) (*config.Config, error) {
 	amURLs := strings.Split(rulerConfig.AlertmanagerURL, ",")
 	validURLs := make([]*url.URL, 0, len(amURLs))
 
@@ -113,8 +129,17 @@ func buildNotifierConfig(rulerConfig *Config) (*config.Config, error) {
 		validURLs = append(validURLs, url)
 	}
 
+	relabels := buildAlertRelabelConfigs(rulerConfig.ExternalLabels, userID)
+
 	if len(validURLs) == 0 {
-		return &config.Config{}, nil
+		if len(relabels) == 0 {
+			return &config.Config{}, nil
+		}
+		return &config.Config{
+			AlertingConfig: config.AlertingConfig{
+				AlertRelabelConfigs: relabels,
+			},
+		}, nil
 	}
 
 	apiVersion := config.AlertmanagerAPIVersionV1
@@ -133,10 +158,49 @@ func buildNotifierConfig(rulerConfig *Config) (*config.Config, error) {
 		},
 		AlertingConfig: config.AlertingConfig{
 			AlertmanagerConfigs: amConfigs,
+			AlertRelabelConfigs: relabels,
 		},
 	}
 
 	return promConfig, nil
+}
+
+// buildAlertRelabelConfigs builds the alert relabel rules applied on the
+// notification path. The resulting list is applied in order by the vendored
+// Prometheus notifier (see Manager.relabelAlerts) and promotes
+// operator-owned labels and the trusted tenant identifier above any
+// tenant-authored rule labels, which the upstream notifier would otherwise
+// treat as winning defaults.
+func buildAlertRelabelConfigs(externalLabels []labels.Label, userID string) []*relabel.Config {
+	size := len(externalLabels)
+	if userID != "" {
+		size++
+	}
+	if size == 0 {
+		return nil
+	}
+
+	relabels := make([]*relabel.Config, 0, size)
+	for _, l := range externalLabels {
+		l := l
+		relabels = append(relabels, &relabel.Config{
+			Action:      relabel.Replace,
+			Regex:       relabel.MustNewRegexp("(.*)"),
+			TargetLabel: l.Name,
+			Replacement: l.Value,
+			Separator:   ";",
+		})
+	}
+	if userID != "" {
+		relabels = append(relabels, &relabel.Config{
+			Action:      relabel.Replace,
+			Regex:       relabel.MustNewRegexp("(.*)"),
+			TargetLabel: tenantLabel,
+			Replacement: userID,
+			Separator:   ";",
+		})
+	}
+	return relabels
 }
 
 func amConfigFromURL(rulerConfig *Config, url *url.URL, apiVersion config.AlertmanagerAPIVersion) *config.AlertmanagerConfig {

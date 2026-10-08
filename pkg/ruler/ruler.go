@@ -72,8 +72,11 @@ const (
 type Config struct {
 	// This is used for template expansion in alerts; must be a valid URL.
 	ExternalURL flagext.URLValue `yaml:"external_url"`
-	// Labels to add to all alerts
-	ExternalLabels labels.Labels `yaml:"external_labels,omitempty" doc:"nocli|description=Labels to add to all alerts."`
+	// Labels to add to all alerts. These labels are enforced on the ruler
+	// notification path via alert relabeling, so any colliding
+	// tenant-authored rule label will be overwritten with the operator value
+	// before the alert is sent. See pkg/ruler/notifier.go.
+	ExternalLabels labels.Labels `yaml:"external_labels,omitempty" doc:"nocli|description=Labels to add to all alerts. These labels are enforced via alert relabeling and will overwrite any colliding tenant-authored rule labels. The reserved label '__tenant_id__' is also always stamped with the trusted tenant identity before delivery."`
 	// GRPC Client configuration.
 	ClientTLSConfig grpcclient.Config `yaml:"ruler_client"`
 	// How frequently to evaluate rules by default.
@@ -86,6 +89,16 @@ type Config struct {
 	// URL of the Alertmanager to send notifications to.
 	// If your are configuring the ruler to send to a Cortex Alertmanager,
 	// ensure this includes any path set in the Alertmanager external URL.
+	//
+	// Security note: when serving multiple tenants, this must point at a
+	// tenant-aware Alertmanager (e.g. the Cortex Alertmanager, which routes
+	// per X-Scope-OrgID). A non-tenant-aware upstream Alertmanager treats
+	// alert labels as the sole provenance signal; the ruler mitigates label
+	// forgery by stamping the trusted tenant id into the alert payload and
+	// enforcing operator external labels via relabeling (see
+	// pkg/ruler/notifier.go), but routing/inhibition keyed only on labels
+	// still cannot distinguish tenants whose rules legitimately share the
+	// same operator-owned label values.
 	AlertmanagerURL string `yaml:"alertmanager_url"`
 	// Whether to use DNS SRV records to discover Alertmanager.
 	AlertmanagerDiscovery bool `yaml:"enable_alertmanager_discovery"`
