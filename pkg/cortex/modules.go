@@ -649,6 +649,21 @@ func (t *Cortex) initMemberlistKV() (services.Service, error) {
 	t.Cfg.MemberlistKV.Codecs = []codec.Codec{
 		ring.GetCodec(),
 	}
+	// Register the set of KV keys the Cortex components actually use. Any
+	// gossip message carrying a different key is dropped before it reaches
+	// the KV store or the Prometheus label vectors (defence against unbounded
+	// memberlist KV store growth and label-cardinality explosion from
+	// gossip-supplied keys). Values here must match the string literals used
+	// by the lifecyclers / ring consumers combined with the "collectors/"
+	// prefix configured on KVStore.RegisterFlagsWithPrefix.
+	t.Cfg.MemberlistKV.AllowedKeys = []string{
+		"collectors/" + ingester.RingKey,         // ingester lifecyclers
+		"collectors/" + storegateway.RingKey,     // store-gateway lifecyclers
+		"collectors/alertmanager",                // alertmanager sharding ring
+		"collectors/compactor",                   // compactor sharding ring
+		"collectors/ring",                        // ruler sharding ring (ringKey = "ring")
+		"collectors/distributor",                 // distributor ring
+	}
 	dnsProviderReg := prometheus.WrapRegistererWithPrefix(
 		"cortex_",
 		prometheus.WrapRegistererWith(
