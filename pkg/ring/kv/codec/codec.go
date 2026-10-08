@@ -1,9 +1,20 @@
 package codec
 
 import (
+	"fmt"
+
 	"github.com/gogo/protobuf/proto"
 	"github.com/golang/snappy"
 )
+
+// maxDecodedProtoSize bounds the size (in bytes) of the buffer we are willing to
+// allocate while decompressing a snappy-encoded KV payload. snappy allocates
+// make([]byte, dLen) using the attacker-declared varint length BEFORE the body
+// is validated, so without this guard a tiny packet can request a multi-GiB
+// allocation. Legitimate ring descriptors are far smaller than 128 MiB, so this
+// gives generous headroom while keeping the attacker-controlled allocation
+// bounded.
+const maxDecodedProtoSize = 128 * 1024 * 1024
 
 // Codec allows KV clients to serialise and deserialise values.
 type Codec interface {
@@ -32,7 +43,18 @@ func (p Proto) CodecID() string {
 // Decode implements Codec
 func (p Proto) Decode(bytes []byte) (interface{}, error) {
 	out := p.factory()
-	bytes, err := snappy.Decode(nil, bytes)
+	// snappy.Decode allocates a destination buffer sized by the attacker-declared
+	// varint length in the compressed stream before any body validation. Pre-check
+	// the declared length so a malicious peer cannot drive us into a multi-GiB
+	// allocation with a tiny input.
+	dLen, err := snappy.DecodedLen(bytes)
+	if err != nil {
+		return nil, err
+	}
+	if dLen < 0 || dLen > maxDecodedProtoSize {
+		return nil, fmt.Errorf("snappy-decoded value too large: %d bytes (max %d)", dLen, maxDecodedProtoSize)
+	}
+	bytes, err = snappy.Decode(nil, bytes)
 	if err != nil {
 		return nil, err
 	}

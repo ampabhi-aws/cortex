@@ -35,6 +35,18 @@ const (
 
 const zeroZeroZeroZero = "0.0.0.0"
 
+// defaultMaxPacketSize is the maximum number of bytes we will buffer per incoming
+// "packet" TCP connection before giving up. It is set well above UDPBufferSize
+// (10 MiB, see memberlist_client.go) that the sender uses, so legitimate
+// memberlist packets fit comfortably while attacker-driven unbounded reads are
+// rejected before they can exhaust memory, FDs or goroutines.
+const defaultMaxPacketSize = 10*1024*1024 + 4*1024
+
+// defaultPacketReadTimeout caps how long we wait on a single inbound "packet"
+// connection before closing it. This prevents a stalled or half-open connection
+// from pinning a goroutine, FD and buffer indefinitely.
+const defaultPacketReadTimeout = 30 * time.Second
+
 // TCPTransportConfig is a configuration structure for creating new TCPTransport.
 type TCPTransportConfig struct {
 	// BindAddrs is a list of addresses to bind to.
@@ -49,6 +61,17 @@ type TCPTransportConfig struct {
 
 	// Timeout for writing packet data. Zero = no timeout.
 	PacketWriteTimeout time.Duration `yaml:"packet_write_timeout"`
+
+	// Timeout for reading inbound packet data. Zero disables the deadline and
+	// lets slow/malicious peers hold goroutines and FDs indefinitely, so leaving
+	// this at zero is NOT recommended on untrusted networks.
+	PacketReadTimeout time.Duration `yaml:"packet_read_timeout"`
+
+	// Maximum size, in bytes, of a single inbound "packet" message (including
+	// the memberlist header and MD5 trailer). Must be larger than
+	// memberlist's UDPBufferSize to accommodate the largest legitimate packet.
+	// Zero means unlimited, which is NOT recommended.
+	MaxPacketSize int `yaml:"max_packet_size"`
 
 	// Transport logs lot of messages at debug level, so it deserves an extra flag for turning it on
 	TransportDebug bool `yaml:"-"`
@@ -72,6 +95,8 @@ func (cfg *TCPTransportConfig) RegisterFlagsWithPrefix(f *flag.FlagSet, prefix s
 	f.IntVar(&cfg.BindPort, prefix+"memberlist.bind-port", 7946, "Port to listen on for gossip messages.")
 	f.DurationVar(&cfg.PacketDialTimeout, prefix+"memberlist.packet-dial-timeout", 5*time.Second, "Timeout used when connecting to other nodes to send packet.")
 	f.DurationVar(&cfg.PacketWriteTimeout, prefix+"memberlist.packet-write-timeout", 5*time.Second, "Timeout for writing 'packet' data.")
+	f.DurationVar(&cfg.PacketReadTimeout, prefix+"memberlist.packet-read-timeout", defaultPacketReadTimeout, "Timeout for reading inbound 'packet' data. Zero disables the deadline, which is not recommended on untrusted networks because stalled peers can leak goroutines and file descriptors.")
+	f.IntVar(&cfg.MaxPacketSize, prefix+"memberlist.max-packet-size", defaultMaxPacketSize, "Maximum size, in bytes, of a single inbound 'packet' message (including the header and MD5 trailer). Oversized packets are rejected. Zero disables the limit, which is not recommended.")
 	f.BoolVar(&cfg.TransportDebug, prefix+"memberlist.transport-debug", false, "Log debug transport messages. Note: global log.level must be at debug level as well.")
 
 	f.BoolVar(&cfg.TLSEnabled, prefix+"memberlist.tls-enabled", false, "Enable TLS on the memberlist transport layer.")
@@ -245,6 +270,17 @@ func (t *TCPTransport) handleConnection(conn net.Conn) {
 		}
 	}()
 
+	// Apply a read deadline up-front so stalled or half-open connections cannot
+	// pin goroutines, FDs and buffers forever. For "stream" connections we clear
+	// the deadline below before handing the connection over to memberlist, which
+	// manages its own timeouts.
+	if t.cfg.PacketReadTimeout > 0 {
+		if err := conn.SetReadDeadline(time.Now().Add(t.cfg.PacketReadTimeout)); err != nil {
+			level.Warn(t.logger).Log("msg", "failed to set read deadline", "err", err, "remote", conn.RemoteAddr())
+			return
+		}
+	}
+
 	// let's read first byte, and determine what to do about this connection
 	msgType := []byte{0}
 	_, err := io.ReadFull(conn, msgType)
@@ -255,6 +291,15 @@ func (t *TCPTransport) handleConnection(conn net.Conn) {
 
 	if messageType(msgType[0]) == stream {
 		t.incomingStreams.Inc()
+
+		// Clear the read deadline we installed above: memberlist takes ownership of
+		// the connection and will manage its own deadlines for stream traffic.
+		if t.cfg.PacketReadTimeout > 0 {
+			if err := conn.SetReadDeadline(time.Time{}); err != nil {
+				level.Warn(t.logger).Log("msg", "failed to clear read deadline", "err", err, "remote", conn.RemoteAddr())
+				return
+			}
+		}
 
 		// hand over this connection to memberlist
 		closeConn = false
@@ -280,11 +325,24 @@ func (t *TCPTransport) handleConnection(conn net.Conn) {
 			return
 		}
 
-		// read the rest to buffer -- this is the "packet" itself
-		buf, err := io.ReadAll(conn)
+		// read the rest to buffer -- this is the "packet" itself. We cap the number
+		// of bytes we are willing to buffer so a malicious peer cannot drive us
+		// into an OOM by streaming an unbounded amount of data into io.ReadAll.
+		var reader io.Reader = conn
+		if t.cfg.MaxPacketSize > 0 {
+			// Allow one extra byte so we can detect oversize packets rather than
+			// silently truncating them.
+			reader = io.LimitReader(conn, int64(t.cfg.MaxPacketSize)+1)
+		}
+		buf, err := io.ReadAll(reader)
 		if err != nil {
 			t.receivedPacketsErrors.Inc()
 			level.Warn(t.logger).Log("msg", "error while reading packet data", "err", err, "remote", conn.RemoteAddr())
+			return
+		}
+		if t.cfg.MaxPacketSize > 0 && len(buf) > t.cfg.MaxPacketSize {
+			t.receivedPacketsErrors.Inc()
+			level.Warn(t.logger).Log("msg", "packet exceeds max size, dropping", "max_packet_size", t.cfg.MaxPacketSize, "remote", conn.RemoteAddr())
 			return
 		}
 
