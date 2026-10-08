@@ -747,6 +747,25 @@ func (am *MultitenantAlertmanager) loadAlertmanagerConfigs(ctx context.Context) 
 		return nil, nil, errors.Wrapf(err, "failed to load alertmanager configurations for owned users")
 	}
 
+	// Skip configs that are already stored but exceed the per-tenant limit (or
+	// the hard ceiling if the per-tenant limit is unset / larger than the
+	// ceiling). Without this check, a config that was persisted before the limit
+	// was tightened — or that is simply too large to parse — would be fetched,
+	// parsed and written to disk on every sync poll by every replica that owns
+	// the tenant, crash-looping the Alertmanager process.
+	if am.limits != nil {
+		for userID, cfg := range configs {
+			maxConfigSize := am.limits.AlertmanagerMaxConfigSize(userID)
+			if maxConfigSize <= 0 || maxConfigSize > defaultMaxConfigSize {
+				maxConfigSize = defaultMaxConfigSize
+			}
+			if size := alertConfigSize(cfg); size > maxConfigSize {
+				level.Warn(am.logger).Log("msg", "skipping stored Alertmanager configuration that exceeds the configured size limit; delete or shrink it to re-enable the tenant", "user", userID, "size", size, "limit", maxConfigSize)
+				delete(configs, userID)
+			}
+		}
+	}
+
 	am.tenantsDiscovered.Set(float64(numUsersDiscovered))
 	am.tenantsOwned.Set(float64(numUsersOwned))
 	return allUserIDs, configs, nil
@@ -1356,4 +1375,22 @@ func storeTemplateFile(templateFilepath, content string) (bool, error) {
 	}
 
 	return true, nil
+}
+
+// alertConfigSize returns the approximate serialized size (in bytes) of the
+// user-facing representation of the given stored alert config. It is the sum
+// of the raw YAML config plus every template body, which mirrors the quantity
+// bounded by SetUserConfig at ingestion time. Keeping the two sides consistent
+// ensures that a config accepted by the API never fails the read-side limit,
+// and that an oversized config already in the store can be skipped before it
+// is parsed and before any template file is written to the data directory.
+func alertConfigSize(cfg alertspb.AlertConfigDesc) int {
+	size := len(cfg.RawConfig)
+	for _, tmpl := range cfg.Templates {
+		if tmpl == nil {
+			continue
+		}
+		size += len(tmpl.GetBody()) + len(tmpl.GetFilename())
+	}
+	return size
 }
