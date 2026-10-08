@@ -863,6 +863,16 @@ func (r *Ruler) DeleteTenantConfiguration(w http.ResponseWriter, req *http.Reque
 func (r *Ruler) ListAllRules(w http.ResponseWriter, req *http.Request) {
 	logger := util_log.WithContext(req.Context(), r.logger)
 
+	// This cross-tenant admin endpoint discloses every tenant's rule groups.
+	// Require a tenant ID in the request context so the endpoint cannot be
+	// reached completely unauthenticated when it is enabled, mirroring the
+	// Alertmanager admin endpoint.
+	if _, err := tenant.TenantID(req.Context()); err != nil {
+		level.Warn(logger).Log("msg", "unable to determine the OrgID", "err", err.Error())
+		http.Error(w, fmt.Sprintf("unable to determine the OrgID: %s", err.Error()), http.StatusUnauthorized)
+		return
+	}
+
 	userIDs, err := r.store.ListAllUsers(req.Context())
 	if err != nil {
 		level.Error(logger).Log("msg", errListAllUser, "err", err)

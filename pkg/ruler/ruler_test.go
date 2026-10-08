@@ -1108,7 +1108,7 @@ func TestRuler_ListAllRules(t *testing.T) {
 	router := mux.NewRouter()
 	router.Path("/ruler/rule_groups").Methods(http.MethodGet).HandlerFunc(r.ListAllRules)
 
-	req := requestFor(t, http.MethodGet, "https://localhost:8080/ruler/rule_groups", nil, "")
+	req := requestFor(t, http.MethodGet, "https://localhost:8080/ruler/rule_groups", nil, "admin")
 	w := httptest.NewRecorder()
 	router.ServeHTTP(w, req)
 
@@ -1133,6 +1133,12 @@ func TestRuler_ListAllRules(t *testing.T) {
 	expectedResponse, err := yaml.Marshal(gs)
 	require.NoError(t, err)
 	require.YAMLEq(t, string(expectedResponse), string(body))
+
+	// Without X-Scope-OrgID the admin endpoint must reject the request.
+	reqNoAuth := httptest.NewRequest(http.MethodGet, "https://localhost:8080/ruler/rule_groups", nil)
+	wNoAuth := httptest.NewRecorder()
+	router.ServeHTTP(wNoAuth, reqNoAuth)
+	require.Equal(t, http.StatusUnauthorized, wNoAuth.Result().StatusCode)
 }
 
 type senderFunc func(alerts ...*notifier.Alert)
