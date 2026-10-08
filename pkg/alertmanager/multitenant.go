@@ -25,6 +25,8 @@ import (
 	"github.com/weaveworks/common/httpgrpc/server"
 	"github.com/weaveworks/common/user"
 	"golang.org/x/time/rate"
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/status"
 
 	"github.com/cortexproject/cortex/pkg/alertmanager/alertmanagerpb"
 	"github.com/cortexproject/cortex/pkg/alertmanager/alertspb"
@@ -992,7 +994,7 @@ func (am *MultitenantAlertmanager) ServeHTTP(w http.ResponseWriter, req *http.Re
 		return
 	}
 
-	if am.cfg.ShardingEnabled && am.distributor.IsPathSupported(req.URL.Path) {
+	if am.cfg.ShardingEnabled && am.distributor != nil && am.distributor.IsPathSupported(req.URL.Path) {
 		am.distributor.DistributeRequest(w, req)
 		return
 	}
@@ -1004,6 +1006,11 @@ func (am *MultitenantAlertmanager) ServeHTTP(w http.ResponseWriter, req *http.Re
 
 // HandleRequest implements gRPC Alertmanager service, which receives request from AlertManager-Distributor.
 func (am *MultitenantAlertmanager) HandleRequest(ctx context.Context, in *httpgrpc.HTTPRequest) (*httpgrpc.HTTPResponse, error) {
+	// am.grpcServer is only initialised when sharding is enabled. Reject the RPC with a
+	// proper gRPC error instead of dereferencing a nil pointer and crashing the process.
+	if am.grpcServer == nil {
+		return nil, status.Error(codes.FailedPrecondition, "alertmanager sharding is not enabled")
+	}
 	return am.grpcServer.Handle(ctx, in)
 }
 
