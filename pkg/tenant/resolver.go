@@ -83,6 +83,12 @@ func (t *SingleResolver) TenantID(ctx context.Context) (string, error) {
 		return "", err
 	}
 
+	// Reject an empty tenant ID. This additionally covers the case where the
+	// upstream gRPC extractor accepts an empty x-scope-orgid metadata value.
+	if id == "" {
+		return "", errInvalidTenantID
+	}
+
 	if containsUnsafePathSegments(id) {
 		return "", errInvalidTenantID
 	}
@@ -131,6 +137,9 @@ func (t *MultiResolver) TenantIDs(ctx context.Context) ([]string, error) {
 
 	orgIDs := strings.Split(orgID, tenantIDsLabelSeparator)
 	for _, orgID := range orgIDs {
+		// ValidTenantID rejects an empty element so that a header value like "a|"
+		// (which splits to ["a", ""]) or "|" (which splits to ["", ""]) is rejected
+		// outright instead of being silently normalised away.
 		if err := ValidTenantID(orgID); err != nil {
 			return nil, err
 		}
@@ -139,7 +148,12 @@ func (t *MultiResolver) TenantIDs(ctx context.Context) ([]string, error) {
 		}
 	}
 
-	return NormalizeTenantIDs(orgIDs), nil
+	orgIDs = NormalizeTenantIDs(orgIDs)
+	if len(orgIDs) == 0 {
+		return nil, errInvalidTenantID
+	}
+
+	return orgIDs, nil
 }
 
 // ExtractTenantIDFromHTTPRequest extracts a single TenantID through a given
