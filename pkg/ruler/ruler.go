@@ -863,6 +863,18 @@ func (r *Ruler) DeleteTenantConfiguration(w http.ResponseWriter, req *http.Reque
 func (r *Ruler) ListAllRules(w http.ResponseWriter, req *http.Request) {
 	logger := util_log.WithContext(req.Context(), r.logger)
 
+	// Fail closed if the request has no tenant ID in context. The route is
+	// expected to be registered behind the auth middleware (see
+	// pkg/api/api.go, gated by api.enable-admin-endpoints), so a missing
+	// tenant indicates the admin endpoint has been exposed without
+	// authentication. Returning StatusUnauthorized here matches the auth
+	// middleware's behaviour (see DeleteTenantConfiguration) and prevents a
+	// cross-tenant rule-group dump when the handler is reached directly.
+	if _, err := tenant.TenantID(req.Context()); err != nil {
+		http.Error(w, err.Error(), http.StatusUnauthorized)
+		return
+	}
+
 	userIDs, err := r.store.ListAllUsers(req.Context())
 	if err != nil {
 		level.Error(logger).Log("msg", errListAllUser, "err", err)

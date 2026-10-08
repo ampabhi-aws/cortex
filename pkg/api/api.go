@@ -48,6 +48,14 @@ type Config struct {
 	AlertmanagerHTTPPrefix string `yaml:"alertmanager_http_prefix"`
 	PrometheusHTTPPrefix   string `yaml:"prometheus_http_prefix"`
 
+	// EnableAdminEndpoints, when true, registers administrative/debug endpoints
+	// that disclose cross-tenant data (for example GET /ruler/rule_groups) on
+	// the HTTP listener. Defaults to false so that these endpoints are not
+	// reachable from the tenant-facing listener unless an operator explicitly
+	// opts in. When enabled, the endpoints are also wrapped by the auth
+	// middleware so that a tenant ID is required.
+	EnableAdminEndpoints bool `yaml:"enable_admin_endpoints"`
+
 	// The following configs are injected by the upstream caller.
 	ServerPrefix       string               `yaml:"-"`
 	LegacyHTTPPrefix   string               `yaml:"-"`
@@ -71,6 +79,7 @@ type Config struct {
 func (cfg *Config) RegisterFlags(f *flag.FlagSet) {
 	f.BoolVar(&cfg.ResponseCompression, "api.response-compression-enabled", false, "Use GZIP compression for API responses. Some endpoints serve large YAML or JSON blobs which can benefit from compression.")
 	f.Var(&cfg.HTTPRequestHeadersToLog, "api.http-request-headers-to-log", "Which HTTP Request headers to add to logs")
+	f.BoolVar(&cfg.EnableAdminEndpoints, "api.enable-admin-endpoints", false, "Register administrative/debug endpoints that may expose cross-tenant data (for example GET /ruler/rule_groups). Disabled by default; these endpoints must only be reachable from an operator-controlled listener.")
 	cfg.RegisterFlagsWithPrefix("", f)
 }
 
@@ -291,8 +300,16 @@ func (a *API) RegisterRuler(r *ruler.Ruler) {
 	// Legacy Ring Route
 	a.RegisterRoute("/ruler_ring", r, false, "GET", "POST")
 
-	// List all user rule groups
-	a.RegisterRoute("/ruler/rule_groups", http.HandlerFunc(r.ListAllRules), false, "GET")
+	// List all user rule groups. This endpoint discloses the complete rule
+	// configuration of every tenant and must never be reachable from the
+	// tenant-facing listener. It is only registered when the operator opts in
+	// via -api.enable-admin-endpoints, and then only behind the auth
+	// middleware so that a tenant ID is required. The handler itself fails
+	// closed when no tenant ID is present in the request context (see
+	// ruler.ListAllRules).
+	if a.cfg.EnableAdminEndpoints {
+		a.RegisterRoute("/ruler/rule_groups", http.HandlerFunc(r.ListAllRules), true, "GET")
+	}
 
 	ruler.RegisterRulerServer(a.server.GRPC, r)
 }

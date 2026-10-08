@@ -1108,7 +1108,10 @@ func TestRuler_ListAllRules(t *testing.T) {
 	router := mux.NewRouter()
 	router.Path("/ruler/rule_groups").Methods(http.MethodGet).HandlerFunc(r.ListAllRules)
 
-	req := requestFor(t, http.MethodGet, "https://localhost:8080/ruler/rule_groups", nil, "")
+	// ListAllRules now fails closed unless a tenant ID is in the request context
+	// (the route is expected to run behind the auth middleware). Inject a tenant
+	// so the handler proceeds to return the full set of rule groups.
+	req := requestFor(t, http.MethodGet, "https://localhost:8080/ruler/rule_groups", nil, "user1")
 	w := httptest.NewRecorder()
 	router.ServeHTTP(w, req)
 
