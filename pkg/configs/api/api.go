@@ -20,6 +20,7 @@ import (
 	amconfig "github.com/prometheus/alertmanager/config"
 	amtemplate "github.com/prometheus/alertmanager/template"
 
+	"github.com/cortexproject/cortex/pkg/alertmanager"
 	"github.com/cortexproject/cortex/pkg/configs/db"
 	"github.com/cortexproject/cortex/pkg/configs/userconfig"
 	"github.com/cortexproject/cortex/pkg/tenant"
@@ -227,6 +228,16 @@ func (a *API) validateAlertmanagerConfig(w http.ResponseWriter, r *http.Request)
 func validateAlertmanagerConfig(cfg string, noCfg NotificationsConfig) error {
 	amCfg, err := amconfig.Load(cfg)
 	if err != nil {
+		return err
+	}
+
+	// Apply the same receiver file-option blocklist used by the bucket-store
+	// write path (pkg/alertmanager/api.go). Without this check, a tenant can
+	// upload a config with eg. tls_config.ca_file pointing at an unreadable
+	// path, which passes ingestion but later fails inside
+	// Alertmanager.ApplyConfig when buildIntegrationsMap tries to load the
+	// file, silently disabling alert dispatch for that tenant.
+	if err := alertmanager.ValidateAlertmanagerConfig(amCfg); err != nil {
 		return err
 	}
 

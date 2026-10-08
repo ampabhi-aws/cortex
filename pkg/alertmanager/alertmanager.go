@@ -262,6 +262,12 @@ func New(cfg *Config, reg *prometheus.Registry) (*Alertmanager, error) {
 		Registry: am.registry,
 		Logger:   log.With(am.logger, "component", "api"),
 		GroupFunc: func(f1 func(*dispatch.Route) bool, f2 func(*types.Alert, time.Time) bool) (dispatch.AlertGroups, map[model.Fingerprint][]string) {
+			// ApplyConfig may not have run yet (or may have failed before creating
+			// the dispatcher). Guard against a nil dispatcher so that handlers that
+			// call GroupFunc (eg. GET <prefix>/api/v2/alerts/groups) do not panic.
+			if am.dispatcher == nil {
+				return dispatch.AlertGroups{}, map[model.Fingerprint][]string{}
+			}
 			return am.dispatcher.Groups(f1, f2)
 		},
 	})
@@ -309,6 +315,13 @@ func clusterWait(position func() int, timeout time.Duration) func() time.Duratio
 }
 
 // ApplyConfig applies a new configuration to an Alertmanager.
+//
+// All fallible work (template parsing, building the integrations map) is
+// performed BEFORE any mutation of the Alertmanager state. On failure we
+// return the error and leave the previous inhibitor/dispatcher/pipeline
+// running untouched, so callers (eg. MultitenantAlertmanager.setConfig) can
+// keep the last-known-good config and surface the reload failure through
+// cortex_alertmanager_config_last_reload_successful.
 func (am *Alertmanager) ApplyConfig(userID string, conf *config.Config, rawCfg string) error {
 	templateFiles := make([]string, len(conf.Templates))
 	for i, t := range conf.Templates {
@@ -326,20 +339,6 @@ func (am *Alertmanager) ApplyConfig(userID string, conf *config.Config, rawCfg s
 	}
 	tmpl.ExternalURL = am.cfg.ExternalURL
 
-	am.api.Update(conf, func(_ model.LabelSet) {})
-
-	// Ensure inhibitor is set before being called
-	if am.inhibitor != nil {
-		am.inhibitor.Stop()
-	}
-
-	// Ensure dispatcher is set before being called
-	if am.dispatcher != nil {
-		am.dispatcher.Stop()
-	}
-
-	am.inhibitor = inhibit.NewInhibitor(am.alerts, conf.InhibitRules, am.marker, log.With(am.logger, "component", "inhibitor"))
-
 	waitFunc := clusterWait(am.state.Position, am.cfg.PeerTimeout)
 
 	timeoutFunc := func(d time.Duration) time.Duration {
@@ -352,6 +351,11 @@ func (am *Alertmanager) ApplyConfig(userID string, conf *config.Config, rawCfg s
 	// Create a firewall binded to the per-tenant config.
 	firewallDialer := util_net.NewFirewallDialer(newFirewallDialerConfigProvider(userID, am.cfg.Limits))
 
+	// Build the integrations map BEFORE mutating any existing state. If this
+	// fails (eg. a receiver references an unreadable TLS file) we must return
+	// the error so the previous pipeline stays active and the caller records
+	// the reload as unsuccessful; silently returning nil here would leave the
+	// tenant with no dispatcher but a "last reload successful" metric of 1.
 	integrationsMap, err := buildIntegrationsMap(conf.Receivers, tmpl, firewallDialer, am.logger, func(integrationName string, notifier notify.Notifier) notify.Notifier {
 		if am.cfg.Limits != nil {
 			rl := &tenantRateLimits{
@@ -365,13 +369,28 @@ func (am *Alertmanager) ApplyConfig(userID string, conf *config.Config, rawCfg s
 		return notifier
 	})
 	if err != nil {
-		return nil
+		return errors.Wrap(err, "failed to build integrations map")
 	}
 
 	muteTimes := make(map[string][]timeinterval.TimeInterval, len(conf.MuteTimeIntervals))
 	for _, ti := range conf.MuteTimeIntervals {
 		muteTimes[ti.Name] = ti.TimeIntervals
 	}
+
+	// All fallible work has succeeded. From here on we mutate the Alertmanager.
+	am.api.Update(conf, func(_ model.LabelSet) {})
+
+	// Ensure inhibitor is set before being called
+	if am.inhibitor != nil {
+		am.inhibitor.Stop()
+	}
+
+	// Ensure dispatcher is set before being called
+	if am.dispatcher != nil {
+		am.dispatcher.Stop()
+	}
+
+	am.inhibitor = inhibit.NewInhibitor(am.alerts, conf.InhibitRules, am.marker, log.With(am.logger, "component", "inhibitor"))
 
 	pipeline := am.pipelineBuilder.New(
 		integrationsMap,

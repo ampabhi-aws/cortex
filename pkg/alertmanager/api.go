@@ -304,6 +304,19 @@ func (am *MultitenantAlertmanager) ListAllConfigs(w http.ResponseWriter, r *http
 	<-done
 }
 
+// ValidateAlertmanagerConfig applies the Cortex receiver file-option
+// blocklist to a loaded Alertmanager configuration. It rejects any
+// receiver/global HTTP config that references on-disk credential or TLS
+// files (ca_file, cert_file, key_file, password_file, bearer_token_file,
+// credentials_file, oauth2 client_secret_file, slack api_url_file,
+// victorops api_key_file). Exposed so callers outside this package (eg.
+// the legacy configdb ingestion path) can run the same validation at
+// ingestion time instead of surfacing the error much later as a silent
+// integration-build failure.
+func ValidateAlertmanagerConfig(cfg interface{}) error {
+	return validateAlertmanagerConfig(cfg)
+}
+
 // validateAlertmanagerConfig recursively scans the input config looking for data types for which
 // we have a specific validation and, whenever encountered, it runs their validation. Returns the
 // first error or nil if validation succeeds.

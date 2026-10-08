@@ -294,9 +294,19 @@ func NewMultitenantAlertmanager(cfg *MultitenantAlertmanagerConfig, store alerts
 		if err != nil {
 			return nil, fmt.Errorf("unable to read fallback config %q: %s", cfg.FallbackConfigFile, err)
 		}
-		_, err = amconfig.LoadFile(cfg.FallbackConfigFile)
+		loadedFallback, err := amconfig.LoadFile(cfg.FallbackConfigFile)
 		if err != nil {
 			return nil, fmt.Errorf("unable to load fallback config %q: %s", cfg.FallbackConfigFile, err)
+		}
+		// Apply the same receiver file-option blocklist used by the alertmanager
+		// API (pkg/alertmanager/api.go) to the operator-supplied fallback
+		// config. Without this check, a fallback referencing an unreadable
+		// tls_config.ca_file (or bearer_token_file, etc.) would pass startup
+		// validation and then fail at integration-build time for every
+		// fallback-provisioned tenant, silently disabling their alert
+		// dispatch.
+		if err := validateAlertmanagerConfig(loadedFallback); err != nil {
+			return nil, fmt.Errorf("invalid fallback config %q: %s", cfg.FallbackConfigFile, err)
 		}
 	}
 
@@ -871,6 +881,18 @@ func (am *MultitenantAlertmanager) setConfig(cfg alertspb.AlertConfigDesc) error
 			// they submit a broken one, the Manager will keep running the last known
 			// working configuration.
 			return fmt.Errorf("invalid Cortex configuration for %v: %v", cfg.User, err)
+		}
+	}
+
+	// Apply the receiver file-option blocklist (the same one enforced by the
+	// alertmanager API in pkg/alertmanager/api.go) to configs loaded here.
+	// Not every ingestion path validates file options (eg. the legacy
+	// configdb store), so configs that would fail at integration-build time
+	// (and thus silently disable dispatch) are rejected here before we touch
+	// the running Alertmanager.
+	if userAmConfig != nil {
+		if err := validateAlertmanagerConfig(userAmConfig); err != nil {
+			return fmt.Errorf("invalid Cortex alertmanager config for %v: %v", cfg.User, err)
 		}
 	}
 
