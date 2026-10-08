@@ -14,7 +14,16 @@ type PrefixedBucketClient struct {
 }
 
 // NewPrefixedBucketClient returns a new PrefixedBucketClient.
+//
+// The prefix must be non-empty: an empty prefix would make the client write
+// to the bucket root which is the shared namespace parent of all per-tenant
+// prefixes and could therefore leak or clobber other tenants' data. Callers
+// should ensure a non-empty prefix (for tenant prefixes this is enforced via
+// ValidTenantID); we panic as a last-resort defence against misuse.
 func NewPrefixedBucketClient(bucket objstore.Bucket, prefix string) *PrefixedBucketClient {
+	if prefix == "" {
+		panic("bucket.NewPrefixedBucketClient: empty prefix")
+	}
 	return &PrefixedBucketClient{
 		bucket: bucket,
 		prefix: prefix,

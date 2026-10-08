@@ -1756,6 +1756,17 @@ func (i *Ingester) getTSDBUsers() []string {
 }
 
 func (i *Ingester) getOrCreateTSDB(userID string, force bool) (*userTSDB, error) {
+	// Reject empty tenant IDs defensively. Normally this is already blocked
+	// by tenant.ValidTenantID at the auth boundary, but a defence-in-depth
+	// check here guarantees we never open a TSDB on the shared root
+	// directory (BlocksDir("") == cfg.Dir), which would allow an attacker
+	// controlling the x-scope-orgid header to open a Prometheus TSDB over
+	// every tenant's data and (if close-idle-tsdb-timeout is positive) have
+	// it later deleted via os.RemoveAll.
+	if userID == "" {
+		return nil, errors.New("empty tenant ID")
+	}
+
 	db := i.getTSDB(userID)
 	if db != nil {
 		return db, nil
@@ -2303,6 +2314,17 @@ func (i *Ingester) closeAndDeleteUserTSDBIfIdle(userID string) tsdbCloseCheckRes
 	i.TSDBState.seriesCount.Sub(int64(userDB.Head().NumSeries()))
 
 	dir := userDB.db.Dir()
+
+	// Defence-in-depth: refuse to delete anything that is not strictly below
+	// the configured TSDB root. If a logic bug or auth bypass ever lets a
+	// userTSDB be created with an empty (or otherwise root-collapsing) userID,
+	// userDB.db.Dir() would equal cfg.BlocksStorageConfig.TSDB.Dir and the
+	// subsequent os.RemoveAll would wipe every tenant's local TSDB on this
+	// ingester. Fail fast in that case instead.
+	if dir == "" || dir == i.cfg.BlocksStorageConfig.TSDB.Dir {
+		level.Error(i.logger).Log("msg", "refusing to delete local TSDB whose directory is not strictly below the configured TSDB root", "user", userID, "dir", dir, "tsdb_root", i.cfg.BlocksStorageConfig.TSDB.Dir)
+		return tsdbDataRemovalFailed
+	}
 
 	if err := userDB.Close(); err != nil {
 		level.Error(i.logger).Log("msg", "failed to close idle TSDB", "user", userID, "err", err)
