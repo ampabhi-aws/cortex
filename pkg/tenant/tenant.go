@@ -11,8 +11,12 @@ import (
 )
 
 var (
+	errTenantIDEmpty   = errors.New("tenant ID is empty")
 	errTenantIDTooLong = errors.New("tenant ID is too long: max 150 characters")
 )
+
+// MaxTenantIDLength is the maximum allowed length of a tenant ID.
+const MaxTenantIDLength = 150
 
 type errTenantIDUnsupportedCharacter struct {
 	pos      int
@@ -49,8 +53,21 @@ func NormalizeTenantIDs(tenantIDs []string) []string {
 	return tenantIDs[0:posOut]
 }
 
-// ValidTenantID
+// ValidTenantID returns an error if the given string is not a valid tenant ID.
+// An empty tenant ID is rejected because downstream code uses tenant IDs as
+// filesystem/object-storage path segments; the empty value would collapse the
+// per-tenant sandbox onto the shared root.
 func ValidTenantID(s string) error {
+	// reject empty tenant IDs so that no tenant-scoped resource can escape its
+	// per-tenant sandbox by resolving to the shared parent prefix/directory.
+	if len(s) == 0 {
+		return errTenantIDEmpty
+	}
+
+	if len(s) > MaxTenantIDLength {
+		return errTenantIDTooLong
+	}
+
 	// check if it contains invalid runes
 	for pos, r := range s {
 		if !isSupported(r) {
@@ -59,10 +76,6 @@ func ValidTenantID(s string) error {
 				pos:      pos,
 			}
 		}
-	}
-
-	if len(s) > 150 {
-		return errTenantIDTooLong
 	}
 
 	return nil
