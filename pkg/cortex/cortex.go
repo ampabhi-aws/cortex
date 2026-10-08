@@ -18,6 +18,7 @@ import (
 	prom_storage "github.com/prometheus/prometheus/storage"
 	"github.com/weaveworks/common/server"
 	"github.com/weaveworks/common/signals"
+	"google.golang.org/grpc"
 	"google.golang.org/grpc/health/grpc_health_v1"
 	"gopkg.in/yaml.v2"
 
@@ -353,6 +354,7 @@ func New(cfg Config) (*Cortex, error) {
 		Cfg: cfg,
 	}
 
+	cortex.setupPanicRecovery()
 	cortex.setupThanosTracing()
 	cortex.setupGRPCHeaderForwarding()
 
@@ -361,6 +363,16 @@ func New(cfg Config) (*Cortex, error) {
 	}
 
 	return cortex, nil
+}
+
+// setupPanicRecovery prepends gRPC middleware that recovers panics raised in
+// any downstream handler. grpc-go does not recover handler panics, so without
+// this a single bad request (e.g. a nil-pointer dereference inside a handler)
+// would terminate the whole Cortex process. Must be installed before the
+// other gRPC interceptors so it also covers them.
+func (t *Cortex) setupPanicRecovery() {
+	t.Cfg.Server.GRPCMiddleware = append([]grpc.UnaryServerInterceptor{GRPCPanicRecoveryUnaryInterceptor}, t.Cfg.Server.GRPCMiddleware...)
+	t.Cfg.Server.GRPCStreamMiddleware = append([]grpc.StreamServerInterceptor{GRPCPanicRecoveryStreamInterceptor}, t.Cfg.Server.GRPCStreamMiddleware...)
 }
 
 // setupThanosTracing appends a gRPC middleware used to inject our tracer into the custom
