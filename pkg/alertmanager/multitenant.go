@@ -76,6 +76,10 @@ type MultitenantAlertmanagerConfig struct {
 	FallbackConfigFile string `yaml:"fallback_config_file"`
 	AutoWebhookRoot    string `yaml:"auto_webhook_root"`
 
+	// MaxTenants is the maximum number of per-tenant Alertmanagers that can be
+	// provisioned on a single instance via the fallback-config path. 0 = unlimited.
+	MaxTenants int `yaml:"max_tenants"`
+
 	Cluster ClusterConfig `yaml:"cluster"`
 
 	EnableAPI bool `yaml:"enable_api"`
@@ -112,6 +116,7 @@ func (cfg *MultitenantAlertmanagerConfig) RegisterFlags(f *flag.FlagSet) {
 	f.StringVar(&cfg.FallbackConfigFile, "alertmanager.configs.fallback", "", "Filename of fallback config to use if none specified for instance.")
 	f.StringVar(&cfg.AutoWebhookRoot, "alertmanager.configs.auto-webhook-root", "", "Root of URL to generate if config is "+autoWebhookURL)
 	f.DurationVar(&cfg.PollInterval, "alertmanager.configs.poll-interval", 15*time.Second, "How frequently to poll Cortex configs")
+	f.IntVar(&cfg.MaxTenants, "alertmanager.max-tenants", 0, "Maximum number of tenants whose Alertmanagers can be auto-provisioned via the fallback config on a single instance. When this limit is reached, additional tenants will be rejected on first access instead of being created. 0 to disable the limit.")
 
 	f.BoolVar(&cfg.EnableAPI, "experimental.alertmanager.enable-api", false, "Enable the experimental alertmanager config api.")
 
@@ -1040,6 +1045,25 @@ func (am *MultitenantAlertmanager) serveRequest(w http.ResponseWriter, req *http
 }
 
 func (am *MultitenantAlertmanager) alertmanagerFromFallbackConfig(userID string) (*Alertmanager, error) {
+	// Constrain the tenant ID before it is used as a storage object name and on-disk
+	// directory, to prevent attacker-controlled X-Scope-OrgID values from provisioning
+	// tenants with arbitrary charset or unbounded length.
+	if err := tenant.ValidTenantID(userID); err != nil {
+		return nil, err
+	}
+
+	// Bound the number of per-tenant Alertmanagers that can be auto-provisioned on
+	// this instance via the fallback-config path, so that unauthenticated/unvalidated
+	// GETs cannot provision an unbounded number of tenants.
+	if max := am.cfg.MaxTenants; max > 0 {
+		am.alertmanagersMtx.Lock()
+		n := len(am.alertmanagers)
+		am.alertmanagersMtx.Unlock()
+		if n >= max {
+			return nil, fmt.Errorf("max number of alertmanager tenants reached (%d)", max)
+		}
+	}
+
 	// Upload an empty config so that the Alertmanager is no de-activated in the next poll
 	cfgDesc := alertspb.ToProto("", nil, userID)
 	err := am.store.SetAlertConfig(context.Background(), cfgDesc)
