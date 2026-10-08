@@ -771,7 +771,7 @@ func (am *MultitenantAlertmanager) isUserOwned(userID string) bool {
 func (am *MultitenantAlertmanager) syncConfigs(cfgs map[string]alertspb.AlertConfigDesc) {
 	level.Debug(am.logger).Log("msg", "adding configurations", "num_configs", len(cfgs))
 	for user, cfg := range cfgs {
-		err := am.setConfig(cfg)
+		_, err := am.setConfig(cfg)
 		if err != nil {
 			am.multitenantMetrics.lastReloadSuccessful.WithLabelValues(user).Set(float64(0))
 			level.Warn(am.logger).Log("msg", "error applying config", "err", err)
@@ -806,8 +806,12 @@ func (am *MultitenantAlertmanager) syncConfigs(cfgs map[string]alertspb.AlertCon
 }
 
 // setConfig applies the given configuration to the alertmanager for `userID`,
-// creating an alertmanager if it doesn't already exist.
-func (am *MultitenantAlertmanager) setConfig(cfg alertspb.AlertConfigDesc) error {
+// creating an alertmanager if it doesn't already exist. It returns the
+// per-tenant Alertmanager (either the pre-existing one or the one just
+// created) while still holding am.alertmanagersMtx, so callers can rely on
+// the returned pointer without re-reading the shared map after the lock has
+// been released (which would race with syncConfigs' delete loop).
+func (am *MultitenantAlertmanager) setConfig(cfg alertspb.AlertConfigDesc) (*Alertmanager, error) {
 	var userAmConfig *amconfig.Config
 	var err error
 	var hasTemplateChanges bool
@@ -824,14 +828,14 @@ func (am *MultitenantAlertmanager) setConfig(cfg alertspb.AlertConfigDesc) error
 	for _, tmpl := range cfg.Templates {
 		templateFilePath, err := safeTemplateFilepath(userTemplateDir, tmpl.Filename)
 		if err != nil {
-			return err
+			return nil, err
 		}
 
 		// Removing from pathsToRemove map the files that still exists in the config
 		delete(pathsToRemove, templateFilePath)
 		hasChanged, err := storeTemplateFile(templateFilePath, tmpl.Body)
 		if err != nil {
-			return err
+			return nil, err
 		}
 
 		if hasChanged {
@@ -856,12 +860,12 @@ func (am *MultitenantAlertmanager) setConfig(cfg alertspb.AlertConfigDesc) error
 	rawCfg := cfg.RawConfig
 	if cfg.RawConfig == "" {
 		if am.fallbackConfig == "" {
-			return fmt.Errorf("blank Alertmanager configuration for %v", cfg.User)
+			return nil, fmt.Errorf("blank Alertmanager configuration for %v", cfg.User)
 		}
 		level.Debug(am.logger).Log("msg", "blank Alertmanager configuration; using fallback", "user", cfg.User)
 		userAmConfig, err = amconfig.Load(am.fallbackConfig)
 		if err != nil {
-			return fmt.Errorf("unable to load fallback configuration for %v: %v", cfg.User, err)
+			return nil, fmt.Errorf("unable to load fallback configuration for %v: %v", cfg.User, err)
 		}
 		rawCfg = am.fallbackConfig
 	} else {
@@ -870,7 +874,7 @@ func (am *MultitenantAlertmanager) setConfig(cfg alertspb.AlertConfigDesc) error
 			// This means that if a user has a working config and
 			// they submit a broken one, the Manager will keep running the last known
 			// working configuration.
-			return fmt.Errorf("invalid Cortex configuration for %v: %v", cfg.User, err)
+			return nil, fmt.Errorf("invalid Cortex configuration for %v: %v", cfg.User, err)
 		}
 	}
 
@@ -879,7 +883,7 @@ func (am *MultitenantAlertmanager) setConfig(cfg alertspb.AlertConfigDesc) error
 	// 2) then, submitted a non-working configuration (and we kept running the prev working config)
 	// 3) finally, the cortex AM instance is restarted and the running version is no longer present
 	if userAmConfig == nil {
-		return fmt.Errorf("no usable Alertmanager configuration for %v", cfg.User)
+		return nil, fmt.Errorf("no usable Alertmanager configuration for %v", cfg.User)
 	}
 
 	// Transform webhook configs URLs to the per tenant monitor
@@ -889,7 +893,7 @@ func (am *MultitenantAlertmanager) setConfig(cfg alertspb.AlertConfigDesc) error
 				if w.URL.String() == autoWebhookURL {
 					u, err := url.Parse(am.cfg.AutoWebhookRoot + "/" + cfg.User + "/monitor")
 					if err != nil {
-						return err
+						return nil, err
 					}
 
 					userAmConfig.Receivers[i].WebhookConfigs[j].URL = &amconfig.URL{URL: u}
@@ -903,20 +907,21 @@ func (am *MultitenantAlertmanager) setConfig(cfg alertspb.AlertConfigDesc) error
 		level.Debug(am.logger).Log("msg", "initializing new per-tenant alertmanager", "user", cfg.User)
 		newAM, err := am.newAlertmanager(cfg.User, userAmConfig, rawCfg)
 		if err != nil {
-			return err
+			return nil, err
 		}
 		am.alertmanagers[cfg.User] = newAM
+		existing = newAM
 	} else if am.cfgs[cfg.User].RawConfig != cfg.RawConfig || hasTemplateChanges {
 		level.Info(am.logger).Log("msg", "updating new per-tenant alertmanager", "user", cfg.User)
 		// If the config changed, apply the new one.
 		err := existing.ApplyConfig(cfg.User, userAmConfig, rawCfg)
 		if err != nil {
-			return fmt.Errorf("unable to apply Alertmanager config for user %v: %v", cfg.User, err)
+			return nil, fmt.Errorf("unable to apply Alertmanager config for user %v: %v", cfg.User, err)
 		}
 	}
 
 	am.cfgs[cfg.User] = cfg
-	return nil
+	return existing, nil
 }
 
 func (am *MultitenantAlertmanager) getTenantDirectory(userID string) string {
@@ -1030,6 +1035,15 @@ func (am *MultitenantAlertmanager) serveRequest(w http.ResponseWriter, req *http
 			http.Error(w, "Failed to initialize the Alertmanager", http.StatusInternalServerError)
 			return
 		}
+		// Defence in depth: alertmanagerFromFallbackConfig must never return
+		// (nil, nil), but guard explicitly so a logic bug cannot cause a
+		// nil-pointer dereference and panic the serving goroutine (which, on
+		// the sharded gRPC path, has no recover() upstream).
+		if userAM == nil {
+			level.Error(am.logger).Log("msg", "alertmanager was not available after fallback configuration", "user", userID)
+			http.Error(w, "Failed to initialize the Alertmanager", http.StatusServiceUnavailable)
+			return
+		}
 
 		userAM.mux.ServeHTTP(w, req)
 		return
@@ -1048,14 +1062,18 @@ func (am *MultitenantAlertmanager) alertmanagerFromFallbackConfig(userID string)
 	}
 
 	// Calling setConfig with an empty configuration will use the fallback config.
-	err = am.setConfig(cfgDesc)
+	// Rely on the Alertmanager returned by setConfig (produced while still
+	// holding am.alertmanagersMtx) rather than re-reading am.alertmanagers
+	// after the lock has been released, which would race with the
+	// syncConfigs delete loop and could return (nil, nil).
+	userAM, err := am.setConfig(cfgDesc)
 	if err != nil {
 		return nil, err
 	}
-
-	am.alertmanagersMtx.Lock()
-	defer am.alertmanagersMtx.Unlock()
-	return am.alertmanagers[userID], nil
+	if userAM == nil {
+		return nil, fmt.Errorf("alertmanager for user %s is no longer available", userID)
+	}
+	return userAM, nil
 }
 
 // ReplicateStateForUser attempts to replicate a partial state sent by an alertmanager to its other replicas through the ring.
