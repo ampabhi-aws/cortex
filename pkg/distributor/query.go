@@ -230,6 +230,8 @@ func mergeExemplarSets(a, b []cortexpb.Exemplar) []cortexpb.Exemplar {
 
 // queryIngestersExemplars queries the ingesters for exemplars.
 func (d *Distributor) queryIngestersExemplars(ctx context.Context, replicationSet ring.ReplicationSet, req *ingester_client.ExemplarQueryRequest) (*ingester_client.ExemplarQueryResponse, error) {
+	queryLimiter := limiter.QueryLimiterFromContextWithFallback(ctx)
+
 	// Fetch exemplars from multiple ingesters in parallel, using the replicationSet
 	// to deal with consistency.
 	results, err := replicationSet.Do(ctx, d.cfg.ExtraQueryDelay, func(ctx context.Context, ing *ring.InstanceDesc) (interface{}, error) {
@@ -243,6 +245,18 @@ func (d *Distributor) queryIngestersExemplars(ctx context.Context, replicationSe
 		if err != nil {
 			d.ingesterQueryFailures.WithLabelValues(ing.Addr).Inc()
 			return nil, err
+		}
+
+		// Account the per-ingester response against the tenant's QueryLimiter,
+		// mirroring queryIngesterStream. This also protects the distributor
+		// from being swamped by oversized exemplar responses.
+		if dataBytesLimitErr := queryLimiter.AddDataBytes(resp.Size()); dataBytesLimitErr != nil {
+			return nil, validation.LimitError(dataBytesLimitErr.Error())
+		}
+		for _, ts := range resp.Timeseries {
+			if limitErr := queryLimiter.AddSeries(ts.Labels); limitErr != nil {
+				return nil, validation.LimitError(limitErr.Error())
+			}
 		}
 
 		return resp, nil
