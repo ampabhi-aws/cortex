@@ -118,10 +118,17 @@ func (m *Block) ThanosMeta(userID string) *metadata.Meta {
 }
 
 func (m *Block) thanosMetaSegmentFiles() (files []string) {
-	if m.SegmentsFormat == SegmentsFormat1Based6Digits {
-		for i := 1; i <= m.SegmentsNum; i++ {
-			files = append(files, fmt.Sprintf("%06d", i))
-		}
+	// Defence in depth: regardless of what the bucket index on disk claims, never
+	// allocate an unbounded or implausibly large slice of segment file names here.
+	// ReadIndex rejects such documents up-front, but this guard keeps us safe
+	// against any other caller that may construct a Block in-memory.
+	if m.SegmentsFormat != SegmentsFormat1Based6Digits || m.SegmentsNum <= 0 || m.SegmentsNum > MaxSegmentsPerBlock {
+		return nil
+	}
+
+	files = make([]string, 0, m.SegmentsNum)
+	for i := 1; i <= m.SegmentsNum; i++ {
+		files = append(files, fmt.Sprintf("%06d", i))
 	}
 
 	return files
