@@ -7,6 +7,7 @@ import (
 	"errors"
 	"flag"
 	"fmt"
+	"io"
 	"net/http"
 	"net/url"
 	"time"
@@ -26,6 +27,12 @@ import (
 var (
 	errBadURL = errors.New("configs_api_url is not set or valid")
 )
+
+// maxConfigsResponseSize bounds the maximum response body the configs-db
+// client will decode. Without this, a malicious or buggy configs-API server
+// could feed an unbounded JSON stream into the ruler/alertmanager poller and
+// exhaust its memory.
+const maxConfigsResponseSize = 64 << 20 // 64 MiB
 
 // Config says where we can find the ruler userconfig.
 type Config struct {
@@ -154,7 +161,7 @@ func doRequest(endpoint string, timeout time.Duration, tlsConfig *tls.Config, si
 	}
 
 	var config ConfigsResponse
-	if err := json.NewDecoder(resp.Body).Decode(&config); err != nil {
+	if err := json.NewDecoder(io.LimitReader(resp.Body, maxConfigsResponseSize)).Decode(&config); err != nil {
 		level.Error(util_log.Logger).Log("msg", "configs: couldn't decode JSON body", "err", err)
 		return nil, err
 	}

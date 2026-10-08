@@ -32,6 +32,13 @@ var (
 	ErrWebhookNotificationsAreDisabled = errors.New("webhook notifications are disabled")
 )
 
+// maxConfigsAPIBodySize bounds the maximum request body size accepted by the
+// (deprecated) configs API handlers. Without this cap, a remote client could
+// stream an unbounded body into memory via io.ReadAll / json.Decoder /
+// yaml.Decoder, exhausting process memory and/or persisting arbitrarily large
+// rows into the shared configs database.
+const maxConfigsAPIBodySize = 4 << 20 // 4 MiB
+
 // Config configures Configs API
 type Config struct {
 	Notifications NotificationsConfig `yaml:"notifications"`
@@ -154,18 +161,21 @@ func (a *API) setConfig(w http.ResponseWriter, r *http.Request) {
 	}
 	logger := util_log.WithContext(r.Context(), util_log.Logger)
 
+	// Bound the body size. This prevents a tenant from streaming an arbitrarily
+	// large JSON/YAML payload that would be materialised in full (into maps and
+	// strings on userconfig.Config) and then persisted to the shared configs DB.
+	r.Body = http.MaxBytesReader(w, r.Body, maxConfigsAPIBodySize)
+
 	var cfg userconfig.Config
 	switch parseConfigFormat(r.Header.Get("Content-Type"), FormatJSON) {
 	case FormatJSON:
 		if err := json.NewDecoder(r.Body).Decode(&cfg); err != nil {
-			// XXX: Untested
 			level.Error(logger).Log("msg", "error decoding json body", "err", err)
 			http.Error(w, err.Error(), http.StatusBadRequest)
 			return
 		}
 	case FormatYAML:
 		if err := yaml.NewDecoder(r.Body).Decode(&cfg); err != nil {
-			// XXX: Untested
 			level.Error(logger).Log("msg", "error decoding yaml body", "err", err)
 			http.Error(w, err.Error(), http.StatusBadRequest)
 			return
@@ -203,10 +213,22 @@ func (a *API) setConfig(w http.ResponseWriter, r *http.Request) {
 
 func (a *API) validateAlertmanagerConfig(w http.ResponseWriter, r *http.Request) {
 	logger := util_log.WithContext(r.Context(), util_log.Logger)
-	cfg, err := io.ReadAll(r.Body)
+
+	// Require a tenant like every other handler in this file; without this the
+	// endpoint is reachable fully anonymously and can be used by any remote
+	// client that can connect to the HTTP listener.
+	if _, _, err := tenant.ExtractTenantIDFromHTTPRequest(r); err != nil {
+		http.Error(w, err.Error(), http.StatusUnauthorized)
+		return
+	}
+
+	// Bound the body size. io.ReadAll grows a single heap buffer to the full
+	// body length and string(cfg) copies it again, so an unbounded body is a
+	// trivial OOM vector.
+	cfg, err := io.ReadAll(http.MaxBytesReader(w, r.Body, maxConfigsAPIBodySize))
 	if err != nil {
 		level.Error(logger).Log("msg", "error reading request body", "err", err)
-		http.Error(w, err.Error(), http.StatusInternalServerError)
+		http.Error(w, "configuration too big or unreadable", http.StatusBadRequest)
 		return
 	}
 
