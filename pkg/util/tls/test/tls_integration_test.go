@@ -28,11 +28,12 @@ import (
 )
 
 type tcIntegrationClientServer struct {
-	name            string
-	tlsGrpcEnabled  bool
-	tlsConfig       tls.ClientConfig
-	httpExpectError func(*testing.T, error)
-	grpcExpectError func(*testing.T, error)
+	name                    string
+	tlsGrpcEnabled          bool
+	tlsConfig               tls.ClientConfig
+	httpExpectError         func(*testing.T, error)
+	grpcExpectError         func(*testing.T, error)
+	grpcDialOptsExpectError func(*testing.T, error)
 }
 
 type grpcHealthCheck struct {
@@ -142,6 +143,10 @@ func newIntegrationClientServer(
 			clientConfig.TLS = tc.tlsConfig
 
 			dialOptions, err := clientConfig.DialOption(nil, nil)
+			if tc.grpcDialOptsExpectError != nil {
+				tc.grpcDialOptsExpectError(t, err)
+				return
+			}
 			assert.NoError(t, err, tc.name)
 			dialOptions = append([]grpc.DialOption{grpc.WithDefaultCallOptions(clientConfig.CallOptions()...)}, dialOptions...)
 
@@ -241,7 +246,9 @@ func TestServerWithLocalhostCertNoClientCertAuth(t *testing.T) {
 				tlsConfig: tls.ClientConfig{
 					InsecureSkipVerify: true,
 				},
-				grpcExpectError: unavailableDescErr,
+				// TLS material supplied with tls_enabled=false must now fail
+				// closed in the shared helper (fail-open TLS mitigation).
+				grpcDialOptsExpectError: errorContainsString("TLS options were configured but TLS is not enabled"),
 			},
 			{
 				name:           "ca-path-set",
@@ -256,7 +263,9 @@ func TestServerWithLocalhostCertNoClientCertAuth(t *testing.T) {
 				tlsConfig: tls.ClientConfig{
 					CAPath: certs.caCertFile,
 				},
-				grpcExpectError: unavailableDescErr,
+				// TLS material supplied with tls_enabled=false must now fail
+				// closed in the shared helper (fail-open TLS mitigation).
+				grpcDialOptsExpectError: errorContainsString("TLS options were configured but TLS is not enabled"),
 			},
 		},
 	)

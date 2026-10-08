@@ -62,8 +62,19 @@ func (cfg *Config) RegisterFlagsWithPrefix(f *flag.FlagSet, prefix string) {
 	cfg.TLS.RegisterFlagsWithPrefix(prefix+"etcd", f)
 }
 
+// Validate fails closed if TLS material has been configured without the
+// matching -etcd.tls-enabled flag. Without this check the clientv3 dialer
+// would silently drop the certificate paths and send ring state, HA tracker
+// state and the etcd username/password over plaintext.
+func (cfg *Config) Validate() error {
+	return cfg.TLS.Validate(cfg.EnableTLS)
+}
+
 // GetTLS sets the TLS config field with certs
 func (cfg *Config) GetTLS() (*tls.Config, error) {
+	if err := cfg.Validate(); err != nil {
+		return nil, err
+	}
 	if !cfg.EnableTLS {
 		return nil, nil
 	}

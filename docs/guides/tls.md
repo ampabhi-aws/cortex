@@ -81,6 +81,16 @@ through the following config parameters:
 
 Client flags are component specific.
 
+**Important:** For every Cortex gRPC client (and for `-etcd.*` and
+`-memberlist.*`), the corresponding `-*.tls-enabled` flag must be set to
+`true` whenever any `tls-cert-path`, `tls-key-path`, `tls-ca-path`,
+`tls-server-name` or `tls-insecure-skip-verify` option is configured.
+From Cortex v1.14 the process fails to start when TLS material is supplied
+but the matching `.tls-enabled` flag is `false`, so that configured
+certificates are never silently discarded in favour of plaintext.
+A `cortex_client_tls_enabled{client="…"}` gauge is exported for every
+registered gRPC client to allow alerting on unexpectedly plaintext links.
+
 For an HTTP client in the Alertmanager:
 ```
     # Path to the TLS Cert for the HTTP Client
