@@ -8,6 +8,7 @@ import (
 	"os"
 	"path/filepath"
 	"reflect"
+	"strings"
 
 	"github.com/go-kit/log"
 	"github.com/go-kit/log/level"
@@ -45,7 +46,14 @@ var (
 	errTLSFileNotAllowed             = errors.New("setting TLS ca_file, cert_file and key_file is not allowed")
 	errSlackAPIURLFileNotAllowed     = errors.New("setting Slack api_url_file and global slack_api_url_file is not allowed")
 	errVictorOpsAPIKeyFileNotAllowed = errors.New("setting VictorOps api_key_file is not allowed")
+	errOpsGenieAPIKeyFileNotAllowed  = errors.New("setting OpsGenie api_key_file and global opsgenie_api_key_file is not allowed")
 )
+
+// allowedFileFields lists the yaml tag names of *_file-style settings that are
+// explicitly permitted by Cortex. Any other non-empty string/Secret field whose
+// yaml tag ends in "_file" is rejected by the generic reflection walk to make
+// validateAlertmanagerConfig fail-closed when new upstream fields are added.
+var allowedFileFields = map[string]struct{}{}
 
 // UserConfig is used to communicate a users alertmanager configs
 type UserConfig struct {
@@ -350,6 +358,33 @@ func validateAlertmanagerConfig(cfg interface{}) error {
 		if err := validateVictorOpsConfig(v.Interface().(config.VictorOpsConfig)); err != nil {
 			return err
 		}
+
+	case reflect.TypeOf(config.OpsGenieConfig{}):
+		if err := validateOpsGenieConfig(v.Interface().(config.OpsGenieConfig)); err != nil {
+			return err
+		}
+	}
+
+	// Generic fail-closed check: reject any non-empty string/Secret field whose
+	// YAML tag ends in "_file" unless explicitly allow-listed. This ensures that
+	// new upstream *_file settings (which could be used to exfiltrate local
+	// files via notifier integrations) are denied by default rather than
+	// silently accepted because the per-type switch above hasn't been updated.
+	if t.Kind() == reflect.Struct {
+		for i := 0; i < t.NumField(); i++ {
+			f := t.Field(i)
+			tag := strings.Split(f.Tag.Get("yaml"), ",")[0]
+			if tag == "" || !strings.HasSuffix(tag, "_file") {
+				continue
+			}
+			if _, ok := allowedFileFields[tag]; ok {
+				continue
+			}
+			fv := v.Field(i)
+			if fv.Kind() == reflect.String && fv.String() != "" {
+				return fmt.Errorf("setting %q is not allowed", tag)
+			}
+		}
 	}
 
 	// If the input config is a struct, recursively iterate on all fields.
@@ -428,6 +463,21 @@ func validateReceiverTLSConfig(cfg commoncfg.TLSConfig) error {
 func validateGlobalConfig(cfg config.GlobalConfig) error {
 	if cfg.SlackAPIURLFile != "" {
 		return errSlackAPIURLFileNotAllowed
+	}
+	if cfg.OpsGenieAPIKeyFile != "" {
+		return errOpsGenieAPIKeyFileNotAllowed
+	}
+	return nil
+}
+
+// validateOpsGenieConfig validates the OpsGenie config and returns an error if
+// it contains settings not allowed by Cortex. The vendored OpsGenie notifier
+// reads APIKeyFile from disk at notification time and places its contents in
+// the Authorization header of the request to the (tenant-controlled) api_url,
+// which would let a tenant exfiltrate arbitrary local files.
+func validateOpsGenieConfig(cfg config.OpsGenieConfig) error {
+	if cfg.APIKeyFile != "" {
+		return errOpsGenieAPIKeyFileNotAllowed
 	}
 	return nil
 }
