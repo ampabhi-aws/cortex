@@ -52,6 +52,16 @@ func TestFirewallDialer(t *testing.T) {
 				{"2001:4860:4860::8844", false},    // Google DNS
 				{"::ffff:172.217.168.78", false},   // IPv6 mapped v4 non-private
 				{"::ffff:192.168.0.1", true},       // IPv6 mapped v4 private
+				{"0.0.0.0", true},                  // IPv4 unspecified (routes to loopback)
+				{"::", true},                       // IPv6 unspecified (routes to loopback)
+				{"100.64.0.1", true},               // RFC 6598 CGNAT / EKS pod CIDR
+				{"::ffff:127.0.0.1", true},         // IPv6 mapped v4 loopback
+				{"fec0::1", true},                  // IPv6 site-local
+				{"192.0.0.1", true},                // 192.0.0.0/24 IETF protocol assignments
+				{"198.18.0.1", true},               // 198.18.0.0/15 benchmarking
+				{"255.255.255.255", true},          // limited broadcast
+				{"224.0.0.1", true},                // IPv4 multicast
+				{"ff02::1", true},                  // IPv6 link-local multicast
 			},
 		},
 		"should support blocking custom CIDRs": {
@@ -127,6 +137,25 @@ func TestIsPrivate(t *testing.T) {
 		{net.IP{0xfb, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff}, false},
 		{net.IP{0xfd, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff}, true},
 		{net.IP{0xfe, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0}, false},
+		// Newly covered ranges:
+		{net.IPv4(0, 0, 0, 0), true},             // 0.0.0.0/8 "this network"
+		{net.IPv4(0, 1, 2, 3), true},             // 0.0.0.0/8
+		{net.IPv4(100, 63, 255, 255), false},     // just below 100.64.0.0/10
+		{net.IPv4(100, 64, 0, 0), true},          // 100.64.0.0/10 CGNAT
+		{net.IPv4(100, 127, 255, 255), true},     // 100.64.0.0/10 upper
+		{net.IPv4(100, 128, 0, 0), false},        // just above 100.64.0.0/10
+		{net.IPv4(192, 0, 0, 1), true},           // 192.0.0.0/24
+		{net.IPv4(192, 0, 1, 0), false},          // just above 192.0.0.0/24
+		{net.IPv4(198, 17, 255, 255), false},     // just below 198.18.0.0/15
+		{net.IPv4(198, 18, 0, 0), true},          // 198.18.0.0/15
+		{net.IPv4(198, 19, 255, 255), true},      // 198.18.0.0/15 upper
+		{net.IPv4(198, 20, 0, 0), false},         // just above 198.18.0.0/15
+		{net.IPv4(255, 255, 255, 255), true},     // limited broadcast
+		// fec0::/10 site-local
+		{net.IP{0xfe, 0xc0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1}, true},
+		{net.IP{0xfe, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff}, true},
+		// fe80::/10 link-local is handled by isLocal, not isPrivate.
+		{net.IP{0xfe, 0x80, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1}, false},
 	}
 
 	for _, test := range tests {

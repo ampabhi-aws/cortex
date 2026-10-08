@@ -67,30 +67,37 @@ func (d *FirewallDialer) control(_, address string, _ syscall.RawConn) error {
 	return nil
 }
 
+// isLocal reports whether ip refers to the local host or an otherwise
+// non-routable address that the kernel/link-layer may deliver locally.
+// In particular IsUnspecified() must be included: on Linux/BSD a connect()
+// to 0.0.0.0 or :: is delivered to loopback, so without this check a
+// tenant-controlled receiver URL such as http://0.0.0.0:<port>/<path>
+// bypasses the firewall and reaches loopback-only services.
 func isLocal(ip net.IP) bool {
-	return ip.IsLoopback() || ip.IsLinkLocalUnicast() || ip.IsLinkLocalMulticast()
+	return ip.IsLoopback() || ip.IsUnspecified() || // 0.0.0.0 and :: route to localhost
+		ip.IsLinkLocalUnicast() || ip.IsLinkLocalMulticast() ||
+		ip.IsInterfaceLocalMulticast() || ip.IsMulticast()
 }
 
-// isPrivate reports whether ip is a private address, according to
-// RFC 1918 (IPv4 addresses) and RFC 4193 (IPv6 addresses).
-//
-// This function has been copied from golang and should be removed once
-// we'll upgrade to go 1.17. See: https://github.com/golang/go/pull/42793
+// isPrivate reports whether ip is a non-routable (private, shared, benchmark,
+// protocol-assignments, site-local or broadcast) address. This is a
+// deliberately broader definition than Go's stdlib net.IP.IsPrivate (which
+// only covers RFC 1918 / RFC 4193) because the firewall must fail closed on
+// every address that is not a routable public destination; otherwise a
+// tenant-controlled receiver URL can reach CGNAT pod CIDRs, TEST-NET ranges,
+// benchmarking ranges, or site-local IPv6 addresses that are often reachable
+// from within the pod/VM.
 func isPrivate(ip net.IP) bool {
 	if ip4 := ip.To4(); ip4 != nil {
-		// Following RFC 4193, Section 3. Local IPv6 Unicast Addresses which says:
-		//   The Internet Assigned Numbers Authority (IANA) has reserved the
-		//   following three blocks of the IPv4 address space for private internets:
-		//     10.0.0.0        -   10.255.255.255  (10/8 prefix)
-		//     172.16.0.0      -   172.31.255.255  (172.16/12 prefix)
-		//     192.168.0.0     -   192.168.255.255 (192.168/16 prefix)
-		return ip4[0] == 10 ||
-			(ip4[0] == 172 && ip4[1]&0xf0 == 16) ||
-			(ip4[0] == 192 && ip4[1] == 168)
+		return ip4[0] == 0 || // 0.0.0.0/8 "this network" (RFC 1122)
+			ip4[0] == 10 || // 10.0.0.0/8 (RFC 1918)
+			(ip4[0] == 100 && ip4[1]&0xc0 == 64) || // 100.64.0.0/10 CGNAT / EKS pod CIDRs (RFC 6598)
+			(ip4[0] == 172 && ip4[1]&0xf0 == 16) || // 172.16.0.0/12 (RFC 1918)
+			(ip4[0] == 192 && ip4[1] == 0 && ip4[2] == 0) || // 192.0.0.0/24 IETF protocol assignments (RFC 6890)
+			(ip4[0] == 192 && ip4[1] == 168) || // 192.168.0.0/16 (RFC 1918)
+			(ip4[0] == 198 && ip4[1]&0xfe == 18) || // 198.18.0.0/15 benchmarking (RFC 2544)
+			ip4.Equal(net.IPv4bcast) // 255.255.255.255 limited broadcast
 	}
-	// Following RFC 4193, Section 3. Private Address Space which says:
-	//   The Internet Assigned Numbers Authority (IANA) has reserved the
-	//   following block of the IPv6 address space for local internets:
-	//     FC00::  -  FDFF:FFFF:FFFF:FFFF:FFFF:FFFF:FFFF:FFFF (FC00::/7 prefix)
-	return len(ip) == net.IPv6len && ip[0]&0xfe == 0xfc
+	// IPv6: fc00::/7 unique local (RFC 4193) and fec0::/10 site-local (RFC 3879, deprecated but still routable on some networks).
+	return len(ip) == net.IPv6len && (ip[0]&0xfe == 0xfc || (ip[0] == 0xfe && ip[1]&0xc0 == 0xc0))
 }
