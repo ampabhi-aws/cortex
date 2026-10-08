@@ -51,7 +51,10 @@ func TestConfigAPIEndpoint(t *testing.T) {
 	require.NoError(t, s.StartAndWaitReady(cortex1))
 
 	// Get config from /config API endpoint.
-	res, err := e2e.GetRequest(fmt.Sprintf("http://%s/config", cortex1.Endpoint(9009)))
+	req, err := http.NewRequest(http.MethodGet, fmt.Sprintf("http://%s/config", cortex1.Endpoint(9009)), nil)
+	require.NoError(t, err)
+	req.Header.Set("X-Scope-OrgID", "user-1")
+	res, err := (&http.Client{}).Do(req)
 	require.NoError(t, err)
 
 	defer runutil.ExhaustCloseWithErrCapture(&err, res.Body, "config API response")
