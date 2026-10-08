@@ -81,6 +81,23 @@ func (am *MultitenantAlertmanager) RingHandler(w http.ResponseWriter, req *http.
 	am.ring.ServeHTTP(w, req)
 }
 
+// RingForgetHandler is the authenticated admin endpoint that removes an
+// instance from the alertmanager ring. It must be registered behind the API
+// auth middleware.
+func (am *MultitenantAlertmanager) RingForgetHandler(w http.ResponseWriter, req *http.Request) {
+	if !am.cfg.ShardingEnabled {
+		http.Error(w, "alertmanager ring is not enabled", http.StatusNotFound)
+		return
+	}
+
+	if am.State() != services.Running {
+		http.Error(w, "alertmanager is not running yet", http.StatusServiceUnavailable)
+		return
+	}
+
+	am.ring.ForgetHandler(w, req)
+}
+
 // GetStatusHandler returns the status handler for this multi-tenant
 // alertmanager.
 func (am *MultitenantAlertmanager) GetStatusHandler() StatusHandler {

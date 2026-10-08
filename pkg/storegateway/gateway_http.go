@@ -51,3 +51,20 @@ func (c *StoreGateway) RingHandler(w http.ResponseWriter, req *http.Request) {
 
 	c.ring.ServeHTTP(w, req)
 }
+
+// RingForgetHandler is the authenticated admin endpoint that removes an
+// instance from the store-gateway ring. It must be registered behind the API
+// auth middleware.
+func (c *StoreGateway) RingForgetHandler(w http.ResponseWriter, req *http.Request) {
+	if !c.gatewayCfg.ShardingEnabled {
+		http.Error(w, "store gateway ring is not enabled", http.StatusNotFound)
+		return
+	}
+
+	if c.State() != services.Running {
+		http.Error(w, "store gateway is not running yet", http.StatusServiceUnavailable)
+		return
+	}
+
+	c.ring.ForgetHandler(w, req)
+}

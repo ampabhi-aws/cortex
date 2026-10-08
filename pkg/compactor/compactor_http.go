@@ -51,3 +51,20 @@ func (c *Compactor) RingHandler(w http.ResponseWriter, req *http.Request) {
 
 	c.ring.ServeHTTP(w, req)
 }
+
+// RingForgetHandler is the authenticated admin endpoint that removes an
+// instance from the compactor ring. It must be registered behind the API
+// auth middleware.
+func (c *Compactor) RingForgetHandler(w http.ResponseWriter, req *http.Request) {
+	if !c.compactorCfg.ShardingEnabled {
+		http.Error(w, "compactor ring is not enabled", http.StatusNotFound)
+		return
+	}
+
+	if c.State() != services.Running {
+		http.Error(w, "compactor is not running yet", http.StatusServiceUnavailable)
+		return
+	}
+
+	c.ring.ForgetHandler(w, req)
+}

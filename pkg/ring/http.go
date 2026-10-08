@@ -3,6 +3,7 @@ package ring
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"html/template"
 	"math"
@@ -12,6 +13,7 @@ import (
 	"time"
 
 	"github.com/go-kit/log/level"
+	"github.com/weaveworks/common/user"
 )
 
 const pageContent = `
@@ -24,8 +26,12 @@ const pageContent = `
 	<body>
 		<h1>Ring Status</h1>
 		<p>Current time: {{ .Now }}</p>
-		<form action="" method="POST">
+		{{ if .ForgetEnabled }}
+		<form action="{{ .ForgetPath }}" method="POST">
 			<input type="hidden" name="csrf_token" value="$__CSRF_TOKEN_PLACEHOLDER__">
+		{{ else }}
+		<form action="" method="GET">
+		{{ end }}
 			<table width="100%" border="1">
 				<thead>
 					<tr>
@@ -55,7 +61,13 @@ const pageContent = `
 						<td>{{ .HeartbeatTimestamp }}</td>
 						<td>{{ .NumTokens }}</td>
 						<td>{{ .Ownership }}%</td>
-						<td><button name="forget" value="{{ .ID }}" type="submit">Forget</button></td>
+						<td>
+							{{ if $.ForgetEnabled }}
+							<button name="forget" value="{{ .ID }}" type="submit">Forget</button>
+							{{ else }}
+							&mdash;
+							{{ end }}
+						</td>
 					</tr>
 					{{ end }}
 				</tbody>
@@ -90,13 +102,31 @@ func init() {
 	pageTemplate = template.Must(t.Parse(pageContent))
 }
 
+// ErrForgetEndpointDisabled is returned when the operator POSTs to the forget
+// endpoint but has not opted in via -ring.enable-forget-endpoint.
+var ErrForgetEndpointDisabled = errors.New("ring forget endpoint is disabled; set -ring.enable-forget-endpoint to enable it")
+
+// ErrMissingInstanceID is returned when the forget endpoint is called without
+// an instance id. The handler refuses to issue a KV write for this case so a
+// bogus POST cannot force unnecessary ring descriptor rewrites.
+var ErrMissingInstanceID = errors.New("missing instance id")
+
 func (r *Ring) forget(ctx context.Context, id string) error {
+	if id == "" {
+		return ErrMissingInstanceID
+	}
 	unregister := func(in interface{}) (out interface{}, retry bool, err error) {
 		if in == nil {
 			return nil, false, fmt.Errorf("found empty ring when trying to unregister")
 		}
 
 		ringDesc := in.(*Desc)
+		// No-op for unknown instance ids so a bogus POST cannot force a KV write
+		// (and the associated gossip broadcast on memberlist) for an id that is
+		// not actually in the ring.
+		if _, ok := ringDesc.Ingesters[id]; !ok {
+			return nil, false, nil
+		}
 		ringDesc.RemoveIngester(id)
 		return ringDesc, true, nil
 	}
@@ -116,27 +146,22 @@ type ingesterDesc struct {
 }
 
 type httpResponse struct {
-	Ingesters  []ingesterDesc `json:"shards"`
-	Now        time.Time      `json:"now"`
-	ShowTokens bool           `json:"-"`
+	Ingesters     []ingesterDesc `json:"shards"`
+	Now           time.Time      `json:"now"`
+	ShowTokens    bool           `json:"-"`
+	ForgetEnabled bool           `json:"-"`
+	ForgetPath    string         `json:"-"`
 }
 
+// ServeHTTP renders the read-only ring status page. The destructive "forget"
+// operation lives behind a dedicated authenticated handler (ForgetHandler) so
+// that a POST to the public status page can never mutate the shared KV ring.
 func (r *Ring) ServeHTTP(w http.ResponseWriter, req *http.Request) {
-	if req.Method == http.MethodPost {
-		ingesterID := req.FormValue("forget")
-		if err := r.forget(req.Context(), ingesterID); err != nil {
-			level.Error(r.logger).Log("msg", "error forgetting instance", "err", err)
-		}
-
-		// Implement PRG pattern to prevent double-POST and work with CSRF middleware.
-		// https://en.wikipedia.org/wiki/Post/Redirect/Get
-
-		// http.Redirect() would convert our relative URL to absolute, which is not what we want.
-		// Browser knows how to do that, and it also knows real URL. Furthermore it will also preserve tokens parameter.
-		// Note that relative Location URLs are explicitly allowed by specification, so we're not doing anything wrong here.
-		w.Header().Set("Location", "#")
-		w.WriteHeader(http.StatusFound)
-
+	if req.Method != http.MethodGet {
+		// Any non-GET request on the status page is refused. The forget
+		// operation is served by ForgetHandler on a different route, behind
+		// the API auth middleware and gated by -ring.enable-forget-endpoint.
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
 		return
 	}
 
@@ -181,11 +206,70 @@ func (r *Ring) ServeHTTP(w http.ResponseWriter, req *http.Request) {
 
 	tokensParam := req.URL.Query().Get("tokens")
 
+	// Resolve the forget URL relative to the current page so operator-authored
+	// proxies at arbitrary path prefixes continue to work.
+	forgetPath := strings.TrimRight(req.URL.Path, "/") + "/forget"
+
 	renderHTTPResponse(w, httpResponse{
-		Ingesters:  ingesters,
-		Now:        now,
-		ShowTokens: tokensParam == "true",
+		Ingesters:     ingesters,
+		Now:           now,
+		ShowTokens:    tokensParam == "true",
+		ForgetEnabled: r.cfg.EnableForgetEndpoint,
+		ForgetPath:    forgetPath,
 	}, pageTemplate, req)
+}
+
+// ForgetHandler is the authenticated POST handler that removes an instance
+// from the ring. It MUST be registered behind the API auth middleware so that
+// an identity is always present before a destructive KV write is issued. It
+// also requires the operator to have opted in via -ring.enable-forget-endpoint
+// (default off).
+func (r *Ring) ForgetHandler(w http.ResponseWriter, req *http.Request) {
+	if req.Method != http.MethodPost {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
+	// Explicit opt-in: the destructive endpoint is disabled unless the operator
+	// has set -ring.enable-forget-endpoint.
+	if !r.cfg.EnableForgetEndpoint {
+		level.Warn(r.logger).Log("msg", "refusing ring forget request: endpoint is disabled", "err", ErrForgetEndpointDisabled)
+		http.Error(w, ErrForgetEndpointDisabled.Error(), http.StatusForbidden)
+		return
+	}
+
+	ingesterID := req.FormValue("forget")
+	if ingesterID == "" {
+		http.Error(w, ErrMissingInstanceID.Error(), http.StatusBadRequest)
+		return
+	}
+
+	// Identify the authenticated principal (as surfaced by the API auth
+	// middleware via the X-Scope-OrgID header) so every successful mutation
+	// is attributable in the audit log.
+	principal, _ := user.ExtractOrgID(req.Context())
+	if principal == "" {
+		principal = "<unknown>"
+	}
+
+	if err := r.forget(req.Context(), ingesterID); err != nil {
+		level.Error(r.logger).Log("msg", "error forgetting instance", "err", err, "principal", principal, "instance", ingesterID)
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+
+	level.Info(r.logger).Log("msg", "ring forget", "principal", principal, "instance", ingesterID)
+
+	// Implement PRG pattern to prevent double-POST and work with CSRF middleware.
+	// https://en.wikipedia.org/wiki/Post/Redirect/Get
+	//
+	// Redirect back to the parent status page (strip the trailing "/forget").
+	parent := strings.TrimSuffix(req.URL.Path, "/forget")
+	if parent == "" {
+		parent = "#"
+	}
+	w.Header().Set("Location", parent)
+	w.WriteHeader(http.StatusFound)
 }
 
 // RenderHTTPResponse either responds with json or a rendered html page using the passed in template

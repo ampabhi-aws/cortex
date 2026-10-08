@@ -443,6 +443,17 @@ func (r *Ruler) ServeHTTP(w http.ResponseWriter, req *http.Request) {
 	}
 }
 
+// ForgetHandler forwards to the ruler ring's forget admin endpoint when the
+// ruler is running with sharding enabled. It must be registered behind the
+// API auth middleware.
+func (r *Ruler) ForgetHandler(w http.ResponseWriter, req *http.Request) {
+	if !r.cfg.EnableSharding {
+		http.Error(w, "ruler ring is not enabled", http.StatusNotFound)
+		return
+	}
+	r.ring.ForgetHandler(w, req)
+}
+
 func (r *Ruler) run(ctx context.Context) error {
 	level.Info(r.logger).Log("msg", "ruler up and running")
 

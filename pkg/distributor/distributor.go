@@ -1267,3 +1267,14 @@ func (d *Distributor) ServeHTTP(w http.ResponseWriter, req *http.Request) {
 		util.WriteHTMLResponse(w, ringNotEnabledPage)
 	}
 }
+
+// ForgetHandler forwards to the distributor's ring forget admin endpoint when
+// the distributor is running with the ring enabled. It must be registered
+// behind the API auth middleware.
+func (d *Distributor) ForgetHandler(w http.ResponseWriter, req *http.Request) {
+	if d.distributorsRing == nil {
+		http.Error(w, "distributor ring is not enabled", http.StatusNotFound)
+		return
+	}
+	d.distributorsRing.ForgetHandler(w, req)
+}
