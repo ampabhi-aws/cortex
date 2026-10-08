@@ -3306,6 +3306,64 @@ func TestDistributor_Push_RelabelDropWillExportMetricOfDroppedSamples(t *testing
 	require.NoError(t, testutil.GatherAndCompare(regs[0], strings.NewReader(expectedMetrics), metrics...))
 }
 
+func TestDistributor_Push_LabelRemoval_EmptyLabelsSetDiscardsSamplesAndReturnsError(t *testing.T) {
+	// When drop_labels / HA replica-label removal strips every label from a
+	// series, the samples must be counted in cortex_discarded_samples_total
+	// (not cortex_discarded_exemplars_total) with reason
+	// "user_label_removal_configuration", and the push must surface a 400
+	// so the writer learns its data was dropped.
+	inputSeries := []labels.Labels{
+		{
+			{Name: "__name__", Value: "some_metric"},
+			{Name: "cluster", Value: "one"},
+		},
+	}
+
+	var limits validation.Limits
+	flagext.DefaultValues(&limits)
+	limits.DropLabels = []string{"__name__", "cluster"}
+
+	ds, _, regs, _ := prepare(t, prepConfig{
+		numIngesters:     2,
+		happyIngesters:   2,
+		numDistributors:  1,
+		shardByAllLabels: true,
+		limits:           &limits,
+	})
+
+	regs[0].MustRegister(validation.DiscardedSamples)
+	regs[0].MustRegister(validation.DiscardedExemplars)
+	validation.DiscardedSamples.Reset()
+	validation.DiscardedExemplars.Reset()
+
+	req := mockWriteRequest(inputSeries, 1, 1)
+	ctx := user.InjectOrgID(context.Background(), "user1")
+	_, err := ds[0].Push(ctx, req)
+
+	// The writer must observe the drop as an HTTP 400 partial error.
+	require.Error(t, err)
+	resp, ok := httpgrpc.HTTPResponseFromError(err)
+	require.True(t, ok)
+	assert.Equal(t, int32(http.StatusBadRequest), resp.Code)
+	assert.Contains(t, string(resp.Body), "no labels left after applying drop_labels")
+
+	// Samples must land on cortex_discarded_samples_total (not exemplars),
+	// and because no exemplars were pushed, cortex_discarded_exemplars_total
+	// must remain untouched by this call site.
+	expectedMetrics := `
+		# HELP cortex_discarded_samples_total The total number of samples that were discarded.
+		# TYPE cortex_discarded_samples_total counter
+		cortex_discarded_samples_total{reason="user_label_removal_configuration",user="user1"} 1
+		`
+	require.NoError(t, testutil.GatherAndCompare(regs[0], strings.NewReader(expectedMetrics),
+		"cortex_discarded_samples_total"))
+
+	// The exemplar metric must have zero samples attributed to this reason
+	// (there was no exemplar in the request).
+	assert.Equal(t, float64(0), testutil.ToFloat64(validation.DiscardedExemplars.WithLabelValues(
+		validation.DroppedByUserConfigurationOverride, "user1")))
+}
+
 func countMockIngestersCalls(ingesters []*mockIngester, name string) int {
 	count := 0
 	for i := 0; i < len(ingesters); i++ {

@@ -665,11 +665,28 @@ func (d *Distributor) Push(ctx context.Context, req *cortexpb.WriteRequest) (*co
 		}
 
 		if len(ts.Labels) == 0 {
-			validation.DiscardedExemplars.WithLabelValues(
+			// All labels were removed by drop_labels and/or HA replica-label
+			// removal. Count the loss in the samples (and exemplars) metrics,
+			// log a rate-limited warning, and surface the drop to the writer so
+			// the push does not silently return 200.
+			validation.DiscardedSamples.WithLabelValues(
 				validation.DroppedByUserConfigurationOverride,
 				userID,
 			).Add(float64(len(ts.Samples)))
-
+			if len(ts.Exemplars) > 0 {
+				validation.DiscardedExemplars.WithLabelValues(
+					validation.DroppedByUserConfigurationOverride,
+					userID,
+				).Add(float64(len(ts.Exemplars)))
+			}
+			level.Warn(util_log.WithContext(ctx, d.log)).Log(
+				"msg", "dropping series: no labels left after label removal",
+				"user", userID,
+			)
+			if firstPartialErr == nil {
+				firstPartialErr = httpgrpc.Errorf(http.StatusBadRequest,
+					"series has no labels left after applying drop_labels/HA replica removal")
+			}
 			continue
 		}
 
