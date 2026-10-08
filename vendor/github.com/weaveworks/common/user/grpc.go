@@ -18,6 +18,15 @@ func ExtractFromGRPCRequest(ctx context.Context) (string, context.Context, error
 		return "", ctx, ErrNoOrgID
 	}
 
+	// Reject a present-but-empty x-scope-orgid value so the gRPC path matches
+	// the HTTP path (ExtractOrgIDFromHTTPRequest rejects ""). Without this,
+	// downstream components that join the tenant ID directly onto a filesystem
+	// path (e.g. the Alertmanager data directory) would collapse the
+	// per-tenant directory onto the shared data root.
+	if orgIDs[0] == "" {
+		return "", ctx, ErrNoOrgID
+	}
+
 	return orgIDs[0], InjectOrgID(ctx, orgIDs[0]), nil
 }
 
