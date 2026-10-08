@@ -51,7 +51,7 @@ func NewShuffleShardingPlanner(
 	}
 }
 
-func (p *ShuffleShardingPlanner) Plan(_ context.Context, metasByMinTime []*metadata.Meta) ([]*metadata.Meta, error) {
+func (p *ShuffleShardingPlanner) Plan(ctx context.Context, metasByMinTime []*metadata.Meta) ([]*metadata.Meta, error) {
 	// Ensure all blocks fits within the largest range. This is a double check
 	// to ensure there's no bug in the previous blocks grouping, given this Plan()
 	// is just a pass-through.
@@ -89,7 +89,30 @@ func (p *ShuffleShardingPlanner) Plan(_ context.Context, metasByMinTime []*metad
 		return nil, nil
 	}
 
-	go markBlocksVisitedHeartBeat(p.ctx, p.bkt, p.logger, resultMetas, p.ringLifecyclerID, p.blockVisitMarkerFileUpdateInterval, p.blockVisitMarkerWriteFailed)
+	// Scope the heartbeat lifetime to the per-plan/per-group compaction job.
+	// We parent on p.ctx (the per-tenant compaction context) so a shutdown
+	// still propagates, but we also tie cancellation to ctx (the Plan call's
+	// context, transitively tied to the per-group compaction via Thanos'
+	// BucketCompactor workCtx) so the heartbeat is cancelled as soon as the
+	// compaction iteration that owns this plan ends. This prevents the
+	// heartbeat from outliving its compaction job and resurrecting block
+	// prefixes that another concurrent component (BlocksCleaner) has already
+	// hard-deleted.
+	hbCtx, cancel := context.WithCancel(p.ctx)
+	if ctx != nil {
+		go func() {
+			select {
+			case <-ctx.Done():
+				cancel()
+			case <-hbCtx.Done():
+			}
+		}()
+	}
+
+	go func() {
+		defer cancel()
+		markBlocksVisitedHeartBeat(hbCtx, p.bkt, p.logger, resultMetas, p.ringLifecyclerID, p.blockVisitMarkerFileUpdateInterval, p.blockVisitMarkerWriteFailed)
+	}()
 
 	return resultMetas, nil
 }
