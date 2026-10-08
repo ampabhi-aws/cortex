@@ -20,6 +20,7 @@ import (
 	amconfig "github.com/prometheus/alertmanager/config"
 	amtemplate "github.com/prometheus/alertmanager/template"
 
+	amvalidation "github.com/cortexproject/cortex/pkg/alertmanager/validation"
 	"github.com/cortexproject/cortex/pkg/configs/db"
 	"github.com/cortexproject/cortex/pkg/configs/userconfig"
 	"github.com/cortexproject/cortex/pkg/tenant"
@@ -230,6 +231,25 @@ func validateAlertmanagerConfig(cfg string, noCfg NotificationsConfig) error {
 		return err
 	}
 
+	// Reject server-local file references (password_file, bearer_token_file,
+	// credentials_file, OAuth2 client_secret_file, Slack/VictorOps *_file,
+	// TLS ca_file/cert_file/key_file) exactly like the maintained Alertmanager
+	// API does. This closes the legacy configs API path through which a
+	// low-privilege tenant could otherwise cause the Alertmanager to read an
+	// arbitrary host file and send its contents to a tenant-chosen webhook URL
+	// (see pkg/alertmanager/validation and CVE-2021-31232 for context).
+	if err := amvalidation.ValidateAlertmanagerConfig(amCfg); err != nil {
+		return err
+	}
+
+	// Validate referenced template filenames do not try to escape the
+	// per-tenant template directory on disk.
+	for _, name := range amCfg.Templates {
+		if err := amvalidation.ValidateTemplateFilename(name); err != nil {
+			return err
+		}
+	}
+
 	for _, recv := range amCfg.Receivers {
 		if noCfg.DisableEmail && len(recv.EmailConfigs) > 0 {
 			return ErrEmailNotificationsAreDisabled
@@ -249,6 +269,12 @@ func validateRulesFiles(c userconfig.Config) error {
 
 func validateTemplateFiles(c userconfig.Config) error {
 	for fn, content := range c.TemplateFiles {
+		// Enforce that TemplateFiles keys (which end up written to disk under
+		// the per-tenant template directory) do not contain any path separator
+		// that could be used to escape the tenant directory.
+		if err := amvalidation.ValidateTemplateFilename(fn); err != nil {
+			return err
+		}
 		if _, err := template.New(fn).Funcs(template.FuncMap(amtemplate.DefaultFuncs)).Parse(content); err != nil {
 			return err
 		}
