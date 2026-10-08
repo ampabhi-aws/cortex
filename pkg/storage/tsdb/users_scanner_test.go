@@ -49,3 +49,21 @@ func TestUsersScanner_ScanUsers_ShouldReturnUsersForWhichOwnerCheckOrTenantDelet
 	assert.Equal(t, expected, actual)
 	assert.Empty(t, deleted)
 }
+
+func TestUsersScanner_ScanUsers_ShouldSkipUsersWhenOwnerCheckFailsAndPolicyIsSkip(t *testing.T) {
+	// With OnOwnershipErrorSkip the scanner must fail closed on ownership errors so that
+	// destructive consumers (blocks cleaner) do not run concurrently on the same tenant
+	// from several replicas during ring instability.
+	bucketClient := &bucket.ClientMock{}
+	bucketClient.MockIter("", []string{"user-1", "user-2"}, nil)
+
+	isOwned := func(userID string) (bool, error) {
+		return false, errors.New("ring error")
+	}
+
+	s := NewUsersScannerWithPolicy(bucketClient, isOwned, OnOwnershipErrorSkip, log.NewNopLogger())
+	actual, deleted, err := s.ScanUsers(context.Background())
+	require.NoError(t, err)
+	assert.Empty(t, actual)
+	assert.Empty(t, deleted)
+}
