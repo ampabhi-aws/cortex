@@ -62,6 +62,13 @@ func request(t *testing.T, method, urlStr string, body io.Reader) *httptest.Resp
 
 // requestAsUser makes a request to the configs API as the given user.
 func requestAsUser(t *testing.T, userID string, method, urlStr string, contentType string, body io.Reader) *httptest.ResponseRecorder {
+	return requestAsUserWithHeaders(t, userID, method, urlStr, contentType, nil, body)
+}
+
+// requestAsUserWithHeaders makes a request to the configs API as the given
+// user, optionally setting additional HTTP headers (e.g. If-Match for
+// optimistic concurrency on writes).
+func requestAsUserWithHeaders(t *testing.T, userID string, method, urlStr string, contentType string, headers map[string]string, body io.Reader) *httptest.ResponseRecorder {
 	w := httptest.NewRecorder()
 	r, err := http.NewRequest(method, urlStr, body)
 	require.NoError(t, err)
@@ -70,6 +77,9 @@ func requestAsUser(t *testing.T, userID string, method, urlStr string, contentTy
 	require.NoError(t, err)
 	if contentType != "" {
 		r.Header.Set("Content-Type", contentType)
+	}
+	for k, v := range headers {
+		r.Header.Set(k, v)
 	}
 	app.ServeHTTP(w, r)
 	return w

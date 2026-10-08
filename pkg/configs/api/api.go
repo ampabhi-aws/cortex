@@ -68,25 +68,38 @@ func New(database db.DB, cfg Config) *API {
 	return a
 }
 
-func (a *API) admin(w http.ResponseWriter, r *http.Request) {
-	w.Header().Add("Content-Type", "text/html")
-	fmt.Fprintf(w, `
-<!doctype html>
-<html>
-	<head><title>configs :: configuration service</title></head>
-	<body>
-		<h1>configs :: configuration service</h1>
-	</body>
-</html>
-`)
+// Route describes a single HTTP route exposed by the configs API.
+type Route struct {
+	Name    string
+	Method  string
+	Path    string
+	Handler http.Handler
 }
 
-// RegisterRoutes registers the configs API HTTP routes with the provided Router.
-func (a *API) RegisterRoutes(r *mux.Router) {
-	for _, route := range []struct {
-		name, method, path string
-		handler            http.HandlerFunc
-	}{
+// Routes returns the HTTP routes exposed by the configs API so they can be
+// registered through the central API gate (and therefore pick up the
+// configured authentication middleware). Prefer this over RegisterRoutes.
+func (a *API) Routes() []Route {
+	defs := a.routeDefs()
+	routes := make([]Route, 0, len(defs))
+	for _, r := range defs {
+		routes = append(routes, Route{
+			Name:    r.name,
+			Method:  r.method,
+			Path:    r.path,
+			Handler: r.handler,
+		})
+	}
+	return routes
+}
+
+type routeDef struct {
+	name, method, path string
+	handler            http.HandlerFunc
+}
+
+func (a *API) routeDefs() []routeDef {
+	return []routeDef{
 		{"root", "GET", "/", a.admin},
 		// Dedicated APIs for updating rules config. In the future, these *must*
 		// be used.
@@ -102,14 +115,37 @@ func (a *API) RegisterRoutes(r *mux.Router) {
 		// Internal APIs.
 		{"private_get_rules", "GET", "/private/api/prom/configs/rules", a.getConfigs},
 		{"private_get_alertmanager_config", "GET", "/private/api/prom/configs/alertmanager", a.getConfigs},
-	} {
+	}
+}
+
+func (a *API) admin(w http.ResponseWriter, r *http.Request) {
+	w.Header().Add("Content-Type", "text/html")
+	fmt.Fprintf(w, `
+<!doctype html>
+<html>
+	<head><title>configs :: configuration service</title></head>
+	<body>
+		<h1>configs :: configuration service</h1>
+	</body>
+</html>
+`)
+}
+
+// RegisterRoutes registers the configs API HTTP routes with the provided Router.
+//
+// Deprecated: callers in the Cortex binary should route the configs API
+// through API.RegisterConfigsAPI so the configured authentication middleware
+// is always applied. This method is kept so the API type can serve as its
+// own http.Handler (for tests and standalone embeddings).
+func (a *API) RegisterRoutes(r *mux.Router) {
+	for _, route := range a.routeDefs() {
 		r.Handle(route.path, route.handler).Methods(route.method).Name(route.name)
 	}
 }
 
 // getConfig returns the request configuration.
 func (a *API) getConfig(w http.ResponseWriter, r *http.Request) {
-	userID, _, err := tenant.ExtractTenantIDFromHTTPRequest(r)
+	userID, err := tenant.TenantID(r.Context())
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusUnauthorized)
 		return
@@ -147,7 +183,7 @@ func (a *API) getConfig(w http.ResponseWriter, r *http.Request) {
 }
 
 func (a *API) setConfig(w http.ResponseWriter, r *http.Request) {
-	userID, _, err := tenant.ExtractTenantIDFromHTTPRequest(r)
+	userID, err := tenant.TenantID(r.Context())
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusUnauthorized)
 		return
@@ -192,6 +228,17 @@ func (a *API) setConfig(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, fmt.Sprintf("Invalid templates: %v", err), http.StatusBadRequest)
 		return
 	}
+
+	// Optimistic concurrency control: if a non-deleted config already exists
+	// for this tenant, require the caller to acknowledge the current version
+	// via the If-Match header so a stale/forged write cannot silently clobber
+	// another writer's state. Clients submit the current `id` returned by GET.
+	if ok, status, msg := a.checkIfMatch(r, userID); !ok {
+		level.Info(logger).Log("msg", "rejecting config write due to If-Match precondition", "userID", userID, "status", status, "err", msg)
+		http.Error(w, msg, status)
+		return
+	}
+
 	if err := a.db.SetConfig(r.Context(), userID, cfg); err != nil {
 		// XXX: Untested
 		level.Error(logger).Log("msg", "error storing config", "err", err)
@@ -199,6 +246,56 @@ func (a *API) setConfig(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	w.WriteHeader(http.StatusNoContent)
+}
+
+// IfMatchHeader is the standard HTTP header used to carry the expected
+// current config id for optimistic concurrency on configs writes.
+const IfMatchHeader = "If-Match"
+
+// checkIfMatch enforces optimistic concurrency on write handlers.
+//
+// Behaviour:
+//   - If no (non-deleted) config exists for the tenant, the write is
+//     permitted regardless of the If-Match header value (first-time create).
+//   - Otherwise, if the request supplies an If-Match header, its value must
+//     equal the current config id (optionally quoted). Mismatches are
+//     rejected with 412 Precondition Failed and bad syntax with 400.
+//   - If an existing config is present but no If-Match header was sent, the
+//     write is rejected with 428 Precondition Required so the client cannot
+//     silently clobber another writer's state.
+func (a *API) checkIfMatch(r *http.Request, userID string) (ok bool, status int, msg string) {
+	current, err := a.db.GetConfig(r.Context(), userID)
+	if err == sql.ErrNoRows {
+		return true, 0, ""
+	}
+	if err != nil {
+		return false, http.StatusInternalServerError, err.Error()
+	}
+	if current.IsDeleted() {
+		// Treated like no active config: let the write recreate it.
+		return true, 0, ""
+	}
+
+	raw := r.Header.Get(IfMatchHeader)
+	if raw == "" {
+		return false, http.StatusPreconditionRequired, fmt.Sprintf("If-Match header required (current config id is %d)", current.ID)
+	}
+	// Strip optional surrounding quotes, as per RFC 7232 (we accept both
+	// quoted and bare ids for ergonomics).
+	trimmed := strings.TrimSpace(raw)
+	trimmed = strings.TrimPrefix(trimmed, "W/")
+	trimmed = strings.Trim(trimmed, "\"")
+	if trimmed == "*" {
+		return true, 0, ""
+	}
+	supplied, err := strconv.ParseUint(trimmed, 10, 64)
+	if err != nil {
+		return false, http.StatusBadRequest, "invalid If-Match header: expected current config id"
+	}
+	if userconfig.ID(supplied) != current.ID {
+		return false, http.StatusPreconditionFailed, fmt.Sprintf("If-Match precondition failed: current config id is %d", current.ID)
+	}
+	return true, 0, ""
 }
 
 func (a *API) validateAlertmanagerConfig(w http.ResponseWriter, r *http.Request) {
@@ -297,7 +394,7 @@ func (a *API) getConfigs(w http.ResponseWriter, r *http.Request) {
 }
 
 func (a *API) deactivateConfig(w http.ResponseWriter, r *http.Request) {
-	userID, _, err := tenant.ExtractTenantIDFromHTTPRequest(r)
+	userID, err := tenant.TenantID(r.Context())
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusUnauthorized)
 		return
@@ -319,7 +416,7 @@ func (a *API) deactivateConfig(w http.ResponseWriter, r *http.Request) {
 }
 
 func (a *API) restoreConfig(w http.ResponseWriter, r *http.Request) {
-	userID, _, err := tenant.ExtractTenantIDFromHTTPRequest(r)
+	userID, err := tenant.TenantID(r.Context())
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusUnauthorized)
 		return
