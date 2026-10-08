@@ -814,6 +814,22 @@ func (am *MultitenantAlertmanager) setConfig(cfg alertspb.AlertConfigDesc) error
 	var userTemplateDir = filepath.Join(am.getTenantDirectory(cfg.User), templatesDir)
 	var pathsToRemove = make(map[string]struct{})
 
+	// Defence in depth: never apply a config that the Alertmanager API would have rejected,
+	// regardless of which store/writer produced it (CVE-2021-36157 / `*_file` credential ban).
+	// We only enforce the hard, security-critical checks here (file-ban reflection walk and
+	// template filename safety) and intentionally skip the per-tenant size/template-count
+	// limits so that grandfathered configs produced through other write paths are not broken.
+	if cfg.RawConfig != "" {
+		if err := ValidateAlertmanagerConfigString(cfg.RawConfig); err != nil {
+			return errors.Wrap(err, "refusing to apply invalid tenant alertmanager config")
+		}
+	}
+	for _, tmpl := range cfg.Templates {
+		if err := validateTemplateFilename(tmpl.Filename); err != nil {
+			return errors.Wrap(err, "refusing to apply invalid tenant alertmanager config")
+		}
+	}
+
 	// List existing files to keep track the ones to be removed
 	if oldTemplateFiles, err := os.ReadDir(userTemplateDir); err == nil {
 		for _, file := range oldTemplateFiles {
