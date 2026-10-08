@@ -10,13 +10,20 @@ import (
 	"github.com/cortexproject/cortex/pkg/configs/db/memory"
 	"github.com/cortexproject/cortex/pkg/configs/db/postgres"
 	"github.com/cortexproject/cortex/pkg/configs/userconfig"
+	"github.com/cortexproject/cortex/pkg/util/flagext"
 )
 
 // Config configures the database.
 type Config struct {
-	URI           string `yaml:"uri"`
-	MigrationsDir string `yaml:"migrations_dir"`
-	PasswordFile  string `yaml:"password_file"`
+	// URI is the database connection string. It may embed credentials via
+	// userinfo (e.g. postgres://user:password@host/db), which is why it is
+	// declared as flagext.Secret so that MarshalYAML redacts the value in
+	// config dumps served by endpoints such as GET /config. Prefer supplying
+	// the password via -configs.database.password-file so the password is
+	// never present in the on-disk configuration or in the dumped YAML.
+	URI           flagext.Secret `yaml:"uri"`
+	MigrationsDir string         `yaml:"migrations_dir"`
+	PasswordFile  string         `yaml:"password_file"`
 
 	// Allow injection of mock DBs for unit testing.
 	Mock DB `yaml:"-"`
@@ -24,7 +31,9 @@ type Config struct {
 
 // RegisterFlags adds the flags required to configure this to the given FlagSet.
 func (cfg *Config) RegisterFlags(f *flag.FlagSet) {
-	f.StringVar(&cfg.URI, "configs.database.uri", "postgres://postgres@configs-db.weave.local/configs?sslmode=disable", "URI where the database can be found (for dev you can use memory://)")
+	// Seed the default; flagext.Secret.Set never returns an error.
+	_ = cfg.URI.Set("postgres://postgres@configs-db.weave.local/configs?sslmode=disable")
+	f.Var(&cfg.URI, "configs.database.uri", "URI where the database can be found (for dev you can use memory://). Prefer -configs.database.password-file for the password; credentials embedded here are redacted in /config output but still kept in process memory.")
 	f.StringVar(&cfg.MigrationsDir, "configs.database.migrations-dir", "", "Path where the database migration files can be found")
 	f.StringVar(&cfg.PasswordFile, "configs.database.password-file", "", "File containing password (username goes in URI)")
 }
@@ -64,7 +73,7 @@ func New(cfg Config) (DB, error) {
 		return cfg.Mock, nil
 	}
 
-	u, err := url.Parse(cfg.URI)
+	u, err := url.Parse(cfg.URI.Value)
 	if err != nil {
 		return nil, err
 	}
