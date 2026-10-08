@@ -8,6 +8,7 @@ import (
 	"os"
 	"path/filepath"
 	"reflect"
+	"strings"
 
 	"github.com/go-kit/log"
 	"github.com/go-kit/log/level"
@@ -37,6 +38,13 @@ const (
 	errTemplateTooBig        = "template %s is too big: %d bytes (limit: %d bytes)"
 
 	fetchConcurrency = 16
+
+	// defaultMaxConfigSize is a hard ceiling (1 MiB) enforced by SetUserConfig on
+	// every incoming body regardless of the per-tenant limit. It prevents a
+	// single tenant from exhausting the memory of a shared Alertmanager process
+	// when the per-tenant limit is left at its zero ("no limit") default or set
+	// to an unsafely large value. A tighter per-tenant limit is still honored.
+	defaultMaxConfigSize = 1 << 20
 )
 
 var (
@@ -100,26 +108,41 @@ func (am *MultitenantAlertmanager) SetUserConfig(w http.ResponseWriter, r *http.
 		return
 	}
 
-	var input io.Reader
+	// Always bound the request body independently of the per-tenant limit so a
+	// tenant cannot exhaust the shared Alertmanager process's memory when the
+	// per-tenant limit is unset (0 = no limit) or set higher than the hard
+	// ceiling. A tenant-configured limit <=0 or above the ceiling is clamped to
+	// defaultMaxConfigSize; a tighter per-tenant limit is honored as-is.
 	maxConfigSize := am.limits.AlertmanagerMaxConfigSize(userID)
-	if maxConfigSize > 0 {
-		// LimitReader will return EOF after reading specified number of bytes. To check if
-		// we have read too many bytes, allow one extra byte.
-		input = io.LimitReader(r.Body, int64(maxConfigSize)+1)
-	} else {
-		input = r.Body
+	if maxConfigSize <= 0 || maxConfigSize > defaultMaxConfigSize {
+		maxConfigSize = defaultMaxConfigSize
 	}
 
-	payload, err := io.ReadAll(input)
+	// MaxBytesReader aborts the connection once the limit is exceeded instead of
+	// buffering further bytes, so the server does not allocate memory
+	// proportional to the attacker's upload size. Allow one extra byte so we can
+	// distinguish "exactly at the limit" from "over the limit".
+	payload, err := io.ReadAll(http.MaxBytesReader(w, r.Body, int64(maxConfigSize)+1))
 	if err != nil {
-		level.Error(logger).Log("msg", errReadingConfiguration, "err", err.Error())
-		http.Error(w, fmt.Sprintf("%s: %s", errReadingConfiguration, err.Error()), http.StatusBadRequest)
+		// http.MaxBytesReader returns a sentinel-less error with the message
+		// "http: request body too large" when the body exceeds the limit. Report
+		// it as a size violation so the caller gets an actionable error, rather
+		// than a generic read error. (http.MaxBytesError was added in Go 1.19;
+		// match on the stable error string for compatibility with Go 1.18.)
+		if strings.Contains(err.Error(), "request body too large") {
+			msg := fmt.Sprintf(errConfigurationTooBig, maxConfigSize)
+			level.Warn(logger).Log("msg", msg, "user", userID)
+			http.Error(w, msg, http.StatusBadRequest)
+			return
+		}
+		level.Warn(logger).Log("msg", errReadingConfiguration, "err", err.Error(), "user", userID, "limit", maxConfigSize)
+		http.Error(w, errReadingConfiguration, http.StatusBadRequest)
 		return
 	}
 
-	if maxConfigSize > 0 && len(payload) > maxConfigSize {
+	if len(payload) > maxConfigSize {
 		msg := fmt.Sprintf(errConfigurationTooBig, maxConfigSize)
-		level.Warn(logger).Log("msg", msg)
+		level.Warn(logger).Log("msg", msg, "user", userID)
 		http.Error(w, msg, http.StatusBadRequest)
 		return
 	}
