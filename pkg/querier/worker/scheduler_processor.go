@@ -3,6 +3,7 @@ package worker
 import (
 	"context"
 	"fmt"
+	"net"
 	"net/http"
 	"time"
 
@@ -180,6 +181,11 @@ func (sp *schedulerProcessor) runRequest(ctx context.Context, logger log.Logger,
 		}
 	}
 
+	if derr := validateFrontendCallbackAddress(frontendAddress); derr != nil {
+		level.Error(logger).Log("msg", "refusing to send query result to invalid frontend address", "frontend", frontendAddress, "err", derr)
+		return
+	}
+
 	c, err := sp.frontendPool.GetClientFor(frontendAddress)
 	if err == nil {
 		// Response is empty and uninteresting.
@@ -225,4 +231,37 @@ type frontendClient struct {
 
 func (fc *frontendClient) Close() error {
 	return fc.conn.Close()
+}
+
+// validateFrontendCallbackAddress performs a minimal defensive sanity check on
+// the frontend callback address before the querier dials it with the query
+// result. The scheduler is the authoritative source of this address, but
+// because the frontendAddress originates on the wire from a (possibly
+// unauthenticated) FrontendLoop caller, we validate here as defence in depth
+// against the SSRF / cross-tenant exfiltration primitive described in the
+// Cortex security advisory for the query-scheduler FrontendLoop. The address
+// must parse as host:port, the port must be a plausible TCP port, and when the
+// host is an IP literal it must not be a wildcard/multicast/link-local
+// address. Loopback is allowed because single-process/all-in-one deployments
+// and tests legitimately use it.
+func validateFrontendCallbackAddress(addr string) error {
+	if addr == "" {
+		return fmt.Errorf("empty frontend address")
+	}
+	host, port, err := net.SplitHostPort(addr)
+	if err != nil {
+		return fmt.Errorf("frontend address %q is not host:port: %w", addr, err)
+	}
+	if host == "" {
+		return fmt.Errorf("frontend address %q has empty host", addr)
+	}
+	if port == "" || port == "0" {
+		return fmt.Errorf("frontend address %q has invalid port", addr)
+	}
+	if ip := net.ParseIP(host); ip != nil {
+		if ip.IsUnspecified() || ip.IsMulticast() || ip.IsLinkLocalUnicast() || ip.IsLinkLocalMulticast() {
+			return fmt.Errorf("frontend address %q points to a disallowed IP (unspecified/multicast/link-local)", addr)
+		}
+	}
+	return nil
 }
