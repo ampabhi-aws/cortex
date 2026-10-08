@@ -2,9 +2,10 @@ package v2
 
 import (
 	"context"
+	cryptorand "crypto/rand"
+	"encoding/binary"
 	"flag"
 	"fmt"
-	"math/rand"
 	"net/http"
 	"sync"
 	"time"
@@ -70,6 +71,11 @@ type Frontend struct {
 
 	schedulerWorkers *frontendSchedulerWorkers
 	requests         *requestsInProgress
+
+	// Counter of QueryResult calls received for a queryID that is not currently in flight.
+	// Elevated values indicate stale responses after a frontend restart or, more concerning,
+	// an attacker spraying forged QueryResult calls with guessed query IDs.
+	unknownQueryResults prometheus.Counter
 }
 
 type frontendRequest struct {
@@ -118,8 +124,19 @@ func NewFrontend(cfg Config, log log.Logger, reg prometheus.Registerer) (*Fronte
 	}
 	// Randomize to avoid getting responses from queries sent before restart, which could lead to mixing results
 	// between different queries. Note that frontend verifies the user, so it cannot leak results between tenants.
-	// This isn't perfect, but better than nothing.
-	f.lastQueryID.Store(rand.Uint64())
+	// Use crypto/rand so the initial counter value is unpredictable even to an attacker that can observe the
+	// process start time (e.g. via the /metrics process_start_time_seconds gauge); the global math/rand source
+	// is seeded with time.Now().UnixNano() and would otherwise be guessable within a ~10ms window.
+	var seedBytes [8]byte
+	if _, err := cryptorand.Read(seedBytes[:]); err != nil {
+		return nil, errors.Wrap(err, "failed to initialize query ID counter from crypto/rand")
+	}
+	f.lastQueryID.Store(binary.BigEndian.Uint64(seedBytes[:]))
+
+	f.unknownQueryResults = promauto.With(reg).NewCounter(prometheus.CounterOpts{
+		Name: "cortex_query_frontend_unknown_query_results_total",
+		Help: "Number of QueryResult RPCs received for a query ID that is not currently in flight on this frontend. A sustained non-zero rate can indicate stale responses after a restart or a caller spraying forged results.",
+	})
 
 	promauto.With(reg).NewGaugeFunc(prometheus.GaugeOpts{
 		Name: "cortex_query_frontend_queries_in_progress",
@@ -252,7 +269,16 @@ func (f *Frontend) QueryResult(ctx context.Context, qrReq *frontendv2pb.QueryRes
 	// It is possible that some old response belonging to different user was received, if frontend has restarted.
 	// To avoid leaking query results between users, we verify the user here.
 	// To avoid mixing results from different queries, we randomize queryID counter on start.
-	if req != nil && req.userID == userID {
+	// A miss (no in-flight request, or tenant mismatch) is accounted so that a caller spraying forged
+	// QueryResult calls with guessed query IDs is observable rather than silently ignored.
+	switch {
+	case req == nil:
+		f.unknownQueryResults.Inc()
+		level.Debug(f.log).Log("msg", "QueryResult received for unknown query ID", "queryID", qrReq.QueryID, "user", userID)
+	case req.userID != userID:
+		f.unknownQueryResults.Inc()
+		level.Warn(f.log).Log("msg", "QueryResult received with tenant mismatch for in-flight query", "queryID", qrReq.QueryID, "caller_user", userID)
+	default:
 		select {
 		case req.response <- qrReq:
 			// Should always be possible, unless QueryResult is called multiple times with the same queryID.
