@@ -141,6 +141,32 @@ func (sp *schedulerProcessor) querierLoop(c schedulerpb.SchedulerForQuerier_Quer
 			}
 			logger := util_log.WithContext(ctx, sp.log)
 
+			// Guard against panics escaping from the request handler (e.g. decoder
+			// bugs on peer-supplied bytes). Without this, an unrecovered panic on
+			// this bare worker goroutine would crash the querier process. Degrade
+			// to an internal server error response and keep the scheduler stream
+			// in lock step with the server.
+			defer func() {
+				if r := recover(); r != nil {
+					level.Error(logger).Log("msg", "panic while handling query", "err", r)
+
+					response := &httpgrpc.HTTPResponse{
+						Code: http.StatusInternalServerError,
+						Body: []byte(fmt.Sprintf("panic while handling query: %v", r)),
+					}
+					if fc, err := sp.frontendPool.GetClientFor(request.FrontendAddress); err == nil {
+						_, _ = fc.(frontendv2pb.FrontendForQuerierClient).QueryResult(ctx, &frontendv2pb.QueryResultRequest{
+							QueryID:      request.QueryID,
+							HttpResponse: response,
+						})
+					}
+
+					if err := c.Send(&schedulerpb.QuerierToScheduler{}); err != nil {
+						level.Error(logger).Log("msg", "error notifying scheduler about finished query", "err", err, "addr", address)
+					}
+				}
+			}()
+
 			sp.runRequest(ctx, logger, request.QueryID, request.FrontendAddress, request.StatsEnabled, request.HttpRequest)
 
 			// Report back to scheduler that processing of the query has finished.

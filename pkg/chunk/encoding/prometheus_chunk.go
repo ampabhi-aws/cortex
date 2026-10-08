@@ -9,6 +9,12 @@ import (
 	"github.com/prometheus/prometheus/tsdb/chunkenc"
 )
 
+// xorChunkHeaderLen is the size of the fixed header prepended to every Prometheus
+// XOR chunk payload: a 2-byte big-endian sample count. All consumers of the
+// decoded chunk (XORChunk.iterator, XORChunk.NumSamples) index this header
+// unconditionally, so a shorter payload would panic with a slice bounds error.
+const xorChunkHeaderLen = 2
+
 // Wrapper around Prometheus chunk.
 type prometheusXorChunk struct {
 	chunk chunkenc.Chunk
@@ -58,6 +64,14 @@ func (p *prometheusXorChunk) Marshal(i io.Writer) error {
 }
 
 func (p *prometheusXorChunk) UnmarshalFromBuf(bytes []byte) error {
+	// Validate the payload before handing it to the TSDB primitive. chunkenc.FromData
+	// performs no length checking, but XORChunk.iterator and XORChunk.NumSamples
+	// unconditionally index a 2-byte header, so a sub-header payload would panic
+	// on first iterator creation or Len() call.
+	if len(bytes) < xorChunkHeaderLen {
+		return errors.Errorf("invalid Prometheus XOR chunk: got %d bytes, want at least %d", len(bytes), xorChunkHeaderLen)
+	}
+
 	c, err := chunkenc.FromData(chunkenc.EncXOR, bytes)
 	if err != nil {
 		return errors.Wrap(err, "failed to create Prometheus chunk from bytes")
