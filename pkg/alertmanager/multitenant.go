@@ -59,6 +59,8 @@ var (
 	errInvalidExternalURL                  = errors.New("the configured external URL is invalid: should not end with /")
 	errShardingUnsupportedStorage          = errors.New("the configured alertmanager storage backend is not supported when sharding is enabled")
 	errZoneAwarenessEnabledWithoutZoneInfo = errors.New("the configured alertmanager has zone awareness enabled but zone is not set")
+	errNotUserOwned                        = errors.New("alertmanager tenant is not owned by this instance")
+	errAlertmanagerNotReady                = errors.New("alertmanager for tenant is not yet synced on this instance")
 )
 
 // MultitenantAlertmanagerConfig is the configuration for a multitenant Alertmanager.
@@ -1014,6 +1016,13 @@ func (am *MultitenantAlertmanager) serveRequest(w http.ResponseWriter, req *http
 		http.Error(w, err.Error(), http.StatusUnauthorized)
 		return
 	}
+	// Reject obviously invalid tenant IDs before we would otherwise instantiate
+	// per-tenant state (goroutines, directories, store objects) for an attacker
+	// controlled X-Scope-OrgID header.
+	if err := tenant.ValidTenantID(userID); err != nil {
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
 	am.alertmanagersMtx.Lock()
 	userAM, ok := am.alertmanagers[userID]
 	am.alertmanagersMtx.Unlock()
@@ -1024,10 +1033,30 @@ func (am *MultitenantAlertmanager) serveRequest(w http.ResponseWriter, req *http
 	}
 
 	if am.fallbackConfig != "" {
-		userAM, err = am.alertmanagerFromFallbackConfig(userID)
+		userAM, err = am.alertmanagerFromFallbackConfig(req.Context(), userID)
+		if err == errNotUserOwned {
+			level.Debug(am.logger).Log("msg", "not serving request: tenant is not owned by this alertmanager instance", "user", userID)
+			http.Error(w, "the Alertmanager is not configured on this instance", http.StatusNotFound)
+			return
+		}
+		if err == errAlertmanagerNotReady {
+			w.Header().Set("Retry-After", "1")
+			http.Error(w, "the Alertmanager for this tenant is not yet ready, retry shortly", http.StatusServiceUnavailable)
+			return
+		}
 		if err != nil {
 			level.Error(am.logger).Log("msg", "unable to initialize the Alertmanager with a fallback configuration", "user", userID, "err", err)
 			http.Error(w, "Failed to initialize the Alertmanager", http.StatusInternalServerError)
+			return
+		}
+		// A concurrent syncConfigs() may have removed the Alertmanager between
+		// the setConfig() call inside alertmanagerFromFallbackConfig and the
+		// final map lookup, in which case userAM may be nil here. Avoid a nil
+		// pointer dereference and surface a transient 503 instead.
+		if userAM == nil {
+			level.Warn(am.logger).Log("msg", "alertmanager was removed by a concurrent sync before fallback could serve the request", "user", userID)
+			w.Header().Set("Retry-After", "1")
+			http.Error(w, "the Alertmanager for this tenant is not yet ready, retry shortly", http.StatusServiceUnavailable)
 			return
 		}
 
@@ -1039,17 +1068,35 @@ func (am *MultitenantAlertmanager) serveRequest(w http.ResponseWriter, req *http
 	http.Error(w, "the Alertmanager is not configured", http.StatusNotFound)
 }
 
-func (am *MultitenantAlertmanager) alertmanagerFromFallbackConfig(userID string) (*Alertmanager, error) {
-	// Upload an empty config so that the Alertmanager is no de-activated in the next poll
+func (am *MultitenantAlertmanager) alertmanagerFromFallbackConfig(ctx context.Context, userID string) (*Alertmanager, error) {
+	// Never serve/instantiate a tenant this instance does not own under sharding.
+	// This closes the window where a load balancer sends an un-sharded path
+	// (e.g. the UI root or an asset) to a non-owner replica, which would then
+	// lazily materialise and overwrite the tenant's stored config.
+	if am.cfg.ShardingEnabled && !am.isUserOwned(userID) {
+		return nil, errNotUserOwned
+	}
+
+	// Do not clobber an existing configuration. If a configuration already
+	// exists in the store but this instance has not synced it yet (periodic
+	// poll window, or just after a ring change), tell the caller to retry.
+	if _, err := am.store.GetAlertConfig(ctx, userID); err == nil {
+		return nil, errAlertmanagerNotReady
+	} else if !errors.Is(err, alertspb.ErrNotFound) {
+		return nil, err
+	}
+
+	// Upload an empty config so that the Alertmanager is not de-activated in
+	// the next poll. The upload is performed only when no configuration
+	// exists for this tenant, so an existing tenant config can never be
+	// destroyed by a non-mutating request on the fallback path.
 	cfgDesc := alertspb.ToProto("", nil, userID)
-	err := am.store.SetAlertConfig(context.Background(), cfgDesc)
-	if err != nil {
+	if err := am.store.SetAlertConfig(ctx, cfgDesc); err != nil {
 		return nil, err
 	}
 
 	// Calling setConfig with an empty configuration will use the fallback config.
-	err = am.setConfig(cfgDesc)
-	if err != nil {
+	if err := am.setConfig(cfgDesc); err != nil {
 		return nil, err
 	}
 
