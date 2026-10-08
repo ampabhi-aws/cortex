@@ -27,8 +27,8 @@ type Config struct {
 	EnableTLS   bool                   `yaml:"tls_enabled"`
 	TLS         cortextls.ClientConfig `yaml:",inline"`
 
-	UserName string `yaml:"username"`
-	Password string `yaml:"password"`
+	UserName flagext.Secret `yaml:"username"`
+	Password flagext.Secret `yaml:"password"`
 }
 
 // Clientv3Facade is a subset of all Etcd client operations that are required
@@ -57,8 +57,8 @@ func (cfg *Config) RegisterFlagsWithPrefix(f *flag.FlagSet, prefix string) {
 	f.DurationVar(&cfg.DialTimeout, prefix+"etcd.dial-timeout", 10*time.Second, "The dial timeout for the etcd connection.")
 	f.IntVar(&cfg.MaxRetries, prefix+"etcd.max-retries", 10, "The maximum number of retries to do for failed ops.")
 	f.BoolVar(&cfg.EnableTLS, prefix+"etcd.tls-enabled", false, "Enable TLS.")
-	f.StringVar(&cfg.UserName, prefix+"etcd.username", "", "Etcd username.")
-	f.StringVar(&cfg.Password, prefix+"etcd.password", "", "Etcd password.")
+	f.Var(&cfg.UserName, prefix+"etcd.username", "Etcd username.")
+	f.Var(&cfg.Password, prefix+"etcd.password", "Etcd password.")
 	cfg.TLS.RegisterFlagsWithPrefix(prefix+"etcd", f)
 }
 
@@ -104,8 +104,8 @@ func New(cfg Config, codec codec.Codec, logger log.Logger) (*Client, error) {
 		DialKeepAliveTimeout: 2 * cfg.DialTimeout,
 		PermitWithoutStream:  true,
 		TLS:                  tlsConfig,
-		Username:             cfg.UserName,
-		Password:             cfg.Password,
+		Username:             cfg.UserName.Value,
+		Password:             cfg.Password.Value,
 	})
 	if err != nil {
 		return nil, err
