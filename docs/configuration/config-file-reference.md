@@ -2471,6 +2471,15 @@ The `memberlist_config` configures the Gossip memberlist.
 # CLI flag: -memberlist.message-history-buffer-bytes
 [message_history_buffer_bytes: <int> | default = 0]
 
+# When true, accept gossiped KV updates for any key, even if no local watcher
+# is registered for it. The safe default (false) drops updates for unknown
+# keys and counts them in received_broadcasts_invalid_total; this bounds
+# m.store and the per-key Prometheus series by what the local process actually
+# subscribes to, and prevents an unauthenticated gossip peer from growing them
+# without limit.
+# CLI flag: -memberlist.accept-all-gossiped-keys
+[accept_all_gossiped_keys: <boolean> | default = false]
+
 # IP address to listen on for gossip messages. Multiple addresses may be
 # specified. Defaults to 0.0.0.0
 # CLI flag: -memberlist.bind-addr

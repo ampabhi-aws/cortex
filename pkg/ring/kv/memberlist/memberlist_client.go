@@ -157,6 +157,17 @@ type KVConfig struct {
 	// How much space to use to keep received and sent messages in memory (for troubleshooting).
 	MessageHistoryBufferBytes int `yaml:"message_history_buffer_bytes"`
 
+	// AcceptAllGossipedKeys, when true, disables the key allowlist enforced by
+	// acceptableKey. The default (false) causes gossiped KV updates for keys
+	// without a local WatchKey/WatchPrefix subscription and no pre-existing
+	// store entry to be dropped and counted via received_broadcasts_invalid_total.
+	// This prevents an unauthenticated peer on the gossip transport from
+	// growing m.store (and the associated Prometheus series) without bound.
+	// Set to true only to restore the pre-fix behaviour for backwards
+	// compatibility with components that gossip updates before registering a
+	// watcher.
+	AcceptAllGossipedKeys bool `yaml:"accept_all_gossiped_keys"`
+
 	TCPTransport TCPTransportConfig `yaml:",inline"`
 
 	// Where to put custom metrics. Metrics are not registered, if this is nil.
@@ -190,6 +201,7 @@ func (cfg *KVConfig) RegisterFlagsWithPrefix(f *flag.FlagSet, prefix string) {
 	f.DurationVar(&cfg.GossipToTheDeadTime, prefix+"memberlist.gossip-to-dead-nodes-time", mlDefaults.GossipToTheDeadTime, "How long to keep gossiping to dead nodes, to give them chance to refute their death.")
 	f.DurationVar(&cfg.DeadNodeReclaimTime, prefix+"memberlist.dead-node-reclaim-time", mlDefaults.DeadNodeReclaimTime, "How soon can dead node's name be reclaimed with new address. 0 to disable.")
 	f.IntVar(&cfg.MessageHistoryBufferBytes, prefix+"memberlist.message-history-buffer-bytes", 0, "How much space to use for keeping received and sent messages in memory for troubleshooting (two buffers). 0 to disable.")
+	f.BoolVar(&cfg.AcceptAllGossipedKeys, prefix+"memberlist.accept-all-gossiped-keys", false, "When true, accept gossiped KV updates for any key, even if no local watcher is registered for it. The safe default (false) drops updates for unknown keys and counts them in received_broadcasts_invalid_total; this bounds m.store and the per-key Prometheus series by what the local process actually subscribes to, and prevents an unauthenticated gossip peer from growing them without limit.")
 	f.BoolVar(&cfg.EnableCompression, prefix+"memberlist.compression-enabled", mlDefaults.EnableCompression, "Enable message compression. This can be used to reduce bandwidth usage at the cost of slightly more CPU utilization.")
 	f.StringVar(&cfg.AdvertiseAddr, prefix+"memberlist.advertise-addr", mlDefaults.AdvertiseAddr, "Gossip address to advertise to other members in the cluster. Used for NAT traversal.")
 	f.IntVar(&cfg.AdvertisePort, prefix+"memberlist.advertise-port", mlDefaults.AdvertisePort, "Gossip port to advertise to other members in the cluster. Used for NAT traversal.")
@@ -272,8 +284,8 @@ type KV struct {
 	watchPrefixDroppedNotifications     *prometheus.CounterVec
 
 	storeValuesDesc        *prometheus.Desc
-	storeTombstones        *prometheus.GaugeVec
-	storeRemovedTombstones *prometheus.CounterVec
+	storeTombstones        prometheus.Gauge
+	storeRemovedTombstones prometheus.Counter
 
 	memberlistMembersCount prometheus.GaugeFunc
 	memberlistHealthScore  prometheus.GaugeFunc
@@ -781,6 +793,60 @@ func removeWatcherChannel(k string, w chan string, watchers map[string][]chan st
 	}
 }
 
+// acceptableKey reports whether the given KV key is one that this process is
+// interested in receiving gossiped updates for. Updates for keys that are not
+// acceptable are dropped before they are stored, which prevents an
+// unauthenticated peer on the gossip transport from growing m.store without
+// bound (which would also inflate every push/pull LocalState dump and the
+// per-key Prometheus series) by forging updates with arbitrary new keys.
+//
+// A key is acceptable when any of the following is true:
+//   - cfg.AcceptAllGossipedKeys is set (opt-out of the allowlist entirely);
+//   - a WatchKey subscriber is registered for the exact key;
+//   - a WatchPrefix subscriber is registered for a prefix of the key;
+//   - no watchers of any kind have been registered yet (so the KV is not
+//     yet in use locally, e.g. during startup or in unit tests);
+//   - the key already exists in the local store (meaning the local process
+//     previously accepted or produced it, e.g. via CAS).
+//
+// This matches the mitigation guidance in the companion security finding:
+// reject unknown keys at NotifyMsg / MergeRemoteState before writing them
+// into m.store or using them as Prometheus label values.
+func (m *KV) acceptableKey(key string) bool {
+	if m.cfg.AcceptAllGossipedKeys {
+		return true
+	}
+	m.watchersMu.Lock()
+	if _, ok := m.watchers[key]; ok {
+		m.watchersMu.Unlock()
+		return true
+	}
+	for p := range m.prefixWatchers {
+		if strings.HasPrefix(key, p) {
+			m.watchersMu.Unlock()
+			return true
+		}
+	}
+	// If no watchers or prefix watchers are registered, treat the KV as not
+	// yet in use by any local consumer. In that mode we accept any key to
+	// avoid breaking unit tests and startup scenarios where gossip may be
+	// received before watchers are wired up. Enforcement kicks in as soon as
+	// the first watcher is registered, which happens on Cortex module start.
+	noWatchers := len(m.watchers) == 0 && len(m.prefixWatchers) == 0
+	m.watchersMu.Unlock()
+	if noWatchers {
+		return true
+	}
+
+	// Also accept keys that this process already has locally (e.g. values
+	// written via CAS from this node). Those keys are not attacker-chosen,
+	// so letting peer updates for them through does not expand the key set.
+	m.storeMu.Lock()
+	_, inStore := m.store[key]
+	m.storeMu.Unlock()
+	return inStore
+}
+
 func (m *KV) notifyWatchers(key string) {
 	m.watchersMu.Lock()
 	defer m.watchersMu.Unlock()
@@ -985,6 +1051,15 @@ func (m *KV) NotifyMsg(msg []byte) {
 		return
 	}
 
+	// Reject updates for keys this process does not know about. This prevents
+	// an unauthenticated gossip peer from growing m.store (and the per-key
+	// metric series backing kv_store_value_tombstones*) without bound.
+	if !m.acceptableKey(kvPair.Key) {
+		m.numberOfInvalidReceivedMessages.Inc()
+		level.Warn(m.logger).Log("msg", "ignoring gossiped update for unknown key", "key", kvPair.Key)
+		return
+	}
+
 	// we have a ring update! Let's merge it with our version of the ring for given key
 	mod, version, err := m.mergeBytesValueForKey(kvPair.Key, kvPair.Value, codec)
 
@@ -1157,6 +1232,16 @@ func (m *KV) MergeRemoteState(data []byte, join bool) {
 			continue
 		}
 
+		// Reject remote-state entries for keys this process does not know
+		// about. See acceptableKey for rationale: this bounds the key set
+		// written into m.store and the per-key tombstone metric series by
+		// what the local process actually subscribes to.
+		if !m.acceptableKey(kvPair.Key) {
+			m.numberOfInvalidReceivedMessages.Inc()
+			level.Warn(m.logger).Log("msg", "ignoring remote-state entry for unknown key", "key", kvPair.Key)
+			continue
+		}
+
 		// we have both key and value, try to merge it with our state
 		change, newver, err := m.mergeBytesValueForKey(kvPair.Key, kvPair.Value, codec)
 
@@ -1229,8 +1314,21 @@ func (m *KV) mergeValueForKey(key string, incomingValue Mergeable, casVersion ui
 	if m.cfg.LeftIngestersTimeout > 0 {
 		limit := time.Now().Add(-m.cfg.LeftIngestersTimeout)
 		total, removed := result.RemoveTombstones(limit)
-		m.storeTombstones.WithLabelValues(key).Set(float64(total))
-		m.storeRemovedTombstones.WithLabelValues(key).Add(float64(removed))
+
+		// Note: the "key" label was intentionally removed from these metrics.
+		// It made every distinct gossiped key create a new permanent series,
+		// which an unauthenticated gossip peer could exploit to blow up the
+		// Prometheus cardinality and /metrics response. Report aggregates
+		// instead:
+		//   - storeRemovedTombstones is a counter that accumulates removals
+		//     across every merge of every key.
+		//   - storeTombstones is a gauge that is Set to the current tombstone
+		//     count of the value that was just merged; it is still useful as
+		//     an operational signal (non-zero means tombstones exist in at
+		//     least one recently-updated value) without creating per-key
+		//     series.
+		m.storeTombstones.Set(float64(total))
+		m.storeRemovedTombstones.Add(float64(removed))
 
 		// Remove tombstones from change too. If change turns out to be empty after this,
 		// we don't need to gossip the change. However, the local value will be always be updated.
