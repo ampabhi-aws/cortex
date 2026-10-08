@@ -378,7 +378,6 @@ func (c *haTracker) checkReplica(ctx context.Context, userID, cluster, replica s
 
 	c.electedLock.RLock()
 	entry, ok := c.elected[key]
-	clusters := len(c.clusters[userID])
 	c.electedLock.RUnlock()
 
 	if ok && now.Sub(timestamp.Time(entry.ReceivedAt)) < c.cfg.UpdateTimeout+c.updateTimeoutJitter {
@@ -389,13 +388,34 @@ func (c *haTracker) checkReplica(ctx context.Context, userID, cluster, replica s
 	}
 
 	if !ok {
-		// If we don't know about this cluster yet and we have reached the limit for number of clusters, we error out now.
-		if limit := c.limits.MaxHAClusters(userID); limit > 0 && clusters+1 > limit {
-			return tooManyClustersError{limit: limit}
+		// Admit this cluster synchronously (under the write lock) against the
+		// per-user MaxHAClusters cap, instead of relying on the asynchronous
+		// WatchPrefix callback that would otherwise let callers bypass the
+		// limit by sending clusters whose KV write fails or by sending bursts
+		// of distinct values faster than the watch can propagate.
+		c.electedLock.Lock()
+		if _, elected := c.elected[key]; !elected {
+			userClusters := c.clusters[userID]
+			if _, seen := userClusters[cluster]; !seen {
+				if limit := c.limits.MaxHAClusters(userID); limit > 0 && len(userClusters)+1 > limit {
+					c.electedLock.Unlock()
+					return tooManyClustersError{limit: limit}
+				}
+				if userClusters == nil {
+					userClusters = map[string]struct{}{}
+					c.clusters[userID] = userClusters
+				}
+				userClusters[cluster] = struct{}{}
+			}
 		}
+		c.electedLock.Unlock()
 	}
 
 	err := c.checkKVStore(ctx, key, replica, now)
+	// Only increment the kvCASCalls counter for clusters that passed the
+	// MaxHAClusters admission check above, so attacker-controlled label
+	// values that would be rejected cannot create unbounded CounterVec
+	// children retained for the process lifetime.
 	c.kvCASCalls.WithLabelValues(userID, cluster).Inc()
 	if err != nil {
 		// The callback within checkKVStore will return a replicasNotMatchError if the sample is being deduped,

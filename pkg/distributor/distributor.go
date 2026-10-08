@@ -484,9 +484,25 @@ func (d *Distributor) checkSample(ctx context.Context, userID, cluster, replica 
 		return false, nil
 	}
 
+	maxLen := d.limits.MaxLabelValueLength(userID)
+
 	// If replica label is too long, don't use it. We accept the sample here, but it will fail validation later anyway.
-	if len(replica) > d.limits.MaxLabelValueLength(userID) {
+	if len(replica) > maxLen {
 		return false, nil
+	}
+
+	// The cluster label is used as a KV store key and as a Prometheus metric
+	// label value, both of which retain the string for the process lifetime.
+	// Reject requests whose cluster label is too long or syntactically unsafe
+	// *before* they reach the HA tracker, so a tenant cannot pin unbounded
+	// heap by submitting oversized or arbitrarily-shaped values.
+	if len(cluster) > maxLen {
+		validation.DiscardedSamples.WithLabelValues(validation.HAClusterLabelTooLong, userID).Inc()
+		return false, httpgrpc.Errorf(http.StatusBadRequest, "HA cluster label value too long (%d > %d)", len(cluster), maxLen)
+	}
+	if !model.LabelValue(cluster).IsValid() || strings.ContainsRune(cluster, '/') {
+		validation.DiscardedSamples.WithLabelValues(validation.HAClusterLabelInvalid, userID).Inc()
+		return false, httpgrpc.Errorf(http.StatusBadRequest, "HA cluster label value is invalid")
 	}
 
 	// At this point we know we have both HA labels, we should lookup

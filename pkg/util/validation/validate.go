@@ -58,6 +58,15 @@ const (
 	// Too many HA clusters is one of the reasons for discarding samples.
 	TooManyHAClusters = "too_many_ha_clusters"
 
+	// HAClusterLabelTooLong is used when the HA cluster label value exceeds the
+	// configured maximum label value length and the sample is rejected before
+	// it reaches the HA tracker.
+	HAClusterLabelTooLong = "ha_cluster_label_value_too_long"
+
+	// HAClusterLabelInvalid is used when the HA cluster label value contains
+	// characters that would be unsafe to use as a KV store key.
+	HAClusterLabelInvalid = "ha_cluster_label_value_invalid"
+
 	// DroppedByRelabelConfiguration Samples can also be discarded because of relabeling configuration
 	DroppedByRelabelConfiguration = "relabel_configuration"
 	// DroppedByUserConfigurationOverride Samples discarded due to user configuration removing label __name__
