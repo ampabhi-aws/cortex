@@ -959,8 +959,19 @@ func (i *Ingester) Push(ctx context.Context, req *cortexpb.WriteRequest) (*corte
 	// Walk the samples, appending them to the users database
 	app := db.Appender(ctx).(extendedAppender)
 	for _, ts := range req.Timeseries {
-		// The labels must be sorted (in our case, it's guaranteed a write request
-		// has sorted labels once hit the ingester).
+		// The ingester cannot assume its callers have validated the request:
+		// Ingester.Push is exposed as the gRPC cortex.Ingester/Push method and
+		// as the HTTP /push and /ingester/push routes, so a tenant may reach it
+		// without going through the distributor. We therefore enforce the same
+		// per-tenant label validation here. See validation.ValidateLabels for the
+		// list of checks (metric name, label name/value length, max label names
+		// per series, max labels size bytes, duplicate and unsorted labels).
+		if err := validation.ValidateLabels(i.limits, userID, ts.Labels, req.SkipLabelNameValidation); err != nil {
+			failedSamplesCount += len(ts.Samples)
+			failedExemplarsCount += len(ts.Exemplars)
+			updateFirstPartial(func() error { return err })
+			continue
+		}
 
 		// Look up a reference for this series.
 		ref, copiedLabels := app.GetRef(cortexpb.FromLabelAdaptersToLabels(ts.Labels))
@@ -970,6 +981,14 @@ func (i *Ingester) Push(ctx context.Context, req *cortexpb.WriteRequest) (*corte
 
 		for _, s := range ts.Samples {
 			var err error
+
+			// Per-sample validation (reject old samples, creation grace period) must
+			// also happen here because the ingester cannot trust the caller.
+			if vErr := validation.ValidateSample(i.limits, userID, ts.Labels, s); vErr != nil {
+				failedSamplesCount++
+				updateFirstPartial(func() error { return vErr })
+				continue
+			}
 
 			// If the cached reference exists, we try to use it.
 			if ref != 0 {
