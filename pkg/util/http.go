@@ -19,6 +19,8 @@ import (
 	otlog "github.com/opentracing/opentracing-go/log"
 	yaml "gopkg.in/yaml.v2"
 	yamlv3 "gopkg.in/yaml.v3"
+
+	util_math "github.com/cortexproject/cortex/pkg/util/math"
 )
 
 const messageSizeLargerErrFmt = "received message larger than max (%d vs %d)"
@@ -200,7 +202,11 @@ func decompressFromReader(reader io.Reader, expectedSize, maxSize int, compressi
 		err  error
 	)
 	if expectedSize > 0 {
-		buf.Grow(expectedSize + bytes.MinRead) // extra space guarantees no reallocation
+		// Grow incrementally, capped to a small constant; bytes.Buffer will
+		// resize as data actually arrives. This avoids committing hundreds of
+		// MB of RSS from an attacker-controlled Content-Length before any body
+		// byte has been read.
+		buf.Grow(util_math.Min(expectedSize, 64*1024) + bytes.MinRead)
 	}
 	// Read from LimitReader with limit max+1. So if the underlying
 	// reader is over limit, the result will be bigger than max.
