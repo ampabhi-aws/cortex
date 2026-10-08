@@ -17,6 +17,17 @@ var (
 	expectedSamplesPerSeries   = 10
 	expectedExemplarsPerSeries = 1
 
+	// maxTimeseriesPerRequest bounds the number of repeated `timeseries` (and
+	// metadata) elements that may be present in a single remote-write request.
+	// It is a hard safety cap, enforced during Unmarshal of PreallocWriteRequest,
+	// to prevent an untrusted sender from triggering tens-of-GB-scale heap
+	// amplification by sending many empty (but still pooled/pre-allocated)
+	// elements. 0 disables the check. The default is deliberately high so that
+	// legitimate Prometheus remote_write batches (typically <= a few thousand
+	// series) are never affected, while still bounding the pathological case.
+	// See the security advisory covering CWE-770 in the write path.
+	maxTimeseriesPerRequest = 100000
+
 	/*
 		We cannot pool these as pointer-to-slice because the place we use them is in WriteRequest which is generated from Protobuf
 		and we don't have an option to make it a pointer. There is overhead here 24 bytes of garbage every time a PreallocTimeseries
@@ -39,6 +50,12 @@ var (
 	}
 )
 
+// ErrTooManyTimeseries is returned by PreallocWriteRequest.Unmarshal when the
+// decoded request would contain more repeated timeseries (plus metadata)
+// elements than the configured per-request cap. It is treated as a client
+// error (HTTP 400) by the push handler.
+var ErrTooManyTimeseries = fmt.Errorf("too many timeseries in write request")
+
 // PreallocConfig configures how structures will be preallocated to optimise
 // proto unmarshalling.
 type PreallocConfig struct{}
@@ -48,6 +65,7 @@ func (PreallocConfig) RegisterFlags(f *flag.FlagSet) {
 	f.IntVar(&expectedTimeseries, "ingester-client.expected-timeseries", expectedTimeseries, "Expected number of timeseries per request, used for preallocations.")
 	f.IntVar(&expectedLabels, "ingester-client.expected-labels", expectedLabels, "Expected number of labels per timeseries, used for preallocations.")
 	f.IntVar(&expectedSamplesPerSeries, "ingester-client.expected-samples-per-series", expectedSamplesPerSeries, "Expected number of samples per timeseries, used for preallocations.")
+	f.IntVar(&maxTimeseriesPerRequest, "ingester-client.max-timeseries-per-request", maxTimeseriesPerRequest, "Hard cap on the number of timeseries (plus metadata) elements accepted in a single remote-write / Push request. Enforced during Unmarshal to bound the work implied by the message, not just its byte size. 0 disables the check.")
 }
 
 // PreallocWriteRequest is a WriteRequest which preallocs slices on Unmarshal.
@@ -56,9 +74,30 @@ type PreallocWriteRequest struct {
 }
 
 // Unmarshal implements proto.Message.
+//
+// After the generated Unmarshal returns, Unmarshal enforces a cap on the
+// total number of repeated `timeseries` and `metadata` elements. This bounds
+// the amount of work (and heap) implied by a single Push request independently
+// of the (optionally compressed) byte size that -distributor.max-recv-msg-size
+// gates. The oversized request is dropped back into the pool so a hostile
+// sender cannot pin tens of GB of live heap by repeatedly sending bomb bodies.
 func (p *PreallocWriteRequest) Unmarshal(dAtA []byte) error {
 	p.Timeseries = PreallocTimeseriesSliceFromPool()
-	return p.WriteRequest.Unmarshal(dAtA)
+	if err := p.WriteRequest.Unmarshal(dAtA); err != nil {
+		return err
+	}
+	if maxTimeseriesPerRequest > 0 {
+		if total := len(p.Timeseries) + len(p.Metadata); total > maxTimeseriesPerRequest {
+			// Return every PreallocTimeseries and the backing slice to the
+			// pool before failing so a hostile caller cannot force the
+			// process to retain the oversized allocation across GC cycles.
+			ReuseSlice(p.Timeseries)
+			p.Timeseries = nil
+			p.Metadata = nil
+			return fmt.Errorf("%w: %d > %d", ErrTooManyTimeseries, total, maxTimeseriesPerRequest)
+		}
+	}
+	return nil
 }
 
 // PreallocTimeseries is a TimeSeries which preallocs slices on Unmarshal.
