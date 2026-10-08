@@ -86,6 +86,8 @@ func TestAPIConfig(t *testing.T) {
 			if tc.actualCfg != nil {
 				tc.actualCfg(&cortex.Cfg)
 			}
+			// Enable admin endpoints so /config is registered.
+			cortex.Cfg.API.EnableAdminEndpoints = true
 
 			_, err := cortex.initAPI()
 			require.NoError(t, err)

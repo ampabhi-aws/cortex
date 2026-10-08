@@ -48,6 +48,14 @@ type Config struct {
 	AlertmanagerHTTPPrefix string `yaml:"alertmanager_http_prefix"`
 	PrometheusHTTPPrefix   string `yaml:"prometheus_http_prefix"`
 
+	// EnableAdminEndpoints controls whether sensitive admin endpoints such as
+	// /config and /runtime_config are registered on the HTTP listener. These
+	// endpoints expose the serialised Cortex configuration (which may include
+	// credentials) and per-tenant override information, so they are disabled
+	// by default. Operators that need them must opt-in and should expose them
+	// via a separately-protected ingress.
+	EnableAdminEndpoints bool `yaml:"enable_admin_endpoints"`
+
 	// The following configs are injected by the upstream caller.
 	ServerPrefix       string               `yaml:"-"`
 	LegacyHTTPPrefix   string               `yaml:"-"`
@@ -71,6 +79,7 @@ type Config struct {
 func (cfg *Config) RegisterFlags(f *flag.FlagSet) {
 	f.BoolVar(&cfg.ResponseCompression, "api.response-compression-enabled", false, "Use GZIP compression for API responses. Some endpoints serve large YAML or JSON blobs which can benefit from compression.")
 	f.Var(&cfg.HTTPRequestHeadersToLog, "api.http-request-headers-to-log", "Which HTTP Request headers to add to logs")
+	f.BoolVar(&cfg.EnableAdminEndpoints, "api.enable-admin-endpoints", false, "If true, exposes sensitive admin endpoints (/config and /runtime_config) on the HTTP listener. These endpoints disclose the serialised configuration (potentially including redacted credentials) and per-tenant override information, and should only be enabled behind a separately-authenticated ingress.")
 	cfg.RegisterFlagsWithPrefix("", f)
 }
 
@@ -214,16 +223,21 @@ func (a *API) RegisterAlertmanager(am *alertmanager.MultitenantAlertmanager, tar
 
 // RegisterAPI registers the standard endpoints associated with a running Cortex.
 func (a *API) RegisterAPI(httpPathPrefix string, actualCfg interface{}, defaultCfg interface{}) {
-	a.indexPage.AddLink(SectionAdminEndpoints, "/config", "Current Config (including the default values)")
-	a.indexPage.AddLink(SectionAdminEndpoints, "/config?mode=diff", "Current Config (show only values that differ from the defaults)")
-
-	a.RegisterRoute("/config", a.cfg.configHandler(actualCfg, defaultCfg), false, "GET")
 	a.RegisterRoute("/", indexHandler(httpPathPrefix, a.indexPage), false, "GET")
 	a.RegisterRoute("/debug/fgprof", fgprof.Handler(), false, "GET")
+
+	if a.cfg.EnableAdminEndpoints {
+		a.indexPage.AddLink(SectionAdminEndpoints, "/config", "Current Config (including the default values)")
+		a.indexPage.AddLink(SectionAdminEndpoints, "/config?mode=diff", "Current Config (show only values that differ from the defaults)")
+		a.RegisterRoute("/config", a.cfg.configHandler(actualCfg, defaultCfg), false, "GET")
+	}
 }
 
 // RegisterRuntimeConfig registers the endpoints associates with the runtime configuration
 func (a *API) RegisterRuntimeConfig(runtimeConfigHandler http.HandlerFunc) {
+	if !a.cfg.EnableAdminEndpoints {
+		return
+	}
 	a.indexPage.AddLink(SectionAdminEndpoints, "/runtime_config", "Current Runtime Config (incl. Overrides)")
 	a.indexPage.AddLink(SectionAdminEndpoints, "/runtime_config?mode=diff", "Current Runtime Config (show only values that differ from the defaults)")
 
