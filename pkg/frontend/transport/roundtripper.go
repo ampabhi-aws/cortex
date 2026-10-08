@@ -34,6 +34,15 @@ func (b *buffer) Bytes() []byte {
 }
 
 func (a *grpcRoundTripperAdapter) RoundTrip(r *http.Request) (*http.Response, error) {
+	// Strip end-user authentication/authorization headers before converting
+	// the request into an httpgrpc.HTTPRequest. These headers are propagated
+	// into the queued request that the scheduler hands to a querier; a
+	// compromised or rogue querier (or any other component holding a queued
+	// request) must never be given gateway-forwarded end-user credentials.
+	// The downstream querier only needs the tenant identity (X-Scope-OrgID),
+	// standard content negotiation, and tracing headers, all of which are
+	// preserved by server.HTTPRequest.
+	r = stripSensitiveRequestHeaders(r)
 	req, err := server.HTTPRequest(r)
 	if err != nil {
 		return nil, err
@@ -54,4 +63,37 @@ func (a *grpcRoundTripperAdapter) RoundTrip(r *http.Request) (*http.Response, er
 		httpResp.Header[h.Key] = h.Values
 	}
 	return httpResp, nil
+}
+
+// sensitiveRequestHeaders are stripped from the HTTP request before it is
+// converted to the httpgrpc form that is queued for the querier. This stops
+// gateway-forwarded end-user credentials (Authorization, Cookie,
+// Proxy-Authorization) from being handed to any component that dequeues the
+// request from the scheduler.
+var sensitiveRequestHeaders = []string{
+	"Authorization",
+	"Cookie",
+	"Proxy-Authorization",
+}
+
+func stripSensitiveRequestHeaders(r *http.Request) *http.Request {
+	if r == nil || r.Header == nil {
+		return r
+	}
+	// Only clone when we actually need to mutate headers.
+	needsClone := false
+	for _, h := range sensitiveRequestHeaders {
+		if len(r.Header.Values(h)) > 0 {
+			needsClone = true
+			break
+		}
+	}
+	if !needsClone {
+		return r
+	}
+	cloned := r.Clone(r.Context())
+	for _, h := range sensitiveRequestHeaders {
+		cloned.Header.Del(h)
+	}
+	return cloned
 }
