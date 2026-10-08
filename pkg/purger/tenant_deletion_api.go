@@ -52,6 +52,46 @@ func (api *TenantDeletionAPI) DeleteTenant(w http.ResponseWriter, r *http.Reques
 		return
 	}
 
+	// Apply the strict tenant-ID charset/length validation regardless of the
+	// resolver mode. The default SingleResolver only rejects path-traversal
+	// characters, which still allows arbitrary charsets (spaces, unicode,
+	// control chars) to be used verbatim as object-storage prefixes. Writing
+	// a tenant-deletion marker is a cluster-wide, bucket-polluting side
+	// effect, so we require a well-formed tenant ID here.
+	if err := tenant.ValidTenantID(userID); err != nil {
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
+
+	userBucket := bucket.NewUserBucketClient(userID, api.bucketClient, api.cfgProvider)
+
+	// Idempotency: if a deletion marker already exists for this tenant, do
+	// not re-upload it. The marker is a fixed-path object inside the tenant
+	// prefix, so re-upload is pure overhead and gives a trivial amplification
+	// primitive for repeated POSTs.
+	if exists, err := cortex_tsdb.TenantDeletionMarkExists(ctx, api.bucketClient, userID); err != nil {
+		level.Error(api.logger).Log("msg", "failed to check tenant deletion mark", "user", userID, "err", err)
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	} else if exists {
+		level.Info(api.logger).Log("msg", "tenant deletion mark already exists, skipping re-upload", "user", userID)
+		w.WriteHeader(http.StatusOK)
+		return
+	}
+
+	// Refuse to create a marker (and therefore a brand new top-level bucket
+	// prefix) for a tenant that has no data in the bucket. This prevents a
+	// caller from creating phantom tenants that the compactor would then
+	// re-scan every cleanup cycle.
+	if empty, err := isUserPrefixEmpty(ctx, userBucket); err != nil {
+		level.Error(api.logger).Log("msg", "failed to inspect tenant prefix", "user", userID, "err", err)
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	} else if empty {
+		http.Error(w, "no data for tenant", http.StatusNotFound)
+		return
+	}
+
 	err = cortex_tsdb.WriteTenantDeletionMark(r.Context(), api.bucketClient, userID, api.cfgProvider, cortex_tsdb.NewTenantDeletionMark(time.Now()))
 	if err != nil {
 		level.Error(api.logger).Log("msg", "failed to write tenant deletion mark", "user", userID, "err", err)
@@ -63,6 +103,23 @@ func (api *TenantDeletionAPI) DeleteTenant(w http.ResponseWriter, r *http.Reques
 	level.Info(api.logger).Log("msg", "tenant deletion mark in blocks storage created", "user", userID)
 
 	w.WriteHeader(http.StatusOK)
+}
+
+// isUserPrefixEmpty returns true if the tenant's prefix in the bucket contains
+// no objects at all. The caller must pass a bucket already scoped to the
+// tenant (e.g. via bucket.NewUserBucketClient).
+func isUserPrefixEmpty(ctx context.Context, userBkt objstore.Bucket) (bool, error) {
+	var errNotEmpty = errors.New("not empty")
+	err := userBkt.Iter(ctx, "", func(string) error {
+		return errNotEmpty
+	})
+	if errors.Is(err, errNotEmpty) {
+		return false, nil
+	}
+	if err != nil {
+		return false, err
+	}
+	return true, nil
 }
 
 type DeleteTenantStatusResponse struct {
