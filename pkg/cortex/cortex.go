@@ -12,6 +12,7 @@ import (
 
 	"github.com/go-kit/log"
 	"github.com/go-kit/log/level"
+	grpc_recovery "github.com/grpc-ecosystem/go-grpc-middleware/recovery"
 	"github.com/pkg/errors"
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/prometheus/promql"
@@ -344,10 +345,15 @@ func New(cfg Config) (*Cortex, error) {
 			"/cortex.Ingester/TransferChunks",
 			"/frontend.Frontend/Process",
 			"/frontend.Frontend/NotifyClientShutdown",
-			"/schedulerpb.SchedulerForFrontend/FrontendLoop",
 			"/schedulerpb.SchedulerForQuerier/QuerierLoop",
 			"/schedulerpb.SchedulerForQuerier/NotifyQuerierShutdown",
 		})
+
+	// Install panic recovery as the outermost gRPC interceptor so that handler panics
+	// (for example, nil-pointer dereferences from malformed client messages) are
+	// converted into gRPC errors rather than crashing the process.
+	cfg.Server.GRPCMiddleware = append(cfg.Server.GRPCMiddleware, grpc_recovery.UnaryServerInterceptor())
+	cfg.Server.GRPCStreamMiddleware = append(cfg.Server.GRPCStreamMiddleware, grpc_recovery.StreamServerInterceptor())
 
 	cortex := &Cortex{
 		Cfg: cfg,
