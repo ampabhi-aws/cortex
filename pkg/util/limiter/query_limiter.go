@@ -54,6 +54,16 @@ func AddQueryLimiterToContext(ctx context.Context, limiter *QueryLimiter) contex
 	return context.WithValue(ctx, ctxKey, limiter)
 }
 
+// QueryLimiterFromContext returns the QueryLimiter attached to ctx, if any.
+// Callers that want to share a single limiter across multiple sub-queriers
+// (e.g. tenant-federation) should use this to avoid installing a second
+// limiter and thereby turning the four per-query limits into per-tenant
+// limits.
+func QueryLimiterFromContext(ctx context.Context) (*QueryLimiter, bool) {
+	ql, ok := ctx.Value(ctxKey).(*QueryLimiter)
+	return ql, ok
+}
+
 // QueryLimiterFromContextWithFallback returns a QueryLimiter from the current context.
 // If there is not a QueryLimiter on the context it will return a new no-op limiter.
 func QueryLimiterFromContextWithFallback(ctx context.Context) *QueryLimiter {

@@ -3,6 +3,7 @@ package tenant
 import (
 	"context"
 	"errors"
+	"fmt"
 	"net/http"
 	"strings"
 
@@ -98,7 +99,14 @@ func (t *SingleResolver) TenantIDs(ctx context.Context) ([]string, error) {
 	return []string{orgID}, err
 }
 
+// MultiResolver supports a `|`-separated list of tenant IDs. It enforces per-ID
+// character/length validation (see ValidTenantID) and, when configured, an
+// upper bound on the number of IDs in a single X-Scope-OrgID header to prevent
+// unbounded fan-out downstream (e.g. in the tenant-federation merge querier).
 type MultiResolver struct {
+	// maxTenantIDs is the maximum number of tenant IDs allowed in a single
+	// X-Scope-OrgID header. 0 means unlimited (backwards compatible default).
+	maxTenantIDs int
 }
 
 // NewMultiResolver creates a tenant resolver, which allows request to have
@@ -107,6 +115,26 @@ type MultiResolver struct {
 // https://cortexmetrics.io/docs/guides/limitations/#tenant-id-naming)
 func NewMultiResolver() *MultiResolver {
 	return &MultiResolver{}
+}
+
+// NewMultiResolverWithMaxTenantIDs creates a MultiResolver that additionally
+// rejects any X-Scope-OrgID header carrying more than maxTenantIDs IDs. A value
+// of 0 (or negative) disables the cap and preserves the previous unbounded
+// behaviour.
+func NewMultiResolverWithMaxTenantIDs(maxTenantIDs int) *MultiResolver {
+	if maxTenantIDs < 0 {
+		maxTenantIDs = 0
+	}
+	return &MultiResolver{maxTenantIDs: maxTenantIDs}
+}
+
+// SetMaxTenantIDs updates the maximum tenant-ID count enforced by this
+// resolver. A value of 0 (or negative) disables the cap.
+func (t *MultiResolver) SetMaxTenantIDs(maxTenantIDs int) {
+	if maxTenantIDs < 0 {
+		maxTenantIDs = 0
+	}
+	t.maxTenantIDs = maxTenantIDs
 }
 
 func (t *MultiResolver) TenantID(ctx context.Context) (string, error) {
@@ -130,6 +158,15 @@ func (t *MultiResolver) TenantIDs(ctx context.Context) ([]string, error) {
 	}
 
 	orgIDs := strings.Split(orgID, tenantIDsLabelSeparator)
+	// Reject obviously abusive X-Scope-OrgID headers before paying any further
+	// per-ID validation or downstream fan-out cost. This guards against the
+	// pattern where ~200k short, syntactically valid tenant IDs are packed into
+	// a single 1 MiB header to force the tenant-federation merge querier to
+	// build one storage.Querier per ID (see
+	// pkg/querier/tenantfederation/merge_queryable.go).
+	if t.maxTenantIDs > 0 && len(orgIDs) > t.maxTenantIDs {
+		return nil, fmt.Errorf("too many tenant IDs in X-Scope-OrgID: %d (limit: %d)", len(orgIDs), t.maxTenantIDs)
+	}
 	for _, orgID := range orgIDs {
 		if err := ValidTenantID(orgID); err != nil {
 			return nil, err

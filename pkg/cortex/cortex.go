@@ -332,7 +332,7 @@ func New(cfg Config) (*Cortex, error) {
 	// Swap out the default resolver to support multiple tenant IDs separated by a '|'
 	if cfg.TenantFederation.Enabled {
 		util_log.WarnExperimentalUse("tenant-federation")
-		tenant.WithDefaultResolver(tenant.NewMultiResolver())
+		tenant.WithDefaultResolver(tenant.NewMultiResolverWithMaxTenantIDs(cfg.TenantFederation.MaxTenants))
 	}
 
 	// Don't check auth header on TransferChunks, as we weren't originally

@@ -221,7 +221,14 @@ func NewQueryable(distributor QueryableWithFilter, stores []QueryableWithFilter,
 			return nil, err
 		}
 
-		ctx = limiter.AddQueryLimiterToContext(ctx, limiter.NewQueryLimiter(limits.MaxFetchedSeriesPerQuery(userID), limits.MaxFetchedChunkBytesPerQuery(userID), limits.MaxChunksPerQuery(userID), limits.MaxFetchedDataBytesPerQuery(userID)))
+		// Reuse a QueryLimiter already attached to the context (installed by an
+		// outer wrapper such as the tenant-federation merge queryable), so the
+		// four per-query limits (max fetched series/chunk-bytes/chunks/data-bytes)
+		// are enforced per request rather than being multiplied by the number of
+		// federated tenants.
+		if _, ok := limiter.QueryLimiterFromContext(ctx); !ok {
+			ctx = limiter.AddQueryLimiterToContext(ctx, limiter.NewQueryLimiter(limits.MaxFetchedSeriesPerQuery(userID), limits.MaxFetchedChunkBytesPerQuery(userID), limits.MaxChunksPerQuery(userID), limits.MaxFetchedDataBytesPerQuery(userID)))
+		}
 
 		mint, maxt, err = validateQueryTimeRange(ctx, userID, mint, maxt, limits, cfg.MaxQueryIntoFuture)
 		if err == errEmptyTimeRange {
