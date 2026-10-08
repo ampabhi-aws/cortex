@@ -246,7 +246,10 @@ func (a *API) RegisterDistributor(d *distributor.Distributor, pushConfig distrib
 
 	// Legacy Routes
 	a.RegisterRoute(path.Join(a.cfg.LegacyHTTPPrefix, "/push"), push.Handler(pushConfig.MaxRecvMsgSize, a.sourceIPs, a.cfg.wrapDistributorPush(d)), true, "POST")
-	a.RegisterRoute("/all_user_stats", http.HandlerFunc(d.AllUserStatsHandler), false, "GET")
+	// Note: the legacy unauthenticated "/all_user_stats" alias has been
+	// removed. Use "/distributor/all_user_stats" (also an operator endpoint)
+	// behind an authenticating/authorising reverse proxy as documented in
+	// docs/guides/authentication-and-authorisation.md.
 	a.RegisterRoute("/ha-tracker", d.HATracker, false, "GET")
 }
 
