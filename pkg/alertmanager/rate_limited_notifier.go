@@ -29,11 +29,23 @@ type rateLimitedNotifier struct {
 }
 
 func newRateLimitedNotifier(upstream notify.Notifier, limits rateLimits, recheckInterval time.Duration, counter prometheus.Counter) *rateLimitedNotifier {
+	return newRateLimitedNotifierWithLimiter(upstream, limits, rate.NewLimiter(limits.RateLimit(), limits.Burst()), recheckInterval, counter)
+}
+
+// newRateLimitedNotifierWithLimiter wraps upstream with a rate-limited notifier
+// that uses the supplied, caller-owned *rate.Limiter. Callers can share a
+// single limiter across multiple notifier instances (for example, every
+// webhook_configs[] entry of a tenant) so the enforced rate matches the
+// documented per-user semantics instead of being multiplied by the number of
+// integration instances. The limiter is also persistent across ApplyConfig
+// reloads when the caller keeps it alive, which prevents config churn from
+// resetting the token bucket.
+func newRateLimitedNotifierWithLimiter(upstream notify.Notifier, limits rateLimits, limiter *rate.Limiter, recheckInterval time.Duration, counter prometheus.Counter) *rateLimitedNotifier {
 	return &rateLimitedNotifier{
 		upstream:        upstream,
 		counter:         counter,
 		limits:          limits,
-		limiter:         rate.NewLimiter(limits.RateLimit(), limits.Burst()),
+		limiter:         limiter,
 		recheckInterval: recheckInterval,
 	}
 }
