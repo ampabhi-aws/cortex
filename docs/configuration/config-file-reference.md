@@ -86,6 +86,12 @@ api:
   # CLI flag: -api.http-request-headers-to-log
   [http_request_headers_to_log: <list of string> | default = []]
 
+  # Expose the ingester-local HTTP push endpoints (`/ingester/push` and
+  # `/push`). These bypass distributor validation and per-tenant rate limits
+  # and are intended for testing and debugging only. Disabled by default.
+  # CLI flag: -api.ingester-push-endpoint-enabled
+  [enable_ingester_push_endpoint: <boolean> | default = false]
+
 # The server_config configures the HTTP and gRPC server of the launched
 # service(s).
 [server: <server_config>]
