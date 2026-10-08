@@ -1966,7 +1966,27 @@ func TestSafeTemplateFilepath(t *testing.T) {
 		"should fail if the provided template is escaping the dir": {
 			dir:         "/data/tenant",
 			template:    "../test.tmpl",
-			expectedErr: errors.New(`invalid template name "../test.tmpl": the template filepath is escaping the per-tenant local directory`),
+			expectedErr: errors.New(`invalid template name "../test.tmpl": the template name cannot contain any path`),
+		},
+		"should fail if the provided template escapes to a sibling directory sharing the dir name prefix": {
+			dir:         "/data/tenant/templates",
+			template:    "../templates-evil/x.tmpl",
+			expectedErr: errors.New(`invalid template name "../templates-evil/x.tmpl": the template name cannot contain any path`),
+		},
+		"should fail if the provided template escapes to a sibling directory via deep traversal": {
+			dir:         "/data/tenant/templates",
+			template:    "../templates2/a/b/c.tmpl",
+			expectedErr: errors.New(`invalid template name "../templates2/a/b/c.tmpl": the template name cannot contain any path`),
+		},
+		"should fail if the provided template is an absolute path": {
+			dir:         "/data/tenant/templates",
+			template:    "/etc/passwd",
+			expectedErr: errors.New(`invalid template name "/etc/passwd": the template name cannot contain any path`),
+		},
+		"should fail if the provided template contains a path separator": {
+			dir:         "/data/tenant/templates",
+			template:    "sub/file.tmpl",
+			expectedErr: errors.New(`invalid template name "sub/file.tmpl": the template name cannot contain any path`),
 		},
 	}
 

@@ -822,6 +822,15 @@ func (am *MultitenantAlertmanager) setConfig(cfg alertspb.AlertConfigDesc) error
 	}
 
 	for _, tmpl := range cfg.Templates {
+		// Defence in depth: reject any filename containing a path separator
+		// before it ever reaches disk, regardless of which alertstore backend
+		// produced the entry (e.g. the legacy configdb backend copies the
+		// tenant-supplied map key verbatim and the configs HTTP API only
+		// validates template content, not the filename key).
+		if err := validateTemplateFilename(tmpl.Filename); err != nil {
+			return err
+		}
+
 		templateFilePath, err := safeTemplateFilepath(userTemplateDir, tmpl.Filename)
 		if err != nil {
 			return err
@@ -1317,16 +1326,25 @@ func safeTemplateFilepath(dir, templateName string) (string, error) {
 		return "", err
 	}
 
-	// Build the actual path of the template.
-	actualPath, err := filepath.Abs(filepath.Join(containerDir, templateName))
-	if err != nil {
+	// Reject any path component in the template name up front. This is the
+	// primary fence: templates must be plain filenames with no path
+	// separators, no "." and no ".." components.
+	if err := validateTemplateFilename(templateName); err != nil {
 		return "", err
 	}
 
+	// Build the actual path of the template.
+	actualPath := filepath.Join(containerDir, templateName)
+
 	// Ensure the actual path of the template is within the expected directory.
-	// This check is a counter-measure to make sure the tenant is not trying to
-	// escape its own directory on disk.
-	if !strings.HasPrefix(actualPath, containerDir) {
+	// A bare strings.HasPrefix on the two absolute paths is NOT a boundary-aware
+	// containment check: for containerDir=/data/<tenant>/templates it would
+	// accept /data/<tenant>/templates-evil/x.tmpl because the suffix starts at
+	// a non-separator byte. Use filepath.Rel so we reason about path components
+	// and reject anything that is the dir itself, resolves above it, or is
+	// absolute (e.g. templateName was an absolute path).
+	rel, err := filepath.Rel(containerDir, actualPath)
+	if err != nil || rel == "." || rel == ".." || strings.HasPrefix(rel, ".."+string(os.PathSeparator)) || filepath.IsAbs(rel) {
 		return "", fmt.Errorf("invalid template name %q: the template filepath is escaping the per-tenant local directory", templateName)
 	}
 
