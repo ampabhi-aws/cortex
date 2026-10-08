@@ -5,7 +5,6 @@ import (
 	"flag"
 	"fmt"
 	"io"
-	"math"
 	"net/http"
 	"os"
 	"path/filepath"
@@ -71,6 +70,12 @@ const (
 	// Number of timeseries to return in each batch of a QueryStream.
 	queryStreamBatchSize    = 128
 	metadataStreamBatchSize = 128
+
+	// metadataStreamBatchMessageSize is the soft cap, in bytes, on a single
+	// MetricsForLabelMatchersStreamResponse batch. It is also used as the
+	// per-request byte budget inside MetricsForLabelMatchers to bound how much
+	// memory a single metadata query can allocate before it is rejected.
+	metadataStreamBatchMessageSize = 1 * 1024 * 1024
 
 	// Discarded Metadata metric labels.
 	perUserMetadataLimit   = "per_user_metadata_limit"
@@ -1462,11 +1467,19 @@ func (i *Ingester) MetricsForLabelMatchers(ctx context.Context, req *client.Metr
 		sets = append(sets, seriesSet)
 	}
 
+	// Enforce a hard series/byte budget inside the ingester, independent of
+	// querier-side limits, so that a single metadata request cannot force
+	// the ingester to materialize an unbounded result slice (and then marshal
+	// it as a single gRPC message) regardless of how the operator configured
+	// the querier-side -querier.max-fetched-series-per-query flag.
+	maxSeries := i.limiter.MaxSeriesPerQuery(userID)
+
 	// Generate the response merging all series sets.
 	result := &client.MetricsForLabelMatchersResponse{
 		Metric: make([]*cortexpb.Metric, 0),
 	}
 
+	responseSizeBytes := 0
 	mergedSet := storage.NewMergeSeriesSet(sets, storage.ChainedSeriesMerge)
 	for mergedSet.Next() {
 		// Interrupt if the context has been canceled.
@@ -1474,35 +1487,124 @@ func (i *Ingester) MetricsForLabelMatchers(ctx context.Context, req *client.Metr
 			return nil, ctx.Err()
 		}
 
-		result.Metric = append(result.Metric, &cortexpb.Metric{
+		m := &cortexpb.Metric{
 			Labels: cortexpb.FromLabelsToLabelAdapters(mergedSet.At().Labels()),
-		})
+		}
+		result.Metric = append(result.Metric, m)
+
+		if maxSeries > 0 && len(result.Metric) > maxSeries {
+			return nil, httpgrpc.Errorf(http.StatusUnprocessableEntity,
+				"exceeded maximum number of series in a single metadata query (limit: %d)", maxSeries)
+		}
+
+		responseSizeBytes += m.Size()
+		if responseSizeBytes > metadataStreamBatchMessageSize*16 {
+			// Hard cap on buffered response size. The multiplier keeps the limit
+			// comfortably below Cortex's default -server.grpc-max-send-msg-size-bytes=4MB
+			// for the buffering path but allows legitimate large metadata queries.
+			return nil, httpgrpc.Errorf(http.StatusUnprocessableEntity,
+				"exceeded maximum size of a single metadata query response (limit: %d bytes)", metadataStreamBatchMessageSize*16)
+		}
 	}
 
 	return result, nil
 }
 
 func (i *Ingester) MetricsForLabelMatchersStream(req *client.MetricsForLabelMatchersRequest, stream client.Ingester_MetricsForLabelMatchersStreamServer) error {
-	result, err := i.MetricsForLabelMatchers(stream.Context(), req)
+	if err := i.checkRunning(); err != nil {
+		return err
+	}
+
+	ctx := stream.Context()
+	userID, err := tenant.TenantID(ctx)
 	if err != nil {
 		return err
 	}
 
-	for i := 0; i < len(result.Metric); i += metadataStreamBatchSize {
-		j := i + metadataStreamBatchSize
-		if j > len(result.Metric) {
-			j = len(result.Metric)
-		}
-		resp := &client.MetricsForLabelMatchersStreamResponse{
-			Metric: result.Metric[i:j],
-		}
-		err := client.SendMetricsForLabelMatchersStream(stream, resp)
-		if err != nil {
-			return err
-		}
+	db := i.getTSDB(userID)
+	if db == nil {
+		return nil
 	}
 
-	return nil
+	_, _, matchersSet, err := client.FromMetricsForLabelMatchersRequest(req)
+	if err != nil {
+		return err
+	}
+
+	mint, maxt, err := metadataQueryRange(req.StartTimestampMs, req.EndTimestampMs, db)
+	if err != nil {
+		return err
+	}
+
+	q, err := db.Querier(ctx, mint, maxt)
+	if err != nil {
+		return err
+	}
+	defer q.Close()
+
+	var sets []storage.SeriesSet
+	for _, matchers := range matchersSet {
+		if ctx.Err() != nil {
+			return ctx.Err()
+		}
+
+		hints := &storage.SelectHints{
+			Start: mint,
+			End:   maxt,
+			Func:  "series",
+		}
+		sets = append(sets, q.Select(true, hints, matchers...))
+	}
+
+	maxSeries := i.limiter.MaxSeriesPerQuery(userID)
+
+	mergedSet := storage.NewMergeSeriesSet(sets, storage.ChainedSeriesMerge)
+	batch := make([]*cortexpb.Metric, 0, metadataStreamBatchSize)
+	batchSize := 0
+	total := 0
+
+	flush := func() error {
+		if len(batch) == 0 {
+			return nil
+		}
+		if err := client.SendMetricsForLabelMatchersStream(stream, &client.MetricsForLabelMatchersStreamResponse{
+			Metric: batch,
+		}); err != nil {
+			return err
+		}
+		batch = batch[:0]
+		batchSize = 0
+		return nil
+	}
+
+	for mergedSet.Next() {
+		if ctx.Err() != nil {
+			return ctx.Err()
+		}
+
+		m := &cortexpb.Metric{
+			Labels: cortexpb.FromLabelsToLabelAdapters(mergedSet.At().Labels()),
+		}
+		total++
+
+		if maxSeries > 0 && total > maxSeries {
+			return httpgrpc.Errorf(http.StatusUnprocessableEntity,
+				"exceeded maximum number of series in a single metadata query (limit: %d)", maxSeries)
+		}
+
+		mSize := m.Size()
+
+		if (batchSize > 0 && batchSize+mSize > metadataStreamBatchMessageSize) || len(batch) >= metadataStreamBatchSize {
+			if err := flush(); err != nil {
+				return err
+			}
+		}
+
+		batch = append(batch, m)
+		batchSize += mSize
+	}
+
+	return flush()
 }
 
 // MetricsMetadata returns all the metric metadata of a user.
@@ -2562,8 +2664,10 @@ func metadataQueryRange(queryStart, queryEnd int64, db *userTSDB) (mint, maxt in
 	// data for the timerange requested (which will be empty), the dashboards will break. To fix this we should
 	// return the "head block" range until we can query the store-gateway.
 
-	// Now the question would be what to do when the query is partially in the ingester range. I would err on the side
-	// of caution and query the entire db, as I can't think of a good way to query the head + the overlapping range.
+	// Now the question would be what to do when the query is partially in the ingester range. Previously
+	// this clamp used (0, math.MaxInt64), but that let a caller-chosen start=0 force a full-TSDB scan on
+	// every ingester in the tenant shard. Clamp instead to the actual head range so the ingester scans
+	// only the data it holds, independent of what the caller requested.
 	mint, maxt = queryStart, queryEnd
 
 	lowestTs, err := db.StartTime()
@@ -2571,12 +2675,29 @@ func metadataQueryRange(queryStart, queryEnd int64, db *userTSDB) (mint, maxt in
 		return mint, maxt, err
 	}
 
+	headMinT := db.Head().MinTime()
+	headMaxT := db.Head().MaxTime()
+
 	// Completely outside.
 	if queryEnd < lowestTs {
-		mint, maxt = db.Head().MinTime(), db.Head().MaxTime()
-	} else if queryStart < lowestTs {
-		// Partially inside.
-		mint, maxt = 0, math.MaxInt64
+		mint, maxt = headMinT, headMaxT
+		return
+	}
+
+	// Partially inside: clamp the requested range to the data actually held by
+	// this ingester instead of widening it to (0, math.MaxInt64).
+	if queryStart < lowestTs {
+		mint = lowestTs
+	}
+	if queryEnd > headMaxT {
+		maxt = headMaxT
+	}
+
+	// Preserve the invariant that mint <= maxt even if lowestTs > headMaxT
+	// (can happen in edge cases around block compaction).
+	if mint > maxt {
+		mint = headMinT
+		maxt = headMaxT
 	}
 
 	return

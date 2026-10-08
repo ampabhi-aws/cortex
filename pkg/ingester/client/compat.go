@@ -118,8 +118,18 @@ func ToMetricsForLabelMatchersRequest(from, to model.Time, matchers []*labels.Ma
 	}, nil
 }
 
+// MaxMetricsForLabelMatchersMatcherSets caps how many matcher sets a single
+// MetricsForLabelMatchersRequest may carry. The ingester runs one independent
+// Select per matcher set and holds every series set open simultaneously before
+// merging, so an unbounded fan-out would let a direct gRPC caller multiply
+// query cost arbitrarily inside a single ~4 MB request.
+const MaxMetricsForLabelMatchersMatcherSets = 32
+
 // FromMetricsForLabelMatchersRequest unpacks a MetricsForLabelMatchersRequest proto
 func FromMetricsForLabelMatchersRequest(req *MetricsForLabelMatchersRequest) (model.Time, model.Time, [][]*labels.Matcher, error) {
+	if len(req.MatchersSet) > MaxMetricsForLabelMatchersMatcherSets {
+		return 0, 0, nil, fmt.Errorf("too many matcher sets in MetricsForLabelMatchersRequest: %d (max %d)", len(req.MatchersSet), MaxMetricsForLabelMatchersMatcherSets)
+	}
 	matchersSet := make([][]*labels.Matcher, 0, len(req.MatchersSet))
 	for _, matchers := range req.MatchersSet {
 		matchers, err := FromLabelMatchers(matchers.Matchers)
