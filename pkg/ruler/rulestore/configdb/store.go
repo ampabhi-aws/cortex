@@ -3,6 +3,7 @@ package configdb
 import (
 	"context"
 	"errors"
+	"sync"
 
 	"github.com/cortexproject/cortex/pkg/configs/client"
 	"github.com/cortexproject/cortex/pkg/configs/userconfig"
@@ -13,9 +14,17 @@ const (
 	Name = "configdb"
 )
 
-// ConfigRuleStore is a concrete implementation of RuleStore that sources rules from the config service
+// ConfigRuleStore is a concrete implementation of RuleStore that sources rules from the config service.
+//
+// ConfigRuleStore caches rule groups and the latest observed config ID across calls. The same
+// instance is shared by the ruler's background sync loop and all ruler HTTP handlers (including
+// the fan-out performed by Ruler.ListAllRules), so every access to the cached state must be
+// serialised. mtx guards both since and ruleGroupList, and the list methods return defensive
+// copies so callers can safely mutate the result without corrupting the cache.
 type ConfigRuleStore struct {
-	configClient  client.Client
+	configClient client.Client
+
+	mtx           sync.Mutex
 	since         userconfig.ID
 	ruleGroupList map[string]rulespb.RuleGroupList
 }
@@ -45,13 +54,20 @@ func (c *ConfigRuleStore) ListAllUsers(ctx context.Context) ([]string, error) {
 	return result, err
 }
 
-// ListAllRuleGroups implements RuleStore
+// ListAllRuleGroups implements RuleStore. The returned map and its slice values are
+// defensive copies of the cache: callers may safely mutate them.
 func (c *ConfigRuleStore) ListAllRuleGroups(ctx context.Context) (map[string]rulespb.RuleGroupList, error) {
-	configs, err := c.configClient.GetRules(ctx, c.since)
+	c.mtx.Lock()
+	since := c.since
+	c.mtx.Unlock()
 
+	configs, err := c.configClient.GetRules(ctx, since)
 	if err != nil {
 		return nil, err
 	}
+
+	c.mtx.Lock()
+	defer c.mtx.Unlock()
 
 	for user, cfg := range configs {
 		userRules := rulespb.RuleGroupList{}
@@ -73,7 +89,13 @@ func (c *ConfigRuleStore) ListAllRuleGroups(ctx context.Context) (map[string]rul
 
 	c.since = getLatestConfigID(configs, c.since)
 
-	return c.ruleGroupList, nil
+	// Return a defensive copy so callers cannot mutate the cache (either the top-level
+	// map via delete() or the per-user slice via in-place compaction).
+	out := make(map[string]rulespb.RuleGroupList, len(c.ruleGroupList))
+	for u, l := range c.ruleGroupList {
+		out[u] = append(rulespb.RuleGroupList(nil), l...)
+	}
+	return out, nil
 }
 
 // getLatestConfigID gets the latest configs ID.
@@ -98,16 +120,16 @@ func (c *ConfigRuleStore) ListRuleGroupsForUserAndNamespace(ctx context.Context,
 		return r[userID], nil
 	}
 
-	list := r[userID]
-	for ix := 0; ix < len(list); {
-		if list[ix].GetNamespace() != namespace {
-			list = append(list[:ix], list[ix+1:]...)
-		} else {
-			ix++
+	// Filter into a fresh slice to avoid any in-place mutation of the slice we received
+	// (which is itself already a defensive copy from ListAllRuleGroups, but we keep this
+	// invariant explicit so future refactors do not silently reintroduce aliasing).
+	filtered := rulespb.RuleGroupList{}
+	for _, g := range r[userID] {
+		if g.GetNamespace() == namespace {
+			filtered = append(filtered, g)
 		}
 	}
-
-	return list, nil
+	return filtered, nil
 }
 
 func (c *ConfigRuleStore) LoadRuleGroups(ctx context.Context, groupsToLoad map[string]rulespb.RuleGroupList) error {
