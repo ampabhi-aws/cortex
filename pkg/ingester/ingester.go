@@ -918,6 +918,14 @@ func (i *Ingester) Push(ctx context.Context, req *cortexpb.WriteRequest) (*corte
 		return nil, wrapWithUser(err, userID)
 	}
 
+	// Fail writes loudly for tenants marked for deletion instead of silently accepting
+	// pushes that the shipper (and the cleaner) will discard. Operators can clear this
+	// by cancelling the deletion via POST /purger/cancel_delete_tenant while the
+	// grace period is still running.
+	if db.deletionMarkFound.Load() {
+		return nil, httpgrpc.Errorf(http.StatusForbidden, "tenant %q is marked for deletion; new writes are rejected until the deletion mark is cleared", userID)
+	}
+
 	// Ensure the ingester shutdown procedure hasn't started
 	i.stoppedMtx.RLock()
 	if i.stopped {
