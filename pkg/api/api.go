@@ -65,12 +65,23 @@ type Config struct {
 
 	// Allows and is used to configure the addition of HTTP Header fields to logs
 	HTTPRequestHeadersToLog flagext.StringSlice `yaml:"http_request_headers_to_log"`
+
+	// EnableIngesterPushEndpoint controls whether the ingester-local HTTP push
+	// routes `/ingester/push` and `/push` are exposed. These routes wire a
+	// remote-write request directly into Ingester.Push, bypassing the
+	// distributor's per-tenant validation (label sortedness/duplicates,
+	// metric-name/metadata/label-size limits, CreationGracePeriod, etc.) and
+	// per-tenant ingestion rate limiter. They are intended for testing and
+	// debugging only and are disabled by default. Do not enable in production
+	// unless the HTTP surface is strictly path-filtered by a fronting proxy.
+	EnableIngesterPushEndpoint bool `yaml:"enable_ingester_push_endpoint"`
 }
 
 // RegisterFlags adds the flags required to config this to the given FlagSet.
 func (cfg *Config) RegisterFlags(f *flag.FlagSet) {
 	f.BoolVar(&cfg.ResponseCompression, "api.response-compression-enabled", false, "Use GZIP compression for API responses. Some endpoints serve large YAML or JSON blobs which can benefit from compression.")
 	f.Var(&cfg.HTTPRequestHeadersToLog, "api.http-request-headers-to-log", "Which HTTP Request headers to add to logs")
+	f.BoolVar(&cfg.EnableIngesterPushEndpoint, "api.ingester-push-endpoint-enabled", false, "Expose the ingester-local HTTP push endpoints (`/ingester/push` and `/push`). These bypass distributor validation and per-tenant rate limits and are intended for testing and debugging only. Disabled by default.")
 	cfg.RegisterFlagsWithPrefix("", f)
 }
 
@@ -267,12 +278,25 @@ func (a *API) RegisterIngester(i Ingester, pushConfig distributor.Config) {
 	a.indexPage.AddLink(SectionDangerous, "/ingester/shutdown", "Trigger Ingester Shutdown (Dangerous)")
 	a.RegisterRoute("/ingester/flush", http.HandlerFunc(i.FlushHandler), false, "GET", "POST")
 	a.RegisterRoute("/ingester/shutdown", http.HandlerFunc(i.ShutdownHandler), false, "GET", "POST")
-	a.RegisterRoute("/ingester/push", push.Handler(pushConfig.MaxRecvMsgSize, a.sourceIPs, i.Push), true, "POST") // For testing and debugging.
 
 	// Legacy Routes
 	a.RegisterRoute("/flush", http.HandlerFunc(i.FlushHandler), false, "GET", "POST")
 	a.RegisterRoute("/shutdown", http.HandlerFunc(i.ShutdownHandler), false, "GET", "POST")
-	a.RegisterRoute("/push", push.Handler(pushConfig.MaxRecvMsgSize, a.sourceIPs, i.Push), true, "POST") // For testing and debugging.
+
+	// The /ingester/push and /push HTTP routes wire remote-write requests
+	// directly into Ingester.Push, bypassing the distributor's validation
+	// (label sortedness/duplicates, metric-name/label/metadata size limits,
+	// CreationGracePeriod/RejectOldSamples) and its per-tenant ingestion
+	// rate limiter. A single sample with a far-future timestamp accepted on
+	// this path raises the TSDB head MaxTime and persistently rejects
+	// subsequent legitimate samples for that tenant (ErrOutOfBounds, since
+	// appendableMinValidTime = MaxTime - chunkRange/2). They are therefore
+	// kept off by default and must be explicitly opted into for testing or
+	// debugging.
+	if a.cfg.EnableIngesterPushEndpoint {
+		a.RegisterRoute("/ingester/push", push.Handler(pushConfig.MaxRecvMsgSize, a.sourceIPs, i.Push), true, "POST") // For testing and debugging.
+		a.RegisterRoute("/push", push.Handler(pushConfig.MaxRecvMsgSize, a.sourceIPs, i.Push), true, "POST")          // For testing and debugging.
+	}
 }
 
 func (a *API) RegisterTenantDeletion(api *purger.TenantDeletionAPI) {
