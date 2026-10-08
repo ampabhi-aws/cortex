@@ -2,6 +2,8 @@
 
 ## master / unreleased
 
+* [CHANGE] Purger: the `/purger/delete_tenant` and `/purger/delete_tenant_status` endpoints are now disabled by default. Operators must opt in with `-purger.enable-tenant-deletion-api=true` (or `purger.enable_tenant_deletion_api: true` in YAML) and must additionally gate the route at the deployment layer so it is not reachable by tenants. The route is admin-only; Cortex has no application-layer admin principal and the tenant acted on is taken from the `X-Scope-OrgID` request header.
+
   **This release removes support for chunks storage. See below for more.**
 * [CHANGE] Remove support for chunks storage entirely. If you are using chunks storage on a previous version, you must [migrate your data](https://github.com/cortexproject/cortex/blob/v1.11.1/docs/blocks-storage/migrate-from-chunks-to-blocks.md) on version 1.12 or earlier. Before upgrading to this release, you should also remove any deprecated chunks-related configuration, as this release will no longer accept that. The following flags are gone:
   - `-dynamodb.*`
