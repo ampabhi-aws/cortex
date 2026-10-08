@@ -40,6 +40,7 @@ const (
 	maxLabelNamesPerSeries  = "max_label_names_per_series"
 	tooFarInFuture          = "too_far_in_future"
 	invalidLabel            = "label_invalid"
+	invalidLabelValue       = "label_value_invalid"
 	labelNameTooLong        = "label_name_too_long"
 	duplicateLabelNames     = "duplicate_label_names"
 	labelsNotSorted         = "labels_not_sorted"
@@ -210,6 +211,18 @@ func ValidateLabels(cfg LabelValidationConfig, userID string, ls []cortexpb.Labe
 		} else if len(l.Value) > maxLabelValueLength {
 			DiscardedSamples.WithLabelValues(labelValueTooLong, userID).Inc()
 			return newLabelValueTooLongError(ls, l.Name, l.Value, maxLabelValueLength)
+		} else if !utf8.ValidString(l.Value) {
+			// Reject label values that are not valid UTF-8. This excludes the
+			// Prometheus separator byte (0xFF) and all other invalid-UTF-8
+			// sequences that could otherwise be smuggled through the
+			// hand-written protobuf decoder (pkg/cortexpb/timeseries.go). A 0xFF
+			// in a label value is indistinguishable from the fingerprint
+			// separator in both the Cortex active-series index
+			// (pkg/ingester/active_series.go) and the vendored Prometheus TSDB
+			// labels.Hash(), which an attacker can exploit to force unbounded
+			// hash-bucket collisions and quadratic cost per push/purge.
+			DiscardedSamples.WithLabelValues(invalidLabelValue, userID).Inc()
+			return newInvalidLabelValueError(ls, l.Name, l.Value)
 		} else if cmp := strings.Compare(lastLabelName, l.Name); cmp >= 0 {
 			if cmp == 0 {
 				DiscardedSamples.WithLabelValues(duplicateLabelNames, userID).Inc()

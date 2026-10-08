@@ -99,6 +99,14 @@ func newInvalidLabelError(series []cortexpb.LabelAdapter, labelName string) Vali
 	}
 }
 
+func newInvalidLabelValueError(series []cortexpb.LabelAdapter, labelName, labelValue string) ValidationError {
+	return &genericValidationError{
+		message: "sample invalid label value for label %.200q: not valid UTF-8 metric %.200q",
+		cause:   labelName,
+		series:  series,
+	}
+}
+
 func newDuplicatedLabelError(series []cortexpb.LabelAdapter, labelName string) ValidationError {
 	return &genericValidationError{
 		message: "duplicate label name: %.200q metric %.200q",

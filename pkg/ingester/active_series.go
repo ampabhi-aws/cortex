@@ -1,13 +1,13 @@
 package ingester
 
 import (
+	"encoding/binary"
 	"hash"
 	"math"
 	"sync"
 	"time"
 
 	"github.com/cespare/xxhash"
-	"github.com/prometheus/common/model"
 	"github.com/prometheus/prometheus/model/labels"
 	"go.uber.org/atomic"
 
@@ -16,6 +16,13 @@ import (
 
 const (
 	numActiveSeriesStripes = 512
+
+	// maxActiveSeriesEntriesPerFingerprint caps the number of distinct label
+	// sets we are willing to keep in a single hash bucket. Even with an
+	// injective fingerprint, a hostile tenant could still try to find hash
+	// collisions; capping the bucket size guarantees that scans and
+	// per-entry purge work on the active-series index stay bounded.
+	maxActiveSeriesEntriesPerFingerprint = 32
 )
 
 // ActiveSeries is keeping track of recently active series for a single tenant.
@@ -60,20 +67,27 @@ func (c *ActiveSeries) UpdateSeries(series labels.Labels, now time.Time, labelsC
 	c.stripes[stripeID].updateSeriesTimestamp(now, series, fp, labelsCopy)
 }
 
-var sep = []byte{model.SeparatorByte}
-
 var hashPool = sync.Pool{New: func() interface{} { return xxhash.New() }}
 
+// fingerprint computes an injective 64-bit hash of the label set by
+// length-prefixing each component. Without length prefixing, a tenant could
+// embed the Prometheus separator byte (0xFF) in a label value and craft
+// distinct label sets that share the same serialized byte stream, forcing
+// unbounded hash-bucket collisions and quadratic ingestion/purge cost in the
+// active-series index. Length-prefixing closes that pre-image family.
 func fingerprint(series labels.Labels) uint64 {
 	sum := hashPool.Get().(hash.Hash64)
 	defer hashPool.Put(sum)
 
 	sum.Reset()
+	var n [8]byte
 	for _, label := range series {
+		binary.LittleEndian.PutUint64(n[:], uint64(len(label.Name)))
+		_, _ = sum.Write(n[:])
 		_, _ = sum.Write(util.YoloBuf(label.Name))
-		_, _ = sum.Write(sep)
+		binary.LittleEndian.PutUint64(n[:], uint64(len(label.Value)))
+		_, _ = sum.Write(n[:])
 		_, _ = sum.Write(util.YoloBuf(label.Value))
-		_, _ = sum.Write(sep)
 	}
 
 	return sum.Sum64()
@@ -153,6 +167,15 @@ func (s *activeSeriesStripe) findOrCreateEntryForSeries(fingerprint uint64, seri
 		}
 	}
 
+	// Cap the per-fingerprint bucket so that bucket scans and purge work
+	// can never become super-linear if an attacker finds (or forces) a
+	// hash collision. The returned atomic.Int64 is still a valid sink,
+	// but the entry is not inserted; the caller treats this as a
+	// best-effort active-series update.
+	if len(s.refs[fingerprint]) >= maxActiveSeriesEntriesPerFingerprint {
+		return atomic.NewInt64(nowNanos), true
+	}
+
 	s.active++
 	e := activeSeriesEntry{
 		lbs:   labelsCopy(series),
@@ -205,19 +228,26 @@ func (s *activeSeriesStripe) purge(keepUntil time.Time) {
 		}
 
 		// We have more entries, which means there's a collision,
-		// so we have to iterate over the entries.
-		for i := 0; i < len(entries); {
+		// so we have to iterate over the entries. Build a new slice in
+		// one pass instead of splicing in place, which would be O(N) per
+		// removal and O(N^2) per bucket under the write lock.
+		kept := entries[:0]
+		for i := range entries {
 			ts := entries[i].nanos.Load()
 			if ts < keepUntilNanos {
-				entries = append(entries[:i], entries[i+1:]...)
-			} else {
-				if ts < oldest {
-					oldest = ts
-				}
-
-				i++
+				continue
 			}
+			if ts < oldest {
+				oldest = ts
+			}
+			kept = append(kept, entries[i])
 		}
+		// Zero out any trailing references so the underlying array can be
+		// garbage-collected.
+		for i := len(kept); i < len(entries); i++ {
+			entries[i] = activeSeriesEntry{}
+		}
+		entries = kept
 
 		// Either update or delete the entries in the map
 		if cnt := len(entries); cnt == 0 {
