@@ -47,13 +47,23 @@ To activate this feature it requires setting `-proxy.passthrough-non-registered-
 
 ### Authentication
 
-`query-tee` supports [HTTP basic authentication](https://developer.mozilla.org/en-US/docs/Web/HTTP/Authentication). It allows either to configure username and password in the backend URL, to forward the request auth to the backend or merge the two.
-
-The request sent from the `query-tee` to the backend includes HTTP basic authentication when one of the following conditions are met:
+`query-tee` supports [HTTP basic authentication](https://developer.mozilla.org/en-US/docs/Web/HTTP/Authentication). The outgoing request to the backend is authenticated as follows:
 
 - If the endpoint URL has username and password, `query-tee` uses it.
-- If the endpoint URL has username only, `query-tee` keeps the username and inject the password received in the incoming request (if any).
 - If the endpoint URL has no username and no password, `query-tee` forwards the incoming request basic authentication (if any).
+- Configuring an endpoint URL that has a username but no password is rejected at request time. Merging a caller-supplied password with a server-chosen username has no legitimate use and would turn `query-tee` into a password-guessing oracle, so this merge mode has been removed.
+
+### Security
+
+> **Important:** `query-tee` is a credential-holding reverse proxy. If the backend endpoint URL embeds basic-auth credentials (for example `-backend.endpoints=https://user:pass@cortex-gateway/`) or if the backends trust the `X-Scope-OrgID` header unconditionally (which every Cortex component does), then anyone who can reach the `query-tee` port can read any tenant's data without presenting any credential of their own. The following flags exist to close that gap:
+
+- `-server.service-address=<ip>` — binds the listener to a specific interface instead of all interfaces. Set it to `127.0.0.1` or an internal management interface.
+- `-proxy.client-basic-auth-username=<user>` and `-proxy.client-basic-auth-password=<pass>` — require every request to the listener (except the health check at `/`) to present matching HTTP basic auth before `query-tee` fans the request out to the backends.
+- `-backend.tenant-id=<tenant>` — pins the forwarded `X-Scope-OrgID` header to an operator-chosen value regardless of what the caller sent. Strongly recommended whenever `-backend.endpoints` embeds credentials.
+- `-proxy.allowed-tenants=<tenant,tenant,…>` — if tenant pinning is not acceptable, restrict the set of `X-Scope-OrgID` values that will be forwarded. Mutually exclusive with `-backend.tenant-id`.
+- `-proxy.passthrough-non-registered-routes` — the catch-all pass-through handler forwards every method and path to the preferred backend, including write (`/api/v1/push`), ruler/Alertmanager and admin endpoints. Do **not** enable it on a listener reachable by untrusted callers, and always pair it with `-proxy.passthrough-routes-allowlist=<prefix,prefix,…>` to limit the exposed surface and with `-proxy.client-basic-auth-username/-password` to authenticate callers.
+
+Deploy `query-tee` on a network that is not reachable by tenants — its backend credentials grant cross-tenant read (and, with the pass-through flag, cross-tenant write) access.
 
 ### Backend response selection
 
