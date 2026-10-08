@@ -12,7 +12,6 @@ import (
 	"github.com/pkg/errors"
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/promauto"
-	"github.com/prometheus/prometheus/config"
 	"github.com/prometheus/prometheus/model/rulefmt"
 	"github.com/prometheus/prometheus/notifier"
 	promRules "github.com/prometheus/prometheus/rules"
@@ -24,7 +23,6 @@ import (
 
 type DefaultMultiTenantManager struct {
 	cfg            Config
-	notifierCfg    *config.Config
 	managerFactory ManagerFactory
 
 	mapper *mapper
@@ -48,8 +46,12 @@ type DefaultMultiTenantManager struct {
 }
 
 func NewDefaultMultiTenantManager(cfg Config, managerFactory ManagerFactory, reg prometheus.Registerer, logger log.Logger) (*DefaultMultiTenantManager, error) {
-	ncfg, err := buildNotifierConfig(&cfg)
-	if err != nil {
+	// Validate the notifier configuration eagerly so a misconfigured
+	// alertmanager URL fails fast at startup. The per-tenant notifier
+	// config is built lazily in getOrCreateNotifier so that each tenant's
+	// configuration can stamp a trusted tenant identity into the alert
+	// payload (see buildNotifierConfig).
+	if _, err := buildNotifierConfig(&cfg, ""); err != nil {
 		return nil, err
 	}
 
@@ -60,7 +62,6 @@ func NewDefaultMultiTenantManager(cfg Config, managerFactory ManagerFactory, reg
 
 	return &DefaultMultiTenantManager{
 		cfg:                cfg,
-		notifierCfg:        ncfg,
 		managerFactory:     managerFactory,
 		notifiers:          map[string]*rulerNotifier{},
 		mapper:             newMapper(cfg.RulePath, logger),
@@ -221,8 +222,18 @@ func (r *DefaultMultiTenantManager) getOrCreateNotifier(userID string, userManag
 
 	n.run()
 
-	// This should never fail, unless there's a programming mistake.
-	if err := n.applyConfig(r.notifierCfg); err != nil {
+	// Build a per-tenant notifier configuration so operator-owned external
+	// labels unconditionally overwrite any colliding tenant-authored rule
+	// labels and the trusted tenant identity is stamped into every alert
+	// payload (not just the X-Scope-OrgID header, which non-tenant-aware
+	// Alertmanagers ignore).
+	ncfg, err := buildNotifierConfig(&r.cfg, userID)
+	if err != nil {
+		n.stop()
+		return nil, err
+	}
+	if err := n.applyConfig(ncfg); err != nil {
+		n.stop()
 		return nil, err
 	}
 
@@ -267,7 +278,15 @@ func (r *DefaultMultiTenantManager) Stop() {
 	r.mapper.cleanup()
 }
 
-func (*DefaultMultiTenantManager) ValidateRuleGroup(g rulefmt.RuleGroup) []error {
+// ValidateRuleGroup validates a rule group. In addition to the per-rule
+// validation performed by Prometheus' rulefmt, it rejects any rule label
+// whose name collides with an operator-configured external label or the
+// reserved tenant-identity label (tenantLabel) used by the notifier. This
+// prevents a tenant from pre-setting those names in rule `labels:` blocks
+// and shadowing authoritative, operator- or server-authored values on the
+// alert-notification path. (See buildNotifierConfig for the complementary
+// enforcement at delivery time via AlertRelabelConfigs.)
+func (r *DefaultMultiTenantManager) ValidateRuleGroup(g rulefmt.RuleGroup) []error {
 	var errs []error
 
 	if g.Name == "" {
@@ -280,19 +299,43 @@ func (*DefaultMultiTenantManager) ValidateRuleGroup(g rulefmt.RuleGroup) []error
 		return errs
 	}
 
-	for i, r := range g.Rules {
-		for _, err := range r.Validate() {
+	reserved := make(map[string]struct{}, len(r.cfg.ExternalLabels)+1)
+	reserved[tenantLabel] = struct{}{}
+	for _, l := range r.cfg.ExternalLabels {
+		reserved[l.Name] = struct{}{}
+	}
+
+	for i, rl := range g.Rules {
+		for _, err := range rl.Validate() {
 			var ruleName string
-			if r.Alert.Value != "" {
-				ruleName = r.Alert.Value
+			if rl.Alert.Value != "" {
+				ruleName = rl.Alert.Value
 			} else {
-				ruleName = r.Record.Value
+				ruleName = rl.Record.Value
 			}
 			errs = append(errs, &rulefmt.Error{
 				Group:    g.Name,
 				Rule:     i,
 				RuleName: ruleName,
 				Err:      err,
+			})
+		}
+
+		for name := range rl.Labels {
+			if _, bad := reserved[name]; !bad {
+				continue
+			}
+			var ruleName string
+			if rl.Alert.Value != "" {
+				ruleName = rl.Alert.Value
+			} else {
+				ruleName = rl.Record.Value
+			}
+			errs = append(errs, &rulefmt.Error{
+				Group:    g.Name,
+				Rule:     i,
+				RuleName: ruleName,
+				Err:      fmt.Errorf("rule label %q is reserved by the ruler (operator external labels or tenant identity) and must not be set in rule labels", name),
 			})
 		}
 	}

@@ -11,6 +11,7 @@ import (
 	"github.com/prometheus/prometheus/discovery"
 	"github.com/prometheus/prometheus/discovery/dns"
 	"github.com/prometheus/prometheus/model/labels"
+	"github.com/prometheus/prometheus/model/relabel"
 	"github.com/stretchr/testify/require"
 
 	"github.com/cortexproject/cortex/pkg/util"
@@ -245,6 +246,15 @@ func TestBuildNotifierConfig(t *testing.T) {
 							},
 						},
 					},
+					AlertRelabelConfigs: []*relabel.Config{
+						{
+							Action:      relabel.Replace,
+							Regex:       relabel.MustNewRegexp("(.*)"),
+							TargetLabel: "region",
+							Replacement: "us-east-1",
+							Separator:   ";",
+						},
+					},
 				},
 				GlobalConfig: config.GlobalConfig{
 					ExternalLabels: []labels.Label{
@@ -257,7 +267,7 @@ func TestBuildNotifierConfig(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			ncfg, err := buildNotifierConfig(tt.cfg)
+			ncfg, err := buildNotifierConfig(tt.cfg, "")
 			if tt.err == nil {
 				require.NoError(t, err)
 				require.Equal(t, tt.ncfg, ncfg)
