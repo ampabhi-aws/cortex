@@ -10,6 +10,7 @@ import (
 	"strings"
 	"sync"
 	"time"
+	"unicode/utf8"
 
 	"github.com/go-kit/log"
 	"github.com/go-kit/log/level"
@@ -489,6 +490,16 @@ func (d *Distributor) checkSample(ctx context.Context, userID, cluster, replica 
 		return false, nil
 	}
 
+	// The cluster label is used as part of a KV-store key and as a Prometheus
+	// metric label value. Non-UTF-8 or structurally dangerous bytes (e.g. the
+	// '/' key separator or NUL/newline/carriage-return) must be rejected here,
+	// before they can reach the HA tracker's KV store or any WithLabelValues
+	// call, where they would cause a panic in the client_golang library.
+	if len(cluster) > d.limits.MaxLabelValueLength(userID) || !utf8.ValidString(cluster) ||
+		strings.ContainsAny(cluster, "/\\\n\r\x00") {
+		return false, httpgrpc.Errorf(http.StatusBadRequest, "invalid %s label value", d.limits.HAClusterLabel(userID))
+	}
+
 	// At this point we know we have both HA labels, we should lookup
 	// the cluster/instance here to see if we want to accept this sample.
 	err := d.HATracker.checkReplica(ctx, userID, cluster, replica, time.Now())
@@ -606,8 +617,14 @@ func (d *Distributor) Push(ctx context.Context, req *cortexpb.WriteRequest) (*co
 			cortexpb.ReuseSlice(req.Timeseries)
 
 			if errors.Is(err, replicasNotMatchError{}) {
-				// These samples have been deduped.
-				d.dedupedSamples.WithLabelValues(userID, cluster).Add(float64(numSamples))
+				// These samples have been deduped. Use the error-returning form of
+				// WithLabelValues: the cluster label is derived from untrusted push
+				// payload and must never be allowed to panic the distributor.
+				if m, metricErr := d.dedupedSamples.GetMetricWithLabelValues(userID, cluster); metricErr == nil {
+					m.Add(float64(numSamples))
+				} else {
+					level.Warn(d.log).Log("msg", "skipping deduped_samples metric for invalid label value", "err", metricErr)
+				}
 				return nil, httpgrpc.Errorf(http.StatusAccepted, err.Error())
 			}
 
