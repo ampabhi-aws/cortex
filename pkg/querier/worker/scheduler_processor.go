@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"net/http"
 	"time"
+	"unicode"
 
 	"github.com/go-kit/log"
 	"github.com/go-kit/log/level"
@@ -29,6 +30,28 @@ import (
 	cortexmiddleware "github.com/cortexproject/cortex/pkg/util/middleware"
 	"github.com/cortexproject/cortex/pkg/util/services"
 )
+
+// maxFrontendAddressLength caps the attacker-controllable FrontendAddress at a
+// reasonable upper bound. gRPC targets easily fit in 253 bytes; larger values
+// are treated as abuse. Kept in sync with pkg/scheduler.maxFrontendAddressLength.
+const maxFrontendAddressLength = 253
+
+// isValidFrontendAddress applies basic syntactic validation to the
+// FrontendAddress copied verbatim from the scheduler stream, which may
+// originate from an untrusted caller when the query-scheduler gRPC listener is
+// not protected by mTLS/network policy. It is a defence-in-depth check against
+// trivial outbound-gRPC/SSRF abuse via frontendPool.GetClientFor.
+func isValidFrontendAddress(addr string) bool {
+	if addr == "" || len(addr) > maxFrontendAddressLength {
+		return false
+	}
+	for _, r := range addr {
+		if r < 0x20 || r == 0x7f || unicode.IsSpace(r) {
+			return false
+		}
+	}
+	return true
+}
 
 func newSchedulerProcessor(cfg Config, handler RequestHandler, log log.Logger, reg prometheus.Registerer) (*schedulerProcessor, []services.Service) {
 	p := &schedulerProcessor{
@@ -178,6 +201,11 @@ func (sp *schedulerProcessor) runRequest(ctx context.Context, logger log.Logger,
 			Code: http.StatusRequestEntityTooLarge,
 			Body: []byte(errMsg),
 		}
+	}
+
+	if !isValidFrontendAddress(frontendAddress) {
+		level.Error(logger).Log("msg", "refusing to send query result to malformed frontend address", "frontend", frontendAddress)
+		return
 	}
 
 	c, err := sp.frontendPool.GetClientFor(frontendAddress)
