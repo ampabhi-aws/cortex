@@ -46,7 +46,15 @@ type configurable struct {
 
 // post a config
 func (c configurable) post(t *testing.T, userID string, config userconfig.Config) userconfig.View {
-	w := requestAsUser(t, userID, "POST", c.Endpoint, "", readerFromConfig(t, config))
+	headers := map[string]string{}
+	// If the tenant already has a config, we must supply its id via
+	// If-Match to pass optimistic concurrency. On first write there is no
+	// current config and the header is omitted.
+	current := requestAsUserWithHeaders(t, userID, "GET", c.Endpoint, "", nil, nil)
+	if current.Code == http.StatusOK {
+		headers[IfMatchHeader] = fmt.Sprintf("%d", parseView(t, current.Body.Bytes()).ID)
+	}
+	w := requestAsUserWithHeaders(t, userID, "POST", c.Endpoint, "", headers, readerFromConfig(t, config))
 	require.Equal(t, http.StatusNoContent, w.Code)
 	return c.get(t, userID)
 }

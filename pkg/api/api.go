@@ -18,6 +18,7 @@ import (
 	"github.com/cortexproject/cortex/pkg/alertmanager"
 	"github.com/cortexproject/cortex/pkg/alertmanager/alertmanagerpb"
 	"github.com/cortexproject/cortex/pkg/compactor"
+	configsapi "github.com/cortexproject/cortex/pkg/configs/api"
 	"github.com/cortexproject/cortex/pkg/cortexpb"
 	"github.com/cortexproject/cortex/pkg/distributor"
 	"github.com/cortexproject/cortex/pkg/distributor/distributorpb"
@@ -331,6 +332,31 @@ func (a *API) RegisterRing(r *ring.Ring) {
 
 	// Legacy Route
 	a.RegisterRoute("/ring", r, false, "GET", "POST")
+}
+
+// RegisterConfigsAPI registers the (deprecated) configs API routes through
+// the central API gate, ensuring the configured authentication middleware is
+// applied. Previously the configs module mounted its router directly on the
+// shared mux, bypassing the AuthMiddleware pipeline that every other Cortex
+// component uses to pin the tenant ID into the request context.
+func (a *API) RegisterConfigsAPI(c *configsapi.API) {
+	for _, r := range c.Routes() {
+		// Skip the legacy admin index page: the API module already owns "/"
+		// via RegisterAPI, so re-registering it would panic in gorilla/mux.
+		// The index handler of the parent API is strictly more useful and
+		// carries no per-tenant data.
+		if r.Path == "/" {
+			continue
+		}
+		// Per-tenant endpoints must be authenticated so the tenant id is
+		// pinned into the request context by AuthMiddleware. The all-tenant
+		// /private/... endpoints feed internal Cortex clients that do not
+		// supply a tenant header, so we keep them unauthenticated here and
+		// rely on operators to keep them off the tenant-facing listener
+		// (see the finding's mitigation section).
+		auth := !strings.HasPrefix(r.Path, "/private/")
+		a.RegisterRoute(r.Path, r.Handler, auth, r.Method)
+	}
 }
 
 // RegisterStoreGateway registers the ring UI page associated with the store-gateway.
