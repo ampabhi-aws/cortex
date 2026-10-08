@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"net/http"
+	"net/http/httptest"
 	"os"
 	"path"
 	"strings"
@@ -155,6 +156,27 @@ func Test_GetAllConfigs_Empty(t *testing.T) {
 		err := json.Unmarshal(w.Body.Bytes(), &found)
 		assert.NoError(t, err, "Could not unmarshal JSON")
 		assert.Equal(t, ConfigsView{Configs: map[string]userconfig.View{}}, found)
+	}
+}
+
+// Unauthenticated callers must not be able to dump every tenant's rules /
+// Alertmanager configuration via the /private/* endpoints.
+func Test_GetAllConfigs_Unauthenticated(t *testing.T) {
+	setup(t)
+	defer cleanup(t)
+
+	for _, c := range allClients {
+		// No Authorization header at all.
+		w := requestAnonymous(t, "GET", c.PrivateEndpoint, nil)
+		assert.Equal(t, http.StatusUnauthorized, w.Code)
+
+		// Wrong bearer token.
+		wReq := httptest.NewRecorder()
+		r, err := http.NewRequest("GET", c.PrivateEndpoint, nil)
+		require.NoError(t, err)
+		r.Header.Set("Authorization", "Bearer wrong-token")
+		app.ServeHTTP(wReq, r)
+		assert.Equal(t, http.StatusUnauthorized, wReq.Code)
 	}
 }
 
