@@ -385,8 +385,39 @@ func (q querier) Select(sortSeries bool, sp *storage.SelectHints, matchers ...*l
 	return seriesSet
 }
 
+// validateMetadataRange enforces the per-tenant MaxQueryLength on the metadata
+// path (LabelValues / LabelNames). The query-frontend does not split or clamp
+// metadata queries, and Prometheus defaults start/end to minTime/maxTime, so
+// without an explicit check a single unparameterised request can scan an
+// arbitrarily wide range. validateQueryTimeRange has already been applied at
+// querier construction, but it only clamps based on -querier.max-query-lookback
+// (default 0). We additionally enforce -store.max-query-length here, matching
+// what Select() does for instant / range queries.
+func (q querier) validateMetadataRange() error {
+	userID, err := tenant.TenantID(q.ctx)
+	if err != nil {
+		return err
+	}
+	startMs, endMs, err := validateQueryTimeRange(q.ctx, userID, q.mint, q.maxt, q.limits, q.maxQueryIntoFuture)
+	if err == errEmptyTimeRange {
+		return nil
+	} else if err != nil {
+		return err
+	}
+	startTime := model.Time(startMs)
+	endTime := model.Time(endMs)
+	if maxQueryLength := q.limits.MaxQueryLength(userID); maxQueryLength > 0 && endTime.Sub(startTime) > maxQueryLength {
+		return validation.LimitError(fmt.Sprintf(validation.ErrQueryTooLong, endTime.Sub(startTime), maxQueryLength))
+	}
+	return nil
+}
+
 // LabelsValue implements storage.Querier.
 func (q querier) LabelValues(name string, matchers ...*labels.Matcher) ([]string, storage.Warnings, error) {
+	if err := q.validateMetadataRange(); err != nil {
+		return nil, nil, err
+	}
+
 	if !q.queryStoreForLabels {
 		return q.metadataQuerier.LabelValues(name, matchers...)
 	}
@@ -431,6 +462,10 @@ func (q querier) LabelValues(name string, matchers ...*labels.Matcher) ([]string
 }
 
 func (q querier) LabelNames(matchers ...*labels.Matcher) ([]string, storage.Warnings, error) {
+	if err := q.validateMetadataRange(); err != nil {
+		return nil, nil, err
+	}
+
 	if !q.queryStoreForLabels {
 		return q.metadataQuerier.LabelNames(matchers...)
 	}

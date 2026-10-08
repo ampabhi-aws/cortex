@@ -739,6 +739,8 @@ func (q *blocksStoreQuerier) fetchLabelNamesFromStore(
 		warnings      = storage.Warnings(nil)
 		queriedBlocks = []ulid.ULID(nil)
 		spanLog       = spanlogger.FromContext(ctx)
+		queryLimiter  = limiter.QueryLimiterFromContextWithFallback(ctx)
+		reqStats      = stats.FromContext(ctx)
 	)
 
 	// Concurrently fetch series from all clients.
@@ -784,6 +786,10 @@ func (q *blocksStoreQuerier) fetchLabelNamesFromStore(
 				"queried blocks", strings.Join(convertULIDsToString(myQueriedBlocks), " "))
 
 			// Store the result.
+			if err := queryLimiter.AddDataBytes(namesResp.Size()); err != nil {
+				return validation.LimitError(err.Error())
+			}
+			reqStats.AddFetchedDataBytes(uint64(namesResp.Size()))
 			mtx.Lock()
 			nameSets = append(nameSets, namesResp.Names)
 			for _, w := range namesResp.Warnings {
@@ -820,6 +826,8 @@ func (q *blocksStoreQuerier) fetchLabelValuesFromStore(
 		warnings      = storage.Warnings(nil)
 		queriedBlocks = []ulid.ULID(nil)
 		spanLog       = spanlogger.FromContext(ctx)
+		queryLimiter  = limiter.QueryLimiterFromContextWithFallback(ctx)
+		reqStats      = stats.FromContext(ctx)
 	)
 
 	// Concurrently fetch series from all clients.
@@ -868,6 +876,10 @@ func (q *blocksStoreQuerier) fetchLabelValuesFromStore(
 			sort.Strings(valuesResp.Values)
 
 			// Store the result.
+			if err := queryLimiter.AddDataBytes(valuesResp.Size()); err != nil {
+				return validation.LimitError(err.Error())
+			}
+			reqStats.AddFetchedDataBytes(uint64(valuesResp.Size()))
 			mtx.Lock()
 			valueSets = append(valueSets, valuesResp.Values)
 			for _, w := range valuesResp.Warnings {
