@@ -80,6 +80,13 @@ type MultitenantAlertmanagerConfig struct {
 
 	EnableAPI bool `yaml:"enable_api"`
 
+	// EnableAdminListAllConfigs makes the operator-only /multitenant_alertmanager/configs
+	// endpoint opt-in. When false (default), the endpoint returns 404 Not Found. When true,
+	// the endpoint returns a redacted list of tenant metadata only (never raw configs or
+	// template bodies). The endpoint still requires an authenticated caller via the
+	// Cortex AuthMiddleware regardless of this flag's value.
+	EnableAdminListAllConfigs bool `yaml:"enable_admin_list_all_configs"`
+
 	// For distributor.
 	AlertmanagerClient ClientConfig `yaml:"alertmanager_client"`
 
@@ -114,6 +121,7 @@ func (cfg *MultitenantAlertmanagerConfig) RegisterFlags(f *flag.FlagSet) {
 	f.DurationVar(&cfg.PollInterval, "alertmanager.configs.poll-interval", 15*time.Second, "How frequently to poll Cortex configs")
 
 	f.BoolVar(&cfg.EnableAPI, "experimental.alertmanager.enable-api", false, "Enable the experimental alertmanager config api.")
+	f.BoolVar(&cfg.EnableAdminListAllConfigs, "alertmanager.enable-admin-list-all-configs", false, "Enable the operator-only /multitenant_alertmanager/configs endpoint which lists metadata for all tenants' Alertmanager configurations. Even when enabled, the endpoint is authenticated and never returns raw tenant configuration or template bodies. The endpoint should only be exposed on an internal/operator network. Disabled by default.")
 
 	f.BoolVar(&cfg.ShardingEnabled, "alertmanager.sharding-enabled", false, "Shard tenants across multiple alertmanager instances.")
 

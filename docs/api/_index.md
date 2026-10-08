@@ -684,7 +684,11 @@ Displays a web page with the current status of the Alertmanager, including the A
 GET /multitenant_alertmanager/configs
 ```
 
-List all Alertmanager configurations. This endpoint is not part of alertmanager-API and is always available regardless of whether alertmanager-API is enabled or not. It should not be exposed to end users. This endpoint returns a YAML dictionary with all the Alertmanager configurations and `200` status code on success.
+List all Alertmanager configurations. This is an operator-only administrative endpoint. It is disabled by default and must be opted-in via the `-alertmanager.enable-admin-list-all-configs` flag (default `false`). When disabled it returns `404 Not Found`.
+
+Even when enabled, the response contains ONLY metadata (tenant ID, SHA-256 hash and byte size of each tenant's raw Alertmanager configuration, and per-template filename, size and hash). It never returns raw tenant configuration or template bodies, because tenant configs commonly embed third-party credentials such as Slack webhook URLs, SMTP passwords, PagerDuty routing keys and bearer tokens.
+
+The route is registered with authentication enabled so Cortex's `AuthMiddleware` runs. This endpoint must still not be exposed to end users: operators are expected to serve all `/multitenant_alertmanager/*`, `/ruler/rule_groups`, `/config`, ring and `/memberlist` administrative routes on a separate internal listener and/or to deny them at the gateway. On success this endpoint returns a YAML dictionary of per-tenant metadata and `200` status.
 
 ### Alertmanager ring status
 
