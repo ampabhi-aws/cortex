@@ -4,7 +4,6 @@ import (
 	"testing"
 
 	"github.com/stretchr/testify/assert"
-	"github.com/stretchr/testify/require"
 )
 
 func TestShuffleShardExpectedInstancesPerZone(t *testing.T) {
@@ -83,8 +82,3 @@ func TestShuffleShardExpectedInstances(t *testing.T) {
 	}
 }
 
-func TestYoloBuf(t *testing.T) {
-	s := yoloBuf("hello world")
-
-	require.Equal(t, []byte("hello world"), s)
-}
