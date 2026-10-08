@@ -15,6 +15,11 @@ type Limits interface {
 	// frontend will process in parallel.
 	MaxQueryParallelism(string) int
 
+	// MaxQuerySplits returns the maximum number of sub-requests a single query
+	// may be split into by the query-frontend's split-by-interval middleware.
+	// A return value <= 0 disables the limit.
+	MaxQuerySplits(string) int
+
 	// MaxCacheFreshness returns the period after which results are cacheable,
 	// to prevent caching of very recent results.
 	MaxCacheFreshness(string) time.Duration

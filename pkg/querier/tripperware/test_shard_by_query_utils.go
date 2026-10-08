@@ -360,6 +360,10 @@ func (mockLimits) MaxQueryParallelism(string) int {
 	return 14 // Flag default.
 }
 
+func (mockLimits) MaxQuerySplits(string) int {
+	return 0 // Disabled by default in tests.
+}
+
 func (m mockLimits) MaxCacheFreshness(string) time.Duration {
 	return m.maxCacheFreshness
 }
