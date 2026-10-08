@@ -15,6 +15,7 @@ import (
 	"github.com/prometheus/alertmanager/config"
 	"github.com/prometheus/client_golang/prometheus"
 	commoncfg "github.com/prometheus/common/config"
+	"github.com/prometheus/common/sigv4"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	"github.com/thanos-io/objstore"
@@ -784,6 +785,30 @@ func TestValidateAlertmanagerConfig(t *testing.T) {
 				}},
 			},
 			expected: errTLSFileNotAllowed,
+		},
+		"SigV4Config without credentials borrows ambient identity": {
+			input: sigv4.SigV4Config{Region: "r"},
+			expected: errSigV4AmbientCredentialsNotAllowed,
+		},
+		"SigV4Config profile is not allowed": {
+			input: sigv4.SigV4Config{Region: "r", AccessKey: "a", SecretKey: "b", Profile: "p"},
+			expected: errSigV4ProfileNotAllowed,
+		},
+		"SigV4Config role_arn is not allowed": {
+			input: sigv4.SigV4Config{Region: "r", AccessKey: "a", SecretKey: "b", RoleARN: "role"},
+			expected: errSigV4RoleARNNotAllowed,
+		},
+		"SigV4Config nested in SNS receiver is validated": {
+			input: config.Config{
+				Receivers: []*config.Receiver{{
+					Name: "sns",
+					SNSConfigs: []*config.SNSConfig{{
+						Sigv4:    sigv4.SigV4Config{Region: "r"},
+						TopicARN: "t",
+					}},
+				}},
+			},
+			expected: errSigV4AmbientCredentialsNotAllowed,
 		},
 	}
 

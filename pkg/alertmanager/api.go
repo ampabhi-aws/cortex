@@ -15,6 +15,7 @@ import (
 	"github.com/prometheus/alertmanager/config"
 	"github.com/prometheus/alertmanager/template"
 	commoncfg "github.com/prometheus/common/config"
+	"github.com/prometheus/common/sigv4"
 	"gopkg.in/yaml.v2"
 
 	"github.com/cortexproject/cortex/pkg/alertmanager/alertspb"
@@ -40,11 +41,14 @@ const (
 )
 
 var (
-	errPasswordFileNotAllowed        = errors.New("setting password_file, bearer_token_file and credentials_file is not allowed")
-	errOAuth2SecretFileNotAllowed    = errors.New("setting OAuth2 client_secret_file is not allowed")
-	errTLSFileNotAllowed             = errors.New("setting TLS ca_file, cert_file and key_file is not allowed")
-	errSlackAPIURLFileNotAllowed     = errors.New("setting Slack api_url_file and global slack_api_url_file is not allowed")
-	errVictorOpsAPIKeyFileNotAllowed = errors.New("setting VictorOps api_key_file is not allowed")
+	errPasswordFileNotAllowed            = errors.New("setting password_file, bearer_token_file and credentials_file is not allowed")
+	errOAuth2SecretFileNotAllowed        = errors.New("setting OAuth2 client_secret_file is not allowed")
+	errTLSFileNotAllowed                 = errors.New("setting TLS ca_file, cert_file and key_file is not allowed")
+	errSlackAPIURLFileNotAllowed         = errors.New("setting Slack api_url_file and global slack_api_url_file is not allowed")
+	errVictorOpsAPIKeyFileNotAllowed     = errors.New("setting VictorOps api_key_file is not allowed")
+	errSigV4AmbientCredentialsNotAllowed = errors.New("setting SNS sigv4 without both access_key and secret_key is not allowed (would use the Cortex process's ambient AWS credentials)")
+	errSigV4ProfileNotAllowed            = errors.New("setting SNS sigv4 profile is not allowed")
+	errSigV4RoleARNNotAllowed            = errors.New("setting SNS sigv4 role_arn is not allowed")
 )
 
 // UserConfig is used to communicate a users alertmanager configs
@@ -350,6 +354,11 @@ func validateAlertmanagerConfig(cfg interface{}) error {
 		if err := validateVictorOpsConfig(v.Interface().(config.VictorOpsConfig)); err != nil {
 			return err
 		}
+
+	case reflect.TypeOf(sigv4.SigV4Config{}):
+		if err := validateSigV4Config(v.Interface().(sigv4.SigV4Config)); err != nil {
+			return err
+		}
 	}
 
 	// If the input config is a struct, recursively iterate on all fields.
@@ -437,6 +446,25 @@ func validateGlobalConfig(cfg config.GlobalConfig) error {
 func validateSlackConfig(cfg config.SlackConfig) error {
 	if cfg.APIURLFile != "" {
 		return errSlackAPIURLFileNotAllowed
+	}
+	return nil
+}
+
+// validateSigV4Config validates the SigV4 config (embedded in SNS receivers) and returns an
+// error if it would cause the Cortex process to supply its own ambient AWS identity to a
+// tenant-controlled receiver. A tenant must provide explicit static credentials; using the
+// AWS default credential chain (env vars, shared credentials file, EC2 instance role via
+// IMDS, or IRSA web identity), named profiles, or STS AssumeRole targets is not allowed
+// because those would borrow the shared Cortex service's cloud identity.
+func validateSigV4Config(cfg sigv4.SigV4Config) error {
+	if cfg.Profile != "" {
+		return errSigV4ProfileNotAllowed
+	}
+	if cfg.RoleARN != "" {
+		return errSigV4RoleARNNotAllowed
+	}
+	if cfg.AccessKey == "" || cfg.SecretKey == "" {
+		return errSigV4AmbientCredentialsNotAllowed
 	}
 	return nil
 }
