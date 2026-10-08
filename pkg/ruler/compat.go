@@ -136,6 +136,7 @@ type RulesLimits interface {
 	RulerTenantShardSize(userID string) int
 	RulerMaxRuleGroupsPerTenant(userID string) int
 	RulerMaxRulesPerRuleGroup(userID string) int
+	RulerMinRuleEvaluationInterval(userID string) time.Duration
 }
 
 // EngineQueryFunc returns a new query function using the rules.EngineQueryFunc function
