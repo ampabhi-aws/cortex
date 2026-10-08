@@ -7,6 +7,7 @@ import (
 	"html/template"
 	"math"
 	"net/http"
+	"net/url"
 	"sort"
 	"strings"
 	"time"
@@ -25,7 +26,6 @@ const pageContent = `
 		<h1>Ring Status</h1>
 		<p>Current time: {{ .Now }}</p>
 		<form action="" method="POST">
-			<input type="hidden" name="csrf_token" value="$__CSRF_TOKEN_PLACEHOLDER__">
 			<table width="100%" border="1">
 				<thead>
 					<tr>
@@ -123,12 +123,41 @@ type httpResponse struct {
 
 func (r *Ring) ServeHTTP(w http.ResponseWriter, req *http.Request) {
 	if req.Method == http.MethodPost {
+		// The forget endpoint is a destructive admin action: it CAS-writes the
+		// shared ring KV key and deletes the named instance. Cortex itself has
+		// no authentication subsystem and no CSRF protection, so it is only
+		// safe to accept this request when the operator has explicitly opted
+		// in and placed an authenticated reverse proxy in front of the admin
+		// listener. By default the destructive action is disabled.
+		if !r.cfg.EnableForgetEndpoint {
+			w.Header().Set("Allow", "GET")
+			http.Error(w, "forget endpoint is disabled; set -ring.enable-forget-endpoint=true on the component to enable it (only when the admin HTTP listener is protected by an authenticated reverse proxy)", http.StatusMethodNotAllowed)
+			return
+		}
+
+		// Reject cross-site state-changing requests. `Sec-Fetch-Site` is sent
+		// by all current browsers; `Origin` is sent on all cross-origin and
+		// same-origin POSTs. A request that lacks both is either a non-browser
+		// caller (e.g. an operator curl) which we accept, or an attempt to
+		// bypass this check. We only enforce the check when the signals are
+		// present so that programmatic admin tooling is not broken.
+		if site := req.Header.Get("Sec-Fetch-Site"); site != "" && site != "same-origin" && site != "none" {
+			http.Error(w, "cross-site forget requests are rejected", http.StatusForbidden)
+			return
+		}
+		if origin := req.Header.Get("Origin"); origin != "" {
+			if !sameOriginRequest(req, origin) {
+				http.Error(w, "cross-origin forget requests are rejected", http.StatusForbidden)
+				return
+			}
+		}
+
 		ingesterID := req.FormValue("forget")
 		if err := r.forget(req.Context(), ingesterID); err != nil {
 			level.Error(r.logger).Log("msg", "error forgetting instance", "err", err)
 		}
 
-		// Implement PRG pattern to prevent double-POST and work with CSRF middleware.
+		// Implement PRG pattern to prevent double-POST.
 		// https://en.wikipedia.org/wiki/Post/Redirect/Get
 
 		// http.Redirect() would convert our relative URL to absolute, which is not what we want.
@@ -201,6 +230,19 @@ func renderHTTPResponse(w http.ResponseWriter, v httpResponse, t *template.Templ
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 	}
+}
+
+// sameOriginRequest returns true if the Origin header value matches the
+// request's host. A cross-origin browser attacker cannot make Origin agree
+// with the victim admin host while targeting it, so this check rejects the
+// browser-pivot POST described in the finding without needing a session
+// store.
+func sameOriginRequest(req *http.Request, origin string) bool {
+	u, err := url.Parse(origin)
+	if err != nil || u.Host == "" {
+		return false
+	}
+	return strings.EqualFold(u.Host, req.Host)
 }
 
 // WriteJSONResponse writes some JSON as a HTTP response.
