@@ -69,16 +69,20 @@ func (s splitByInterval) Do(ctx context.Context, r tripperware.Request) (tripper
 }
 
 func splitQuery(r tripperware.Request, interval time.Duration) ([]tripperware.Request, error) {
-	// If Start == end we should just run the original request
-	if r.GetStart() == r.GetEnd() {
-		return []tripperware.Request{r}, nil
-	}
-
 	// Replace @ modifier function to their respective constant values in the query.
 	// This way subqueries will be evaluated at the same time as the parent query.
+	// We do this even when start == end (single-step request) so the query text
+	// used as part of the results cache key is fully pinned and never contains
+	// an unresolved start()/end() modifier.
 	query, err := evaluateAtModifierFunction(r.GetQuery(), r.GetStart(), r.GetEnd())
 	if err != nil {
 		return nil, err
+	}
+
+	// If Start == end we should just run the original request (with its
+	// @-modifier normalized above).
+	if r.GetStart() == r.GetEnd() {
+		return []tripperware.Request{r.WithQuery(query)}, nil
 	}
 	var reqs []tripperware.Request
 	for start := r.GetStart(); start < r.GetEnd(); start = nextIntervalBoundary(start, r.GetStep(), interval) + r.GetStep() {
@@ -101,14 +105,29 @@ func evaluateAtModifierFunction(query string, start, end int64) (string, error) 
 		return "", httpgrpc.Errorf(http.StatusBadRequest, "%s", err)
 	}
 	parser.Inspect(expr, func(n parser.Node, _ []parser.Node) error {
-		if selector, ok := n.(*parser.VectorSelector); ok {
-			switch selector.StartOrEnd {
+		switch e := n.(type) {
+		case *parser.VectorSelector:
+			switch e.StartOrEnd {
 			case parser.START:
-				selector.Timestamp = &start
+				e.Timestamp = &start
 			case parser.END:
-				selector.Timestamp = &end
+				e.Timestamp = &end
 			}
-			selector.StartOrEnd = 0
+			e.StartOrEnd = 0
+		case *parser.SubqueryExpr:
+			// SubqueryExpr also carries a StartOrEnd field. Without clearing
+			// it, SubqueryExpr.String() re-emits `@ start()` / `@ end()`
+			// literally and the printed query (used as part of the results
+			// cache key) stays unpinned, which can cause different-start
+			// requests in the same split-interval bucket to share one cache
+			// entry.
+			switch e.StartOrEnd {
+			case parser.START:
+				e.Timestamp = &start
+			case parser.END:
+				e.Timestamp = &end
+			}
+			e.StartOrEnd = 0
 		}
 		return nil
 	})
