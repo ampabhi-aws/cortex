@@ -99,14 +99,34 @@ func (t *SingleResolver) TenantIDs(ctx context.Context) ([]string, error) {
 }
 
 type MultiResolver struct {
+	// maxTenants, when >0, bounds the number of tenant IDs a single request
+	// may carry. Requests with more tenants are rejected before any fan-out.
+	maxTenants int
 }
+
+// ErrTooManyTenants is returned when a federated request carries more tenant
+// IDs than the configured maximum. The error is surfaced from MultiResolver
+// to callers before any per-tenant work is scheduled.
+var ErrTooManyTenants = errors.New("too many tenant IDs in request")
 
 // NewMultiResolver creates a tenant resolver, which allows request to have
 // multiple tenant ids submitted separated by a '|' character. This enforces
 // further limits on the character set allowed within tenants as detailed here:
 // https://cortexmetrics.io/docs/guides/limitations/#tenant-id-naming)
+//
+// The returned resolver imposes no upper bound on the number of tenant IDs in
+// a single request. Use NewMultiResolverWithMaxTenants to bound fan-out and
+// mitigate N-fold query amplification when tenant federation is enabled on an
+// untrusted ingress.
 func NewMultiResolver() *MultiResolver {
 	return &MultiResolver{}
+}
+
+// NewMultiResolverWithMaxTenants creates a MultiResolver that rejects requests
+// carrying more than maxTenants tenant IDs. A non-positive maxTenants disables
+// the bound (equivalent to NewMultiResolver).
+func NewMultiResolverWithMaxTenants(maxTenants int) *MultiResolver {
+	return &MultiResolver{maxTenants: maxTenants}
 }
 
 func (t *MultiResolver) TenantID(ctx context.Context) (string, error) {
@@ -129,7 +149,20 @@ func (t *MultiResolver) TenantIDs(ctx context.Context) ([]string, error) {
 		return nil, err
 	}
 
+	// Reject obviously oversized headers before splitting. We bound the raw
+	// header to maxTenants * (per-tenant max length + separator) so the
+	// X-Scope-OrgID header cannot be used as a memory amplifier to allocate a
+	// multi-MiB string and a corresponding slice before validation.
+	if t.maxTenants > 0 && len(orgID) > t.maxTenants*(maxTenantIDLength+1) {
+		return nil, ErrTooManyTenants
+	}
+
 	orgIDs := strings.Split(orgID, tenantIDsLabelSeparator)
+	// Enforce the fan-out bound before per-ID validation so an attacker cannot
+	// force an O(N) validation pass over a huge tenant list.
+	if t.maxTenants > 0 && len(orgIDs) > t.maxTenants {
+		return nil, ErrTooManyTenants
+	}
 	for _, orgID := range orgIDs {
 		if err := ValidTenantID(orgID); err != nil {
 			return nil, err

@@ -14,6 +14,12 @@ var (
 	errTenantIDTooLong = errors.New("tenant ID is too long: max 150 characters")
 )
 
+// maxTenantIDLength is the maximum length (in bytes) of an individual tenant
+// ID, enforced by ValidTenantID. Exposed as a package constant so other
+// components (for example MultiResolver.TenantIDs) can derive bounded header
+// sizes from it.
+const maxTenantIDLength = 150
+
 type errTenantIDUnsupportedCharacter struct {
 	pos      int
 	tenantID string
@@ -61,7 +67,7 @@ func ValidTenantID(s string) error {
 		}
 	}
 
-	if len(s) > 150 {
+	if len(s) > maxTenantIDLength {
 		return errTenantIDTooLong
 	}
 
