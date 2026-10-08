@@ -13,6 +13,19 @@ import (
 	"github.com/cortexproject/cortex/pkg/ring/kv/memberlist"
 )
 
+// Hard caps on the size of a *Desc that may be installed via a single Merge
+// call. These bound the memory and CPU cost of a single gossip message so
+// that one adversarial packet cannot install an arbitrarily large ring. The
+// limits are generous relative to realistic ring sizes (thousands of
+// instances, hundreds of tokens per instance) and are intentionally applied
+// only at the gossip ingress boundary - they are not enforced on locally
+// generated rings produced via AddIngester.
+const (
+	maxRingInstances         = 100000
+	maxRingTokensPerInstance = 10000
+	maxRingStringLength      = 4096
+)
+
 // ByAddr is a sortable list of InstanceDesc.
 type ByAddr []InstanceDesc
 
@@ -201,6 +214,10 @@ func (d *Desc) mergeWithTime(mergeable memberlist.Mergeable, localCAS bool, now 
 		return nil, nil
 	}
 
+	if err := validateIncomingDesc(other); err != nil {
+		return nil, err
+	}
+
 	normalizeIngestersMap(other)
 
 	thisIngesterMap := d.Ingesters
@@ -279,6 +296,35 @@ func (d *Desc) MergeContent() []string {
 		result = append(result, k)
 	}
 	return result
+}
+
+// validateIncomingDesc enforces per-value bounds on a ring.Desc arriving via
+// Merge (which is called on gossip ingress). It rejects values large enough
+// that applying them would permanently inflate the local ring or make a
+// single merge expensive. The limits are intentionally very large: they
+// catch adversarial packets, not real production rings.
+func validateIncomingDesc(other *Desc) error {
+	if other == nil {
+		return nil
+	}
+	if n := len(other.Ingesters); n > maxRingInstances {
+		return fmt.Errorf("incoming ring has too many instances: %d (max %d)", n, maxRingInstances)
+	}
+	for name, ing := range other.Ingesters {
+		if len(name) > maxRingStringLength {
+			return fmt.Errorf("incoming ring instance id too long: %d bytes (max %d)", len(name), maxRingStringLength)
+		}
+		if len(ing.Addr) > maxRingStringLength {
+			return fmt.Errorf("incoming ring instance %q has oversized Addr: %d bytes (max %d)", name, len(ing.Addr), maxRingStringLength)
+		}
+		if len(ing.Zone) > maxRingStringLength {
+			return fmt.Errorf("incoming ring instance %q has oversized Zone: %d bytes (max %d)", name, len(ing.Zone), maxRingStringLength)
+		}
+		if n := len(ing.Tokens); n > maxRingTokensPerInstance {
+			return fmt.Errorf("incoming ring instance %q has too many tokens: %d (max %d)", name, n, maxRingTokensPerInstance)
+		}
+	}
+	return nil
 }
 
 // normalizeIngestersMap will do the following:

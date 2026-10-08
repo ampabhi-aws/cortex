@@ -28,6 +28,12 @@ import (
 const (
 	maxCasRetries              = 10          // max retries in CAS operation
 	noChangeDetectedRetrySleep = time.Second // how long to sleep after no change was detected in CAS
+
+	// defaultMaxKeyLength bounds the length of a key accepted from the gossip
+	// network. Local keys registered by components (e.g. "ring", "ruler/ring")
+	// are a handful of bytes; this cap exists to protect against malformed or
+	// adversarial keys and is intentionally generous.
+	defaultMaxKeyLength = 1024
 )
 
 // Client implements kv.Client interface, by using memberlist.KV
@@ -49,6 +55,57 @@ func NewClient(kv *KV, codec codec.Codec) (*Client, error) {
 	}, nil
 }
 
+// RegisterKey marks the given exact key as known to this node. Keys that are
+// not registered through local Client operations (CAS/Get/WatchKey) or
+// explicitly through RegisterKey/RegisterKeyPrefix are rejected when received
+// over the (unauthenticated) gossip network. This prevents an attacker who can
+// reach the gossip port from permanently inflating the local KV store and the
+// Prometheus metric cardinality derived from it.
+func (m *KV) RegisterKey(key string) {
+	if key == "" {
+		return
+	}
+	m.knownKeysMu.Lock()
+	m.knownKeys[key] = struct{}{}
+	m.knownKeysMu.Unlock()
+}
+
+// RegisterKeyPrefix marks the given prefix as known. Any gossip key that
+// starts with one of the registered prefixes is accepted; everything else is
+// rejected.
+func (m *KV) RegisterKeyPrefix(prefix string) {
+	if prefix == "" {
+		return
+	}
+	m.knownKeysMu.Lock()
+	m.knownKeyPrefixes = append(m.knownKeyPrefixes, prefix)
+	m.knownKeysMu.Unlock()
+}
+
+// isKnownKey reports whether key has been registered as an exact-match key or
+// as a prefix via local component operations. When no keys and no prefixes
+// have been registered yet, the check is permissive to preserve startup
+// behaviour where gossip traffic may arrive before any local component has
+// touched the KV; once at least one key or prefix is known, only known keys
+// are accepted.
+func (m *KV) isKnownKey(key string) bool {
+	m.knownKeysMu.RLock()
+	defer m.knownKeysMu.RUnlock()
+
+	if len(m.knownKeys) == 0 && len(m.knownKeyPrefixes) == 0 {
+		return true
+	}
+	if _, ok := m.knownKeys[key]; ok {
+		return true
+	}
+	for _, p := range m.knownKeyPrefixes {
+		if strings.HasPrefix(key, p) {
+			return true
+		}
+	}
+	return false
+}
+
 // List is part of kv.Client interface.
 func (c *Client) List(ctx context.Context, prefix string) ([]string, error) {
 	err := c.awaitKVRunningOrStopping(ctx)
@@ -56,6 +113,7 @@ func (c *Client) List(ctx context.Context, prefix string) ([]string, error) {
 		return nil, err
 	}
 
+	c.kv.RegisterKeyPrefix(prefix)
 	return c.kv.List(prefix), nil
 }
 
@@ -66,6 +124,7 @@ func (c *Client) Get(ctx context.Context, key string) (interface{}, error) {
 		return nil, err
 	}
 
+	c.kv.RegisterKey(key)
 	return c.kv.Get(key, c.codec)
 }
 
@@ -81,6 +140,7 @@ func (c *Client) CAS(ctx context.Context, key string, f func(in interface{}) (ou
 		return err
 	}
 
+	c.kv.RegisterKey(key)
 	return c.kv.CAS(ctx, key, c.codec, f)
 }
 
@@ -91,6 +151,7 @@ func (c *Client) WatchKey(ctx context.Context, key string, f func(interface{}) b
 		return
 	}
 
+	c.kv.RegisterKey(key)
 	c.kv.WatchKey(ctx, key, c.codec, f)
 }
 
@@ -102,6 +163,7 @@ func (c *Client) WatchPrefix(ctx context.Context, prefix string, f func(string, 
 		return
 	}
 
+	c.kv.RegisterKeyPrefix(prefix)
 	c.kv.WatchPrefix(ctx, prefix, c.codec, f)
 }
 
@@ -157,6 +219,16 @@ type KVConfig struct {
 	// How much space to use to keep received and sent messages in memory (for troubleshooting).
 	MessageHistoryBufferBytes int `yaml:"message_history_buffer_bytes"`
 
+	// MaxValueBytes is the maximum size in bytes of a single value accepted
+	// from the gossip network. A value is the codec-encoded payload for a
+	// single KV pair. 0 disables the limit (not recommended).
+	MaxValueBytes int `yaml:"max_value_bytes"`
+
+	// MaxKeys is the maximum number of distinct keys that may exist in the
+	// local KV store. New keys received via gossip beyond this limit are
+	// rejected. 0 disables the limit.
+	MaxKeys int `yaml:"max_keys"`
+
 	TCPTransport TCPTransportConfig `yaml:",inline"`
 
 	// Where to put custom metrics. Metrics are not registered, if this is nil.
@@ -190,6 +262,8 @@ func (cfg *KVConfig) RegisterFlagsWithPrefix(f *flag.FlagSet, prefix string) {
 	f.DurationVar(&cfg.GossipToTheDeadTime, prefix+"memberlist.gossip-to-dead-nodes-time", mlDefaults.GossipToTheDeadTime, "How long to keep gossiping to dead nodes, to give them chance to refute their death.")
 	f.DurationVar(&cfg.DeadNodeReclaimTime, prefix+"memberlist.dead-node-reclaim-time", mlDefaults.DeadNodeReclaimTime, "How soon can dead node's name be reclaimed with new address. 0 to disable.")
 	f.IntVar(&cfg.MessageHistoryBufferBytes, prefix+"memberlist.message-history-buffer-bytes", 0, "How much space to use for keeping received and sent messages in memory for troubleshooting (two buffers). 0 to disable.")
+	f.IntVar(&cfg.MaxValueBytes, prefix+"memberlist.max-value-bytes", 1024*1024, "Maximum size in bytes of a single value accepted from the gossip network. Protects against oversized values installing unbounded state into the local KV store. 0 disables the limit.")
+	f.IntVar(&cfg.MaxKeys, prefix+"memberlist.max-keys", 1024, "Maximum number of distinct keys that may exist in the local KV store. New keys received over the gossip network beyond this limit are rejected. 0 disables the limit.")
 	f.BoolVar(&cfg.EnableCompression, prefix+"memberlist.compression-enabled", mlDefaults.EnableCompression, "Enable message compression. This can be used to reduce bandwidth usage at the cost of slightly more CPU utilization.")
 	f.StringVar(&cfg.AdvertiseAddr, prefix+"memberlist.advertise-addr", mlDefaults.AdvertiseAddr, "Gossip address to advertise to other members in the cluster. Used for NAT traversal.")
 	f.IntVar(&cfg.AdvertisePort, prefix+"memberlist.advertise-port", mlDefaults.AdvertisePort, "Gossip port to advertise to other members in the cluster. Used for NAT traversal.")
@@ -234,6 +308,14 @@ type KV struct {
 	// KV Store.
 	storeMu sync.Mutex
 	store   map[string]valueDesc
+
+	// Allow-list of known keys and key-prefixes. Keys registered through
+	// local Client operations (CAS/Get/WatchKey/List/WatchPrefix) or
+	// explicitly via RegisterKey/RegisterKeyPrefix are the only keys that
+	// are accepted when received over the unauthenticated gossip network.
+	knownKeysMu      sync.RWMutex
+	knownKeys        map[string]struct{}
+	knownKeyPrefixes []string
 
 	// Codec registry
 	codecs map[string]codec.Codec
@@ -345,6 +427,7 @@ func NewKV(cfg KVConfig, logger log.Logger, dnsProvider DNSProvider, registerer 
 		provider:   dnsProvider,
 
 		store:          make(map[string]valueDesc),
+		knownKeys:      make(map[string]struct{}),
 		codecs:         make(map[string]codec.Codec),
 		watchers:       make(map[string][]chan string),
 		prefixWatchers: make(map[string][]chan string),
@@ -978,6 +1061,10 @@ func (m *KV) NotifyMsg(msg []byte) {
 		return
 	}
 
+	if !m.validateIncomingKVPair(&kvPair) {
+		return
+	}
+
 	codec := m.GetCodec(kvPair.GetCodec())
 	if codec == nil {
 		m.numberOfInvalidReceivedMessages.Inc()
@@ -1151,6 +1238,10 @@ func (m *KV) MergeRemoteState(data []byte, join bool) {
 
 		data = data[kvPairLength:]
 
+		if !m.validateIncomingKVPair(&kvPair) {
+			continue
+		}
+
 		codec := m.GetCodec(kvPair.GetCodec())
 		if codec == nil {
 			level.Error(m.logger).Log("msg", "failed to parse remote state: unknown codec for key", "codec", kvPair.GetCodec(), "key", kvPair.GetKey())
@@ -1200,6 +1291,32 @@ func (m *KV) mergeBytesValueForKey(key string, incomingData []byte, codec codec.
 	return m.mergeValueForKey(key, incomingValue, 0, codec)
 }
 
+// validateIncomingKVPair enforces the key length / value size / known-key
+// policy on a KV pair received from the gossip network. It returns false if
+// the pair should be rejected; in that case the invalid-message counter has
+// already been incremented and a warning logged.
+func (m *KV) validateIncomingKVPair(kvPair *KeyValuePair) bool {
+	if len(kvPair.Key) > defaultMaxKeyLength {
+		m.numberOfInvalidReceivedMessages.Inc()
+		level.Warn(m.logger).Log("msg", "rejecting KV pair with oversized key", "key_length", len(kvPair.Key))
+		return false
+	}
+
+	if !m.isKnownKey(kvPair.Key) {
+		m.numberOfInvalidReceivedMessages.Inc()
+		level.Warn(m.logger).Log("msg", "rejecting KV pair with unknown key", "key", kvPair.Key)
+		return false
+	}
+
+	if m.cfg.MaxValueBytes > 0 && len(kvPair.Value) > m.cfg.MaxValueBytes {
+		m.numberOfInvalidReceivedMessages.Inc()
+		level.Warn(m.logger).Log("msg", "rejecting oversized KV pair value", "key", kvPair.Key, "value_length", len(kvPair.Value), "max_value_bytes", m.cfg.MaxValueBytes)
+		return false
+	}
+
+	return true
+}
+
 // Merges incoming value with value we have in our store. Returns "a change" that can be sent to other
 // cluster members to update their state, and new version of the value.
 // If CAS version is specified, then merging will fail if state has changed already, and errVersionMismatch is reported.
@@ -1211,7 +1328,12 @@ func (m *KV) mergeValueForKey(key string, incomingValue Mergeable, casVersion ui
 	// Note that we do not take a deep copy of curr.value here, it is modified in-place.
 	// This is safe because the entire function runs under the store lock; we do not return
 	// the full state anywhere as is done elsewhere (i.e. Get/WatchKey/CAS).
-	curr := m.store[key]
+	curr, hadPrevious := m.store[key]
+	// Enforce max-keys cap: reject brand-new keys once the store is full.
+	// casVersion > 0 means this is a local CAS and the key is known-good.
+	if !hadPrevious && casVersion == 0 && m.cfg.MaxKeys > 0 && len(m.store) >= m.cfg.MaxKeys {
+		return nil, 0, fmt.Errorf("KV store full: %d keys", len(m.store))
+	}
 	// if casVersion is 0, then there was no previous value, so we will just do normal merge, without localCAS flag set.
 	if casVersion > 0 && curr.version != casVersion {
 		return nil, 0, errVersionMismatch
@@ -1229,8 +1351,15 @@ func (m *KV) mergeValueForKey(key string, incomingValue Mergeable, casVersion ui
 	if m.cfg.LeftIngestersTimeout > 0 {
 		limit := time.Now().Add(-m.cfg.LeftIngestersTimeout)
 		total, removed := result.RemoveTombstones(limit)
-		m.storeTombstones.WithLabelValues(key).Set(float64(total))
-		m.storeRemovedTombstones.WithLabelValues(key).Add(float64(removed))
+		// Only emit per-key metrics for keys that are known locally (either
+		// explicitly registered by local components, or - in the permissive
+		// bootstrap period before any key is known - all keys). This avoids
+		// using an attacker-controlled gossip key as an unbounded Prometheus
+		// label value.
+		if m.isKnownKey(key) {
+			m.storeTombstones.WithLabelValues(key).Set(float64(total))
+			m.storeRemovedTombstones.WithLabelValues(key).Add(float64(removed))
+		}
 
 		// Remove tombstones from change too. If change turns out to be empty after this,
 		// we don't need to gossip the change. However, the local value will be always be updated.
