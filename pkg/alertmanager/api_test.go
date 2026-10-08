@@ -5,26 +5,34 @@ import (
 	"context"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"testing"
+	"time"
 
 	"github.com/go-kit/log"
 	"github.com/gorilla/mux"
 	"github.com/pkg/errors"
 	"github.com/prometheus/alertmanager/config"
+	"github.com/prometheus/alertmanager/notify/email"
+	"github.com/prometheus/alertmanager/template"
+	"github.com/prometheus/alertmanager/types"
 	"github.com/prometheus/client_golang/prometheus"
 	commoncfg "github.com/prometheus/common/config"
+	"github.com/prometheus/common/model"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	"github.com/thanos-io/objstore"
 	"github.com/weaveworks/common/user"
+	"golang.org/x/time/rate"
 	"gopkg.in/yaml.v2"
 
 	"github.com/cortexproject/cortex/pkg/alertmanager/alertspb"
 	"github.com/cortexproject/cortex/pkg/alertmanager/alertstore/bucketclient"
 	"github.com/cortexproject/cortex/pkg/util/flagext"
 	util_log "github.com/cortexproject/cortex/pkg/util/log"
+	util_net "github.com/cortexproject/cortex/pkg/util/net"
 	"github.com/cortexproject/cortex/pkg/util/services"
 )
 
@@ -789,8 +797,131 @@ func TestValidateAlertmanagerConfig(t *testing.T) {
 
 	for testName, testData := range tests {
 		t.Run(testName, func(t *testing.T) {
-			err := validateAlertmanagerConfig(testData.input)
+			err := validateAlertmanagerConfig(testData.input, nil, "")
 			assert.ErrorIs(t, err, testData.expected)
 		})
+	}
+}
+
+// mockEmailLimits is a minimal Limits implementation used by the email-firewall
+// regression tests. Other Limits methods are not exercised and intentionally
+// return zero values.
+type mockEmailLimits struct {
+	blockPrivate bool
+	blockCIDRs   []flagext.CIDR
+}
+
+func (m *mockEmailLimits) AlertmanagerReceiversBlockCIDRNetworks(user string) []flagext.CIDR {
+	return m.blockCIDRs
+}
+func (m *mockEmailLimits) AlertmanagerReceiversBlockPrivateAddresses(user string) bool {
+	return m.blockPrivate
+}
+func (m *mockEmailLimits) AlertmanagerMaxConfigSize(string) int             { return 0 }
+func (m *mockEmailLimits) AlertmanagerMaxTemplatesCount(string) int         { return 0 }
+func (m *mockEmailLimits) AlertmanagerMaxTemplateSize(string) int           { return 0 }
+func (m *mockEmailLimits) AlertmanagerMaxDispatcherAggregationGroups(string) int { return 0 }
+func (m *mockEmailLimits) AlertmanagerMaxAlertsCount(string) int            { return 0 }
+func (m *mockEmailLimits) AlertmanagerMaxAlertsSizeBytes(string) int        { return 0 }
+func (m *mockEmailLimits) NotificationRateLimit(string, string) rate.Limit  { return rate.Inf }
+func (m *mockEmailLimits) NotificationBurstSize(string, string) int         { return 0 }
+
+// TestValidateEmailConfigRejectsBlockedSmarthost asserts admission-time rejection
+// of email receivers whose smarthost resolves to an address blocked by the tenant
+// firewall policy. This is the regression test for the SSRF primitive where a
+// tenant uploaded an Alertmanager config with `smarthost: 127.0.0.1:2525`.
+func TestValidateEmailConfigRejectsBlockedSmarthost(t *testing.T) {
+	cfg := config.EmailConfig{
+		Smarthost: config.HostPort{Host: "127.0.0.1", Port: "2525"},
+		From:      "a@example.com",
+		To:        "b@example.com",
+	}
+	limits := &mockEmailLimits{blockPrivate: true}
+	err := validateEmailConfig(cfg, limits, "tenant-a")
+	require.Error(t, err)
+	require.ErrorIs(t, err, errEmailSmarthostBlocked)
+}
+
+// TestValidateEmailConfigAllowsPublicSmarthost asserts admission-time acceptance
+// of email receivers pointing at a public IP under the same firewall policy.
+func TestValidateEmailConfigAllowsPublicSmarthost(t *testing.T) {
+	cfg := config.EmailConfig{
+		Smarthost: config.HostPort{Host: "8.8.8.8", Port: "25"},
+		From:      "a@example.com",
+		To:        "b@example.com",
+	}
+	limits := &mockEmailLimits{blockPrivate: true}
+	require.NoError(t, validateEmailConfig(cfg, limits, "tenant-a"))
+}
+
+// TestValidateEmailConfigNoFirewall asserts validateEmailConfig is a no-op when
+// the operator has not enabled the receiver firewall; this preserves the
+// documented default behaviour.
+func TestValidateEmailConfigNoFirewall(t *testing.T) {
+	cfg := config.EmailConfig{
+		Smarthost: config.HostPort{Host: "127.0.0.1", Port: "2525"},
+		From:      "a@example.com",
+		To:        "b@example.com",
+	}
+	require.NoError(t, validateEmailConfig(cfg, &mockEmailLimits{}, "tenant-a"))
+}
+
+// blockAllFirewallProvider is a FirewallDialerConfigProvider that blocks all
+// private and loopback addresses.
+type blockAllFirewallProvider struct{}
+
+func (blockAllFirewallProvider) BlockCIDRNetworks() []flagext.CIDR { return nil }
+func (blockAllFirewallProvider) BlockPrivateAddresses() bool       { return true }
+
+// TestEmailNotifierFirewallBlocksLoopbackDial is the dial-time regression test
+// for the SSRF: it builds the vendored email notifier with a block-everything
+// FirewallDialer, points it at a loopback test listener, invokes Notify, and
+// asserts that no connection was ever accepted by the listener and that the
+// error returned contains the firewall "blocked address" sentinel.
+func TestEmailNotifierFirewallBlocksLoopbackDial(t *testing.T) {
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	require.NoError(t, err)
+	defer ln.Close()
+
+	accepted := make(chan struct{}, 1)
+	go func() {
+		conn, err := ln.Accept()
+		if err == nil {
+			accepted <- struct{}{}
+			conn.Close()
+		}
+	}()
+
+	host, port, err := net.SplitHostPort(ln.Addr().String())
+	require.NoError(t, err)
+
+	requireTLS := false
+	emailCfg := &config.EmailConfig{
+		NotifierConfig: config.NotifierConfig{VSendResolved: false},
+		Smarthost:      config.HostPort{Host: host, Port: port},
+		From:           "a@example.com",
+		To:             "b@example.com",
+		Hello:          "cortex-ssrf-probe",
+		Headers:        map[string]string{},
+		RequireTLS:     &requireTLS,
+	}
+
+	tmpl, err := template.FromGlobs()
+	require.NoError(t, err)
+
+	fw := util_net.NewFirewallDialer(blockAllFirewallProvider{})
+	n := email.New(emailCfg, tmpl, log.NewNopLogger(), fw.NetDialer())
+
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	_, err = n.Notify(ctx, &types.Alert{Alert: model.Alert{Labels: model.LabelSet{"alertname": "probe"}}})
+	require.Error(t, err, "notifier must not succeed when the firewall blocks the smarthost")
+	require.Contains(t, err.Error(), "blocked address")
+
+	select {
+	case <-accepted:
+		t.Fatal("firewall was bypassed: the loopback listener accepted a connection from the email notifier")
+	case <-time.After(200 * time.Millisecond):
+		// Expected: no connection was accepted.
 	}
 }
