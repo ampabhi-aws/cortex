@@ -673,6 +673,21 @@ func (d *Distributor) Push(ctx context.Context, req *cortexpb.WriteRequest) (*co
 			continue
 		}
 
+		// Cheap O(1) guard: enforce the per-series label-count limit before any per-label work
+		// (sorting, hashing). This prevents an attacker from forcing the distributor to pay
+		// O(n log n) sort cost on an arbitrarily large label set that would be rejected by
+		// validateSeries anyway. See CWE-408 (Incorrect Behavior Order: Early Amplification).
+		if maxLabels := d.limits.MaxLabelNamesPerSeries(userID); len(ts.Labels) > maxLabels {
+			validation.DiscardedSamples.WithLabelValues("max_label_names_per_series", userID).Add(float64(len(ts.Samples)))
+			if firstPartialErr == nil {
+				// Mirror the error format produced by validation.ValidateLabels /
+				// tooManyLabelsError so that callers observe an identical error whether the
+				// limit is enforced here or inside validateSeries.
+				firstPartialErr = httpgrpc.Errorf(http.StatusBadRequest, "series has too many labels (actual: %d, limit: %d) series: '%s'", len(ts.Labels), maxLabels, cortexpb.FromLabelAdaptersToMetric(ts.Labels).String())
+			}
+			continue
+		}
+
 		// We rely on sorted labels in different places:
 		// 1) When computing token for labels, and sharding by all labels. Here different order of labels returns
 		// different tokens, which is bad.
@@ -802,8 +817,17 @@ func (d *Distributor) Push(ctx context.Context, req *cortexpb.WriteRequest) (*co
 	return &cortexpb.WriteResponse{}, firstPartialErr
 }
 
+// labelAdaptersByName implements sort.Interface over []cortexpb.LabelAdapter sorted by Name.
+// Using a typed sort.Interface instead of sort.Slice avoids the reflect-based swapper and the
+// per-comparison closure call, which matters when the slice is large.
+type labelAdaptersByName []cortexpb.LabelAdapter
+
+func (s labelAdaptersByName) Len() int           { return len(s) }
+func (s labelAdaptersByName) Less(i, j int) bool { return s[i].Name < s[j].Name }
+func (s labelAdaptersByName) Swap(i, j int)      { s[i], s[j] = s[j], s[i] }
+
 func sortLabelsIfNeeded(labels []cortexpb.LabelAdapter) {
-	// no need to run sort.Slice, if labels are already sorted, which is most of the time.
+	// no need to run sort, if labels are already sorted, which is most of the time.
 	// we can avoid extra memory allocations (mostly interface-related) this way.
 	sorted := true
 	last := ""
@@ -819,9 +843,9 @@ func sortLabelsIfNeeded(labels []cortexpb.LabelAdapter) {
 		return
 	}
 
-	sort.Slice(labels, func(i, j int) bool {
-		return strings.Compare(labels[i].Name, labels[j].Name) < 0
-	})
+	// Use a typed sort.Interface instead of sort.Slice to avoid the reflect-based swapper
+	// and the closure call overhead on each comparison.
+	sort.Sort(labelAdaptersByName(labels))
 }
 
 func (d *Distributor) send(ctx context.Context, ingester ring.InstanceDesc, timeseries []cortexpb.PreallocTimeseries, metadata []*cortexpb.MetricMetadata, source cortexpb.WriteRequest_SourceEnum) error {
