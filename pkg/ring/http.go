@@ -7,6 +7,7 @@ import (
 	"html/template"
 	"math"
 	"net/http"
+	"net/url"
 	"sort"
 	"strings"
 	"time"
@@ -25,7 +26,6 @@ const pageContent = `
 		<h1>Ring Status</h1>
 		<p>Current time: {{ .Now }}</p>
 		<form action="" method="POST">
-			<input type="hidden" name="csrf_token" value="$__CSRF_TOKEN_PLACEHOLDER__">
 			<table width="100%" border="1">
 				<thead>
 					<tr>
@@ -121,8 +121,39 @@ type httpResponse struct {
 	ShowTokens bool           `json:"-"`
 }
 
+// sameOriginRequest returns true if the request's Origin header matches the
+// server's host (or if the Origin is absent, which is the case for same-origin
+// navigations in some browsers and for non-browser clients). It also honours
+// the Sec-Fetch-Site hint when present, rejecting any value other than
+// "same-origin".
+func sameOriginRequest(req *http.Request) bool {
+	if site := req.Header.Get("Sec-Fetch-Site"); site != "" && site != "same-origin" && site != "none" {
+		return false
+	}
+	origin := req.Header.Get("Origin")
+	if origin == "" {
+		// No Origin header: treat as same-origin (non-browser clients, or
+		// older browsers performing a same-origin top-level navigation).
+		return true
+	}
+	// Parse the Origin header: scheme://host[:port].
+	u, err := url.Parse(origin)
+	if err != nil || u.Host == "" {
+		return false
+	}
+	return strings.EqualFold(u.Host, req.Host)
+}
+
 func (r *Ring) ServeHTTP(w http.ResponseWriter, req *http.Request) {
 	if req.Method == http.MethodPost {
+		// Reject cross-site POSTs. The admin ring page is same-origin only;
+		// a browser that has been coerced by an attacker-controlled page
+		// into submitting this form will set Origin and/or Sec-Fetch-Site
+		// to a cross-site value, which we deny with 403.
+		if !sameOriginRequest(req) {
+			http.Error(w, "cross-site request blocked", http.StatusForbidden)
+			return
+		}
 		ingesterID := req.FormValue("forget")
 		if err := r.forget(req.Context(), ingesterID); err != nil {
 			level.Error(r.logger).Log("msg", "error forgetting instance", "err", err)
