@@ -78,6 +78,10 @@ type Config struct {
 	ClientTLSConfig grpcclient.Config `yaml:"ruler_client"`
 	// How frequently to evaluate rules by default.
 	EvaluationInterval time.Duration `yaml:"evaluation_interval"`
+	// Minimum evaluation interval that tenants are allowed to configure on a rule group.
+	// Protects the ruler from a tenant submitting rule groups with very small evaluation
+	// intervals that would starve other tenants' rule evaluations on the shared PromQL engine.
+	MinRuleEvaluationInterval time.Duration `yaml:"min_rule_evaluation_interval"`
 	// How frequently to poll for updated rules.
 	PollInterval time.Duration `yaml:"poll_interval"`
 	// Path to store rule files for prom manager.
@@ -159,6 +163,7 @@ func (cfg *Config) RegisterFlags(f *flag.FlagSet) {
 	cfg.ExternalURL.URL, _ = url.Parse("") // Must be non-nil
 	f.Var(&cfg.ExternalURL, "ruler.external.url", "URL of alerts return path.")
 	f.DurationVar(&cfg.EvaluationInterval, "ruler.evaluation-interval", 1*time.Minute, "How frequently to evaluate rules")
+	f.DurationVar(&cfg.MinRuleEvaluationInterval, "ruler.min-rule-evaluation-interval", 10*time.Second, "Minimum allowed evaluation interval for tenant-submitted rule groups. Rule groups configured with an interval below this value are rejected at write time, and any pre-existing stored groups with a smaller interval are clamped to this value when loaded. Set to 0 to disable the minimum (not recommended in multi-tenant deployments).")
 	f.DurationVar(&cfg.PollInterval, "ruler.poll-interval", 1*time.Minute, "How frequently to poll for rule changes")
 
 	f.StringVar(&cfg.AlertmanagerURL, "ruler.alertmanager-url", "", "Comma-separated list of URL(s) of the Alertmanager(s) to send notifications to. Each Alertmanager URL is treated as a separate group in the configuration. Multiple Alertmanagers in HA per group can be supported by using DNS resolution via -ruler.alertmanager-discovery.")
