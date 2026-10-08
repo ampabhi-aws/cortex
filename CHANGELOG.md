@@ -2,6 +2,8 @@
 
 ## master / unreleased
 
+* [SECURITY] Tenant resolver: the default `SingleResolver` now rejects tenant IDs that exceed 150 bytes or contain `:` or `|`, and the query results-cache key length-prefixes the tenant component. This prevents cross-tenant results-cache key confusion when the auth gateway does not sanitize `X-Scope-OrgID` (tenant IDs such as `acme:job` previously could collide with another tenant's cache key), and prevents `|` tenant IDs from being silently reinterpreted as multi-tenant sets when `-tenant-federation.enabled` is turned on.
+
   **This release removes support for chunks storage. See below for more.**
 * [CHANGE] Remove support for chunks storage entirely. If you are using chunks storage on a previous version, you must [migrate your data](https://github.com/cortexproject/cortex/blob/v1.11.1/docs/blocks-storage/migrate-from-chunks-to-blocks.md) on version 1.12 or earlier. Before upgrading to this release, you should also remove any deprecated chunks-related configuration, as this release will no longer accept that. The following flags are gone:
   - `-dynamodb.*`
