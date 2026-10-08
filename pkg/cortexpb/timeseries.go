@@ -11,6 +11,18 @@ import (
 	"github.com/prometheus/prometheus/model/labels"
 )
 
+// Capacity ceilings for objects returned to the sync.Pool. Objects whose
+// backing arrays have grown beyond these thresholds (e.g. because an
+// attacker-crafted write request forced them to grow during unmarshalling)
+// are dropped on the floor so the Go GC can reclaim them instead of pinning
+// the inflated capacity in a process-global pool shared by every tenant.
+const (
+	maxPooledTimeseriesPerRequest = 10_000
+	maxPooledLabelsPerSeries      = 64
+	maxPooledSamplesPerSeries     = 256
+	maxPooledExemplarsPerSeries   = 16
+)
+
 var (
 	expectedTimeseries         = 100
 	expectedLabels             = 20
@@ -279,6 +291,12 @@ func ReuseSlice(ts []PreallocTimeseries) {
 		ReuseTimeseries(ts[i].TimeSeries)
 	}
 
+	if cap(ts) > maxPooledTimeseriesPerRequest {
+		// Drop over-sized slices on the floor and let GC reclaim the
+		// backing array instead of pinning attacker-grown capacity in
+		// the shared pool.
+		return
+	}
 	slicePool.Put(ts[:0]) //nolint:staticcheck //see comment on slicePool for more details
 }
 
@@ -290,13 +308,14 @@ func TimeseriesFromPool() *TimeSeries {
 
 // ReuseTimeseries puts the timeseries back into a sync.Pool for reuse.
 func ReuseTimeseries(ts *TimeSeries) {
+	if ts == nil {
+		return
+	}
 	// Name and Value may point into a large gRPC buffer, so clear the reference to allow GC
-	for i := 0; i < len(ts.Labels); i++ {
+	for i := range ts.Labels {
 		ts.Labels[i].Name = ""
 		ts.Labels[i].Value = ""
 	}
-	ts.Labels = ts.Labels[:0]
-	ts.Samples = ts.Samples[:0]
 	// Name and Value may point into a large gRPC buffer, so clear the reference in each exemplar to allow GC
 	for i := range ts.Exemplars {
 		for j := range ts.Exemplars[i].Labels {
@@ -304,6 +323,26 @@ func ReuseTimeseries(ts *TimeSeries) {
 			ts.Exemplars[i].Labels[j].Value = ""
 		}
 	}
-	ts.Exemplars = ts.Exemplars[:0]
+
+	// If any of the backing arrays have grown beyond the pooling
+	// thresholds (e.g. because the request that produced this object
+	// carried a very large series), reallocate at the expected size
+	// rather than recycling an inflated buffer. Otherwise just reset
+	// len to zero and keep the modest capacity.
+	if cap(ts.Labels) > maxPooledLabelsPerSeries {
+		ts.Labels = make([]LabelAdapter, 0, expectedLabels)
+	} else {
+		ts.Labels = ts.Labels[:0]
+	}
+	if cap(ts.Samples) > maxPooledSamplesPerSeries {
+		ts.Samples = make([]Sample, 0, expectedSamplesPerSeries)
+	} else {
+		ts.Samples = ts.Samples[:0]
+	}
+	if cap(ts.Exemplars) > maxPooledExemplarsPerSeries {
+		ts.Exemplars = make([]Exemplar, 0, expectedExemplarsPerSeries)
+	} else {
+		ts.Exemplars = ts.Exemplars[:0]
+	}
 	timeSeriesPool.Put(ts)
 }
