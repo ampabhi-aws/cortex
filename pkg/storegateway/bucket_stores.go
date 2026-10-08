@@ -2,7 +2,6 @@ package storegateway
 
 import (
 	"context"
-	"fmt"
 	"math"
 	"net/http"
 	"os"
@@ -29,10 +28,13 @@ import (
 	"github.com/thanos-io/thanos/pkg/store/storepb"
 	"github.com/weaveworks/common/httpgrpc"
 	"github.com/weaveworks/common/logging"
+	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/metadata"
+	"google.golang.org/grpc/status"
 
 	"github.com/cortexproject/cortex/pkg/storage/bucket"
 	"github.com/cortexproject/cortex/pkg/storage/tsdb"
+	"github.com/cortexproject/cortex/pkg/tenant"
 	"github.com/cortexproject/cortex/pkg/util/backoff"
 	util_log "github.com/cortexproject/cortex/pkg/util/log"
 	"github.com/cortexproject/cortex/pkg/util/spanlogger"
@@ -276,9 +278,9 @@ func (u *BucketStores) Series(req *storepb.SeriesRequest, srv storepb.Store_Seri
 	spanLog, spanCtx := spanlogger.New(srv.Context(), "BucketStores.Series")
 	defer spanLog.Span.Finish()
 
-	userID := getUserIDFromGRPCContext(spanCtx)
-	if userID == "" {
-		return fmt.Errorf("no userID")
+	userID, err := resolveUserID(spanCtx)
+	if err != nil {
+		return err
 	}
 
 	store := u.getStore(userID)
@@ -297,9 +299,9 @@ func (u *BucketStores) LabelNames(ctx context.Context, req *storepb.LabelNamesRe
 	spanLog, spanCtx := spanlogger.New(ctx, "BucketStores.LabelNames")
 	defer spanLog.Span.Finish()
 
-	userID := getUserIDFromGRPCContext(spanCtx)
-	if userID == "" {
-		return nil, fmt.Errorf("no userID")
+	userID, err := resolveUserID(spanCtx)
+	if err != nil {
+		return nil, err
 	}
 
 	store := u.getStore(userID)
@@ -315,9 +317,9 @@ func (u *BucketStores) LabelValues(ctx context.Context, req *storepb.LabelValues
 	spanLog, spanCtx := spanlogger.New(ctx, "BucketStores.LabelValues")
 	defer spanLog.Span.Finish()
 
-	userID := getUserIDFromGRPCContext(spanCtx)
-	if userID == "" {
-		return nil, fmt.Errorf("no userID")
+	userID, err := resolveUserID(spanCtx)
+	if err != nil {
+		return nil, err
 	}
 
 	store := u.getStore(userID)
@@ -548,18 +550,28 @@ func (u *BucketStores) deleteLocalFilesForExcludedTenants(includeUserIDs map[str
 	}
 }
 
-func getUserIDFromGRPCContext(ctx context.Context) string {
-	meta, ok := metadata.FromIncomingContext(ctx)
-	if !ok {
-		return ""
+// resolveUserID returns the tenant the caller is authenticated as (via
+// X-Scope-OrgID / tenant.TenantID). For backwards compatibility it also
+// tolerates the legacy __org_id__ gRPC metadata, but only if present with
+// exactly one value that matches the authenticated identity. Any mismatch
+// is rejected with PermissionDenied to prevent cross-tenant reads.
+func resolveUserID(ctx context.Context) (string, error) {
+	authUserID, err := tenant.TenantID(ctx)
+	if err != nil {
+		return "", status.Error(codes.Unauthenticated, "missing or invalid tenant ID")
+	}
+	if err := tenant.ValidTenantID(authUserID); err != nil {
+		return "", status.Error(codes.Unauthenticated, "invalid tenant ID")
 	}
 
-	values := meta.Get(tsdb.TenantIDExternalLabel)
-	if len(values) != 1 {
-		return ""
+	if md, ok := metadata.FromIncomingContext(ctx); ok {
+		if values := md.Get(tsdb.TenantIDExternalLabel); len(values) > 0 {
+			if len(values) != 1 || values[0] != authUserID {
+				return "", status.Error(codes.PermissionDenied, "tenant ID mismatch")
+			}
+		}
 	}
-
-	return values[0]
+	return authUserID, nil
 }
 
 // ReplicaLabelRemover is a BaseFetcher modifier modifies external labels of existing blocks, it removes given replica labels from the metadata of blocks that have it.
