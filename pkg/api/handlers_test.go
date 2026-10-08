@@ -9,6 +9,8 @@ import (
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+
+	"github.com/cortexproject/cortex/pkg/util/flagext"
 )
 
 func TestIndexHandlerPrefix(t *testing.T) {
@@ -188,4 +190,79 @@ func TestConfigOverrideHandler(t *testing.T) {
 	body, err := io.ReadAll(resp.Body)
 	assert.NoError(t, err)
 	assert.Equal(t, []byte("config"), body)
+}
+
+// TestConfigHandler_RedactsSecrets is a regression test for the
+// Unauthenticated /config endpoint credential leak: every credential-bearing
+// field reachable from the handler must round-trip through yaml.Marshal as
+// "********" (or an opaque URL with the password masked), never as the raw
+// canary string the operator supplied.
+func TestConfigHandler_RedactsSecrets(t *testing.T) {
+	canaries := []string{
+		"SWIFT-PASSWORD-CANARY",
+		"ETCD-PASSWORD-CANARY",
+		"ALERTMANAGER-BASIC-AUTH-CANARY",
+		"S3-ACCESS-KEY-ID-CANARY",
+		"S3-SECRET-ACCESS-KEY-CANARY",
+		"CONFIGS-DB-URI-PASSWORD-CANARY",
+	}
+
+	dbURI := flagext.URLValue{}
+	require.NoError(t, dbURI.Set("postgres://configs:CONFIGS-DB-URI-PASSWORD-CANARY@configs-db.weave.local/configs?sslmode=disable"))
+
+	cfg := struct {
+		Swift struct {
+			Password flagext.Secret `yaml:"password"`
+		} `yaml:"swift"`
+		Etcd struct {
+			UserName string         `yaml:"username"`
+			Password flagext.Secret `yaml:"password"`
+		} `yaml:"etcd"`
+		BasicAuth struct {
+			Username string         `yaml:"basic_auth_username"`
+			Password flagext.Secret `yaml:"basic_auth_password"`
+		} `yaml:"alertmanager_client"`
+		S3 struct {
+			AccessKeyID     flagext.Secret `yaml:"access_key_id"`
+			SecretAccessKey flagext.Secret `yaml:"secret_access_key"`
+		} `yaml:"s3"`
+		ConfigsDB struct {
+			URI flagext.URLValue `yaml:"uri"`
+		} `yaml:"configs_database"`
+	}{}
+	cfg.Swift.Password = flagext.Secret{Value: "SWIFT-PASSWORD-CANARY"}
+	cfg.Etcd.UserName = "cortex"
+	cfg.Etcd.Password = flagext.Secret{Value: "ETCD-PASSWORD-CANARY"}
+	cfg.BasicAuth.Username = "ruler"
+	cfg.BasicAuth.Password = flagext.Secret{Value: "ALERTMANAGER-BASIC-AUTH-CANARY"}
+	cfg.S3.AccessKeyID = flagext.Secret{Value: "S3-ACCESS-KEY-ID-CANARY"}
+	cfg.S3.SecretAccessKey = flagext.Secret{Value: "S3-SECRET-ACCESS-KEY-CANARY"}
+	cfg.ConfigsDB.URI = dbURI
+
+	req := httptest.NewRequest("GET", "http://test.com/config", nil)
+	w := httptest.NewRecorder()
+	DefaultConfigHandler(&cfg, &cfg)(w, req)
+	resp := w.Result()
+	require.Equal(t, 200, resp.StatusCode)
+
+	body, err := io.ReadAll(resp.Body)
+	require.NoError(t, err)
+	bodyStr := string(body)
+
+	for _, canary := range canaries {
+		assert.NotContainsf(t, bodyStr, canary, "canary %q leaked in /config output:\n%s", canary, bodyStr)
+	}
+	// Expect the standard mask to appear for secrets.
+	assert.Contains(t, bodyStr, "********")
+}
+
+// TestConfigHandler_DisabledByDefault verifies that when ExposeConfig is left
+// at its (false) default, the /config endpoint returns 404 instead of serving
+// the configuration dump.
+func TestConfigHandler_DisabledByDefault(t *testing.T) {
+	req := httptest.NewRequest("GET", "http://test.com/config", nil)
+	w := httptest.NewRecorder()
+	http.HandlerFunc(disabledConfigHandler).ServeHTTP(w, req)
+	resp := w.Result()
+	assert.Equal(t, http.StatusNotFound, resp.StatusCode)
 }

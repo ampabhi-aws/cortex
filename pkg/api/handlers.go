@@ -117,6 +117,13 @@ func (cfg *Config) configHandler(actualCfg interface{}, defaultCfg interface{}) 
 	return DefaultConfigHandler(actualCfg, defaultCfg)
 }
 
+// disabledConfigHandler is served instead of DefaultConfigHandler when
+// `-api.expose-config` is false. It explains how to re-enable the endpoint
+// so operators do not have to guess why /config returns 404.
+func disabledConfigHandler(w http.ResponseWriter, _ *http.Request) {
+	http.Error(w, "The /config endpoint is disabled. Set -api.expose-config=true (or api.expose_config: true in YAML) to enable it. Credential fields are redacted when the endpoint is enabled, but the endpoint still exposes the full non-secret configuration and is therefore off by default.", http.StatusNotFound)
+}
+
 func DefaultConfigHandler(actualCfg interface{}, defaultCfg interface{}) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		var output interface{}
