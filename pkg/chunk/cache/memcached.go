@@ -2,9 +2,9 @@ package cache
 
 import (
 	"context"
+	"crypto/sha256"
 	"encoding/hex"
 	"flag"
-	"hash/fnv"
 	"sync"
 	"time"
 
@@ -265,10 +265,15 @@ func (c *Memcached) Stop() {
 }
 
 // HashKey hashes key into something you can store in memcached.
+//
+// A truncated SHA-256 digest is used instead of 64-bit FNV-1a so that an
+// attacker cannot craft keys that collide to the same hashed slot and evict
+// another tenant's cached entries. 128 bits of hex (16 bytes of digest)
+// provide sufficient collision resistance for the shared cache keyspace while
+// keeping the key short enough to be accepted by memcached.
 func HashKey(key string) string {
-	hasher := fnv.New64a()
-	_, _ = hasher.Write([]byte(key)) // This'll never error.
+	sum := sha256.Sum256([]byte(key))
 
 	// Hex because memcache errors for the bytes produced by the hash.
-	return hex.EncodeToString(hasher.Sum(nil))
+	return hex.EncodeToString(sum[:16])
 }
