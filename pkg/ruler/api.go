@@ -288,6 +288,10 @@ var (
 	ErrNoRuleGroups = errors.New("no rule groups found")
 	// ErrBadRuleGroup is returned when the provided rule group can not be unmarshalled
 	ErrBadRuleGroup = errors.New("unable to decoded rule group")
+	// ErrInvalidNamespace signals that the namespace in the request is not a safe path segment.
+	ErrInvalidNamespace = errors.New("invalid namespace")
+	// ErrInvalidGroupName signals that the rule group name in the request is not a safe path segment.
+	ErrInvalidGroupName = errors.New("invalid group name")
 )
 
 func marshalAndSend(output interface{}, w http.ResponseWriter, logger log.Logger) {
@@ -336,6 +340,13 @@ func parseNamespace(params map[string]string) (string, error) {
 		return "", err
 	}
 
+	// Reject namespaces that are not safe path segments. Allowing "", ".",
+	// or ".." lets a tenant steer mapper.MapRules to write outside the
+	// per-tenant rules directory (CWE-22). See pkg/ruler/mapper.go.
+	if namespace == "" || namespace == "." || namespace == ".." {
+		return "", ErrInvalidNamespace
+	}
+
 	return namespace, nil
 }
 
@@ -350,6 +361,12 @@ func parseGroupName(params map[string]string) (string, error) {
 	groupName, err := url.PathUnescape(groupName)
 	if err != nil {
 		return "", err
+	}
+
+	// Reject group names that are not safe path segments, consistent with
+	// namespace validation above.
+	if groupName == "" || groupName == "." || groupName == ".." {
+		return "", ErrInvalidGroupName
 	}
 
 	return groupName, nil
