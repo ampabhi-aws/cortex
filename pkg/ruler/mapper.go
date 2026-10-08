@@ -1,8 +1,9 @@
 package ruler
 
 import (
-	"crypto/md5"
+	"bytes"
 	"net/url"
+	"os"
 	"path/filepath"
 	"sort"
 
@@ -11,6 +12,15 @@ import (
 	"github.com/prometheus/prometheus/model/rulefmt"
 	"github.com/spf13/afero"
 	"gopkg.in/yaml.v3"
+)
+
+// Least-privilege permissions for the on-disk rule artifacts. Only the
+// ruler process itself needs to read or write these files; other local
+// identities sharing the filesystem must not be able to see or tamper
+// with another tenant's recording/alerting rules.
+const (
+	ruleDirPerm  os.FileMode = 0o700
+	ruleFilePerm os.FileMode = 0o600
 )
 
 // mapper is designed to enusre the provided rule sets are identical
@@ -75,7 +85,7 @@ func (m *mapper) MapRules(user string, ruleConfigs map[string][]rulefmt.RuleGrou
 
 	// user rule files will be stored as `/<path>/<userid>/<encoded filename>`
 	path := filepath.Join(m.Path, user)
-	err := m.FS.MkdirAll(path, 0777)
+	err := m.FS.MkdirAll(path, ruleDirPerm)
 	if err != nil {
 		return false, nil, err
 	}
@@ -84,7 +94,23 @@ func (m *mapper) MapRules(user string, ruleConfigs map[string][]rulefmt.RuleGrou
 	for filename, groups := range ruleConfigs {
 		// Store the encoded file name to better handle `/` characters
 		encodedFileName := url.PathEscape(filename)
+		// Reject path-ish namespace names that would otherwise escape the
+		// tenant's directory. `url.PathEscape` leaves `.` and `..` intact,
+		// so an attacker-controlled namespace of `..` (or `.`) would make
+		// writes target the shared rules root. The API boundary should
+		// also reject these, this is a belt-and-braces defence.
+		if encodedFileName == "" || encodedFileName == "." || encodedFileName == ".." {
+			level.Warn(m.logger).Log("msg", "skipping rule namespace with invalid name", "user", user, "namespace", filename)
+			continue
+		}
 		fullFileName := filepath.Join(path, encodedFileName)
+		// Containment check: ensure the computed file still lives directly
+		// inside the tenant's directory (defends against any future
+		// encoding that would allow traversal).
+		if filepath.Dir(fullFileName) != path {
+			level.Warn(m.logger).Log("msg", "skipping rule namespace that escapes tenant directory", "user", user, "namespace", filename)
+			continue
+		}
 
 		fileUpdated, err := m.writeRuleGroupsIfNewer(groups, fullFileName)
 		if err != nil {
@@ -142,17 +168,15 @@ func (m *mapper) writeRuleGroupsIfNewer(groups []rulefmt.RuleGroup, filename str
 		if err != nil {
 			return false, err
 		}
-		newHash := md5.New()
-		currentHash := md5.New()
 
 		// bailout if there is no update
-		if string(currentHash.Sum(current)) == string(newHash.Sum(d)) {
+		if bytes.Equal(current, d) {
 			return false, nil
 		}
 	}
 
 	level.Info(m.logger).Log("msg", "updating rule file", "file", filename)
-	err = afero.WriteFile(m.FS, filename, d, 0777)
+	err = afero.WriteFile(m.FS, filename, d, ruleFilePerm)
 	if err != nil {
 		return false, err
 	}

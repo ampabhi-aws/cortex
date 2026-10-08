@@ -282,6 +282,8 @@ func (a *API) PrometheusAlerts(w http.ResponseWriter, req *http.Request) {
 var (
 	// ErrNoNamespace signals that no namespace was specified in the request
 	ErrNoNamespace = errors.New("a namespace must be provided in the request")
+	// ErrInvalidNamespace signals that the provided namespace is not a valid name
+	ErrInvalidNamespace = errors.New("invalid namespace")
 	// ErrNoGroupName signals a group name url parameter was not found
 	ErrNoGroupName = errors.New("a matching group name must be provided in the request")
 	// ErrNoRuleGroups signals the rule group requested does not exist
@@ -334,6 +336,14 @@ func parseNamespace(params map[string]string) (string, error) {
 	namespace, err := url.PathUnescape(namespace)
 	if err != nil {
 		return "", err
+	}
+
+	// Reject namespace values that would collapse to path components when
+	// later joined into a filesystem path by the ruler mapper. These are
+	// never meaningful rule namespaces and only serve to escape or
+	// collide with the tenant's rules directory.
+	if namespace == "" || namespace == "." || namespace == ".." {
+		return "", ErrInvalidNamespace
 	}
 
 	return namespace, nil
