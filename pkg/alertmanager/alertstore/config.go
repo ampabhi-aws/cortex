@@ -2,11 +2,13 @@ package alertstore
 
 import (
 	"flag"
+	"reflect"
 
 	"github.com/cortexproject/cortex/pkg/alertmanager/alertstore/configdb"
 	"github.com/cortexproject/cortex/pkg/alertmanager/alertstore/local"
 	"github.com/cortexproject/cortex/pkg/configs/client"
 	"github.com/cortexproject/cortex/pkg/storage/bucket"
+	"github.com/cortexproject/cortex/pkg/util/flagext"
 )
 
 // Config configures a the alertmanager storage backend.
@@ -34,4 +36,12 @@ func (cfg *Config) IsFullStateSupported() bool {
 		}
 	}
 	return false
+}
+
+// IsDefaults returns true if this Config is a freshly-registered default
+// (operator has not configured an alertmanager storage backend).
+func (cfg *Config) IsDefaults() bool {
+	defaults := Config{}
+	flagext.DefaultValues(&defaults)
+	return reflect.DeepEqual(*cfg, defaults)
 }

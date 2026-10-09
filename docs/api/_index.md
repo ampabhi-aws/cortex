@@ -795,7 +795,21 @@ The Purger service provides APIs for requesting deletion of tenants.
 POST /purger/delete_tenant
 ```
 
-Request deletion of ALL tenant data. Only works with blocks storage. Experimental.
+Request deletion of ALL tenant data: this writes a deletion mark in the
+blocks bucket (which the compactor acts on to delete the tenant's blocks,
+bucket index, and `markers/` prefix), synchronously deletes the tenant's
+rule groups from the ruler storage, and synchronously deletes the tenant's
+Alertmanager configuration and replicated full state from the Alertmanager
+storage. The call fails closed with HTTP 500 if the ruler or Alertmanager
+storage is not configured, so partial erasure is not silently reported as
+complete. Use `GET /purger/delete_tenant_status` and gate completion on
+the `complete` field (the AND of `blocks_deleted`, `rule_groups_deleted`,
+and `alertmanager_config_deleted`). Any credential that appeared in a
+deleted tenant's Alertmanager configuration (Slack webhooks, PagerDuty /
+VictorOps keys, bearer tokens, SMTP / basic-auth passwords) must be
+treated as compromised and rotated independently, because object-storage
+listing history may retain the deleted object until lifecycle policies
+reap it. Experimental.
 
 _Requires [authentication](#authentication)._
 
