@@ -306,6 +306,31 @@ func (u *userTSDB) casState(from, to tsdbState) bool {
 	return true
 }
 
+// maxBlocksPerCompaction is a defensive cap on the number of blocks produced in
+// a single call to compactHead. Without it, a Head whose min/max times span many
+// block ranges (for example because an attacker-controlled sample with t=0 or a
+// negative timestamp was accepted) would cause the compaction loop to iterate
+// once per block range across the entire span, wedging the single compactionLoop
+// goroutine for every tenant on the ingester. 64 blocks is far above the number
+// produced in normal operation (one per block range, default 2h, over the TSDB
+// retention period) while still bounding the worst case.
+const maxBlocksPerCompaction = 64
+
+// perTenantCompactionTimeout returns a conservative upper bound on how long one
+// tenant may hold the compactionLoop worker. We allow 10 compaction intervals
+// (default: 10 minutes) with a 10 minute floor and 1 hour ceiling, which is
+// generous for legitimate flushes while bounding worst-case stall time.
+func perTenantCompactionTimeout(headCompactionInterval time.Duration) time.Duration {
+	timeout := 10 * headCompactionInterval
+	if timeout < 10*time.Minute {
+		timeout = 10 * time.Minute
+	}
+	if timeout > time.Hour {
+		timeout = time.Hour
+	}
+	return timeout
+}
+
 // compactHead compacts the Head block at specified block durations avoiding a single huge block.
 func (u *userTSDB) compactHead(blockDuration int64) error {
 	if !u.casState(active, forceCompacting) {
@@ -321,21 +346,26 @@ func (u *userTSDB) compactHead(blockDuration int64) error {
 
 	h := u.Head()
 
-	minTime, maxTime := h.MinTime(), h.MaxTime()
+	for n := 0; n < maxBlocksPerCompaction; n++ {
+		minTime, maxTime := h.MinTime(), h.MaxTime()
 
-	for (minTime/blockDuration)*blockDuration != (maxTime/blockDuration)*blockDuration {
+		if (minTime/blockDuration)*blockDuration == (maxTime/blockDuration)*blockDuration {
+			// All remaining head data fits in a single block range.
+			return u.db.CompactHead(tsdb.NewRangeHead(h, minTime, maxTime))
+		}
+
 		// Data in Head spans across multiple block ranges, so we break it into blocks here.
 		// Block max time is exclusive, so we do a -1 here.
 		blockMaxTime := ((minTime/blockDuration)+1)*blockDuration - 1
 		if err := u.db.CompactHead(tsdb.NewRangeHead(h, minTime, blockMaxTime)); err != nil {
 			return err
 		}
-
-		// Get current min/max times after compaction.
-		minTime, maxTime = h.MinTime(), h.MaxTime()
+		// After CompactHead, head.truncateMemory sets h.minTime = blockMaxTime+1
+		// even if the range we just compacted was empty. The next iteration will
+		// re-read h.MinTime()/h.MaxTime() and terminate once they share a block range.
 	}
 
-	return u.db.CompactHead(tsdb.NewRangeHead(h, minTime, maxTime))
+	return errors.New("TSDB head spans too many block ranges; refusing to create an unbounded number of blocks")
 }
 
 // PreCreation implements SeriesLifecycleCallback interface.
@@ -956,6 +986,20 @@ func (i *Ingester) Push(ctx context.Context, req *cortexpb.WriteRequest) (*corte
 		}
 	)
 
+	// Compute the oldest sample timestamp the ingester is willing to accept. This
+	// is defence in depth: the distributor-side sample-age check
+	// (-validation.reject-old-samples) is optional and the /ingester/push path
+	// bypasses the distributor entirely. Without this bound, a single request
+	// containing a sample with an arbitrarily old (or negative) timestamp forces
+	// head compaction to iterate once per block range across the entire head
+	// span, wedging compactionLoop for every tenant on the ingester. We use the
+	// TSDB retention period, because samples older than that would be dropped by
+	// compaction anyway.
+	var oldestAllowed int64
+	if retention := i.cfg.BlocksStorageConfig.TSDB.Retention; retention > 0 {
+		oldestAllowed = util.TimeToMillis(time.Now().Add(-retention))
+	}
+
 	// Walk the samples, appending them to the users database
 	app := db.Appender(ctx).(extendedAppender)
 	for _, ts := range req.Timeseries {
@@ -970,6 +1014,20 @@ func (i *Ingester) Push(ctx context.Context, req *cortexpb.WriteRequest) (*corte
 
 		for _, s := range ts.Samples {
 			var err error
+
+			// Reject samples that are older than the ingester's retention window. Such
+			// samples would be dropped by compaction anyway and, if admitted, would
+			// force head compaction to iterate once per empty block range between the
+			// sample and now, stalling the single compactionLoop goroutine for every
+			// tenant on this ingester.
+			if oldestAllowed != 0 && s.TimestampMs < oldestAllowed {
+				failedSamplesCount++
+				sampleOutOfBoundsCount++
+				updateFirstPartial(func() error {
+					return wrappedTSDBIngestErr(storage.ErrOutOfBounds, model.Time(s.TimestampMs), ts.Labels)
+				})
+				continue
+			}
 
 			// If the cached reference exists, we try to use it.
 			if ref != 0 {
@@ -2224,6 +2282,16 @@ func (i *Ingester) compactBlocks(ctx context.Context, force bool, allowed *util.
 		var err error
 
 		i.TSDBState.compactionsTriggered.Inc()
+
+		// Run each tenant's compaction under its own bounded deadline so a single
+		// pathological tenant cannot stall compactionLoop for the others. The TSDB
+		// compaction entry points do not currently observe this context, but any
+		// wrapper that does (and future tsdb versions that do) will see the
+		// deadline. The hard loop bound in userTSDB.compactHead is the primary
+		// defence; this deadline is defence in depth.
+		var cancel context.CancelFunc
+		ctx, cancel = context.WithTimeout(ctx, perTenantCompactionTimeout(i.cfg.BlocksStorageConfig.TSDB.HeadCompactionInterval))
+		defer cancel()
 
 		reason := ""
 		switch {
