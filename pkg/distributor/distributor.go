@@ -489,6 +489,16 @@ func (d *Distributor) checkSample(ctx context.Context, userID, cluster, replica 
 		return false, nil
 	}
 
+	// If the cluster label is too long, don't use it either. The HA tracker uses this
+	// value as a KV store key suffix, a long-lived in-memory map key, and a Prometheus
+	// metric label value - all before series validation and rate limiting run - so an
+	// unbounded value here would be amplified into every distributor replica and the
+	// shared KV store. We accept the sample here (removeReplicaLabel=false); it will
+	// fail validateSeries later anyway if the value violates max_label_value_length.
+	if len(cluster) > d.limits.MaxLabelValueLength(userID) {
+		return false, nil
+	}
+
 	// At this point we know we have both HA labels, we should lookup
 	// the cluster/instance here to see if we want to accept this sample.
 	err := d.HATracker.checkReplica(ctx, userID, cluster, replica, time.Now())
