@@ -2124,7 +2124,27 @@ func (i *Ingester) shipBlocks(ctx context.Context, allowed *util.AllowedTenants)
 		}
 
 		if userDB.deletionMarkFound.Load() {
-			return nil
+			// A sticky "true" would permanently prevent block shipping, even if the
+			// operator aborts the deletion via DELETE /purger/delete_tenant. Only
+			// honour it while the mark actually exists in storage; otherwise clear
+			// the flag so shipping resumes. We still rate-limit the lookup via
+			// lastDeletionMarkCheck below to avoid hammering object storage.
+			if time.Since(time.Unix(userDB.lastDeletionMarkCheck.Load(), 0)) > cortex_tsdb.DeletionMarkCheckInterval {
+				userDB.lastDeletionMarkCheck.Store(time.Now().Unix())
+				stillMarked, err := cortex_tsdb.TenantDeletionMarkExists(ctx, i.TSDBState.bucket, userID)
+				if err != nil {
+					level.Warn(logutil.WithContext(ctx, i.logger)).Log("msg", "failed to re-check tenant deletion mark", "user", userID, "err", err)
+					return nil
+				}
+				if !stillMarked {
+					userDB.deletionMarkFound.Store(false)
+					level.Info(logutil.WithContext(ctx, i.logger)).Log("msg", "tenant deletion mark cleared, resuming block shipping", "user", userID)
+				} else {
+					return nil
+				}
+			} else {
+				return nil
+			}
 		}
 
 		if time.Since(time.Unix(userDB.lastDeletionMarkCheck.Load(), 0)) > cortex_tsdb.DeletionMarkCheckInterval {
