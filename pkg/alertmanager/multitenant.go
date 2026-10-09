@@ -822,6 +822,15 @@ func (am *MultitenantAlertmanager) setConfig(cfg alertspb.AlertConfigDesc) error
 	}
 
 	for _, tmpl := range cfg.Templates {
+		// Defence-in-depth: reject template filenames that contain a path
+		// separator or try to escape the per-tenant data dir, mirroring the
+		// multitenant Alertmanager HTTP handler. safeTemplateFilepath below
+		// catches absolute paths too, but this fails earlier with a clearer
+		// error and ensures the same check runs for configs sourced from the
+		// store (e.g. the legacy configdb backend).
+		if err := validateTemplateFilename(tmpl.Filename); err != nil {
+			return err
+		}
 		templateFilePath, err := safeTemplateFilepath(userTemplateDir, tmpl.Filename)
 		if err != nil {
 			return err
@@ -871,6 +880,24 @@ func (am *MultitenantAlertmanager) setConfig(cfg alertspb.AlertConfigDesc) error
 			// they submit a broken one, the Manager will keep running the last known
 			// working configuration.
 			return fmt.Errorf("invalid Cortex configuration for %v: %v", cfg.User, err)
+		}
+		// Defence-in-depth: apply the Cortex Alertmanager denylist to configs
+		// coming from any alertstore backend (including the legacy configdb one),
+		// not just those uploaded through the multitenant HTTP handler. This
+		// enforces the same CVE-2021-31232 controls at the point of use, so a
+		// previously stored or externally injected config that references
+		// password_file / bearer_token_file / credentials_file / client_secret_file
+		// / ca_file / cert_file / key_file / slack_api_url_file / api_key_file is
+		// rejected before it can be loaded into a running Alertmanager.
+		if err == nil && userAmConfig != nil {
+			if vErr := validateAlertmanagerConfig(userAmConfig); vErr != nil {
+				return fmt.Errorf("invalid Cortex configuration for %v: %v", cfg.User, vErr)
+			}
+			for _, name := range userAmConfig.Templates {
+				if vErr := validateTemplateFilename(name); vErr != nil {
+					return fmt.Errorf("invalid Cortex configuration for %v: %v", cfg.User, vErr)
+				}
+			}
 		}
 	}
 

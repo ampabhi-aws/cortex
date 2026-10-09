@@ -304,6 +304,25 @@ func (am *MultitenantAlertmanager) ListAllConfigs(w http.ResponseWriter, r *http
 	<-done
 }
 
+// ValidateAlertmanagerConfig is the exported entry point to the recursive
+// Alertmanager config validator. It applies Cortex's denylist for file-reference
+// fields (password_file, bearer_token_file, credentials_file, OAuth2
+// client_secret_file, TLS ca_file/cert_file/key_file, Slack api_url_file,
+// VictorOps api_key_file, ...) so that any caller — including the legacy
+// configs service and MultitenantAlertmanager.setConfig — can enforce the same
+// controls that the multitenant Alertmanager HTTP handler enforces. See
+// validateUserConfig for the full upload-time validation.
+func ValidateAlertmanagerConfig(cfg interface{}) error {
+	return validateAlertmanagerConfig(cfg)
+}
+
+// ValidateTemplateFilename is the exported entry point to the template
+// filename validator; it rejects template names that contain a path separator
+// or try to escape the per-tenant data directory via traversal.
+func ValidateTemplateFilename(filename string) error {
+	return validateTemplateFilename(filename)
+}
+
 // validateAlertmanagerConfig recursively scans the input config looking for data types for which
 // we have a specific validation and, whenever encountered, it runs their validation. Returns the
 // first error or nil if validation succeeds.
