@@ -84,6 +84,8 @@ type ruleLimits struct {
 	tenantShard          int
 	maxRulesPerRuleGroup int
 	maxRuleGroups        int
+	minEvalInterval      time.Duration
+	maxConcurrentEval    int
 }
 
 func (r ruleLimits) EvaluationDelay(_ string) time.Duration {
@@ -100,6 +102,14 @@ func (r ruleLimits) RulerMaxRuleGroupsPerTenant(_ string) int {
 
 func (r ruleLimits) RulerMaxRulesPerRuleGroup(_ string) int {
 	return r.maxRulesPerRuleGroup
+}
+
+func (r ruleLimits) RulerMinEvaluationInterval(_ string) time.Duration {
+	return r.minEvalInterval
+}
+
+func (r ruleLimits) RulerMaxConcurrentEvaluations(_ string) int {
+	return r.maxConcurrentEval
 }
 
 func newEmptyQueryable() storage.Queryable {

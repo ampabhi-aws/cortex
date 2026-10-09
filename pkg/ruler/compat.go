@@ -17,6 +17,7 @@ import (
 	"github.com/prometheus/prometheus/promql"
 	"github.com/prometheus/prometheus/rules"
 	"github.com/prometheus/prometheus/storage"
+	"github.com/prometheus/prometheus/util/gate"
 	"github.com/weaveworks/common/httpgrpc"
 	"github.com/weaveworks/common/user"
 
@@ -24,6 +25,25 @@ import (
 	"github.com/cortexproject/cortex/pkg/querier"
 	util_log "github.com/cortexproject/cortex/pkg/util/log"
 )
+
+// WithConcurrencyGate wraps a rules.QueryFunc with a per-tenant concurrency
+// gate: at most maxConcurrent evaluations for the tenant are allowed to be
+// executing against the shared PromQL engine at the same time. Additional
+// evaluations block (interruptible by ctx) until a slot is free. When
+// maxConcurrent <= 0 the gate is disabled and q is returned unchanged.
+func WithConcurrencyGate(q rules.QueryFunc, maxConcurrent int) rules.QueryFunc {
+	if maxConcurrent <= 0 {
+		return q
+	}
+	g := gate.New(maxConcurrent)
+	return func(ctx context.Context, qs string, t time.Time) (promql.Vector, error) {
+		if err := g.Start(ctx); err != nil {
+			return nil, err
+		}
+		defer g.Done()
+		return q(ctx, qs, t)
+	}
+}
 
 // Pusher is an ingester server that accepts pushes.
 type Pusher interface {
@@ -136,6 +156,8 @@ type RulesLimits interface {
 	RulerTenantShardSize(userID string) int
 	RulerMaxRuleGroupsPerTenant(userID string) int
 	RulerMaxRulesPerRuleGroup(userID string) int
+	RulerMinEvaluationInterval(userID string) time.Duration
+	RulerMaxConcurrentEvaluations(userID string) int
 }
 
 // EngineQueryFunc returns a new query function using the rules.EngineQueryFunc function
@@ -267,7 +289,7 @@ func DefaultTenantManagerFactory(cfg Config, p Pusher, q storage.Queryable, engi
 		return rules.NewManager(&rules.ManagerOptions{
 			Appendable:      NewPusherAppendable(p, userID, overrides, totalWrites, failedWrites),
 			Queryable:       q,
-			QueryFunc:       RecordAndReportRuleQueryMetrics(MetricsQueryFunc(EngineQueryFunc(engine, q, overrides, userID), totalQueries, failedQueries), queryTime, logger),
+			QueryFunc:       RecordAndReportRuleQueryMetrics(MetricsQueryFunc(WithConcurrencyGate(EngineQueryFunc(engine, q, overrides, userID), overrides.RulerMaxConcurrentEvaluations(userID)), totalQueries, failedQueries), queryTime, logger),
 			Context:         user.InjectOrgID(ctx, userID),
 			ExternalURL:     cfg.ExternalURL.URL,
 			NotifyFunc:      SendAlerts(notifier, cfg.ExternalURL.URL.String()),

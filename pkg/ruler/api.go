@@ -290,6 +290,12 @@ var (
 	ErrBadRuleGroup = errors.New("unable to decoded rule group")
 )
 
+// maxRuleGroupBytes caps the size of a rule-group payload accepted by
+// API.CreateRuleGroup. The default is intentionally generous (1 MiB) because
+// a well-formed rule group is small; the cap exists only to prevent a tenant
+// from forcing the ruler to buffer an unbounded body.
+const maxRuleGroupBytes = int64(1 << 20)
+
 func marshalAndSend(output interface{}, w http.ResponseWriter, logger log.Logger) {
 	d, err := yaml.Marshal(&output)
 	if err != nil {
@@ -447,7 +453,7 @@ func (a *API) CreateRuleGroup(w http.ResponseWriter, req *http.Request) {
 		return
 	}
 
-	payload, err := io.ReadAll(req.Body)
+	payload, err := io.ReadAll(http.MaxBytesReader(w, req.Body, maxRuleGroupBytes))
 	if err != nil {
 		level.Error(logger).Log("msg", "unable to read rule group payload", "err", err.Error())
 		http.Error(w, err.Error(), http.StatusBadRequest)
@@ -477,6 +483,12 @@ func (a *API) CreateRuleGroup(w http.ResponseWriter, req *http.Request) {
 	}
 
 	if err := a.ruler.AssertMaxRulesPerRuleGroup(userID, len(rg.Rules)); err != nil {
+		level.Error(logger).Log("msg", "limit validation failure", "err", err.Error(), "user", userID)
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
+
+	if err := a.ruler.AssertMinEvaluationInterval(userID, time.Duration(rg.Interval)); err != nil {
 		level.Error(logger).Log("msg", "limit validation failure", "err", err.Error(), "user", userID)
 		http.Error(w, err.Error(), http.StatusBadRequest)
 		return
