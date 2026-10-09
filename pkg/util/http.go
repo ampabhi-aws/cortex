@@ -23,6 +23,14 @@ import (
 
 const messageSizeLargerErrFmt = "received message larger than max (%d vs %d)"
 
+// maxDecompressBufferInitialGrow caps the eager pre-allocation performed by
+// decompressFromReader based on an attacker-controlled Content-Length. The
+// buffer will still grow organically via bytes.Buffer.ReadFrom as bytes are
+// actually received, so legitimate large requests still work; this cap only
+// prevents a client from forcing a large allocation up front with a bogus
+// Content-Length (see pkg/util/http.go decompressFromReader).
+const maxDecompressBufferInitialGrow = 1024 * 1024 // 1 MiB
+
 // IsRequestBodyTooLarge returns true if the error is "http: request body too large".
 func IsRequestBodyTooLarge(err error) bool {
 	return err != nil && strings.Contains(err.Error(), "http: request body too large")
@@ -200,7 +208,17 @@ func decompressFromReader(reader io.Reader, expectedSize, maxSize int, compressi
 		err  error
 	)
 	if expectedSize > 0 {
-		buf.Grow(expectedSize + bytes.MinRead) // extra space guarantees no reallocation
+		// Cap the up-front allocation so a client cannot force a large heap
+		// allocation by claiming a big Content-Length. bytes.Buffer.ReadFrom
+		// will still grow the buffer as real bytes arrive, so the common case
+		// (expectedSize matches the actual body size) only costs one extra
+		// grow, while a bogus Content-Length no longer pins ~maxSize of heap
+		// per stalled connection until the HTTP read timeout fires.
+		growSize := expectedSize + bytes.MinRead
+		if growSize > maxDecompressBufferInitialGrow {
+			growSize = maxDecompressBufferInitialGrow
+		}
+		buf.Grow(growSize)
 	}
 	// Read from LimitReader with limit max+1. So if the underlying
 	// reader is over limit, the result will be bigger than max.
