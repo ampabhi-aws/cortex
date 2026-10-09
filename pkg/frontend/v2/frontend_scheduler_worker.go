@@ -3,6 +3,7 @@ package v2
 import (
 	"context"
 	"net/http"
+	"runtime/debug"
 	"sync"
 	"time"
 
@@ -198,6 +199,15 @@ func (w *frontendSchedulerWorker) stop() {
 }
 
 func (w *frontendSchedulerWorker) runOne(ctx context.Context, client schedulerpb.SchedulerForFrontendClient) {
+	// Protect the frontend process from panics inside the worker goroutine. A nil-pointer
+	// dereference or other runtime panic here would otherwise take down the entire
+	// query-frontend, dropping all in-flight queries across all tenants.
+	defer func() {
+		if p := recover(); p != nil {
+			level.Error(w.log).Log("msg", "panic in scheduler worker", "panic", p, "stack", string(debug.Stack()))
+		}
+	}()
+
 	backoffConfig := backoff.Config{
 		MinBackoff: 50 * time.Millisecond,
 		MaxBackoff: 1 * time.Second,
@@ -291,7 +301,7 @@ func (w *frontendSchedulerWorker) schedulerLoop(loop schedulerpb.SchedulerForFro
 				req.response <- &frontendv2pb.QueryResultRequest{
 					HttpResponse: &httpgrpc.HTTPResponse{
 						Code: http.StatusInternalServerError,
-						Body: []byte(err.Error()),
+						Body: []byte(resp.Error),
 					},
 				}
 
@@ -301,6 +311,18 @@ func (w *frontendSchedulerWorker) schedulerLoop(loop schedulerpb.SchedulerForFro
 					HttpResponse: &httpgrpc.HTTPResponse{
 						Code: http.StatusTooManyRequests,
 						Body: []byte("too many outstanding requests"),
+					},
+				}
+
+			default:
+				// Unknown status (including zero value) from the scheduler. Report an error
+				// back to the frontend so the request does not hang waiting for a response.
+				level.Error(w.log).Log("msg", "unknown response status from scheduler", "status", resp.Status, "query_id", req.queryID)
+				req.enqueue <- enqueueResult{status: waitForResponse}
+				req.response <- &frontendv2pb.QueryResultRequest{
+					HttpResponse: &httpgrpc.HTTPResponse{
+						Code: http.StatusInternalServerError,
+						Body: []byte("unknown response status from scheduler"),
 					},
 				}
 			}
