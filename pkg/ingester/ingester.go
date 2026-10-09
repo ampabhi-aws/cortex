@@ -905,6 +905,9 @@ func (i *Ingester) Push(ctx context.Context, req *cortexpb.WriteRequest) (*corte
 	if err != nil {
 		return nil, err
 	}
+	if userID == "" {
+		return nil, errors.New("invalid (empty) tenant ID")
+	}
 
 	il := i.getInstanceLimits()
 	if il != nil && il.MaxIngestionRate > 0 {
@@ -1803,8 +1806,14 @@ func (i *Ingester) getOrCreateTSDB(userID string, force bool) (*userTSDB, error)
 
 // createTSDB creates a TSDB for a given userID, and returns the created db.
 func (i *Ingester) createTSDB(userID string) (*userTSDB, error) {
+	if userID == "" {
+		return nil, errors.New("invalid (empty) tenant ID")
+	}
 	tsdbPromReg := prometheus.NewRegistry()
-	udir := i.cfg.BlocksStorageConfig.TSDB.BlocksDir(userID)
+	udir, err := i.cfg.BlocksStorageConfig.TSDB.BlocksDir(userID)
+	if err != nil {
+		return nil, err
+	}
 	userLogger := logutil.WithUserID(userID, i.logger)
 
 	blockRanges := i.cfg.BlocksStorageConfig.TSDB.BlockRanges.ToMilliseconds()
