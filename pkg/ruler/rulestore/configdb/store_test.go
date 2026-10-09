@@ -183,3 +183,110 @@ groups:
 		},
 	}
 }
+
+// Test_ConfigRuleStoreConcurrent exercises ListAllRuleGroups and
+// ListRuleGroupsForUserAndNamespace from many goroutines, mirroring the
+// 16-way fetchRulesConcurrency and 10-way loadRulesConcurrency fan-outs in
+// pkg/ruler/ruler.go. It is intended to be run with -race: on an
+// unsynchronised implementation the Go runtime raises
+// "fatal error: concurrent map writes" or the race detector flags
+// concurrent map access. It also verifies that namespace filtering never
+// mutates the cache (regression test for the in-place filter at the old
+// store.go:104).
+func Test_ConfigRuleStoreConcurrent(t *testing.T) {
+	cfgs := map[string]userconfig.VersionedRulesConfig{}
+	for i := 0; i < 8; i++ {
+		cfgs[fmt.Sprintf("user-%d", i)] = userconfig.VersionedRulesConfig{
+			ID:        userconfig.ID(i + 1),
+			Config:    fakeRuleConfig(),
+			DeletedAt: zeroTime,
+		}
+	}
+	mock := &MockClient{cfgs: cfgs}
+	store := NewConfigRuleStore(mock)
+
+	// Prime the cache so the "concurrent reads" phase has something to see.
+	_, err := store.ListAllRuleGroups(context.Background())
+	assert.NoError(t, err)
+
+	const (
+		fetchGoroutines = 16 // matches ruler.fetchRulesConcurrency
+		loadGoroutines  = 10 // matches ruler.loadRulesConcurrency
+		iterations      = 50
+	)
+
+	done := make(chan struct{})
+	for i := 0; i < fetchGoroutines; i++ {
+		go func() {
+			defer func() { done <- struct{}{} }()
+			for j := 0; j < iterations; j++ {
+				_, err := store.ListAllRuleGroups(context.Background())
+				assert.NoError(t, err)
+			}
+		}()
+	}
+	for i := 0; i < loadGoroutines; i++ {
+		userID := fmt.Sprintf("user-%d", i%8)
+		go func(uid string) {
+			defer func() { done <- struct{}{} }()
+			for j := 0; j < iterations; j++ {
+				_, err := store.ListRuleGroupsForUserAndNamespace(context.Background(), uid, "")
+				assert.NoError(t, err)
+				// Namespace filter path — on the unfixed implementation
+				// this mutates the shared cached slice in place.
+				_, err = store.ListRuleGroupsForUserAndNamespace(context.Background(), uid, "does-not-exist")
+				assert.NoError(t, err)
+			}
+		}(userID)
+	}
+	for i := 0; i < fetchGoroutines+loadGoroutines; i++ {
+		<-done
+	}
+
+	// After the hammering, every tenant must still have exactly one rule
+	// group (fakeRuleConfig produces a single group). Any value other
+	// than 1 means the namespace filter mutated the cache.
+	all, err := store.ListAllRuleGroups(context.Background())
+	assert.NoError(t, err)
+	for user, list := range all {
+		assert.Equalf(t, 1, len(list), "cache corrupted for %s: got %d groups", user, len(list))
+	}
+}
+
+// Test_ConfigRuleStoreReturnsCopy asserts that callers can mutate the map
+// and slices returned by ListAllRuleGroups without corrupting the cache.
+func Test_ConfigRuleStoreReturnsCopy(t *testing.T) {
+	mock := &MockClient{
+		cfgs: map[string]userconfig.VersionedRulesConfig{
+			"user": {
+				ID:        1,
+				Config:    fakeRuleConfig(),
+				DeletedAt: zeroTime,
+			},
+		},
+	}
+	store := NewConfigRuleStore(mock)
+
+	first, err := store.ListAllRuleGroups(context.Background())
+	assert.NoError(t, err)
+	assert.Equal(t, 1, len(first["user"]))
+
+	// Mutate the returned map and slice.
+	delete(first, "user")
+	for k := range first {
+		first[k] = nil
+	}
+
+	// The cache must be unaffected.
+	second, err := store.ListAllRuleGroups(context.Background())
+	assert.NoError(t, err)
+	assert.Equal(t, 1, len(second["user"]))
+
+	// Namespace filter must not corrupt the cache either.
+	_, err = store.ListRuleGroupsForUserAndNamespace(context.Background(), "user", "does-not-exist")
+	assert.NoError(t, err)
+
+	third, err := store.ListAllRuleGroups(context.Background())
+	assert.NoError(t, err)
+	assert.Equal(t, 1, len(third["user"]))
+}
