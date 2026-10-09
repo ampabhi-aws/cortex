@@ -109,7 +109,7 @@ func respondError(logger log.Logger, w http.ResponseWriter, msg string) {
 
 	if err != nil {
 		level.Error(logger).Log("msg", "error marshaling json response", "err", err)
-		http.Error(w, err.Error(), http.StatusInternalServerError)
+		http.Error(w, "internal server error", http.StatusInternalServerError)
 		return
 	}
 
@@ -117,6 +117,15 @@ func respondError(logger log.Logger, w http.ResponseWriter, msg string) {
 	if n, err := w.Write(b); err != nil {
 		level.Error(logger).Log("msg", "error writing response", "bytesWritten", n, "err", err)
 	}
+}
+
+// respondInternalError logs the detailed backend error and returns a stable
+// generic public message to the tenant. This prevents leaking internal
+// infrastructure details (file paths, object keys, DB driver text, ingester
+// addresses, etc.) through HTTP response bodies.
+func respondInternalError(logger log.Logger, w http.ResponseWriter, err error, publicMsg string, status int) {
+	level.Error(logger).Log("msg", publicMsg, "err", err)
+	http.Error(w, publicMsg, status)
 }
 
 // API is used to handle HTTP requests for the ruler service
@@ -149,7 +158,8 @@ func (a *API) PrometheusRules(w http.ResponseWriter, req *http.Request) {
 	rgs, err := a.ruler.GetRules(req.Context())
 
 	if err != nil {
-		respondError(logger, w, err.Error())
+		level.Error(logger).Log("msg", "unable to get rules", "user", userID, "err", err)
+		respondError(logger, w, "unable to get rules")
 		return
 	}
 
@@ -241,7 +251,8 @@ func (a *API) PrometheusAlerts(w http.ResponseWriter, req *http.Request) {
 	rgs, err := a.ruler.GetRules(req.Context())
 
 	if err != nil {
-		respondError(logger, w, err.Error())
+		level.Error(logger).Log("msg", "unable to get rules", "user", userID, "err", err)
+		respondError(logger, w, "unable to get rules")
 		return
 	}
 
@@ -294,7 +305,7 @@ func marshalAndSend(output interface{}, w http.ResponseWriter, logger log.Logger
 	d, err := yaml.Marshal(&output)
 	if err != nil {
 		level.Error(logger).Log("msg", "error marshalling yaml rule groups", "err", err)
-		http.Error(w, err.Error(), http.StatusInternalServerError)
+		http.Error(w, "unable to marshal rule groups", http.StatusInternalServerError)
 		return
 	}
 
@@ -323,6 +334,47 @@ func respondAccepted(w http.ResponseWriter, logger log.Logger) {
 	}
 }
 
+// maxRulerNamespaceLength is the maximum allowed length for a namespace or
+// rule group name path segment. It is large enough to accommodate real-world
+// tenant usage while preventing abusive inputs.
+const maxRulerNamespaceLength = 1024
+
+// ErrInvalidNamespace signals that the namespace path segment contains
+// characters or sequences that are not permitted.
+var ErrInvalidNamespace = errors.New("invalid namespace: must not be empty, contain path separators, '..', or control characters")
+
+// ErrInvalidGroupName signals that the rule group name path segment contains
+// characters or sequences that are not permitted.
+var ErrInvalidGroupName = errors.New("invalid group name: must not be empty, contain path separators, '..', or control characters")
+
+// validateRulerPathSegment ensures that a namespace or group name taken from
+// the URL path is safe to join with the local rule store directory. It rejects
+// empty values, path traversal, path separators, and control characters, and
+// enforces a maximum length. Returning an error here prevents a tenant from
+// pointing the local rule store at files outside its own user directory.
+func validateRulerPathSegment(s string, invalid error) error {
+	if s == "" {
+		return invalid
+	}
+	if len(s) > maxRulerNamespaceLength {
+		return invalid
+	}
+	if s == "." || s == ".." {
+		return invalid
+	}
+	for _, r := range s {
+		if r == '/' || r == '\\' || r == 0 {
+			return invalid
+		}
+		// Reject ASCII control characters (including newline/tab) which can
+		// confuse logs and have no legitimate use in a path segment.
+		if r < 0x20 || r == 0x7f {
+			return invalid
+		}
+	}
+	return nil
+}
+
 // parseNamespace parses the namespace from the provided set of params, in this
 // api these params are derived from the url path
 func parseNamespace(params map[string]string) (string, error) {
@@ -333,6 +385,10 @@ func parseNamespace(params map[string]string) (string, error) {
 
 	namespace, err := url.PathUnescape(namespace)
 	if err != nil {
+		return "", ErrInvalidNamespace
+	}
+
+	if err := validateRulerPathSegment(namespace, ErrInvalidNamespace); err != nil {
 		return "", err
 	}
 
@@ -349,6 +405,10 @@ func parseGroupName(params map[string]string) (string, error) {
 
 	groupName, err := url.PathUnescape(groupName)
 	if err != nil {
+		return "", ErrInvalidGroupName
+	}
+
+	if err := validateRulerPathSegment(groupName, ErrInvalidGroupName); err != nil {
 		return "", err
 	}
 
@@ -395,7 +455,7 @@ func (a *API) ListRules(w http.ResponseWriter, req *http.Request) {
 	level.Debug(logger).Log("msg", "retrieving rule groups with namespace", "userID", userID, "namespace", namespace)
 	rgs, err := a.store.ListRuleGroupsForUserAndNamespace(req.Context(), userID, namespace)
 	if err != nil {
-		http.Error(w, err.Error(), http.StatusBadRequest)
+		respondInternalError(logger, w, err, "unable to list rule groups", http.StatusInternalServerError)
 		return
 	}
 
@@ -407,7 +467,7 @@ func (a *API) ListRules(w http.ResponseWriter, req *http.Request) {
 
 	err = a.store.LoadRuleGroups(req.Context(), map[string]rulespb.RuleGroupList{userID: rgs})
 	if err != nil {
-		http.Error(w, err.Error(), http.StatusBadRequest)
+		respondInternalError(logger, w, err, "unable to load rule groups", http.StatusInternalServerError)
 		return
 	}
 
@@ -431,7 +491,7 @@ func (a *API) GetRuleGroup(w http.ResponseWriter, req *http.Request) {
 			http.Error(w, err.Error(), http.StatusNotFound)
 			return
 		}
-		http.Error(w, err.Error(), http.StatusBadRequest)
+		respondInternalError(logger, w, err, "unable to get rule group", http.StatusInternalServerError)
 		return
 	}
 
@@ -484,8 +544,7 @@ func (a *API) CreateRuleGroup(w http.ResponseWriter, req *http.Request) {
 
 	rgs, err := a.store.ListRuleGroupsForUserAndNamespace(req.Context(), userID, "")
 	if err != nil {
-		level.Error(logger).Log("msg", "unable to fetch current rule groups for validation", "err", err.Error(), "user", userID)
-		http.Error(w, err.Error(), http.StatusInternalServerError)
+		respondInternalError(logger, w, err, "unable to fetch current rule groups for validation", http.StatusInternalServerError)
 		return
 	}
 
@@ -500,8 +559,7 @@ func (a *API) CreateRuleGroup(w http.ResponseWriter, req *http.Request) {
 	level.Debug(logger).Log("msg", "attempting to store rulegroup", "userID", userID, "group", rgProto.String())
 	err = a.store.SetRuleGroup(req.Context(), userID, namespace, rgProto)
 	if err != nil {
-		level.Error(logger).Log("msg", "unable to store rule group", "err", err.Error())
-		http.Error(w, err.Error(), http.StatusInternalServerError)
+		respondInternalError(logger, w, err, "unable to store rule group", http.StatusInternalServerError)
 		return
 	}
 
@@ -523,7 +581,8 @@ func (a *API) DeleteNamespace(w http.ResponseWriter, req *http.Request) {
 			http.Error(w, err.Error(), http.StatusNotFound)
 			return
 		}
-		respondError(logger, w, err.Error())
+		level.Error(logger).Log("msg", "unable to delete namespace", "user", userID, "namespace", namespace, "err", err)
+		respondError(logger, w, "unable to delete namespace")
 		return
 	}
 
@@ -545,7 +604,8 @@ func (a *API) DeleteRuleGroup(w http.ResponseWriter, req *http.Request) {
 			http.Error(w, err.Error(), http.StatusNotFound)
 			return
 		}
-		respondError(logger, w, err.Error())
+		level.Error(logger).Log("msg", "unable to delete rule group", "user", userID, "namespace", namespace, "group", groupName, "err", err)
+		respondError(logger, w, "unable to delete rule group")
 		return
 	}
 

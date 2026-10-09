@@ -44,7 +44,12 @@ func Handler(maxRecvMsgSize int, sourceIPs *middleware.SourceIPExtractor, push F
 		if _, err := push(ctx, &req.WriteRequest); err != nil {
 			resp, ok := httpgrpc.HTTPResponseFromError(err)
 			if !ok {
-				http.Error(w, err.Error(), http.StatusInternalServerError)
+				// Non-httpgrpc errors (e.g. ring/gRPC dial errors) may embed
+				// internal infrastructure details such as ingester host:port
+				// addresses. Log the detail but return a stable public
+				// message to the tenant.
+				level.Error(logger).Log("msg", "push error", "err", err)
+				http.Error(w, "internal server error", http.StatusInternalServerError)
 				return
 			}
 			if resp.GetCode() != 202 {

@@ -123,7 +123,7 @@ func (a *API) getConfig(w http.ResponseWriter, r *http.Request) {
 	} else if err != nil {
 		// XXX: Untested
 		level.Error(logger).Log("msg", "error getting config", "err", err)
-		http.Error(w, err.Error(), http.StatusInternalServerError)
+		http.Error(w, "error getting config", http.StatusInternalServerError)
 		return
 	}
 
@@ -137,12 +137,12 @@ func (a *API) getConfig(w http.ResponseWriter, r *http.Request) {
 	default:
 		// should never reach this point
 		level.Error(logger).Log("msg", "unexpected error detecting the config format")
-		http.Error(w, err.Error(), http.StatusInternalServerError)
+		http.Error(w, "unexpected error detecting the config format", http.StatusInternalServerError)
 	}
 	if err != nil {
 		// XXX: Untested
 		level.Error(logger).Log("msg", "error encoding config", "err", err)
-		http.Error(w, err.Error(), http.StatusInternalServerError)
+		http.Error(w, "error encoding config", http.StatusInternalServerError)
 	}
 }
 
@@ -195,7 +195,7 @@ func (a *API) setConfig(w http.ResponseWriter, r *http.Request) {
 	if err := a.db.SetConfig(r.Context(), userID, cfg); err != nil {
 		// XXX: Untested
 		level.Error(logger).Log("msg", "error storing config", "err", err)
-		http.Error(w, err.Error(), http.StatusInternalServerError)
+		http.Error(w, "error storing config", http.StatusInternalServerError)
 		return
 	}
 	w.WriteHeader(http.StatusNoContent)
@@ -206,7 +206,7 @@ func (a *API) validateAlertmanagerConfig(w http.ResponseWriter, r *http.Request)
 	cfg, err := io.ReadAll(r.Body)
 	if err != nil {
 		level.Error(logger).Log("msg", "error reading request body", "err", err)
-		http.Error(w, err.Error(), http.StatusInternalServerError)
+		http.Error(w, "error reading request body", http.StatusInternalServerError)
 		return
 	}
 
@@ -283,7 +283,7 @@ func (a *API) getConfigs(w http.ResponseWriter, r *http.Request) {
 	if cfgErr != nil {
 		// XXX: Untested
 		level.Error(logger).Log("msg", "error getting configs", "err", cfgErr)
-		http.Error(w, cfgErr.Error(), http.StatusInternalServerError)
+		http.Error(w, "error getting configs", http.StatusInternalServerError)
 		return
 	}
 
@@ -291,7 +291,8 @@ func (a *API) getConfigs(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "application/json")
 	if err := json.NewEncoder(w).Encode(view); err != nil {
 		// XXX: Untested
-		http.Error(w, err.Error(), http.StatusInternalServerError)
+		level.Error(logger).Log("msg", "error encoding configs", "err", err)
+		http.Error(w, "error encoding configs", http.StatusInternalServerError)
 		return
 	}
 }
@@ -311,7 +312,7 @@ func (a *API) deactivateConfig(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		level.Error(logger).Log("msg", "error deactivating config", "err", err)
-		http.Error(w, err.Error(), http.StatusInternalServerError)
+		http.Error(w, "error deactivating config", http.StatusInternalServerError)
 		return
 	}
 	level.Info(logger).Log("msg", "config deactivated", "userID", userID)
@@ -333,7 +334,7 @@ func (a *API) restoreConfig(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		level.Error(logger).Log("msg", "error restoring config", "err", err)
-		http.Error(w, err.Error(), http.StatusInternalServerError)
+		http.Error(w, "error restoring config", http.StatusInternalServerError)
 		return
 	}
 	level.Info(logger).Log("msg", "config restored", "userID", userID)
