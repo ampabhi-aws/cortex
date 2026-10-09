@@ -3,6 +3,7 @@ package ruler
 import (
 	"context"
 	"errors"
+	"fmt"
 	"time"
 
 	"github.com/go-kit/log"
@@ -25,6 +26,14 @@ import (
 	util_log "github.com/cortexproject/cortex/pkg/util/log"
 )
 
+// maxBufferedSamples caps the number of samples that the PusherAppender will
+// buffer in memory before it transparently flushes a batch to the pusher.
+// It is a hard safety ceiling that bounds the ruler's working-set memory
+// regardless of the number of output series produced by a tenant's recording
+// rule. The per-tenant RulerMaxRuleOutputSeries limit (if set) is a stricter,
+// policy-level cap enforced before buffering.
+const maxBufferedSamples = 10000
+
 // Pusher is an ingester server that accepts pushes.
 type Pusher interface {
 	Push(context.Context, *cortexpb.WriteRequest) (*cortexpb.WriteResponse, error)
@@ -38,11 +47,21 @@ type PusherAppender struct {
 	pusher          Pusher
 	labels          []labels.Labels
 	samples         []cortexpb.Sample
+	totalSamples    int
 	userID          string
 	evaluationDelay time.Duration
+	maxOutputSeries int
 }
 
 func (a *PusherAppender) Append(_ storage.SeriesRef, l labels.Labels, t int64, v float64) (storage.SeriesRef, error) {
+	// Reject recording-rule results that exceed the per-tenant output series
+	// limit *before* buffering. This surfaces as a rule evaluation error so
+	// Prometheus marks the rule unhealthy instead of silently OOM-killing the
+	// shared ruler process.
+	if a.maxOutputSeries > 0 && a.totalSamples >= a.maxOutputSeries {
+		return 0, fmt.Errorf("recording rule exceeded the per-user output series limit of %d", a.maxOutputSeries)
+	}
+
 	a.labels = append(a.labels, l)
 
 	// Adapt staleness markers for ruler evaluation delay. As the upstream code
@@ -61,14 +80,24 @@ func (a *PusherAppender) Append(_ storage.SeriesRef, l labels.Labels, t int64, v
 		TimestampMs: t,
 		Value:       v,
 	})
+	a.totalSamples++
+
+	// Transparently flush in bounded batches so that peak memory is capped
+	// regardless of how many output series the recording rule produces.
+	if len(a.samples) >= maxBufferedSamples {
+		return 0, a.flush()
+	}
 	return 0, nil
 }
 
-func (a *PusherAppender) AppendExemplar(_ storage.SeriesRef, _ labels.Labels, _ exemplar.Exemplar) (storage.SeriesRef, error) {
-	return 0, errors.New("exemplars are unsupported")
-}
+// flush pushes the buffered labels/samples to the ingesters and resets the
+// in-memory buffer. It is used both for mid-evaluation batching from Append
+// and for the final tail flush from Commit.
+func (a *PusherAppender) flush() error {
+	if len(a.samples) == 0 {
+		return nil
+	}
 
-func (a *PusherAppender) Commit() error {
 	a.totalWrites.Inc()
 
 	// Since a.pusher is distributor, client.ReuseSlice will be called in a.pusher.Push.
@@ -87,6 +116,16 @@ func (a *PusherAppender) Commit() error {
 	return err
 }
 
+func (a *PusherAppender) AppendExemplar(_ storage.SeriesRef, _ labels.Labels, _ exemplar.Exemplar) (storage.SeriesRef, error) {
+	return 0, errors.New("exemplars are unsupported")
+}
+
+func (a *PusherAppender) Commit() error {
+	err := a.flush()
+	a.totalSamples = 0
+	return err
+}
+
 func (a *PusherAppender) UpdateMetadata(_ storage.SeriesRef, _ labels.Labels, _ metadata.Metadata) (storage.SeriesRef, error) {
 	return 0, errors.New("update metadata unsupported")
 }
@@ -94,6 +133,7 @@ func (a *PusherAppender) UpdateMetadata(_ storage.SeriesRef, _ labels.Labels, _ 
 func (a *PusherAppender) Rollback() error {
 	a.labels = nil
 	a.samples = nil
+	a.totalSamples = 0
 	return nil
 }
 
@@ -127,6 +167,7 @@ func (t *PusherAppendable) Appender(ctx context.Context) storage.Appender {
 		pusher:          t.pusher,
 		userID:          t.userID,
 		evaluationDelay: t.rulesLimits.EvaluationDelay(t.userID),
+		maxOutputSeries: t.rulesLimits.RulerMaxRuleOutputSeries(t.userID),
 	}
 }
 
@@ -136,6 +177,10 @@ type RulesLimits interface {
 	RulerTenantShardSize(userID string) int
 	RulerMaxRuleGroupsPerTenant(userID string) int
 	RulerMaxRulesPerRuleGroup(userID string) int
+	// RulerMaxRuleOutputSeries returns the maximum number of output series a
+	// single recording rule evaluation is allowed to produce for a given
+	// tenant. 0 means unlimited.
+	RulerMaxRuleOutputSeries(userID string) int
 }
 
 // EngineQueryFunc returns a new query function using the rules.EngineQueryFunc function

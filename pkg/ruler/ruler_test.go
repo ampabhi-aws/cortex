@@ -84,6 +84,7 @@ type ruleLimits struct {
 	tenantShard          int
 	maxRulesPerRuleGroup int
 	maxRuleGroups        int
+	maxRuleOutputSeries  int
 }
 
 func (r ruleLimits) EvaluationDelay(_ string) time.Duration {
@@ -100,6 +101,10 @@ func (r ruleLimits) RulerMaxRuleGroupsPerTenant(_ string) int {
 
 func (r ruleLimits) RulerMaxRulesPerRuleGroup(_ string) int {
 	return r.maxRulesPerRuleGroup
+}
+
+func (r ruleLimits) RulerMaxRuleOutputSeries(_ string) int {
+	return r.maxRuleOutputSeries
 }
 
 func newEmptyQueryable() storage.Queryable {

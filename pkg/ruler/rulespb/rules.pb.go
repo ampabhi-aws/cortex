@@ -44,6 +44,10 @@ type RuleGroupDesc struct {
 	// to create custom `ManagerOpts` based on rule configs which can then be passed
 	// to the Prometheus Manager.
 	Options []*types.Any `protobuf:"bytes,9,rep,name=options,proto3" json:"options,omitempty"`
+	// Limit is the maximum number of output series a single rule evaluation in
+	// this group is allowed to produce. Mirrors Prometheus's rulefmt.RuleGroup.Limit.
+	// 0 means unlimited.
+	Limit int64 `protobuf:"varint,10,opt,name=limit,proto3" json:"limit,omitempty"`
 }
 
 func (m *RuleGroupDesc) Reset()      { *m = RuleGroupDesc{} }
@@ -118,6 +122,13 @@ func (m *RuleGroupDesc) GetOptions() []*types.Any {
 		return m.Options
 	}
 	return nil
+}
+
+func (m *RuleGroupDesc) GetLimit() int64 {
+	if m != nil {
+		return m.Limit
+	}
+	return 0
 }
 
 // RuleDesc is a proto representation of a Prometheus Rule
@@ -278,6 +289,9 @@ func (this *RuleGroupDesc) Equal(that interface{}) bool {
 			return false
 		}
 	}
+	if this.Limit != that1.Limit {
+		return false
+	}
 	return true
 }
 func (this *RuleDesc) Equal(that interface{}) bool {
@@ -345,6 +359,7 @@ func (this *RuleGroupDesc) GoString() string {
 	if this.Options != nil {
 		s = append(s, "Options: "+fmt.Sprintf("%#v", this.Options)+",\n")
 	}
+	s = append(s, "Limit: "+fmt.Sprintf("%#v", this.Limit)+",\n")
 	s = append(s, "}")
 	return strings.Join(s, "")
 }
@@ -391,6 +406,11 @@ func (m *RuleGroupDesc) MarshalToSizedBuffer(dAtA []byte) (int, error) {
 	_ = i
 	var l int
 	_ = l
+	if m.Limit != 0 {
+		i = encodeVarintRules(dAtA, i, uint64(m.Limit))
+		i--
+		dAtA[i] = 0x50
+	}
 	if len(m.Options) > 0 {
 		for iNdEx := len(m.Options) - 1; iNdEx >= 0; iNdEx-- {
 			{
@@ -574,6 +594,9 @@ func (m *RuleGroupDesc) Size() (n int) {
 			n += 1 + l + sovRules(uint64(l))
 		}
 	}
+	if m.Limit != 0 {
+		n += 1 + sovRules(uint64(m.Limit))
+	}
 	return n
 }
 
@@ -639,6 +662,7 @@ func (this *RuleGroupDesc) String() string {
 		`Rules:` + repeatedStringForRules + `,`,
 		`User:` + fmt.Sprintf("%v", this.User) + `,`,
 		`Options:` + repeatedStringForOptions + `,`,
+		`Limit:` + fmt.Sprintf("%v", this.Limit) + `,`,
 		`}`,
 	}, "")
 	return s
@@ -892,6 +916,25 @@ func (m *RuleGroupDesc) Unmarshal(dAtA []byte) error {
 				return err
 			}
 			iNdEx = postIndex
+		case 10:
+			if wireType != 0 {
+				return fmt.Errorf("proto: wrong wireType = %d for field Limit", wireType)
+			}
+			m.Limit = 0
+			for shift := uint(0); ; shift += 7 {
+				if shift >= 64 {
+					return ErrIntOverflowRules
+				}
+				if iNdEx >= l {
+					return io.ErrUnexpectedEOF
+				}
+				b := dAtA[iNdEx]
+				iNdEx++
+				m.Limit |= int64(b&0x7F) << shift
+				if b < 0x80 {
+					break
+				}
+			}
 		default:
 			iNdEx = preIndex
 			skippy, err := skipRules(dAtA[iNdEx:])

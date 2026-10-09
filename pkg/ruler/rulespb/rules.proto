@@ -27,6 +27,10 @@ message RuleGroupDesc {
   // to create custom `ManagerOpts` based on rule configs which can then be passed
   // to the Prometheus Manager.
   repeated google.protobuf.Any options = 9;
+  // limit is the maximum number of output series a single rule evaluation in
+  // this group is allowed to produce. It mirrors Prometheus's rulefmt.RuleGroup.Limit
+  // and is enforced by the Prometheus manager during evaluation. 0 means unlimited.
+  int64 limit = 10;
 }
 
 // RuleDesc is a proto representation of a Prometheus Rule
