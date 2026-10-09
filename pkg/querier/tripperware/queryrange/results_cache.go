@@ -2,6 +2,7 @@ package queryrange
 
 import (
 	"context"
+	"crypto/sha256"
 	"flag"
 	"fmt"
 	"net/http"
@@ -141,9 +142,23 @@ type CacheSplitter interface {
 type constSplitter time.Duration
 
 // GenerateCacheKey generates a cache key based on the userID, Request and interval.
+//
+// The variable-length fields (userID and query) are length-prefixed and hashed
+// together with SHA-256 so that the key function is injective: no two distinct
+// (userID, query) pairs can produce the same key byte string. This closes a
+// cross-tenant cache aliasing issue where concatenating the two fields with a
+// bare ':' delimiter (which may legally appear in both tenant IDs under the
+// default resolver and in PromQL metric names) could cause tenant A's query
+// 'P:Q' to collide with tenant 'A:P' querying 'Q'. The 'v2:' prefix allows the
+// cache to coexist with any legacy 'v1' entries (which are simply ignored on
+// lookup because the keys no longer match).
 func (t constSplitter) GenerateCacheKey(userID string, r tripperware.Request) string {
 	currentInterval := r.GetStart() / int64(time.Duration(t)/time.Millisecond)
-	return fmt.Sprintf("%s:%s:%d:%d", userID, r.GetQuery(), r.GetStep(), currentInterval)
+	h := sha256.New()
+	// Length-prefix every variable-length component so the concatenation is
+	// unambiguous (injective) regardless of which characters appear inside.
+	_, _ = fmt.Fprintf(h, "%d:%s%d:%s", len(userID), userID, len(r.GetQuery()), r.GetQuery())
+	return fmt.Sprintf("v2:%x:%d:%d", h.Sum(nil), r.GetStep(), currentInterval)
 }
 
 // ShouldCacheFn checks whether the current request should go to cache
