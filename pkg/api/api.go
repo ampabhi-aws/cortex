@@ -53,6 +53,16 @@ type Config struct {
 	LegacyHTTPPrefix   string               `yaml:"-"`
 	HTTPAuthMiddleware middleware.Interface `yaml:"-"`
 
+	// HTTPAdminAuthMiddleware, if non-nil, is applied in addition to the
+	// HTTPAuthMiddleware to "admin" routes that expose cross-tenant data or
+	// perform cluster-wide operations (for example /multitenant_alertmanager/configs,
+	// /ruler/rule_groups, /distributor/all_user_stats). If it is nil, those
+	// routes are NOT registered at all: the only way to serve cross-tenant
+	// endpoints is to explicitly configure an admin authorization decision.
+	// This is a defence-in-depth control; operators are still expected to
+	// restrict administrative paths at their authenticating proxy.
+	HTTPAdminAuthMiddleware middleware.Interface `yaml:"-"`
+
 	// This allows downstream projects to wrap the distributor push function
 	// and access the deserialized write requests before/after they are pushed.
 	DistributorPushWrapper DistributorPushWrapper `yaml:"-"`
@@ -91,6 +101,7 @@ func (cfg *Config) wrapDistributorPush(d *distributor.Distributor) push.Func {
 
 type API struct {
 	AuthMiddleware       middleware.Interface
+	AdminAuthMiddleware  middleware.Interface
 	cfg                  Config
 	server               *server.Server
 	logger               log.Logger
@@ -114,12 +125,13 @@ func New(cfg Config, serverCfg server.Config, s *server.Server, logger log.Logge
 	}
 
 	api := &API{
-		cfg:            cfg,
-		AuthMiddleware: cfg.HTTPAuthMiddleware,
-		server:         s,
-		logger:         logger,
-		sourceIPs:      sourceIPs,
-		indexPage:      newIndexPageContent(),
+		cfg:                 cfg,
+		AuthMiddleware:      cfg.HTTPAuthMiddleware,
+		AdminAuthMiddleware: cfg.HTTPAdminAuthMiddleware,
+		server:              s,
+		logger:              logger,
+		sourceIPs:           sourceIPs,
+		indexPage:           newIndexPageContent(),
 	}
 
 	// If no authentication middleware is present in the config, use the default authentication middleware.
@@ -158,6 +170,27 @@ func (a *API) RegisterRoute(path string, handler http.Handler, auth bool, method
 	a.server.HTTP.Path(path).Methods(methods...).Handler(handler)
 }
 
+// RegisterAdminRoute registers a route that exposes cross-tenant data or
+// performs cluster-wide operations. It is always wrapped with the standard
+// tenant authentication middleware AND with the configured admin
+// authorization middleware (api.http-admin-auth-middleware). If no admin
+// authorization middleware has been configured the route is deliberately
+// NOT registered: cross-tenant endpoints must never be served on a
+// listener that does not have an explicit admin authorization decision.
+// This mitigates CVE-class "unauthenticated cross-tenant data dump" issues
+// (e.g. /multitenant_alertmanager/configs leaking receiver secrets, or
+// /ruler/rule_groups leaking every tenant's recording/alerting rules) that
+// are reachable from any caller — including a legitimate tenant proxied
+// to the normal API port — when the only control is network/proxy-layer.
+func (a *API) RegisterAdminRoute(path string, handler http.Handler, method string, methods ...string) {
+	if a.AdminAuthMiddleware == nil {
+		level.Warn(a.logger).Log("msg", "admin route not registered: no admin auth middleware configured; cross-tenant endpoint is disabled by default and must be enabled explicitly via a dedicated admin listener/proxy", "path", path)
+		return
+	}
+	handler = a.AdminAuthMiddleware.Wrap(handler)
+	a.RegisterRoute(path, handler, true, method, methods...)
+}
+
 func (a *API) RegisterRoutesWithPrefix(prefix string, handler http.Handler, auth bool, methods ...string) {
 	level.Debug(a.logger).Log("msg", "api: registering route", "methods", strings.Join(methods, ","), "prefix", prefix, "auth", auth)
 	if auth {
@@ -187,7 +220,11 @@ func (a *API) RegisterAlertmanager(am *alertmanager.MultitenantAlertmanager, tar
 	a.indexPage.AddLink(SectionAdminEndpoints, "/multitenant_alertmanager/ring", "Alertmanager Ring Status")
 	// Ensure this route is registered before the prefixed AM route
 	a.RegisterRoute("/multitenant_alertmanager/status", am.GetStatusHandler(), false, "GET")
-	a.RegisterRoute("/multitenant_alertmanager/configs", http.HandlerFunc(am.ListAllConfigs), false, "GET")
+	// /multitenant_alertmanager/configs returns every tenant's Alertmanager
+	// configuration. It must be gated behind an admin authorization decision —
+	// see RegisterAdminRoute. If no admin middleware is configured the route
+	// is not served at all.
+	a.RegisterAdminRoute("/multitenant_alertmanager/configs", http.HandlerFunc(am.ListAllConfigs), "GET")
 	a.RegisterRoute("/multitenant_alertmanager/ring", http.HandlerFunc(am.RingHandler), false, "GET", "POST")
 	a.RegisterRoute("/multitenant_alertmanager/delete_tenant_config", http.HandlerFunc(am.DeleteUserConfig), true, "POST")
 
@@ -241,12 +278,16 @@ func (a *API) RegisterDistributor(d *distributor.Distributor, pushConfig distrib
 	a.indexPage.AddLink(SectionAdminEndpoints, "/distributor/ha_tracker", "HA Tracking Status")
 
 	a.RegisterRoute("/distributor/ring", d, false, "GET", "POST")
-	a.RegisterRoute("/distributor/all_user_stats", http.HandlerFunc(d.AllUserStatsHandler), false, "GET")
+	// /distributor/all_user_stats exposes the full tenant inventory with
+	// per-tenant ingest rates and is gated as an admin route.
+	a.RegisterAdminRoute("/distributor/all_user_stats", http.HandlerFunc(d.AllUserStatsHandler), "GET")
 	a.RegisterRoute("/distributor/ha_tracker", d.HATracker, false, "GET")
 
 	// Legacy Routes
 	a.RegisterRoute(path.Join(a.cfg.LegacyHTTPPrefix, "/push"), push.Handler(pushConfig.MaxRecvMsgSize, a.sourceIPs, a.cfg.wrapDistributorPush(d)), true, "POST")
-	a.RegisterRoute("/all_user_stats", http.HandlerFunc(d.AllUserStatsHandler), false, "GET")
+	// /all_user_stats is the legacy alias of /distributor/all_user_stats and
+	// is likewise gated as an admin route.
+	a.RegisterAdminRoute("/all_user_stats", http.HandlerFunc(d.AllUserStatsHandler), "GET")
 	a.RegisterRoute("/ha-tracker", d.HATracker, false, "GET")
 }
 
@@ -291,8 +332,9 @@ func (a *API) RegisterRuler(r *ruler.Ruler) {
 	// Legacy Ring Route
 	a.RegisterRoute("/ruler_ring", r, false, "GET", "POST")
 
-	// List all user rule groups
-	a.RegisterRoute("/ruler/rule_groups", http.HandlerFunc(r.ListAllRules), false, "GET")
+	// List all user rule groups. This is a cross-tenant admin dump and is
+	// gated behind an admin authorization decision via RegisterAdminRoute.
+	a.RegisterAdminRoute("/ruler/rule_groups", http.HandlerFunc(r.ListAllRules), "GET")
 
 	ruler.RegisterRulerServer(a.server.GRPC, r)
 }
