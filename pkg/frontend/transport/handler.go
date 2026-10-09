@@ -3,6 +3,7 @@ package transport
 import (
 	"bytes"
 	"context"
+	"crypto/rand"
 	"errors"
 	"flag"
 	"fmt"
@@ -16,6 +17,7 @@ import (
 
 	"github.com/go-kit/log"
 	"github.com/go-kit/log/level"
+	"github.com/oklog/ulid"
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/promauto"
 	"github.com/weaveworks/common/httpgrpc"
@@ -249,6 +251,21 @@ func writeError(w http.ResponseWriter, err error) {
 		if util.IsRequestBodyTooLarge(err) {
 			err = errRequestEntityTooLarge
 		}
+	}
+
+	// If the error is already an httpgrpc-encoded response (produced upstream
+	// by the querier/API, where the body has already been through the error
+	// translation / sanitisation layer), forward it unchanged so the
+	// tenant-visible body matches what the querier would have returned
+	// directly. Otherwise `server.WriteError` would fall back to
+	// `http.Error(w, err.Error(), 500)` and leak the raw downstream error
+	// text (gRPC dial strings with IP:port, bucket endpoints, object keys,
+	// etc.) to the tenant. Replace the message with a stable one, logging
+	// the detail with a correlation ID so operators can still investigate.
+	if _, ok := httpgrpc.HTTPResponseFromError(err); !ok {
+		id := ulid.MustNew(ulid.Now(), rand.Reader).String()
+		level.Error(util_log.Logger).Log("msg", "query-frontend downstream error", "error_id", id, "err", err)
+		err = httpgrpc.Errorf(http.StatusInternalServerError, "internal error, see server logs (error_id=%s)", id)
 	}
 	server.WriteError(w, err)
 }

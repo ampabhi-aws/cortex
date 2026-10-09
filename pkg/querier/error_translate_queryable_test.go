@@ -33,7 +33,7 @@ func TestApiStatusCodes(t *testing.T) {
 	}{
 		{
 			err:            errors.New("some random error"),
-			expectedString: "some random error",
+			expectedString: "internal error, see server logs",
 			expectedCode:   500,
 		},
 
@@ -75,16 +75,18 @@ func TestApiStatusCodes(t *testing.T) {
 			expectedCode:   422,
 		},
 
-		// 505 is translated to 500
+		// 505 is translated to 500 and the inner message is redacted so
+		// internal detail (addresses, keys, block IDs) does not escape to
+		// tenants; only a stable message plus a correlation ID is returned.
 		{
 			err:            httpgrpc.Errorf(http.StatusHTTPVersionNotSupported, "test"),
-			expectedString: "test",
+			expectedString: "internal error, see server logs",
 			expectedCode:   500,
 		},
 
 		{
 			err:            context.DeadlineExceeded,
-			expectedString: "context deadline exceeded",
+			expectedString: "internal error, see server logs",
 			expectedCode:   500,
 		},
 

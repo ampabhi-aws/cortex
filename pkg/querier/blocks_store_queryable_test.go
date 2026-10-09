@@ -306,7 +306,7 @@ func TestBlocksStoreQuerier_Select(t *testing.T) {
 			},
 			limits:       &blocksStoreLimitsMock{},
 			queryLimiter: noOpQueryLimiter,
-			expectedErr:  fmt.Errorf("consistency check failed because some blocks were not queried: %s", block2.String()),
+			expectedErr:  fmt.Errorf("consistency check failed because some blocks were not queried"),
 		},
 		"multiple store-gateway instances have some missing blocks (consistency check failed)": {
 			finderResult: bucketindex.Blocks{
@@ -332,7 +332,7 @@ func TestBlocksStoreQuerier_Select(t *testing.T) {
 			},
 			limits:       &blocksStoreLimitsMock{},
 			queryLimiter: noOpQueryLimiter,
-			expectedErr:  fmt.Errorf("consistency check failed because some blocks were not queried: %s %s", block3.String(), block4.String()),
+			expectedErr:  fmt.Errorf("consistency check failed because some blocks were not queried"),
 		},
 		"multiple store-gateway instances have some missing blocks but queried from a replica during subsequent attempts": {
 			finderResult: bucketindex.Blocks{
@@ -993,7 +993,7 @@ func TestBlocksStoreQuerier_Labels(t *testing.T) {
 				// Second attempt returns an error because there are no other store-gateways left.
 				errors.New("no store-gateway remaining after exclude"),
 			},
-			expectedErr: fmt.Sprintf("consistency check failed because some blocks were not queried: %s", block2.String()),
+			expectedErr: "consistency check failed because some blocks were not queried",
 		},
 		"multiple store-gateway instances have some missing blocks (consistency check failed)": {
 			finderResult: bucketindex.Blocks{
@@ -1035,7 +1035,7 @@ func TestBlocksStoreQuerier_Labels(t *testing.T) {
 				// Second attempt returns an error because there are no other store-gateways left.
 				errors.New("no store-gateway remaining after exclude"),
 			},
-			expectedErr: fmt.Sprintf("consistency check failed because some blocks were not queried: %s %s", block3.String(), block4.String()),
+			expectedErr: "consistency check failed because some blocks were not queried",
 		},
 		"multiple store-gateway instances have some missing blocks but queried from a replica during subsequent attempts": {
 			// Block1 has series1
