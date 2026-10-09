@@ -242,12 +242,16 @@ func (a *API) RegisterDistributor(d *distributor.Distributor, pushConfig distrib
 
 	a.RegisterRoute("/distributor/ring", d, false, "GET", "POST")
 	a.RegisterRoute("/distributor/all_user_stats", http.HandlerFunc(d.AllUserStatsHandler), false, "GET")
-	a.RegisterRoute("/distributor/ha_tracker", d.HATracker, false, "GET")
+	// The HA tracker status endpoint is scoped to the calling tenant and
+	// requires an X-Scope-OrgID header so the per-tenant filter can resolve
+	// a tenant ID. An operator wanting an all-tenant view must expose this
+	// endpoint only on an admin listener / behind an authorisation gate.
+	a.RegisterRoute("/distributor/ha_tracker", d.HATracker, true, "GET")
 
 	// Legacy Routes
 	a.RegisterRoute(path.Join(a.cfg.LegacyHTTPPrefix, "/push"), push.Handler(pushConfig.MaxRecvMsgSize, a.sourceIPs, a.cfg.wrapDistributorPush(d)), true, "POST")
 	a.RegisterRoute("/all_user_stats", http.HandlerFunc(d.AllUserStatsHandler), false, "GET")
-	a.RegisterRoute("/ha-tracker", d.HATracker, false, "GET")
+	a.RegisterRoute("/ha-tracker", d.HATracker, true, "GET")
 }
 
 // Ingester is defined as an interface to allow for alternative implementations

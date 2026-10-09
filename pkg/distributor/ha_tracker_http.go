@@ -9,6 +9,7 @@ import (
 
 	"github.com/prometheus/prometheus/model/timestamp"
 
+	"github.com/cortexproject/cortex/pkg/tenant"
 	"github.com/cortexproject/cortex/pkg/util"
 )
 
@@ -56,6 +57,18 @@ func init() {
 }
 
 func (h *haTracker) ServeHTTP(w http.ResponseWriter, req *http.Request) {
+	// Scope the response to the calling tenant so this status endpoint cannot
+	// be used (even accidentally, when exposed by an operator contrary to
+	// deployment guidance) to enumerate every other tenant's cluster/replica
+	// labels. The endpoint is registered with auth=true, so a tenant ID must
+	// be present on the request context.
+	userID, err := tenant.TenantID(req.Context())
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusUnauthorized)
+		return
+	}
+	prefix := userID + "/"
+
 	h.electedLock.RLock()
 	type replica struct {
 		UserID       string        `json:"userID"`
@@ -68,6 +81,10 @@ func (h *haTracker) ServeHTTP(w http.ResponseWriter, req *http.Request) {
 
 	electedReplicas := []replica{}
 	for key, desc := range h.elected {
+		if !strings.HasPrefix(key, prefix) {
+			// Only expose entries belonging to the caller's tenant.
+			continue
+		}
 		chunks := strings.SplitN(key, "/", 2)
 
 		electedReplicas = append(electedReplicas, replica{
