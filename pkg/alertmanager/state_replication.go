@@ -29,6 +29,18 @@ const (
 	syncFromStorage  = "from-storage"
 	syncUserNotFound = "user-not-found"
 	syncFailed       = "failed"
+
+	// msgcBufferSize is the capacity of the state replication channel. A small
+	// buffer lets short bursts of silence/nflog updates proceed without blocking
+	// the caller (who holds a mutex), while still exerting back-pressure on
+	// pathological producers.
+	msgcBufferSize = 32
+
+	// broadcastTimeout bounds how long broadcast() can wait to enqueue a
+	// replication message. It must never block the Silences.mtx (or the nflog
+	// mutex) for longer than this, because the lock-holding callback is invoked
+	// synchronously from the vendored Alertmanager under those locks.
+	broadcastTimeout = 5 * time.Second
 )
 
 // state represents the Alertmanager silences and notification log internal state.
@@ -60,6 +72,10 @@ type state struct {
 	initialSyncDuration      prometheus.Histogram
 
 	msgc chan *clusterpb.Part
+
+	// stopped is closed by running() just before it returns so that in-flight
+	// broadcast() callers never block forever on an abandoned msgc.
+	stopped chan struct{}
 }
 
 // newReplicatedStates creates a new state struct, which manages state to be replicated between alertmanagers.
@@ -72,7 +88,8 @@ func newReplicatedStates(userID string, rf int, re Replicator, st alertstore.Ale
 		replicator:        re,
 		store:             st,
 		states:            make(map[string]cluster.State, 2), // we use two, one for the notifications and one for silences.
-		msgc:              make(chan *clusterpb.Part),
+		msgc:              make(chan *clusterpb.Part, msgcBufferSize),
+		stopped:           make(chan struct{}),
 		reg:               r,
 		settleReadTimeout: defaultSettleReadTimeout,
 		storeReadTimeout:  defaultStoreReadTimeout,
@@ -277,12 +294,19 @@ func (s *state) mergeFullStates(fs []*clusterpb.FullState) error {
 }
 
 func (s *state) running(ctx context.Context) error {
+	// Signal to any goroutine parked in broadcast() that the consumer is gone
+	// so they can abandon the send instead of blocking forever (which would
+	// otherwise keep Silences.mtx / nflog.mtx held for the process lifetime).
+	defer close(s.stopped)
+
 	for {
 		select {
 		case p := <-s.msgc:
-			// If the replication factor is <= 1, we don't need to replicate any state anywhere else.
+			// If the replication factor is <= 1, we don't need to replicate
+			// any state anywhere else, but we must keep draining the channel
+			// so producers in broadcast() do not stall holding a mutex.
 			if s.replicationFactor <= 1 {
-				return nil
+				continue
 			}
 
 			s.stateReplicationTotal.WithLabelValues(p.Key).Inc()
@@ -296,10 +320,35 @@ func (s *state) running(ctx context.Context) error {
 	}
 }
 
+// broadcast enqueues a state update for asynchronous replication. It is called
+// from the vendored Alertmanager (Silences.setSilence, nflog.Log) while the
+// corresponding mutex is held, so the send MUST be bounded: it must not block
+// indefinitely on an unbuffered channel, and it must observe both service
+// shutdown and a wall-clock timeout so a wedged consumer or a slow replica
+// cannot pin the silences/notification-log mutex for the process lifetime.
 func (s *state) broadcast(key string, b []byte) {
 	// We should ignore the Merges into the initial state during settling.
-	if s.Ready() {
-		s.msgc <- &clusterpb.Part{Key: key, Data: b}
+	if !s.Ready() {
+		return
+	}
+
+	msg := &clusterpb.Part{Key: key, Data: b}
+
+	select {
+	case s.msgc <- msg:
+		// Enqueued for replication.
+	case <-s.stopped:
+		// running() has returned (service stopping / stopped); dropping the
+		// update is the only safe outcome because there is no consumer to
+		// drain msgc. Record it so operators can observe the drop.
+		s.stateReplicationFailed.WithLabelValues(key).Inc()
+		level.Warn(s.logger).Log("msg", "state replication stopped; dropping update", "user", s.userID, "key", key)
+	case <-time.After(broadcastTimeout):
+		// Consumer is alive but we could not enqueue within the bound. Drop
+		// rather than hold Silences.mtx (or nflog.mtx) indefinitely; the
+		// state is still carried by the regular full-state resync path.
+		s.stateReplicationFailed.WithLabelValues(key).Inc()
+		level.Warn(s.logger).Log("msg", "timed out enqueuing state replication; dropping update", "user", s.userID, "key", key)
 	}
 }
 
