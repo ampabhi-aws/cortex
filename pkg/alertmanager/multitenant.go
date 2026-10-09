@@ -822,6 +822,15 @@ func (am *MultitenantAlertmanager) setConfig(cfg alertspb.AlertConfigDesc) error
 	}
 
 	for _, tmpl := range cfg.Templates {
+		// Validate the template filename to reject any path (e.g. "../templates"
+		// or "../templates_evil/x.tpl") before resolving it. This is a defence
+		// in depth check that catches configs reaching setConfig from alert
+		// store backends (notably the legacy configdb store) that do not
+		// validate the template filename themselves.
+		if err := validateTemplateFilename(tmpl.Filename); err != nil {
+			return err
+		}
+
 		templateFilePath, err := safeTemplateFilepath(userTemplateDir, tmpl.Filename)
 		if err != nil {
 			return err
@@ -1323,10 +1332,12 @@ func safeTemplateFilepath(dir, templateName string) (string, error) {
 		return "", err
 	}
 
-	// Ensure the actual path of the template is within the expected directory.
-	// This check is a counter-measure to make sure the tenant is not trying to
-	// escape its own directory on disk.
-	if !strings.HasPrefix(actualPath, containerDir) {
+	// Ensure the actual path of the template is strictly within the expected
+	// directory. This check is a counter-measure to make sure the tenant is
+	// not trying to escape its own directory on disk. We require a trailing
+	// path separator so that sibling paths sharing the same string prefix
+	// (e.g. "<dir>_evil/...") and the containerDir itself are rejected.
+	if !strings.HasPrefix(actualPath, containerDir+string(os.PathSeparator)) {
 		return "", fmt.Errorf("invalid template name %q: the template filepath is escaping the per-tenant local directory", templateName)
 	}
 
