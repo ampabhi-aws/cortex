@@ -87,6 +87,12 @@ func TestAPIConfig(t *testing.T) {
 				tc.actualCfg(&cortex.Cfg)
 			}
 
+			// /config and /runtime_config now require authentication by default
+			// (api.config-endpoints-auth-enabled); disable it in-process so this
+			// test can continue to exercise the handler directly without having
+			// to inject auth middleware.
+			cortex.Cfg.API.ConfigEndpointsAuthEnabled = false
+
 			_, err := cortex.initAPI()
 			require.NoError(t, err)
 

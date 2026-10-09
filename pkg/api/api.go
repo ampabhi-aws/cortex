@@ -65,12 +65,22 @@ type Config struct {
 
 	// Allows and is used to configure the addition of HTTP Header fields to logs
 	HTTPRequestHeadersToLog flagext.StringSlice `yaml:"http_request_headers_to_log"`
+
+	// ConfigEndpointsAuthEnabled, when true, requires authenticated access for
+	// the /config and /runtime_config endpoints. These endpoints serve the
+	// running configuration verbatim (including embedded upstream credentials
+	// such as the ruler's Alertmanager client secrets); exposing them
+	// unauthenticated on the same listener as the tenant push API has been
+	// known to disclose outbound service credentials. Defaults to true for
+	// safe-by-default behaviour.
+	ConfigEndpointsAuthEnabled bool `yaml:"config_endpoints_auth_enabled"`
 }
 
 // RegisterFlags adds the flags required to config this to the given FlagSet.
 func (cfg *Config) RegisterFlags(f *flag.FlagSet) {
 	f.BoolVar(&cfg.ResponseCompression, "api.response-compression-enabled", false, "Use GZIP compression for API responses. Some endpoints serve large YAML or JSON blobs which can benefit from compression.")
 	f.Var(&cfg.HTTPRequestHeadersToLog, "api.http-request-headers-to-log", "Which HTTP Request headers to add to logs")
+	f.BoolVar(&cfg.ConfigEndpointsAuthEnabled, "api.config-endpoints-auth-enabled", true, "Require authentication for the /config and /runtime_config endpoints, which dump the running configuration (including embedded secrets such as the ruler's Alertmanager client credentials). Defaults to true. Set to false to restore the legacy unauthenticated behaviour.")
 	cfg.RegisterFlagsWithPrefix("", f)
 }
 
@@ -217,7 +227,7 @@ func (a *API) RegisterAPI(httpPathPrefix string, actualCfg interface{}, defaultC
 	a.indexPage.AddLink(SectionAdminEndpoints, "/config", "Current Config (including the default values)")
 	a.indexPage.AddLink(SectionAdminEndpoints, "/config?mode=diff", "Current Config (show only values that differ from the defaults)")
 
-	a.RegisterRoute("/config", a.cfg.configHandler(actualCfg, defaultCfg), false, "GET")
+	a.RegisterRoute("/config", a.cfg.configHandler(actualCfg, defaultCfg), a.cfg.ConfigEndpointsAuthEnabled, "GET")
 	a.RegisterRoute("/", indexHandler(httpPathPrefix, a.indexPage), false, "GET")
 	a.RegisterRoute("/debug/fgprof", fgprof.Handler(), false, "GET")
 }
@@ -227,7 +237,7 @@ func (a *API) RegisterRuntimeConfig(runtimeConfigHandler http.HandlerFunc) {
 	a.indexPage.AddLink(SectionAdminEndpoints, "/runtime_config", "Current Runtime Config (incl. Overrides)")
 	a.indexPage.AddLink(SectionAdminEndpoints, "/runtime_config?mode=diff", "Current Runtime Config (show only values that differ from the defaults)")
 
-	a.RegisterRoute("/runtime_config", runtimeConfigHandler, false, "GET")
+	a.RegisterRoute("/runtime_config", runtimeConfigHandler, a.cfg.ConfigEndpointsAuthEnabled, "GET")
 }
 
 // RegisterDistributor registers the endpoints associated with the distributor.
