@@ -42,6 +42,12 @@ func defaultIngesterTestConfig(t testing.TB) Config {
 	cfg.LifecyclerConfig.ID = "localhost"
 	cfg.LifecyclerConfig.FinalSleep = 0
 	cfg.ActiveSeriesMetricsEnabled = true
+	// Many existing unit tests push samples with epoch-era (t=0, t=10, ...) or
+	// otherwise synthetic timestamps that are far older than the production
+	// default retention of 6h. Disable the ingester-side sample-age bound in
+	// tests so those fixtures continue to work; tests that specifically exercise
+	// the bound can re-enable it by setting cfg.BlocksStorageConfig.TSDB.Retention.
+	cfg.BlocksStorageConfig.TSDB.Retention = 0
 	return cfg
 }
 
