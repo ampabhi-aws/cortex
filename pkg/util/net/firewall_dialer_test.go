@@ -27,13 +27,14 @@ func TestFirewallDialer(t *testing.T) {
 		cfg   FirewallDialerConfigProvider
 		cases []testCase
 	}{
-		"should not block traffic with no block config": {
+		"should always block loopback and link-local even with no block config": {
 			cfg: firewallCfgProvider{},
 			cases: []testCase{
-				{"localhost", false},
-				{"127.0.0.1", false},
+				{"localhost", true},
+				{"127.0.0.1", true},
 				{"google.com", false},
 				{"172.217.168.78", false},
+				{"fe80::200:5aee:feaa:20a2", true}, // Link-local
 			},
 		},
 		"should support blocking private addresses": {
@@ -59,13 +60,13 @@ func TestFirewallDialer(t *testing.T) {
 				blockCIDRNetworks: []flagext.CIDR{blockedCIDR},
 			},
 			cases: []testCase{
-				{"localhost", false},
-				{"127.0.0.1", false},
+				{"localhost", true},
+				{"127.0.0.1", true},
 				{"192.168.0.1", false},
 				{"10.0.0.1", false},
 				{"172.217.168.78", true},
 				{"fdf8:f53b:82e4::53", false},       // Local
-				{"fe80::200:5aee:feaa:20a2", false}, // Link-local
+				{"fe80::200:5aee:feaa:20a2", true},  // Link-local (always blocked)
 				{"2001:4860:4860::8844", false},     // Google DNS
 				{"::ffff:10.0.0.1", false},          // IPv6 mapped v4 non-blocked
 				{"::ffff:172.217.168.78", true},     // IPv6 mapped v4 blocked
