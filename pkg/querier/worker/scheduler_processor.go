@@ -130,6 +130,31 @@ func (sp *schedulerProcessor) querierLoop(c schedulerpb.SchedulerForQuerier_Quer
 			// We need to inject user into context for sending response back.
 			ctx := user.InjectOrgID(ctx, request.UserID)
 
+			// Enforce tenant self-consistency between the scheduler-asserted
+			// UserID and the X-Scope-OrgID header inside the embedded HTTP
+			// request before dispatching. If a scheduler peer were to feed us a
+			// request whose outer tenant disagrees with the inner header, the
+			// httpgrpc server would execute the inner tenant while we reported
+			// results against the outer one. Reject rather than guess.
+			if err := httpgrpcutil.EnforceTenantConsistency(request.HttpRequest, request.UserID); err != nil {
+				logger := util_log.WithContext(ctx, sp.log)
+				level.Warn(logger).Log("msg", "refusing scheduler request with inconsistent tenant", "err", err, "queryID", request.QueryID, "userID", request.UserID, "frontend", request.FrontendAddress)
+				resp := &httpgrpc.HTTPResponse{
+					Code: http.StatusUnauthorized,
+					Body: []byte(err.Error()),
+				}
+				if fc, cerr := sp.frontendPool.GetClientFor(request.FrontendAddress); cerr == nil {
+					_, _ = fc.(frontendv2pb.FrontendForQuerierClient).QueryResult(ctx, &frontendv2pb.QueryResultRequest{
+						QueryID:      request.QueryID,
+						HttpResponse: resp,
+					})
+				}
+				if serr := c.Send(&schedulerpb.QuerierToScheduler{}); serr != nil {
+					level.Error(logger).Log("msg", "error notifying scheduler about rejected query", "err", serr, "addr", address)
+				}
+				return
+			}
+
 			tracer := opentracing.GlobalTracer()
 			// Ignore errors here. If we cannot get parent span, we just don't create new one.
 			parentSpanContext, _ := httpgrpcutil.GetParentSpanForRequest(tracer, request.HttpRequest)
