@@ -959,7 +959,9 @@ func (am *MultitenantAlertmanager) newAlertmanager(userID string, amConfig *amco
 	return newAM, nil
 }
 
-// GetPositionForUser returns the position this Alertmanager instance holds in the ring related to its other replicas for an specific user.
+// GetPositionForUser returns the position this Alertmanager instance holds in the ring related to its other
+// replicas for a specific user, or -1 if this instance is not one of the user's replicas (or if the ring
+// cannot be read). Callers must treat a negative value as "not a replica" and refuse to act as primary.
 func (am *MultitenantAlertmanager) GetPositionForUser(userID string) int {
 	// If we have a replication factor of 1 or less we don't need to do any work and can immediately return.
 	if am.ring == nil || am.ring.ReplicationFactor() <= 1 {
@@ -969,20 +971,22 @@ func (am *MultitenantAlertmanager) GetPositionForUser(userID string) int {
 	set, err := am.ring.Get(shardByUser(userID), RingOp, nil, nil, nil)
 	if err != nil {
 		level.Error(am.logger).Log("msg", "unable to read the ring while trying to determine the alertmanager position", "err", err)
-		// If we're  unable to determine the position, we don't want a tenant to miss out on the notification - instead,
-		// just assume we're the first in line and run the risk of a double notification.
-		return 0
+		// Do not claim to be the primary replica on ring errors: a false "position 0" is used by callers as a
+		// write grant for the tenant's authoritative state snapshot and as a zero notification delay.
+		return -1
 	}
 
-	var position int
 	for i, instance := range set.Instances {
 		if instance.Addr == am.ringLifecycler.GetInstanceAddr() {
-			position = i
-			break
+			return i
 		}
 	}
 
-	return position
+	// This instance is not one of the user's replicas (e.g. the per-tenant Alertmanager was instantiated via
+	// the fallback-config path on a non-owning instance, or the ring topology changed and syncConfigs has not
+	// yet torn this Alertmanager down). Signal "not a replica" so callers do not overwrite the tenant's
+	// persisted state and do not notify with zero deduplication delay.
+	return -1
 }
 
 // ServeHTTP serves the Alertmanager's web UI and API.
