@@ -71,7 +71,7 @@ func setupScheduler(t *testing.T, reg prometheus.Registerer) (*Scheduler, schedu
 func TestSchedulerBasicEnqueue(t *testing.T) {
 	scheduler, frontendClient, querierClient := setupScheduler(t, nil)
 
-	frontendLoop := initFrontendLoop(t, frontendClient, "frontend-12345")
+	frontendLoop := initFrontendLoop(t, frontendClient, "frontend-12345:9095")
 	frontendToScheduler(t, frontendLoop, &schedulerpb.FrontendToScheduler{
 		Type:        schedulerpb.ENQUEUE,
 		QueryID:     1,
@@ -87,7 +87,7 @@ func TestSchedulerBasicEnqueue(t *testing.T) {
 		msg2, err := querierLoop.Recv()
 		require.NoError(t, err)
 		require.Equal(t, uint64(1), msg2.QueryID)
-		require.Equal(t, "frontend-12345", msg2.FrontendAddress)
+		require.Equal(t, "frontend-12345:9095", msg2.FrontendAddress)
 		require.Equal(t, "GET", msg2.HttpRequest.Method)
 		require.Equal(t, "/hello", msg2.HttpRequest.Url)
 		require.NoError(t, querierLoop.Send(&schedulerpb.QuerierToScheduler{}))
@@ -99,7 +99,7 @@ func TestSchedulerBasicEnqueue(t *testing.T) {
 func TestSchedulerEnqueueWithCancel(t *testing.T) {
 	scheduler, frontendClient, querierClient := setupScheduler(t, nil)
 
-	frontendLoop := initFrontendLoop(t, frontendClient, "frontend-12345")
+	frontendLoop := initFrontendLoop(t, frontendClient, "frontend-12345:9095")
 	frontendToScheduler(t, frontendLoop, &schedulerpb.FrontendToScheduler{
 		Type:        schedulerpb.ENQUEUE,
 		QueryID:     1,
@@ -129,8 +129,8 @@ func initQuerierLoop(t *testing.T, querierClient schedulerpb.SchedulerForQuerier
 func TestSchedulerEnqueueByMultipleFrontendsWithCancel(t *testing.T) {
 	scheduler, frontendClient, querierClient := setupScheduler(t, nil)
 
-	frontendLoop1 := initFrontendLoop(t, frontendClient, "frontend-1")
-	frontendLoop2 := initFrontendLoop(t, frontendClient, "frontend-2")
+	frontendLoop1 := initFrontendLoop(t, frontendClient, "frontend-1:9095")
+	frontendLoop2 := initFrontendLoop(t, frontendClient, "frontend-2:9095")
 
 	frontendToScheduler(t, frontendLoop1, &schedulerpb.FrontendToScheduler{
 		Type:        schedulerpb.ENQUEUE,
@@ -158,7 +158,7 @@ func TestSchedulerEnqueueByMultipleFrontendsWithCancel(t *testing.T) {
 	msg, err := querierLoop.Recv()
 	require.NoError(t, err)
 	require.Equal(t, uint64(1), msg.QueryID)
-	require.Equal(t, "frontend-2", msg.FrontendAddress)
+	require.Equal(t, "frontend-2:9095", msg.FrontendAddress)
 	// Must notify scheduler back about finished processing, or it will not send more requests (nor remove "current" request from pending ones).
 	require.NoError(t, querierLoop.Send(&schedulerpb.QuerierToScheduler{}))
 
@@ -170,7 +170,7 @@ func TestSchedulerEnqueueByMultipleFrontendsWithCancel(t *testing.T) {
 func TestSchedulerEnqueueWithFrontendDisconnect(t *testing.T) {
 	scheduler, frontendClient, querierClient := setupScheduler(t, nil)
 
-	frontendLoop := initFrontendLoop(t, frontendClient, "frontend-12345")
+	frontendLoop := initFrontendLoop(t, frontendClient, "frontend-12345:9095")
 	frontendToScheduler(t, frontendLoop, &schedulerpb.FrontendToScheduler{
 		Type:        schedulerpb.ENQUEUE,
 		QueryID:     1,
@@ -200,7 +200,7 @@ func TestSchedulerEnqueueWithFrontendDisconnect(t *testing.T) {
 func TestCancelRequestInProgress(t *testing.T) {
 	scheduler, frontendClient, querierClient := setupScheduler(t, nil)
 
-	frontendLoop := initFrontendLoop(t, frontendClient, "frontend-12345")
+	frontendLoop := initFrontendLoop(t, frontendClient, "frontend-12345:9095")
 	frontendToScheduler(t, frontendLoop, &schedulerpb.FrontendToScheduler{
 		Type:        schedulerpb.ENQUEUE,
 		QueryID:     1,
@@ -233,7 +233,7 @@ func TestCancelRequestInProgress(t *testing.T) {
 func TestTracingContext(t *testing.T) {
 	scheduler, frontendClient, _ := setupScheduler(t, nil)
 
-	frontendLoop := initFrontendLoop(t, frontendClient, "frontend-12345")
+	frontendLoop := initFrontendLoop(t, frontendClient, "frontend-12345:9095")
 
 	closer, err := config.Configuration{}.InitGlobalTracer("test")
 	require.NoError(t, err)
@@ -244,7 +244,7 @@ func TestTracingContext(t *testing.T) {
 		QueryID:         1,
 		UserID:          "test",
 		HttpRequest:     &httpgrpc.HTTPRequest{Method: "GET", Url: "/hello"},
-		FrontendAddress: "frontend-12345",
+		FrontendAddress: "frontend-12345:9095",
 	}
 
 	sp, _ := opentracing.StartSpanFromContext(context.Background(), "client")
@@ -264,7 +264,7 @@ func TestTracingContext(t *testing.T) {
 func TestSchedulerShutdown_FrontendLoop(t *testing.T) {
 	scheduler, frontendClient, _ := setupScheduler(t, nil)
 
-	frontendLoop := initFrontendLoop(t, frontendClient, "frontend-12345")
+	frontendLoop := initFrontendLoop(t, frontendClient, "frontend-12345:9095")
 
 	// Stop the scheduler. This will disable receiving new requests from frontends.
 	scheduler.StopAsync()
@@ -285,7 +285,7 @@ func TestSchedulerShutdown_FrontendLoop(t *testing.T) {
 func TestSchedulerShutdown_QuerierLoop(t *testing.T) {
 	scheduler, frontendClient, querierClient := setupScheduler(t, nil)
 
-	frontendLoop := initFrontendLoop(t, frontendClient, "frontend-12345")
+	frontendLoop := initFrontendLoop(t, frontendClient, "frontend-12345:9095")
 	frontendToScheduler(t, frontendLoop, &schedulerpb.FrontendToScheduler{
 		Type:        schedulerpb.ENQUEUE,
 		QueryID:     1,
@@ -319,7 +319,7 @@ func TestSchedulerMaxOutstandingRequests(t *testing.T) {
 
 	for i := 0; i < testMaxOutstandingPerTenant; i++ {
 		// coming from different frontends
-		fl := initFrontendLoop(t, frontendClient, fmt.Sprintf("frontend-%d", i))
+		fl := initFrontendLoop(t, frontendClient, fmt.Sprintf("frontend-%d:9095", i))
 		require.NoError(t, fl.Send(&schedulerpb.FrontendToScheduler{
 			Type:        schedulerpb.ENQUEUE,
 			QueryID:     uint64(i),
@@ -333,7 +333,7 @@ func TestSchedulerMaxOutstandingRequests(t *testing.T) {
 	}
 
 	// One more query from the same user will trigger an error.
-	fl := initFrontendLoop(t, frontendClient, "extra-frontend")
+	fl := initFrontendLoop(t, frontendClient, "extra-frontend:9095")
 	require.NoError(t, fl.Send(&schedulerpb.FrontendToScheduler{
 		Type:        schedulerpb.ENQUEUE,
 		QueryID:     0,
@@ -411,7 +411,7 @@ func TestSchedulerMetrics(t *testing.T) {
 
 	scheduler, frontendClient, _ := setupScheduler(t, reg)
 
-	frontendLoop := initFrontendLoop(t, frontendClient, "frontend-12345")
+	frontendLoop := initFrontendLoop(t, frontendClient, "frontend-12345:9095")
 	frontendToScheduler(t, frontendLoop, &schedulerpb.FrontendToScheduler{
 		Type:        schedulerpb.ENQUEUE,
 		QueryID:     1,

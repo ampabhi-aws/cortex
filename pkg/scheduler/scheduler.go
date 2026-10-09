@@ -4,7 +4,9 @@ import (
 	"context"
 	"flag"
 	"io"
+	"net"
 	"net/http"
+	"strings"
 	"sync"
 	"time"
 
@@ -235,6 +237,9 @@ func (s *Scheduler) frontendConnected(frontend schedulerpb.SchedulerForFrontend_
 	if msg.Type != schedulerpb.INIT || msg.FrontendAddress == "" {
 		return "", nil, errors.New("no frontend address")
 	}
+	if err := validateFrontendAddress(msg.FrontendAddress); err != nil {
+		return "", nil, err
+	}
 
 	s.connectedFrontendsMu.Lock()
 	defer s.connectedFrontendsMu.Unlock()
@@ -451,6 +456,11 @@ func (s *Scheduler) forwardErrorToFrontend(ctx context.Context, req *schedulerRe
 		return
 	}
 
+	if err := validateFrontendAddress(req.frontendAddress); err != nil {
+		level.Warn(s.log).Log("msg", "refusing to dial frontend with invalid address", "frontend", req.frontendAddress, "err", err, "requestErr", requestErr)
+		return
+	}
+
 	conn, err := grpc.DialContext(ctx, req.frontendAddress, opts...)
 	if err != nil {
 		level.Warn(s.log).Log("msg", "failed to create gRPC connection to frontend to report error", "frontend", req.frontendAddress, "err", err, "requestErr", requestErr)
@@ -476,6 +486,36 @@ func (s *Scheduler) forwardErrorToFrontend(ctx context.Context, req *schedulerRe
 		level.Warn(s.log).Log("msg", "failed to forward error to frontend", "frontend", req.frontendAddress, "err", err, "requestErr", requestErr)
 		return
 	}
+}
+
+// validateFrontendAddress ensures that a client-asserted frontend address
+// cannot be used as an arbitrary gRPC dial target. It rejects anything that
+// is not a bare host:port literal: strings containing a URL/resolver scheme
+// (such as "dns:///", "unix:///" or "passthrough:///"), strings that fail
+// net.SplitHostPort, and strings with an empty host or port. The returned
+// error is deliberately short and non-sensitive so it is safe to send back to
+// the caller.
+func validateFrontendAddress(addr string) error {
+	if addr == "" {
+		return errors.New("invalid frontend address: empty")
+	}
+	if strings.ContainsAny(addr, " \t\r\n\x00") {
+		return errors.New("invalid frontend address: contains whitespace or control characters")
+	}
+	// gRPC resolver schemes like "dns:///", "unix:///", "passthrough:///"
+	// turn the dial target into something that is not a bare host:port.
+	// Reject any address carrying such a scheme (or any other "://" prefix).
+	if strings.Contains(addr, "://") {
+		return errors.New("invalid frontend address: must be host:port, scheme not allowed")
+	}
+	host, port, err := net.SplitHostPort(addr)
+	if err != nil {
+		return errors.New("invalid frontend address: must be host:port")
+	}
+	if host == "" || port == "" {
+		return errors.New("invalid frontend address: host and port must be non-empty")
+	}
+	return nil
 }
 
 func (s *Scheduler) isRunningOrStopping() bool {
