@@ -279,9 +279,15 @@ type MultitenantAlertmanager struct {
 
 // NewMultitenantAlertmanager creates a new MultitenantAlertmanager.
 func NewMultitenantAlertmanager(cfg *MultitenantAlertmanagerConfig, store alertstore.AlertStore, limits Limits, logger log.Logger, registerer prometheus.Registerer) (*MultitenantAlertmanager, error) {
-	err := os.MkdirAll(cfg.DataDir, 0777)
+	err := os.MkdirAll(cfg.DataDir, 0750)
 	if err != nil {
 		return nil, fmt.Errorf("unable to create Alertmanager data directory %q: %s", cfg.DataDir, err)
+	}
+	// mkdir(2) applies the process umask, so enforce the intended mode explicitly
+	// to prevent a permissive inherited umask from widening permissions on the
+	// directory that holds multi-tenant Alertmanager state (CWE-276).
+	if err := os.Chmod(cfg.DataDir, 0750); err != nil {
+		return nil, fmt.Errorf("unable to set permissions on Alertmanager data directory %q: %s", cfg.DataDir, err)
 	}
 
 	if cfg.ExternalURL.URL == nil {
@@ -525,9 +531,14 @@ func (am *MultitenantAlertmanager) migrateStateFilesToPerTenantDirectories() err
 
 	for userID, files := range st {
 		tenantDir := am.getTenantDirectory(userID)
-		err := os.MkdirAll(tenantDir, 0777)
+		err := os.MkdirAll(tenantDir, 0700)
 		if err != nil {
 			return errors.Wrapf(err, "failed to create per-tenant directory %v", tenantDir)
+		}
+		// Defeat a permissive inherited umask so per-tenant state is not
+		// readable or writable by other local uids (CWE-276).
+		if err := os.Chmod(tenantDir, 0700); err != nil {
+			return errors.Wrapf(err, "failed to set permissions on per-tenant directory %v", tenantDir)
 		}
 
 		errs := tsdb_errors.NewMulti()
@@ -927,9 +938,14 @@ func (am *MultitenantAlertmanager) newAlertmanager(userID string, amConfig *amco
 	reg := prometheus.NewRegistry()
 
 	tenantDir := am.getTenantDirectory(userID)
-	err := os.MkdirAll(tenantDir, 0777)
+	err := os.MkdirAll(tenantDir, 0700)
 	if err != nil {
 		return nil, errors.Wrapf(err, "failed to create per-tenant directory %v", tenantDir)
+	}
+	// Defeat a permissive inherited umask so per-tenant state is not
+	// readable or writable by other local uids (CWE-276).
+	if err := os.Chmod(tenantDir, 0700); err != nil {
+		return nil, errors.Wrapf(err, "failed to set permissions on per-tenant directory %v", tenantDir)
 	}
 
 	newAM, err := New(&Config{
