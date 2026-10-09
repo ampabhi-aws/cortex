@@ -59,6 +59,13 @@ type TCPTransportConfig struct {
 
 	TLSEnabled bool                   `yaml:"tls_enabled"`
 	TLS        cortextls.ClientConfig `yaml:",inline"`
+
+	// TLSRequireClientCert, when true, requires and verifies client certificates
+	// on the server side of the TLS listener. This authenticates every incoming
+	// peer against the configured CA pool and is strongly recommended when TLS
+	// is enabled; otherwise the TLS listener provides confidentiality only and
+	// not peer authentication.
+	TLSRequireClientCert bool `yaml:"tls_require_client_cert"`
 }
 
 func (cfg *TCPTransportConfig) RegisterFlags(f *flag.FlagSet) {
@@ -75,6 +82,7 @@ func (cfg *TCPTransportConfig) RegisterFlagsWithPrefix(f *flag.FlagSet, prefix s
 	f.BoolVar(&cfg.TransportDebug, prefix+"memberlist.transport-debug", false, "Log debug transport messages. Note: global log.level must be at debug level as well.")
 
 	f.BoolVar(&cfg.TLSEnabled, prefix+"memberlist.tls-enabled", false, "Enable TLS on the memberlist transport layer.")
+	f.BoolVar(&cfg.TLSRequireClientCert, prefix+"memberlist.tls-require-client-cert", true, "When TLS is enabled, require and verify client certificates on the memberlist listener. Requires -memberlist.tls-ca-path to be set so that incoming peers can be authenticated.")
 	cfg.TLS.RegisterFlagsWithPrefix(prefix+"memberlist", f)
 }
 
@@ -82,13 +90,14 @@ func (cfg *TCPTransportConfig) RegisterFlagsWithPrefix(f *flag.FlagSet, prefix s
 // operations ("packet" and "stream" are terms used by memberlist).
 // It uses a new TCP connections for each operation. There is no connection reuse.
 type TCPTransport struct {
-	cfg          TCPTransportConfig
-	logger       log.Logger
-	packetCh     chan *memberlist.Packet
-	connCh       chan net.Conn
-	wg           sync.WaitGroup
-	tcpListeners []net.Listener
-	tlsConfig    *tls.Config
+	cfg             TCPTransportConfig
+	logger          log.Logger
+	packetCh        chan *memberlist.Packet
+	connCh          chan net.Conn
+	wg              sync.WaitGroup
+	tcpListeners    []net.Listener
+	tlsConfig       *tls.Config
+	serverTLSConfig *tls.Config
 
 	shutdown atomic.Int32
 
@@ -131,6 +140,26 @@ func NewTCPTransport(config TCPTransportConfig, logger log.Logger) (*TCPTranspor
 		if err != nil {
 			return nil, errors.Wrap(err, "unable to create TLS config")
 		}
+
+		// Build a dedicated server-side TLS config. The client-side config returned by
+		// GetTLSConfig sets RootCAs/Certificates for outbound dials and must NOT be
+		// reused as the listener config, because that leaves ClientAuth defaulted to
+		// NoClientCert — any TLS client with any (or no) certificate would be
+		// accepted. We require and verify a client certificate against the
+		// configured CA pool when TLSRequireClientCert is set (default). See
+		// CWE-306: Missing Authentication for Critical Function.
+		serverCfg := t.tlsConfig.Clone()
+		if config.TLSRequireClientCert {
+			if config.TLS.CAPath == "" {
+				return nil, errors.New("memberlist TLS listener requires a client CA pool: set -memberlist.tls-ca-path or disable -memberlist.tls-require-client-cert (not recommended)")
+			}
+			if len(serverCfg.Certificates) == 0 {
+				return nil, errors.New("memberlist TLS listener requires a server certificate: set -memberlist.tls-cert-path and -memberlist.tls-key-path")
+			}
+			serverCfg.ClientAuth = tls.RequireAndVerifyClientCert
+			serverCfg.ClientCAs = serverCfg.RootCAs
+		}
+		t.serverTLSConfig = serverCfg
 	}
 
 	t.registerMetrics(config.MetricsRegisterer)
@@ -151,7 +180,7 @@ func NewTCPTransport(config TCPTransportConfig, logger log.Logger) (*TCPTranspor
 
 		var tcpLn net.Listener
 		if config.TLSEnabled {
-			tcpLn, err = tls.Listen("tcp", tcpAddr.String(), t.tlsConfig)
+			tcpLn, err = tls.Listen("tcp", tcpAddr.String(), t.serverTLSConfig)
 			if err != nil {
 				return nil, errors.Wrapf(err, "failed to start TLS TCP listener on %q port %d", addr, port)
 			}
@@ -302,6 +331,12 @@ func (t *TCPTransport) handleConnection(conn net.Conn) {
 		if !bytes.Equal(receivedDigest, expectedDigest[:]) {
 			t.receivedPacketsErrors.Inc()
 			level.Warn(t.logger).Log("msg", "packet digest mismatch", "expected", fmt.Sprintf("%x", expectedDigest), "received", fmt.Sprintf("%x", receivedDigest), "data_length", len(buf), "remote", conn.RemoteAddr())
+			// Drop the frame: the integrity check failed, so the packet must not be
+			// delivered to the memberlist delegate. (Previously execution fell through
+			// here, which allowed a forged/corrupt frame to be processed and merged
+			// into the ring; see CWE-306 — missing authentication for critical
+			// function.)
+			return
 		}
 
 		t.debugLog().Log("msg", "Received packet", "addr", addr(addrBuf), "size", len(buf), "hash", fmt.Sprintf("%x", receivedDigest))

@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"crypto/rand"
+	"encoding/base64"
 	"encoding/binary"
 	"errors"
 	"flag"
@@ -159,6 +160,17 @@ type KVConfig struct {
 
 	TCPTransport TCPTransportConfig `yaml:",inline"`
 
+	// GossipSecretKey is a base64-encoded shared secret (16, 24 or 32 bytes once
+	// decoded) used to encrypt and authenticate every gossip packet and stream
+	// via memberlist's built-in AES-GCM-based transport encryption. When set it
+	// enables memberlist's EncryptionEnabled() path and the GossipVerifyIncoming
+	// /GossipVerifyOutgoing checks, so any peer that cannot produce a valid
+	// authentication tag with the configured key is dropped before its payload
+	// reaches the KV delegate. This is the primary mitigation for the
+	// unauthenticated gossip ring-poisoning class of findings
+	// (CWE-306 / CWE-1211).
+	GossipSecretKey flagext.Secret `yaml:"secret_key"`
+
 	// Where to put custom metrics. Metrics are not registered, if this is nil.
 	MetricsRegisterer prometheus.Registerer `yaml:"-"`
 	MetricsNamespace  string                `yaml:"-"`
@@ -193,6 +205,7 @@ func (cfg *KVConfig) RegisterFlagsWithPrefix(f *flag.FlagSet, prefix string) {
 	f.BoolVar(&cfg.EnableCompression, prefix+"memberlist.compression-enabled", mlDefaults.EnableCompression, "Enable message compression. This can be used to reduce bandwidth usage at the cost of slightly more CPU utilization.")
 	f.StringVar(&cfg.AdvertiseAddr, prefix+"memberlist.advertise-addr", mlDefaults.AdvertiseAddr, "Gossip address to advertise to other members in the cluster. Used for NAT traversal.")
 	f.IntVar(&cfg.AdvertisePort, prefix+"memberlist.advertise-port", mlDefaults.AdvertisePort, "Gossip port to advertise to other members in the cluster. Used for NAT traversal.")
+	f.Var(&cfg.GossipSecretKey, prefix+"memberlist.secret-key", "Base64-encoded shared secret (16, 24 or 32 bytes once decoded) used by memberlist to encrypt and authenticate every gossip packet and stream. When set, all cluster members must use the same value and incoming/outgoing gossip verification is enforced. Leaving this empty disables gossip authentication and is only safe on a fully trusted private network.")
 
 	cfg.TCPTransport.RegisterFlagsWithPrefix(f, prefix)
 }
@@ -374,6 +387,31 @@ func (m *KV) buildMemberlistConfig() (*memberlist.Config, error) {
 
 	mlCfg := defaultMemberlistConfig()
 	mlCfg.Delegate = m
+
+	// Configure gossip-plane authentication/encryption. memberlist encrypts and
+	// authenticates every packet and stream when SecretKey is set, and will
+	// reject frames that cannot be decrypted/authenticated before they reach
+	// our Delegate (NotifyMsg / MergeRemoteState). Without this, the TCP
+	// transport only validates an unkeyed MD5 digest that any sender can
+	// compute itself, so an unauthenticated network peer can poison the ring
+	// (CWE-306 / CWE-1211). We also enforce GossipVerifyIncoming/Outgoing so
+	// that unencrypted frames are not accepted even transiently.
+	if secret := m.cfg.GossipSecretKey.Value; secret != "" {
+		key, err := base64.StdEncoding.DecodeString(secret)
+		if err != nil {
+			return nil, fmt.Errorf("invalid memberlist.secret-key: must be base64-encoded: %v", err)
+		}
+		switch len(key) {
+		case 16, 24, 32:
+		default:
+			return nil, fmt.Errorf("invalid memberlist.secret-key: decoded length %d is not 16, 24 or 32 bytes", len(key))
+		}
+		mlCfg.SecretKey = key
+		mlCfg.GossipVerifyIncoming = true
+		mlCfg.GossipVerifyOutgoing = true
+	} else {
+		level.Warn(m.logger).Log("msg", "memberlist gossip is running without a shared secret key (-memberlist.secret-key is empty); peers are not cryptographically authenticated and any host with network access to the gossip port can inject arbitrary ring state. This is only safe on a fully trusted private network.")
+	}
 
 	mlCfg.TCPTimeout = m.cfg.StreamTimeout
 	mlCfg.RetransmitMult = m.cfg.RetransmitMult
