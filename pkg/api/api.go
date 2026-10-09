@@ -263,15 +263,18 @@ type Ingester interface {
 func (a *API) RegisterIngester(i Ingester, pushConfig distributor.Config) {
 	client.RegisterIngesterServer(a.server.GRPC, i)
 
-	a.indexPage.AddLink(SectionDangerous, "/ingester/flush", "Trigger a Flush of data from Ingester to storage")
-	a.indexPage.AddLink(SectionDangerous, "/ingester/shutdown", "Trigger Ingester Shutdown (Dangerous)")
-	a.RegisterRoute("/ingester/flush", http.HandlerFunc(i.FlushHandler), false, "GET", "POST")
-	a.RegisterRoute("/ingester/shutdown", http.HandlerFunc(i.ShutdownHandler), false, "GET", "POST")
+	// Destructive admin endpoints: require authentication (so that a tenant/credential
+	// header must be presented) and only accept POST so they cannot be triggered via
+	// a GET prefetch, an <img> tag, a link crawler, or any other cross-site vector.
+	// They are intentionally NOT advertised on the unauthenticated index page.
+	a.RegisterRoute("/ingester/flush", http.HandlerFunc(i.FlushHandler), true, "POST")
+	a.RegisterRoute("/ingester/shutdown", http.HandlerFunc(i.ShutdownHandler), true, "POST")
 	a.RegisterRoute("/ingester/push", push.Handler(pushConfig.MaxRecvMsgSize, a.sourceIPs, i.Push), true, "POST") // For testing and debugging.
 
-	// Legacy Routes
-	a.RegisterRoute("/flush", http.HandlerFunc(i.FlushHandler), false, "GET", "POST")
-	a.RegisterRoute("/shutdown", http.HandlerFunc(i.ShutdownHandler), false, "GET", "POST")
+	// Legacy /flush and /shutdown routes have been removed: they were duplicate
+	// aliases of /ingester/flush and /ingester/shutdown and were registered without
+	// authentication and with GET allowed, making them trivially triggerable from a
+	// cross-site context. Operators should migrate to the /ingester/* paths.
 	a.RegisterRoute("/push", push.Handler(pushConfig.MaxRecvMsgSize, a.sourceIPs, i.Push), true, "POST") // For testing and debugging.
 }
 
