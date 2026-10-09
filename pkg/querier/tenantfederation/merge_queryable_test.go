@@ -394,7 +394,7 @@ var (
 
 func TestMergeQueryable_Select(t *testing.T) {
 	// Set a multi tenant resolver.
-	tenant.WithDefaultResolver(tenant.NewMultiResolver())
+	tenant.WithDefaultResolver(tenant.NewMultiResolver(0))
 
 	for _, scenario := range []selectScenario{
 		{
@@ -550,7 +550,7 @@ func TestMergeQueryable_Select(t *testing.T) {
 
 func TestMergeQueryable_LabelNames(t *testing.T) {
 	// set a multi tenant resolver
-	tenant.WithDefaultResolver(tenant.NewMultiResolver())
+	tenant.WithDefaultResolver(tenant.NewMultiResolver(0))
 
 	for _, scenario := range []labelNamesScenario{
 		{
@@ -684,7 +684,7 @@ func TestMergeQueryable_LabelNames(t *testing.T) {
 
 func TestMergeQueryable_LabelValues(t *testing.T) {
 	// set a multi tenant resolver
-	tenant.WithDefaultResolver(tenant.NewMultiResolver())
+	tenant.WithDefaultResolver(tenant.NewMultiResolver(0))
 
 	for _, scenario := range []labelValuesScenario{
 		{
@@ -915,7 +915,7 @@ func TestTracingMergeQueryable(t *testing.T) {
 	ctx := user.InjectOrgID(context.Background(), "team-a|team-b")
 
 	// set a multi tenant resolver
-	tenant.WithDefaultResolver(tenant.NewMultiResolver())
+	tenant.WithDefaultResolver(tenant.NewMultiResolver(0))
 	filter := mockTenantQueryableWithFilter{}
 	q := NewQueryable(&filter, false)
 	// retrieve querier if set

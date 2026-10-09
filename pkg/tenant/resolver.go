@@ -3,6 +3,7 @@ package tenant
 import (
 	"context"
 	"errors"
+	"fmt"
 	"net/http"
 	"strings"
 
@@ -99,14 +100,20 @@ func (t *SingleResolver) TenantIDs(ctx context.Context) ([]string, error) {
 }
 
 type MultiResolver struct {
+	// maxTenants is the maximum number of tenant IDs allowed in a single
+	// X-Scope-OrgID header. A value of 0 (or negative) disables the limit.
+	maxTenants int
 }
 
 // NewMultiResolver creates a tenant resolver, which allows request to have
 // multiple tenant ids submitted separated by a '|' character. This enforces
 // further limits on the character set allowed within tenants as detailed here:
 // https://cortexmetrics.io/docs/guides/limitations/#tenant-id-naming)
-func NewMultiResolver() *MultiResolver {
-	return &MultiResolver{}
+//
+// maxTenants bounds the number of tenant IDs accepted per request to protect
+// against federated query amplification. A value <= 0 disables the limit.
+func NewMultiResolver(maxTenants int) *MultiResolver {
+	return &MultiResolver{maxTenants: maxTenants}
 }
 
 func (t *MultiResolver) TenantID(ctx context.Context) (string, error) {
@@ -130,6 +137,9 @@ func (t *MultiResolver) TenantIDs(ctx context.Context) ([]string, error) {
 	}
 
 	orgIDs := strings.Split(orgID, tenantIDsLabelSeparator)
+	if t.maxTenants > 0 && len(orgIDs) > t.maxTenants {
+		return nil, fmt.Errorf("too many tenant IDs present (%d), max %d", len(orgIDs), t.maxTenants)
+	}
 	for _, orgID := range orgIDs {
 		if err := ValidTenantID(orgID); err != nil {
 			return nil, err
