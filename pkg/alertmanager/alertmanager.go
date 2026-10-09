@@ -262,6 +262,13 @@ func New(cfg *Config, reg *prometheus.Registry) (*Alertmanager, error) {
 		Registry: am.registry,
 		Logger:   log.With(am.logger, "component", "api"),
 		GroupFunc: func(f1 func(*dispatch.Route) bool, f2 func(*types.Alert, time.Time) bool) (dispatch.AlertGroups, map[model.Fingerprint][]string) {
+			// Guard against a nil dispatcher. The dispatcher is only set by
+			// ApplyConfig once a valid configuration has been successfully
+			// applied; before that (or if the initial ApplyConfig failed) a
+			// request to the alert-groups API would otherwise panic.
+			if am.dispatcher == nil {
+				return dispatch.AlertGroups{}, map[model.Fingerprint][]string{}
+			}
 			return am.dispatcher.Groups(f1, f2)
 		},
 	})
@@ -310,6 +317,10 @@ func clusterWait(position func() int, timeout time.Duration) func() time.Duratio
 
 // ApplyConfig applies a new configuration to an Alertmanager.
 func (am *Alertmanager) ApplyConfig(userID string, conf *config.Config, rawCfg string) error {
+	// Build everything that can fail BEFORE publishing the new config or
+	// tearing down the currently-running inhibitor and dispatcher. Otherwise
+	// a late failure would leave the tenant Alertmanager with a stopped
+	// dispatcher and no notification pipeline while still accepting alerts.
 	templateFiles := make([]string, len(conf.Templates))
 	for i, t := range conf.Templates {
 		templateFilepath, err := safeTemplateFilepath(filepath.Join(am.cfg.TenantDataDir, templatesDir), t)
@@ -325,20 +336,6 @@ func (am *Alertmanager) ApplyConfig(userID string, conf *config.Config, rawCfg s
 		return err
 	}
 	tmpl.ExternalURL = am.cfg.ExternalURL
-
-	am.api.Update(conf, func(_ model.LabelSet) {})
-
-	// Ensure inhibitor is set before being called
-	if am.inhibitor != nil {
-		am.inhibitor.Stop()
-	}
-
-	// Ensure dispatcher is set before being called
-	if am.dispatcher != nil {
-		am.dispatcher.Stop()
-	}
-
-	am.inhibitor = inhibit.NewInhibitor(am.alerts, conf.InhibitRules, am.marker, log.With(am.logger, "component", "inhibitor"))
 
 	waitFunc := clusterWait(am.state.Position, am.cfg.PeerTimeout)
 
@@ -365,8 +362,25 @@ func (am *Alertmanager) ApplyConfig(userID string, conf *config.Config, rawCfg s
 		return notifier
 	})
 	if err != nil {
-		return nil
+		return errors.Wrap(err, "failed to build integrations map")
 	}
+
+	// From this point on, everything required to construct the new pipeline
+	// has been successfully built. It is now safe to publish the new config
+	// and swap the running components.
+	am.api.Update(conf, func(_ model.LabelSet) {})
+
+	// Ensure inhibitor is set before being called
+	if am.inhibitor != nil {
+		am.inhibitor.Stop()
+	}
+
+	// Ensure dispatcher is set before being called
+	if am.dispatcher != nil {
+		am.dispatcher.Stop()
+	}
+
+	am.inhibitor = inhibit.NewInhibitor(am.alerts, conf.InhibitRules, am.marker, log.With(am.logger, "component", "inhibitor"))
 
 	muteTimes := make(map[string][]timeinterval.TimeInterval, len(conf.MuteTimeIntervals))
 	for _, ti := range conf.MuteTimeIntervals {

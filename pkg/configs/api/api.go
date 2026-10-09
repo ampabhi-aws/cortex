@@ -20,6 +20,7 @@ import (
 	amconfig "github.com/prometheus/alertmanager/config"
 	amtemplate "github.com/prometheus/alertmanager/template"
 
+	"github.com/cortexproject/cortex/pkg/alertmanager"
 	"github.com/cortexproject/cortex/pkg/configs/db"
 	"github.com/cortexproject/cortex/pkg/configs/userconfig"
 	"github.com/cortexproject/cortex/pkg/tenant"
@@ -237,6 +238,18 @@ func validateAlertmanagerConfig(cfg string, noCfg NotificationsConfig) error {
 		if noCfg.DisableWebHook && len(recv.WebhookConfigs) > 0 {
 			return ErrWebhookNotificationsAreDisabled
 		}
+	}
+
+	// Apply the Cortex receiver validators (same set as the native Alertmanager
+	// configuration API). This prevents receivers that reference file paths on
+	// disk (tls_config ca_file/cert_file/key_file, bearer_token_file,
+	// password_file, credentials_file, oauth2 client_secret_file, slack
+	// api_url_file, victorops api_key_file, ...) from being stored via the
+	// legacy configs-service write path. If they reached the Alertmanager they
+	// could cause buildIntegrationsMap to fail, which previously silently
+	// disabled the tenant's notification pipeline.
+	if err := alertmanager.ValidateAlertmanagerConfig(cfg); err != nil {
+		return err
 	}
 
 	return nil
