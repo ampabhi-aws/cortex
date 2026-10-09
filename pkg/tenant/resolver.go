@@ -98,15 +98,35 @@ func (t *SingleResolver) TenantIDs(ctx context.Context) ([]string, error) {
 	return []string{orgID}, err
 }
 
+// errTooManyTenants is returned when a request federates across more tenant
+// IDs than the configured maximum. A caller-controlled, unbounded tenant set
+// would otherwise let a single client mint arbitrary distinct fair-queueing
+// identities and multiply its per-tenant limits.
+var errTooManyTenants = errors.New("too many tenant IDs in request")
+
 type MultiResolver struct {
+	// maxTenants bounds how many tenant IDs may appear in one request. 0
+	// means unbounded (preserves historical behaviour for callers that have
+	// not opted into a limit).
+	maxTenants int
 }
 
 // NewMultiResolver creates a tenant resolver, which allows request to have
 // multiple tenant ids submitted separated by a '|' character. This enforces
 // further limits on the character set allowed within tenants as detailed here:
 // https://cortexmetrics.io/docs/guides/limitations/#tenant-id-naming)
+//
+// The returned resolver imposes no cap on the number of tenant IDs per
+// request. Use NewMultiResolverWithMax to bound the tenant-set size and
+// avoid identity amplification against per-tenant fair-queueing resources.
 func NewMultiResolver() *MultiResolver {
 	return &MultiResolver{}
+}
+
+// NewMultiResolverWithMax returns a MultiResolver that rejects requests whose
+// tenant set exceeds maxTenants. A non-positive value disables the limit.
+func NewMultiResolverWithMax(maxTenants int) *MultiResolver {
+	return &MultiResolver{maxTenants: maxTenants}
 }
 
 func (t *MultiResolver) TenantID(ctx context.Context) (string, error) {
@@ -130,6 +150,11 @@ func (t *MultiResolver) TenantIDs(ctx context.Context) ([]string, error) {
 	}
 
 	orgIDs := strings.Split(orgID, tenantIDsLabelSeparator)
+	// Cheap pre-check against the raw split so a flood of IDs is rejected
+	// before validation or normalisation runs.
+	if t.maxTenants > 0 && len(orgIDs) > t.maxTenants {
+		return nil, errTooManyTenants
+	}
 	for _, orgID := range orgIDs {
 		if err := ValidTenantID(orgID); err != nil {
 			return nil, err
@@ -139,7 +164,13 @@ func (t *MultiResolver) TenantIDs(ctx context.Context) ([]string, error) {
 		}
 	}
 
-	return NormalizeTenantIDs(orgIDs), nil
+	normalized := NormalizeTenantIDs(orgIDs)
+	// Also enforce on the de-duplicated set in case the pre-check is
+	// disabled and callers rely only on the post-normalisation count.
+	if t.maxTenants > 0 && len(normalized) > t.maxTenants {
+		return nil, errTooManyTenants
+	}
+	return normalized, nil
 }
 
 // ExtractTenantIDFromHTTPRequest extracts a single TenantID through a given

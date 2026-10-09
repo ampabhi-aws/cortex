@@ -104,6 +104,40 @@ func TestSingleResolver(t *testing.T) {
 	}
 }
 
+func TestMultiResolverWithMax(t *testing.T) {
+	r := NewMultiResolverWithMax(2)
+
+	t.Run("within-limit", func(t *testing.T) {
+		ctx := user.InjectOrgID(context.Background(), "tenant-a|tenant-b")
+		ids, err := r.TenantIDs(ctx)
+		assert.NoError(t, err)
+		assert.Equal(t, []string{"tenant-a", "tenant-b"}, ids)
+	})
+
+	t.Run("over-limit", func(t *testing.T) {
+		ctx := user.InjectOrgID(context.Background(), "tenant-a|tenant-b|tenant-c")
+		_, err := r.TenantIDs(ctx)
+		assert.Equal(t, errTooManyTenants, err)
+	})
+
+	t.Run("over-limit-with-duplicates", func(t *testing.T) {
+		// Pre-normalisation count exceeds the limit even though the
+		// distinct count would fit; this is intentionally rejected so the
+		// cheap pre-check cannot be bypassed by padding with duplicates.
+		ctx := user.InjectOrgID(context.Background(), "tenant-a|tenant-a|tenant-a")
+		_, err := r.TenantIDs(ctx)
+		assert.Equal(t, errTooManyTenants, err)
+	})
+
+	t.Run("zero-disables-limit", func(t *testing.T) {
+		unlimited := NewMultiResolverWithMax(0)
+		ctx := user.InjectOrgID(context.Background(), "a|b|c|d|e|f|g|h|i|j|k")
+		ids, err := unlimited.TenantIDs(ctx)
+		assert.NoError(t, err)
+		assert.Len(t, ids, 11)
+	})
+}
+
 func TestMultiResolver(t *testing.T) {
 	r := NewMultiResolver()
 	for _, tc := range append(commonResolverTestCases, []resolverTestCase{
