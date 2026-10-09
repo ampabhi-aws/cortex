@@ -7,6 +7,7 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 
 	"github.com/cortexproject/cortex/pkg/configs/userconfig"
@@ -24,6 +25,13 @@ var (
 	counter  int
 )
 
+// testPrivateAPIToken is the shared bearer credential used in tests to
+// exercise the aggregate /private/api/prom/configs/* endpoints. The code
+// path requires a non-empty token (and a matching Authorization header),
+// which protects production deployments from unauthenticated cross-tenant
+// disclosure.
+const testPrivateAPIToken = "test-private-api-token"
+
 // setup sets up the environment for the tests.
 func setup(t *testing.T) {
 	database = dbtest.Setup(t)
@@ -31,6 +39,7 @@ func setup(t *testing.T) {
 		Notifications: NotificationsConfig{
 			DisableEmail: true,
 		},
+		PrivateAPIToken: testPrivateAPIToken,
 	})
 	counter = 0
 }
@@ -42,6 +51,7 @@ func setupWithEmailEnabled(t *testing.T) {
 		Notifications: NotificationsConfig{
 			DisableEmail: false,
 		},
+		PrivateAPIToken: testPrivateAPIToken,
 	})
 	counter = 0
 }
@@ -56,6 +66,9 @@ func request(t *testing.T, method, urlStr string, body io.Reader) *httptest.Resp
 	w := httptest.NewRecorder()
 	r, err := http.NewRequest(method, urlStr, body)
 	require.NoError(t, err)
+	if strings.HasPrefix(urlStr, "/private/") {
+		r.Header.Set("Authorization", "Bearer "+testPrivateAPIToken)
+	}
 	app.ServeHTTP(w, r)
 	return w
 }

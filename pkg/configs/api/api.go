@@ -1,6 +1,7 @@
 package api
 
 import (
+	"crypto/subtle"
 	"database/sql"
 	"encoding/json"
 	"errors"
@@ -10,6 +11,7 @@ import (
 	"io"
 	"mime"
 	"net/http"
+	"regexp"
 	"strconv"
 	"strings"
 
@@ -35,6 +37,12 @@ var (
 // Config configures Configs API
 type Config struct {
 	Notifications NotificationsConfig `yaml:"notifications"`
+
+	// PrivateAPIToken, when non-empty, is required as a bearer credential in
+	// the Authorization header to call the cross-tenant /private/api/prom/configs/*
+	// endpoints. When empty, the aggregate endpoints are disabled entirely
+	// (they return HTTP 403) to prevent unauthenticated cross-tenant disclosure.
+	PrivateAPIToken string `yaml:"private_api_token"`
 }
 
 // NotificationsConfig configures Alertmanager notifications method.
@@ -47,6 +55,7 @@ type NotificationsConfig struct {
 func (cfg *Config) RegisterFlags(f *flag.FlagSet) {
 	f.BoolVar(&cfg.Notifications.DisableEmail, "configs.notifications.disable-email", false, "Disable Email notifications for Alertmanager.")
 	f.BoolVar(&cfg.Notifications.DisableWebHook, "configs.notifications.disable-webhook", false, "Disable WebHook notifications for Alertmanager.")
+	f.StringVar(&cfg.PrivateAPIToken, "configs.private-api-token", "", "Shared bearer credential required to access the cross-tenant /private/api/prom/configs/{rules,alertmanager} endpoints. When empty, those aggregate endpoints are disabled.")
 }
 
 // API implements the configs api.
@@ -81,12 +90,18 @@ func (a *API) admin(w http.ResponseWriter, r *http.Request) {
 `)
 }
 
-// RegisterRoutes registers the configs API HTTP routes with the provided Router.
-func (a *API) RegisterRoutes(r *mux.Router) {
-	for _, route := range []struct {
-		name, method, path string
-		handler            http.HandlerFunc
-	}{
+// Route describes a single HTTP route registered by the configs API.
+type Route struct {
+	Name, Method, Path string
+	Handler            http.HandlerFunc
+}
+
+// UserRoutes returns the tenant-facing routes. These are expected to be
+// registered behind the standard pkg/api auth middleware (which requires an
+// X-Scope-OrgID header), so individual handlers can rely on
+// tenant.ExtractTenantIDFromHTTPRequest to identify the caller.
+func (a *API) UserRoutes() []Route {
+	return []Route{
 		{"root", "GET", "/", a.admin},
 		// Dedicated APIs for updating rules config. In the future, these *must*
 		// be used.
@@ -99,11 +114,31 @@ func (a *API) RegisterRoutes(r *mux.Router) {
 		{"validate_alertmanager_config", "POST", "/api/prom/configs/alertmanager/validate", a.validateAlertmanagerConfig},
 		{"deactivate_config", "DELETE", "/api/prom/configs/deactivate", a.deactivateConfig},
 		{"restore_config", "POST", "/api/prom/configs/restore", a.restoreConfig},
+	}
+}
+
+// PrivateRoutes returns the cross-tenant aggregate routes. These are gated
+// at request time by a shared bearer token (see Config.PrivateAPIToken); the
+// handler also redacts secret-bearing fields before serializing responses.
+func (a *API) PrivateRoutes() []Route {
+	return []Route{
 		// Internal APIs.
 		{"private_get_rules", "GET", "/private/api/prom/configs/rules", a.getConfigs},
 		{"private_get_alertmanager_config", "GET", "/private/api/prom/configs/alertmanager", a.getConfigs},
-	} {
-		r.Handle(route.path, route.handler).Methods(route.method).Name(route.name)
+	}
+}
+
+// RegisterRoutes registers the configs API HTTP routes with the provided Router.
+//
+// Deprecated: prefer registering through pkg/api so the shared auth middleware
+// is applied to the tenant-facing routes. This method is retained for the
+// in-package tests, which exercise the handler stack directly.
+func (a *API) RegisterRoutes(r *mux.Router) {
+	for _, route := range a.UserRoutes() {
+		r.Handle(route.Path, route.Handler).Methods(route.Method).Name(route.Name)
+	}
+	for _, route := range a.PrivateRoutes() {
+		r.Handle(route.Path, route.Handler).Methods(route.Method).Name(route.Name)
 	}
 }
 
@@ -263,7 +298,28 @@ type ConfigsView struct {
 	Configs map[string]userconfig.View `json:"configs"`
 }
 
+// authorizePrivate enforces the shared bearer-token credential required for
+// the cross-tenant aggregate endpoints. It uses a constant-time comparison
+// and fails closed when no token is configured so the endpoint cannot leak
+// every tenant's configuration without an explicit operator opt-in.
+func (a *API) authorizePrivate(w http.ResponseWriter, r *http.Request) bool {
+	if a.cfg.PrivateAPIToken == "" {
+		http.Error(w, "forbidden: cross-tenant configs endpoint disabled (set -configs.private-api-token to enable)", http.StatusForbidden)
+		return false
+	}
+	expected := []byte("Bearer " + a.cfg.PrivateAPIToken)
+	got := []byte(r.Header.Get("Authorization"))
+	if len(expected) != len(got) || subtle.ConstantTimeCompare(expected, got) != 1 {
+		http.Error(w, "forbidden", http.StatusForbidden)
+		return false
+	}
+	return true
+}
+
 func (a *API) getConfigs(w http.ResponseWriter, r *http.Request) {
+	if !a.authorizePrivate(w, r) {
+		return
+	}
 	var cfgs map[string]userconfig.View
 	var cfgErr error
 	logger := util_log.WithContext(r.Context(), util_log.Logger)
@@ -287,13 +343,49 @@ func (a *API) getConfigs(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	view := ConfigsView{Configs: cfgs}
+	// Redact secret-bearing fields from the raw Alertmanager YAML before
+	// serializing: aggregate responses are consumed by the ruler/alertmanager
+	// over an authenticated channel, but they only need rule and routing
+	// structure — not Slack/PagerDuty webhooks, SMTP passwords, bearer
+	// tokens, etc. Redacting here contains blast radius even if the shared
+	// token leaks.
+	redacted := make(map[string]userconfig.View, len(cfgs))
+	for id, v := range cfgs {
+		v.Config.AlertmanagerConfig = redactAlertmanagerSecrets(v.Config.AlertmanagerConfig)
+		redacted[id] = v
+	}
+
+	view := ConfigsView{Configs: redacted}
 	w.Header().Set("Content-Type", "application/json")
 	if err := json.NewEncoder(w).Encode(view); err != nil {
 		// XXX: Untested
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
 	}
+}
+
+// redactionMarker is substituted for the value of any secret-bearing YAML
+// key in alertmanager configuration returned by the cross-tenant endpoint.
+const redactionMarker = "<redacted>"
+
+// secretKeyRE matches YAML keys whose values commonly hold third-party
+// credentials in Alertmanager configuration: webhook URLs (slack_configs,
+// webhook_configs, oauth2.*), API/service/routing keys (PagerDuty,
+// VictorOps, OpsGenie, Pushover, WeChat, Telegram), SMTP/basic-auth
+// passwords, and bearer tokens.
+var secretKeyRE = regexp.MustCompile(`(?mi)^(\s*)([A-Za-z0-9_-]*(?:api_url|url_file|service_key|routing_key|api_key|auth_token|bearer_token|bot_token|user_key|password|password_file|secret|secret_file|_key|_key_file|credentials|_token)\s*:\s*)(\S.*|"[^"]*"|'[^']*')\s*$`)
+
+// redactAlertmanagerSecrets takes a raw Alertmanager YAML document and
+// returns a copy with the values of common secret-bearing keys replaced by
+// a static marker. This is a conservative string transform (not a full YAML
+// round-trip) so that it never fails on malformed input — in the worst case
+// a value fails to match and remains, which is why this function is used
+// only alongside the shared-token gate on the handler.
+func redactAlertmanagerSecrets(y string) string {
+	if y == "" {
+		return y
+	}
+	return secretKeyRE.ReplaceAllString(y, "${1}${2}"+redactionMarker)
 }
 
 func (a *API) deactivateConfig(w http.ResponseWriter, r *http.Request) {

@@ -4,11 +4,13 @@ import (
 	"encoding/json"
 	"fmt"
 	"net/http"
+	"net/http/httptest"
 	"os"
 	"path"
 	"strings"
 	"testing"
 
+	"github.com/cortexproject/cortex/pkg/configs/db/dbtest"
 	"github.com/cortexproject/cortex/pkg/configs/userconfig"
 
 	"github.com/stretchr/testify/assert"
@@ -395,4 +397,108 @@ func Test_SetConfig_ValidateTemplateFiles(t *testing.T) {
 
 	err := validateTemplateFiles(cfg)
 	assert.Equal(t, nil, err)
+}
+
+// Test_PrivateEndpoint_RejectsUnauthenticated proves that the aggregate
+// /private/api/prom/configs/* endpoints no longer serve cluster-wide
+// configuration to anonymous callers (CWE-1220).
+func Test_PrivateEndpoint_RejectsUnauthenticated(t *testing.T) {
+	setup(t)
+	defer cleanup(t)
+
+	// Seed a config so an unauthenticated caller would otherwise see it.
+	_ = rulesClient.post(t, makeUserID(), makeConfig())
+
+	for _, endpoint := range []string{
+		"/private/api/prom/configs/rules",
+		"/private/api/prom/configs/alertmanager",
+	} {
+		// No Authorization header at all.
+		w := httptest.NewRecorder()
+		r, err := http.NewRequest("GET", endpoint, nil)
+		require.NoError(t, err)
+		app.ServeHTTP(w, r)
+		assert.Equal(t, http.StatusForbidden, w.Code, "endpoint=%s", endpoint)
+
+		// Wrong token.
+		w = httptest.NewRecorder()
+		r, err = http.NewRequest("GET", endpoint, nil)
+		require.NoError(t, err)
+		r.Header.Set("Authorization", "Bearer not-the-right-token")
+		app.ServeHTTP(w, r)
+		assert.Equal(t, http.StatusForbidden, w.Code, "endpoint=%s wrong-token", endpoint)
+	}
+}
+
+// Test_PrivateEndpoint_DisabledWhenTokenEmpty proves the handler fails
+// closed when no shared token has been configured, so a misconfiguration
+// cannot leak cross-tenant data by accident.
+func Test_PrivateEndpoint_DisabledWhenTokenEmpty(t *testing.T) {
+	database = dbtest.Setup(t)
+	defer dbtest.Cleanup(t, database)
+	app = New(database, Config{
+		Notifications: NotificationsConfig{DisableEmail: true},
+		// PrivateAPIToken intentionally left empty.
+	})
+	counter = 0
+
+	w := httptest.NewRecorder()
+	r, err := http.NewRequest("GET", "/private/api/prom/configs/rules", nil)
+	require.NoError(t, err)
+	// Even with a valid-looking bearer header, the endpoint must stay closed.
+	r.Header.Set("Authorization", "Bearer anything")
+	app.ServeHTTP(w, r)
+	assert.Equal(t, http.StatusForbidden, w.Code)
+}
+
+// Test_PrivateEndpoint_RedactsAlertmanagerSecrets proves that the raw
+// Alertmanager YAML returned by the aggregate endpoint has secret-bearing
+// values stripped, so a compromised consumer never sees Slack webhooks,
+// PagerDuty keys, SMTP/basic-auth passwords, bearer tokens, etc.
+func Test_PrivateEndpoint_RedactsAlertmanagerSecrets(t *testing.T) {
+	setup(t)
+	defer cleanup(t)
+
+	const amCfg = `route:
+  receiver: s
+receivers:
+- name: s
+  slack_configs:
+  - api_url: https://hooks.slack.com/services/T000/B000/TENANT-SECRET
+    channel: "#a"
+`
+	userID := makeUserID()
+	cfg := userconfig.Config{
+		AlertmanagerConfig: amCfg,
+		RulesConfig:        userconfig.RulesConfig{FormatVersion: userconfig.RuleFormatV2},
+	}
+	// Post via raw request to bypass the Alertmanager config validator.
+	w := requestAsUser(t, userID, "POST", "/api/prom/configs/alertmanager", "", readerFromConfig(t, cfg))
+	require.Equal(t, http.StatusNoContent, w.Code, "body: %s", w.Body.String())
+
+	w = request(t, "GET", "/private/api/prom/configs/alertmanager", nil)
+	require.Equal(t, http.StatusOK, w.Code)
+	body := w.Body.String()
+	assert.NotContains(t, body, "TENANT-SECRET")
+	assert.Contains(t, body, redactionMarker)
+}
+
+func Test_RedactAlertmanagerSecrets(t *testing.T) {
+	in := `route:
+  receiver: s
+receivers:
+- name: s
+  slack_configs:
+  - api_url: https://hooks.slack.com/leak
+  email_configs:
+  - auth_password: SMTP-SECRET
+  http_config:
+    bearer_token: BEARER-SECRET
+    authorization:
+      credentials: CREDS-SECRET
+`
+	out := redactAlertmanagerSecrets(in)
+	for _, s := range []string{"https://hooks.slack.com/leak", "SMTP-SECRET", "BEARER-SECRET", "CREDS-SECRET"} {
+		assert.NotContains(t, out, s, "secret %q leaked", s)
+	}
 }
