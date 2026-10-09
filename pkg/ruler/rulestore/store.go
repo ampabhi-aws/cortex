@@ -19,6 +19,14 @@ var (
 // RuleStore is used to store and retrieve rules.
 // Methods starting with "List" prefix may return partially loaded groups: with only group Name, Namespace and User fields set.
 // To make sure that rules within each group are loaded, client must use LoadRuleGroups method.
+//
+// Implementations must be safe for concurrent use from multiple goroutines.
+// The Cortex ruler fans these methods out to many goroutines (see
+// fetchRulesConcurrency and loadRulesConcurrency in pkg/ruler/ruler.go) and
+// also calls them from HTTP handlers; implementations must therefore
+// synchronise any internal state and must not return references to shared
+// mutable state that callers could mutate while another goroutine is
+// reading or writing it.
 type RuleStore interface {
 	// ListAllUsers returns all users with rule groups configured.
 	ListAllUsers(ctx context.Context) ([]string, error)
