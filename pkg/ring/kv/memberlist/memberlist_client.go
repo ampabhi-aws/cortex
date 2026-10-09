@@ -28,6 +28,25 @@ import (
 const (
 	maxCasRetries              = 10          // max retries in CAS operation
 	noChangeDetectedRetrySleep = time.Second // how long to sleep after no change was detected in CAS
+
+	// maxEncodedValueSize bounds the size of an incoming encoded (snappy-compressed)
+	// KV value accepted from gossip before it is handed to any codec. It is a
+	// cheap first line of defence against decompression bombs on the
+	// NotifyMsg/MergeRemoteState paths (CWE-770): any value larger than this is
+	// dropped without decoding. 2 MiB is well above legitimate ring payloads
+	// (which Encode via snappy and are typically kilobytes) while keeping worst
+	// case concurrent allocations bounded.
+	maxEncodedValueSize = 2 * 1024 * 1024
+
+	// maxMergeRemoteStatePairs caps the number of KV pairs this process will
+	// process in a single MergeRemoteState invocation. memberlist allows up to
+	// maxPushPullRequests (128) concurrent push/pull streams, so a per-stream
+	// cap is required to bound total work per connection.
+	maxMergeRemoteStatePairs = 1024
+
+	// maxMergeRemoteStateSize caps the aggregate size of encoded KV values
+	// processed in a single MergeRemoteState invocation.
+	maxMergeRemoteStateSize = 32 * 1024 * 1024
 )
 
 // Client implements kv.Client interface, by using memberlist.KV
@@ -238,6 +257,15 @@ type KV struct {
 	// Codec registry
 	codecs map[string]codec.Codec
 
+	// Allow-list of keys/prefixes this process actively uses locally. Gossip
+	// updates for keys that are not in the allow-list are dropped so a remote
+	// peer cannot grow the local store with arbitrary attacker-chosen keys
+	// (CWE-770 — unbounded key space). The allow-list is populated lazily when
+	// local client code performs an operation (Get/CAS/WatchKey/WatchPrefix/List).
+	acceptedKeysMu   sync.Mutex
+	acceptedKeys     map[string]struct{}
+	acceptedPrefixes map[string]struct{}
+
 	// Key watchers
 	watchersMu     sync.Mutex
 	watchers       map[string][]chan string
@@ -348,6 +376,8 @@ func NewKV(cfg KVConfig, logger log.Logger, dnsProvider DNSProvider, registerer 
 		codecs:         make(map[string]codec.Codec),
 		watchers:       make(map[string][]chan string),
 		prefixWatchers: make(map[string][]chan string),
+		acceptedKeys:     make(map[string]struct{}),
+		acceptedPrefixes: make(map[string]struct{}),
 		shutdown:       make(chan struct{}),
 		maxCasRetries:  maxCasRetries,
 	}
@@ -510,6 +540,51 @@ func (m *KV) GetCodec(codecID string) codec.Codec {
 	return m.codecs[codecID]
 }
 
+// registerKnownKey records that this process actively uses the given key
+// locally. Only keys in the allow-list are accepted from gossip, which
+// prevents remote peers from injecting arbitrary keys into the local store
+// (CWE-770 — unbounded key space).
+func (m *KV) registerKnownKey(key string) {
+	if key == "" {
+		return
+	}
+	m.acceptedKeysMu.Lock()
+	defer m.acceptedKeysMu.Unlock()
+	m.acceptedKeys[key] = struct{}{}
+}
+
+// registerKnownPrefix records that this process watches a key prefix locally.
+// Any gossip key starting with a registered prefix is accepted. An empty
+// prefix is ignored to avoid accidentally opening the allow-list to every key.
+func (m *KV) registerKnownPrefix(prefix string) {
+	if prefix == "" {
+		return
+	}
+	m.acceptedKeysMu.Lock()
+	defer m.acceptedKeysMu.Unlock()
+	m.acceptedPrefixes[prefix] = struct{}{}
+}
+
+// isKeyAccepted reports whether the given key should be processed when it is
+// received from gossip. A key is accepted if it has been seen in any local
+// operation (Get/CAS/WatchKey/List) or if it matches a registered prefix.
+func (m *KV) isKeyAccepted(key string) bool {
+	if key == "" {
+		return false
+	}
+	m.acceptedKeysMu.Lock()
+	defer m.acceptedKeysMu.Unlock()
+	if _, ok := m.acceptedKeys[key]; ok {
+		return true
+	}
+	for p := range m.acceptedPrefixes {
+		if strings.HasPrefix(key, p) {
+			return true
+		}
+	}
+	return false
+}
+
 // GetListeningPort returns port used for listening for memberlist communication. Useful when BindPort is set to 0.
 // This call is only valid after KV service has been started.
 func (m *KV) GetListeningPort() int {
@@ -640,6 +715,11 @@ func (m *KV) stopping(_ error) error {
 // List returns all known keys under a given prefix.
 // No communication with other nodes in the cluster is done here.
 func (m *KV) List(prefix string) []string {
+	// Local operations register their keys/prefixes so gossip can be filtered
+	// against the resulting allow-list. For List, the caller is interested in
+	// any key under this prefix.
+	m.registerKnownPrefix(prefix)
+
 	m.storeMu.Lock()
 	defer m.storeMu.Unlock()
 
@@ -655,6 +735,7 @@ func (m *KV) List(prefix string) []string {
 // Get returns current value associated with given key.
 // No communication with other nodes in the cluster is done here.
 func (m *KV) Get(key string, codec codec.Codec) (interface{}, error) {
+	m.registerKnownKey(key)
 	val, _, err := m.get(key, codec)
 	return val, err
 }
@@ -679,6 +760,8 @@ func (m *KV) get(key string, codec codec.Codec) (out interface{}, version uint, 
 //
 // Watching ends when 'f' returns false, context is done, or this client is shut down.
 func (m *KV) WatchKey(ctx context.Context, key string, codec codec.Codec, f func(interface{}) bool) {
+	m.registerKnownKey(key)
+
 	// keep one extra notification, to avoid missing notification if we're busy running the function
 	w := make(chan string, 1)
 
@@ -726,6 +809,8 @@ func (m *KV) WatchKey(ctx context.Context, key string, codec codec.Codec, f func
 //
 // Watching ends when 'f' returns false, context is done, or this client is shut down.
 func (m *KV) WatchPrefix(ctx context.Context, prefix string, codec codec.Codec, f func(string, interface{}) bool) {
+	m.registerKnownPrefix(prefix)
+
 	// we use bigger buffer here, since keys are interesting and we don't want to lose them.
 	w := make(chan string, 16)
 
@@ -825,6 +910,8 @@ func (m *KV) notifyWatchers(key string) {
 // detect removals. If Merge doesn't result in any change (returns nil), then operation fails and is retried again.
 // After too many failed retries, this method returns error.
 func (m *KV) CAS(ctx context.Context, key string, codec codec.Codec, f func(in interface{}) (out interface{}, retry bool, err error)) error {
+	m.registerKnownKey(key)
+
 	var lastError error
 
 outer:
@@ -978,6 +1065,24 @@ func (m *KV) NotifyMsg(msg []byte) {
 		return
 	}
 
+	// Reject oversized encoded values before handing them to the codec. This
+	// bounds the attacker-controlled input size that can reach snappy.Decode
+	// and defends against decompression bombs on the gossip path (CWE-770).
+	if len(kvPair.Value) > maxEncodedValueSize {
+		m.numberOfInvalidReceivedMessages.Inc()
+		level.Warn(m.logger).Log("msg", "dropping oversized gossip KV value", "key", kvPair.Key, "size", len(kvPair.Value), "limit", maxEncodedValueSize)
+		return
+	}
+
+	// Only accept gossip for keys this process actively uses locally. Without
+	// an allow-list a remote peer could inject unlimited attacker-chosen keys
+	// into our store, which would then be re-broadcast cluster-wide.
+	if !m.isKeyAccepted(kvPair.Key) {
+		m.numberOfInvalidReceivedMessages.Inc()
+		level.Debug(m.logger).Log("msg", "ignoring gossip for unknown key", "key", kvPair.Key)
+		return
+	}
+
 	codec := m.GetCodec(kvPair.GetCodec())
 	if codec == nil {
 		m.numberOfInvalidReceivedMessages.Inc()
@@ -1125,9 +1230,18 @@ func (m *KV) MergeRemoteState(data []byte, join bool) {
 	kvPair := KeyValuePair{}
 
 	var err error
+	// Caps on the amount of work per push/pull invocation. memberlist allows up
+	// to maxPushPullRequests (128) concurrent streams, so these per-invocation
+	// limits bound aggregate memory and CPU under hostile gossip (CWE-770).
+	pairsProcessed := 0
+	totalValueSize := 0
 	// Data contains individual KV pairs (encoded as protobuf messages), each prefixed with 4 bytes length of KV pair:
 	// [4-bytes length of marshalled KV pair] [marshalled KV pair] [4-bytes length] [KV pair]...
 	for len(data) > 0 {
+		if pairsProcessed >= maxMergeRemoteStatePairs {
+			err = fmt.Errorf("remote state exceeds pair limit (%d)", maxMergeRemoteStatePairs)
+			break
+		}
 		if len(data) < 4 {
 			err = fmt.Errorf("not enough data left for another KV Pair: %d", len(data))
 			break
@@ -1150,6 +1264,25 @@ func (m *KV) MergeRemoteState(data []byte, join bool) {
 		}
 
 		data = data[kvPairLength:]
+		pairsProcessed++
+
+		// Reject oversized encoded values before any codec work. Also enforce
+		// an aggregate cap across all pairs in this invocation.
+		if len(kvPair.Value) > maxEncodedValueSize {
+			level.Warn(m.logger).Log("msg", "dropping oversized gossip KV value", "key", kvPair.Key, "size", len(kvPair.Value), "limit", maxEncodedValueSize)
+			continue
+		}
+		totalValueSize += len(kvPair.Value)
+		if totalValueSize > maxMergeRemoteStateSize {
+			err = fmt.Errorf("remote state exceeds total size limit (%d)", maxMergeRemoteStateSize)
+			break
+		}
+
+		// Ignore gossip for keys this process does not actively use locally.
+		if !m.isKeyAccepted(kvPair.Key) {
+			level.Debug(m.logger).Log("msg", "ignoring remote state for unknown key", "key", kvPair.Key)
+			continue
+		}
 
 		codec := m.GetCodec(kvPair.GetCodec())
 		if codec == nil {

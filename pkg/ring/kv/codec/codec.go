@@ -1,9 +1,21 @@
 package codec
 
 import (
+	"fmt"
+
 	"github.com/gogo/protobuf/proto"
 	"github.com/golang/snappy"
 )
+
+// MaxDecodedSize is an upper bound on the uncompressed size of a single
+// snappy-encoded value accepted by Proto.Decode. It is deliberately set well
+// above any legitimate ring/KV payload so that honest producers are never
+// rejected, while preventing an attacker-declared decompressed length from
+// forcing an unbounded allocation (CWE-770). The vendored golang/snappy
+// library allocates the destination buffer from the declared length *before*
+// validating the body, so this limit must be enforced before calling
+// snappy.Decode.
+const MaxDecodedSize = 32 << 20 // 32 MiB
 
 // Codec allows KV clients to serialise and deserialise values.
 type Codec interface {
@@ -30,13 +42,26 @@ func (p Proto) CodecID() string {
 }
 
 // Decode implements Codec
-func (p Proto) Decode(bytes []byte) (interface{}, error) {
-	out := p.factory()
-	bytes, err := snappy.Decode(nil, bytes)
+func (p Proto) Decode(data []byte) (interface{}, error) {
+	// Bound the decompressed size before allocating. snappy.Decode allocates a
+	// buffer sized by the attacker-declared uncompressed length header (up to
+	// 0xFFFFFFFF) before validating the body, so this pre-check is required to
+	// prevent remote OOM via unauthenticated gossip (CWE-770).
+	n, err := snappy.DecodedLen(data)
 	if err != nil {
 		return nil, err
 	}
-	if err := proto.Unmarshal(bytes, out); err != nil {
+	if n > MaxDecodedSize {
+		return nil, fmt.Errorf("snappy payload too large: declared %d bytes, limit %d", n, MaxDecodedSize)
+	}
+	out := p.factory()
+	// Allocate the destination with the already-validated declared length so
+	// snappy.Decode cannot grow it past our limit.
+	plain, err := snappy.Decode(make([]byte, 0, n), data)
+	if err != nil {
+		return nil, err
+	}
+	if err := proto.Unmarshal(plain, out); err != nil {
 		return nil, err
 	}
 	return out, nil
