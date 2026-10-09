@@ -551,8 +551,12 @@ func (q *blocksStoreQuerier) queryWithConsistencyCheck(ctx context.Context, logg
 	}
 
 	// We've not been able to query all expected blocks after all retries.
-	level.Warn(util_log.WithContext(ctx, logger)).Log("msg", "failed consistency check", "err", err)
-	return fmt.Errorf("consistency check failed because some blocks were not queried: %s", strings.Join(convertULIDsToString(remainingBlocks), " "))
+	// Log the missing block ULIDs for operators; return only a count to the caller
+	// so object-storage block identifiers do not leak across the tenant boundary.
+	level.Warn(util_log.WithContext(ctx, logger)).Log("msg", "failed consistency check",
+		"err", err,
+		"missing_blocks", strings.Join(convertULIDsToString(remainingBlocks), " "))
+	return fmt.Errorf("consistency check failed because %d blocks were not queried", len(remainingBlocks))
 }
 
 func (q *blocksStoreQuerier) fetchSeriesFromStores(
@@ -609,10 +613,12 @@ func (q *blocksStoreQuerier) fetchSeriesFromStores(
 			stream, err := c.Series(gCtx, req)
 			if err != nil {
 				if isRetryableError(err) {
-					level.Warn(spanLog).Log("err", errors.Wrapf(err, "failed to fetch series from %s due to retryable error", c.RemoteAddress()))
+					level.Warn(spanLog).Log("msg", "failed to fetch series due to retryable error", "instance", c.RemoteAddress(), "err", err)
 					return nil
 				}
-				return errors.Wrapf(err, "failed to fetch series from %s", c.RemoteAddress())
+				// Log the store-gateway instance; do NOT embed it in the returned error.
+				level.Warn(spanLog).Log("msg", "failed to fetch series", "instance", c.RemoteAddress(), "err", err)
+				return errors.Wrap(err, "failed to fetch series from store-gateway")
 			}
 
 			mySeries := []*storepb.Series(nil)
@@ -632,12 +638,14 @@ func (q *blocksStoreQuerier) fetchSeriesFromStores(
 				}
 
 				if isRetryableError(err) {
-					level.Warn(spanLog).Log("err", errors.Wrapf(err, "failed to receive series from %s due to retryable error", c.RemoteAddress()))
+					level.Warn(spanLog).Log("msg", "failed to receive series due to retryable error", "instance", c.RemoteAddress(), "err", err)
 					return nil
 				}
 
 				if err != nil {
-					return errors.Wrapf(err, "failed to receive series from %s", c.RemoteAddress())
+					// Log the store-gateway instance; do NOT embed it in the returned error.
+					level.Warn(spanLog).Log("msg", "failed to receive series", "instance", c.RemoteAddress(), "err", err)
+					return errors.Wrap(err, "failed to receive series from store-gateway")
 				}
 
 				// Response may either contain series, warning or hints.
@@ -677,7 +685,8 @@ func (q *blocksStoreQuerier) fetchSeriesFromStores(
 				if h := resp.GetHints(); h != nil {
 					hints := hintspb.SeriesResponseHints{}
 					if err := types.UnmarshalAny(h, &hints); err != nil {
-						return errors.Wrapf(err, "failed to unmarshal series hints from %s", c.RemoteAddress())
+						level.Warn(spanLog).Log("msg", "failed to unmarshal series hints", "instance", c.RemoteAddress(), "err", err)
+						return errors.Wrap(err, "failed to unmarshal series hints from store-gateway")
 					}
 
 					ids, err := convertBlockHintsToULIDs(hints.QueriedBlocks)
@@ -756,17 +765,19 @@ func (q *blocksStoreQuerier) fetchLabelNamesFromStore(
 			namesResp, err := c.LabelNames(gCtx, req)
 			if err != nil {
 				if isRetryableError(err) {
-					level.Warn(spanLog).Log("err", errors.Wrapf(err, "failed to fetch series from %s due to retryable error", c.RemoteAddress()))
+					level.Warn(spanLog).Log("msg", "failed to fetch label names due to retryable error", "instance", c.RemoteAddress(), "err", err)
 					return nil
 				}
-				return errors.Wrapf(err, "failed to fetch series from %s", c.RemoteAddress())
+				level.Warn(spanLog).Log("msg", "failed to fetch label names", "instance", c.RemoteAddress(), "err", err)
+				return errors.Wrap(err, "failed to fetch label names from store-gateway")
 			}
 
 			myQueriedBlocks := []ulid.ULID(nil)
 			if namesResp.Hints != nil {
 				hints := hintspb.LabelNamesResponseHints{}
 				if err := types.UnmarshalAny(namesResp.Hints, &hints); err != nil {
-					return errors.Wrapf(err, "failed to unmarshal label names hints from %s", c.RemoteAddress())
+					level.Warn(spanLog).Log("msg", "failed to unmarshal label names hints", "instance", c.RemoteAddress(), "err", err)
+					return errors.Wrap(err, "failed to unmarshal label names hints from store-gateway")
 				}
 
 				ids, err := convertBlockHintsToULIDs(hints.QueriedBlocks)
@@ -837,17 +848,19 @@ func (q *blocksStoreQuerier) fetchLabelValuesFromStore(
 			valuesResp, err := c.LabelValues(gCtx, req)
 			if err != nil {
 				if isRetryableError(err) {
-					level.Warn(spanLog).Log("err", errors.Wrapf(err, "failed to fetch series from %s due to retryable error", c.RemoteAddress()))
+					level.Warn(spanLog).Log("msg", "failed to fetch label values due to retryable error", "instance", c.RemoteAddress(), "err", err)
 					return nil
 				}
-				return errors.Wrapf(err, "failed to fetch series from %s", c.RemoteAddress())
+				level.Warn(spanLog).Log("msg", "failed to fetch label values", "instance", c.RemoteAddress(), "err", err)
+				return errors.Wrap(err, "failed to fetch label values from store-gateway")
 			}
 
 			myQueriedBlocks := []ulid.ULID(nil)
 			if valuesResp.Hints != nil {
 				hints := hintspb.LabelValuesResponseHints{}
 				if err := types.UnmarshalAny(valuesResp.Hints, &hints); err != nil {
-					return errors.Wrapf(err, "failed to unmarshal label values hints from %s", c.RemoteAddress())
+					level.Warn(spanLog).Log("msg", "failed to unmarshal label values hints", "instance", c.RemoteAddress(), "err", err)
+					return errors.Wrap(err, "failed to unmarshal label values hints from store-gateway")
 				}
 
 				ids, err := convertBlockHintsToULIDs(hints.QueriedBlocks)

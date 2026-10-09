@@ -62,14 +62,14 @@ func TestMetadataHandler_Error(t *testing.T) {
 	recorder := httptest.NewRecorder()
 	handler.ServeHTTP(recorder, request)
 
-	require.Equal(t, http.StatusBadRequest, recorder.Result().StatusCode)
+	require.Equal(t, http.StatusInternalServerError, recorder.Result().StatusCode)
 	responseBody, err := io.ReadAll(recorder.Result().Body)
 	require.NoError(t, err)
 
 	expectedJSON := `
 	{
 		"status": "error",
-		"error": "no user id"
+		"error": "internal server error retrieving metrics metadata"
 	}
 	`
 

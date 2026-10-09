@@ -65,7 +65,10 @@ func RemoteReadHandler(q storage.Queryable, logger log.Logger) http.Handler {
 			}
 		}
 		if lastErr != nil {
-			http.Error(w, lastErr.Error(), http.StatusBadRequest)
+			// Log the raw error server-side; do NOT return it to the caller as it may
+			// contain internal identifiers (store-gateway addresses, block ULIDs, etc.).
+			level.Warn(logger).Log("msg", "remote read failed", "err", lastErr)
+			http.Error(w, "internal server error executing remote read", http.StatusInternalServerError)
 			return
 		}
 		w.Header().Add("Content-Type", "application/x-protobuf")
