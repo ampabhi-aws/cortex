@@ -276,6 +276,17 @@ func (c *Config) registerServerFlagsWithChangedDefaultValues(fs *flag.FlagSet) {
 
 		case "server.grpc.keepalive.ping-without-stream-allowed":
 			_ = f.Value.Set("true")
+
+		case "server.register-instrumentation":
+			// Default-off: the vendored weaveworks server mounts /metrics
+			// and the full net/http/pprof tree on the same unauthenticated
+			// router as the tenant-facing API when this flag is true. We
+			// flip the default so profiling and metrics handlers are not
+			// exposed on the tenant-facing port unless the operator
+			// explicitly re-enables it after fronting Cortex with an
+			// authenticating reverse proxy that blocks /debug/* and
+			// /metrics.
+			_ = f.Value.Set("false")
 		}
 
 		fs.Var(f.Value, f.Name, f.Usage)

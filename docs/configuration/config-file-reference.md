@@ -86,6 +86,14 @@ api:
   # CLI flag: -api.http-request-headers-to-log
   [http_request_headers_to_log: <list of string> | default = []]
 
+  # If true, mount the Cortex /debug/fgprof profiling endpoint on the HTTP
+  # router. Defaults to false; when enabled the endpoint is wrapped with the
+  # configured auth middleware. Operators are responsible for additionally
+  # blocking /debug/*, /metrics, /config, /runtime_config and / at an external
+  # reverse proxy.
+  # CLI flag: -api.enable-profiling
+  [enable_profiling: <boolean> | default = false]
+
 # The server_config configures the HTTP and gRPC server of the launched
 # service(s).
 [server: <server_config>]
@@ -330,9 +338,12 @@ grpc_tls_config:
   # CLI flag: -server.grpc-tls-ca-path
   [client_ca_file: <string> | default = ""]
 
-# Register the intrumentation handlers (/metrics etc).
+# Register the intrumentation handlers (/metrics etc). The upstream default
+# is true, but Cortex changes the default to false because the handlers
+# (including the full /debug/pprof tree) are mounted on the same HTTP
+# listener as the tenant-facing API and have no in-process authentication.
 # CLI flag: -server.register-instrumentation
-[register_instrumentation: <boolean> | default = true]
+[register_instrumentation: <boolean> | default = false]
 
 # Timeout for graceful shutdowns
 # CLI flag: -server.graceful-shutdown-timeout

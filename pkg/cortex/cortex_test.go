@@ -230,6 +230,7 @@ func TestFlagDefaults(t *testing.T) {
 
 	minTimeChecked := false
 	pingWithoutStreamChecked := false
+	registerInstrumentationChecked := false
 	for {
 		line, err := buf.ReadString(delim)
 		if err == io.EOF {
@@ -251,13 +252,25 @@ func TestFlagDefaults(t *testing.T) {
 			assert.Contains(t, nextLine, "(default true)")
 			pingWithoutStreamChecked = true
 		}
+
+		if strings.Contains(line, "-server.register-instrumentation") {
+			// Cortex overrides the upstream weaveworks default of true so
+			// /metrics and /debug/pprof are not mounted on the tenant-facing
+			// HTTP listener by default.
+			nextLine, err := buf.ReadString(delim)
+			require.NoError(t, err)
+			assert.NotContains(t, nextLine, "(default true)")
+			registerInstrumentationChecked = true
+		}
 	}
 
 	require.True(t, minTimeChecked)
 	require.True(t, pingWithoutStreamChecked)
+	require.True(t, registerInstrumentationChecked)
 
 	require.Equal(t, true, c.Server.GRPCServerPingWithoutStreamAllowed)
 	require.Equal(t, 10*time.Second, c.Server.GRPCServerMinTimeBetweenPings)
+	require.Equal(t, false, c.Server.RegisterInstrumentation)
 }
 
 // Generates server config, with gRPC listening on random port.
