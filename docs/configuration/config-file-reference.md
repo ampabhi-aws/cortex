@@ -1043,7 +1043,7 @@ results_cache:
 
     # The default validity of entries for caches unless overridden.
     # CLI flag: -frontend.default-validity
-    [default_validity: <duration> | default = 0s]
+    [default_validity: <duration> | default = 1h]
 
     background:
       # At what concurrency to write back to cache.

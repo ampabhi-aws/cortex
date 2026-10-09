@@ -51,7 +51,17 @@ func (cfg *Config) RegisterFlagsWithPrefix(prefix string, description string, f 
 	cfg.Fifocache.RegisterFlagsWithPrefix(prefix, description, f)
 
 	f.BoolVar(&cfg.EnableFifoCache, prefix+"cache.enable-fifocache", false, description+"Enable in-memory cache.")
-	f.DurationVar(&cfg.DefaultValidity, prefix+"default-validity", 0, description+"The default validity of entries for caches unless overridden.")
+	// The query-frontend results cache has no other invalidation mechanism (the
+	// cache-generation-number loader is a noop since the chunks-storage series
+	// deletion feature was removed), so give the frontend cache a sane default
+	// TTL to bound how long stale/deleted-tenant results can be served. Other
+	// cache namespaces keep the previous default of 0 (no expiry) to preserve
+	// existing behavior.
+	defaultValidity := time.Duration(0)
+	if prefix == "frontend." {
+		defaultValidity = 1 * time.Hour
+	}
+	f.DurationVar(&cfg.DefaultValidity, prefix+"default-validity", defaultValidity, description+"The default validity of entries for caches unless overridden.")
 
 	cfg.Prefix = prefix
 }

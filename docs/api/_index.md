@@ -797,6 +797,13 @@ POST /purger/delete_tenant
 
 Request deletion of ALL tenant data. Only works with blocks storage. Experimental.
 
+Note: this endpoint only triggers deletion of the tenant's blocks (and other
+per-tenant state). It does not actively invalidate the query-frontend results
+cache; cached PromQL query results for the deleted tenant are evicted when
+their TTL expires. The default TTL is controlled by `-frontend.default-validity`
+(defaults to `1h`); operators who require stricter deletion semantics should
+lower it or disable the results cache (`-querier.cache-results=false`).
+
 _Requires [authentication](#authentication)._
 
 ### Tenant Delete Status
