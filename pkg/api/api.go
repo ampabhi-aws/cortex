@@ -5,6 +5,7 @@ import (
 	"flag"
 	"net/http"
 	"path"
+	"strconv"
 	"strings"
 
 	"github.com/NYTimes/gziphandler"
@@ -48,6 +49,20 @@ type Config struct {
 	AlertmanagerHTTPPrefix string `yaml:"alertmanager_http_prefix"`
 	PrometheusHTTPPrefix   string `yaml:"prometheus_http_prefix"`
 
+	// EnableProfilingEndpoints controls whether unauthenticated profiling
+	// endpoints (such as /debug/fgprof) are mounted on the tenant-facing
+	// HTTP listener. It is false by default so profilers are not exposed
+	// without an explicit operator opt-in. See
+	// https://github.com/cortexproject/cortex for guidance on fronting
+	// Cortex with an authenticating reverse proxy before enabling this.
+	EnableProfilingEndpoints bool `yaml:"enable_profiling_endpoints"`
+
+	// FgprofMaxSeconds clamps the "seconds" query parameter of the
+	// /debug/fgprof handler to avoid single-request stop-the-world sampling
+	// of arbitrary duration. Only meaningful when
+	// EnableProfilingEndpoints is true.
+	FgprofMaxSeconds int `yaml:"fgprof_max_seconds"`
+
 	// The following configs are injected by the upstream caller.
 	ServerPrefix       string               `yaml:"-"`
 	LegacyHTTPPrefix   string               `yaml:"-"`
@@ -71,6 +86,8 @@ type Config struct {
 func (cfg *Config) RegisterFlags(f *flag.FlagSet) {
 	f.BoolVar(&cfg.ResponseCompression, "api.response-compression-enabled", false, "Use GZIP compression for API responses. Some endpoints serve large YAML or JSON blobs which can benefit from compression.")
 	f.Var(&cfg.HTTPRequestHeadersToLog, "api.http-request-headers-to-log", "Which HTTP Request headers to add to logs")
+	f.BoolVar(&cfg.EnableProfilingEndpoints, "api.enable-profiling-endpoints", false, "Mount profiling endpoints (/debug/fgprof) on the HTTP listener. Disabled by default because these endpoints perform stop-the-world sampling and must be protected by an authenticating reverse proxy or admin network before being exposed.")
+	f.IntVar(&cfg.FgprofMaxSeconds, "api.fgprof-max-seconds", 30, "Maximum value (in seconds) permitted for the \"seconds\" query parameter of /debug/fgprof. Requests exceeding this bound are clamped. Only applies when -api.enable-profiling-endpoints is true.")
 	cfg.RegisterFlagsWithPrefix("", f)
 }
 
@@ -219,7 +236,50 @@ func (a *API) RegisterAPI(httpPathPrefix string, actualCfg interface{}, defaultC
 
 	a.RegisterRoute("/config", a.cfg.configHandler(actualCfg, defaultCfg), false, "GET")
 	a.RegisterRoute("/", indexHandler(httpPathPrefix, a.indexPage), false, "GET")
-	a.RegisterRoute("/debug/fgprof", fgprof.Handler(), false, "GET")
+
+	// The fgprof endpoint invokes runtime.GoroutineProfile at 99 Hz for the
+	// requested duration, which stops the world and scales with the live
+	// goroutine count. Exposing it unauthenticated with an unbounded
+	// "seconds" query parameter is a trivial remote denial-of-service
+	// vector (CWE-770), so we gate the route behind an explicit opt-in and
+	// serialise requests through a wrapper that clamps the duration.
+	if a.cfg.EnableProfilingEndpoints {
+		maxSeconds := a.cfg.FgprofMaxSeconds
+		if maxSeconds <= 0 {
+			maxSeconds = 30
+		}
+		a.RegisterRoute("/debug/fgprof", boundedFgprofHandler(fgprof.Handler(), maxSeconds), false, "GET")
+	}
+}
+
+// profileInFlight serialises /debug/fgprof requests to at most one at a time
+// so concurrent clients cannot stack independent 99 Hz runtime.GoroutineProfile
+// samplers against the same process.
+var profileInFlight = make(chan struct{}, 1)
+
+// boundedFgprofHandler wraps the fgprof handler to (a) reject concurrent
+// profile requests with 429 and (b) clamp the "seconds" query parameter to
+// maxSeconds to prevent a single request from pinning a stop-the-world
+// sampler for an attacker-controlled duration.
+func boundedFgprofHandler(inner http.Handler, maxSeconds int) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		select {
+		case profileInFlight <- struct{}{}:
+		default:
+			http.Error(w, "a profile is already in progress", http.StatusTooManyRequests)
+			return
+		}
+		defer func() { <-profileInFlight }()
+
+		q := r.URL.Query()
+		if s := q.Get("seconds"); s != "" {
+			if n, err := strconv.Atoi(s); err == nil && n > maxSeconds {
+				q.Set("seconds", strconv.Itoa(maxSeconds))
+				r.URL.RawQuery = q.Encode()
+			}
+		}
+		inner.ServeHTTP(w, r)
+	})
 }
 
 // RegisterRuntimeConfig registers the endpoints associates with the runtime configuration
