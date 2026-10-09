@@ -20,6 +20,7 @@ import (
 	amconfig "github.com/prometheus/alertmanager/config"
 	amtemplate "github.com/prometheus/alertmanager/template"
 
+	"github.com/cortexproject/cortex/pkg/alertmanager"
 	"github.com/cortexproject/cortex/pkg/configs/db"
 	"github.com/cortexproject/cortex/pkg/configs/userconfig"
 	"github.com/cortexproject/cortex/pkg/tenant"
@@ -230,6 +231,24 @@ func validateAlertmanagerConfig(cfg string, noCfg NotificationsConfig) error {
 		return err
 	}
 
+	// Apply the same recursive denylist that the multitenant Alertmanager HTTP
+	// handler applies (CVE-2021-31232): reject every file-reference field
+	// (password_file, bearer_token_file, credentials_file, OAuth2
+	// client_secret_file, TLS ca_file/cert_file/key_file, Slack api_url_file,
+	// VictorOps api_key_file, ...). Without this, a tenant could set e.g.
+	// http_config.bearer_token_file to an arbitrary host path and exfiltrate
+	// its contents in the Authorization header of an outbound notification.
+	if err := alertmanager.ValidateAlertmanagerConfig(amCfg); err != nil {
+		return err
+	}
+
+	// Validate templates referenced in the alertmanager config.
+	for _, name := range amCfg.Templates {
+		if err := alertmanager.ValidateTemplateFilename(name); err != nil {
+			return err
+		}
+	}
+
 	for _, recv := range amCfg.Receivers {
 		if noCfg.DisableEmail && len(recv.EmailConfigs) > 0 {
 			return ErrEmailNotificationsAreDisabled
@@ -249,6 +268,12 @@ func validateRulesFiles(c userconfig.Config) error {
 
 func validateTemplateFiles(c userconfig.Config) error {
 	for fn, content := range c.TemplateFiles {
+		// Reject template filenames that contain a path separator or escape
+		// the per-tenant directory via traversal. This matches the validation
+		// performed by the multitenant Alertmanager HTTP handler.
+		if err := alertmanager.ValidateTemplateFilename(fn); err != nil {
+			return err
+		}
 		if _, err := template.New(fn).Funcs(template.FuncMap(amtemplate.DefaultFuncs)).Parse(content); err != nil {
 			return err
 		}
