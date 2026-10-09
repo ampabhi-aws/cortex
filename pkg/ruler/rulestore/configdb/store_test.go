@@ -183,3 +183,92 @@ groups:
 		},
 	}
 }
+
+// fakeMultiNamespaceRuleConfig returns a rules config with three namespaces
+// (ns1, ns2, ns3), each containing a single group. This is used to exercise
+// filtering behaviour of ListRuleGroupsForUserAndNamespace against the cache.
+func fakeMultiNamespaceRuleConfig() userconfig.RulesConfig {
+	ruleFile := func(groupName string) string {
+		return fmt.Sprintf(`
+groups:
+- name: %s
+  rules:
+  - alert: ScrapeFailed
+    expr: 'up != 1'
+    for: 10m
+    labels:
+      severity: warning
+`, groupName)
+	}
+	return userconfig.RulesConfig{
+		FormatVersion: userconfig.RuleFormatV2,
+		Files: map[string]string{
+			"ns1": ruleFile("g1"),
+			"ns2": ruleFile("g2"),
+			"ns3": ruleFile("g3"),
+		},
+	}
+}
+
+// Test_ConfigRuleStoreListForUserAndNamespace_DoesNotCorruptCache is a
+// regression test for the bug where ListRuleGroupsForUserAndNamespace
+// filtered the cached slice in place with append(list[:ix], list[ix+1:]...),
+// permanently corrupting the cache for the tenant and silently dropping
+// unrelated rule groups on subsequent reads. After filtering by one
+// namespace, a subsequent unfiltered call must still return all original
+// rule groups.
+func Test_ConfigRuleStoreListForUserAndNamespace_DoesNotCorruptCache(t *testing.T) {
+	mock := &MockClient{
+		cfgs: map[string]userconfig.VersionedRulesConfig{
+			"user": {
+				ID:        1,
+				Config:    fakeMultiNamespaceRuleConfig(),
+				DeletedAt: zeroTime,
+			},
+		},
+		err: nil,
+	}
+
+	store := NewConfigRuleStore(mock)
+
+	// Prime the cache.
+	all, err := store.ListRuleGroupsForUserAndNamespace(context.Background(), "user", "")
+	assert.NoError(t, err)
+	assert.Equal(t, 3, len(all), "expected 3 rule groups for user prior to filtered call")
+
+	// Filter by ns3 — this used to corrupt the cached slice in place.
+	ns3, err := store.ListRuleGroupsForUserAndNamespace(context.Background(), "user", "ns3")
+	assert.NoError(t, err)
+	assert.Equal(t, 1, len(ns3), "expected exactly one rule group in ns3")
+	assert.Equal(t, "ns3", ns3[0].GetNamespace())
+
+	// Simulate the ruler sync-loop advancing c.since so unchanged users are
+	// not re-populated on the next call. The scanner's claim is that even
+	// then the cache must still contain all three namespaces.
+	mock.cfgs = map[string]userconfig.VersionedRulesConfig{}
+
+	// A subsequent unfiltered call must still return all three groups.
+	again, err := store.ListRuleGroupsForUserAndNamespace(context.Background(), "user", "")
+	assert.NoError(t, err)
+	assert.Equal(t, 3, len(again), "cache corruption: unfiltered call should still return all 3 rule groups")
+
+	seen := map[string]int{}
+	for _, g := range again {
+		seen[g.GetNamespace()]++
+	}
+	assert.Equal(t, 1, seen["ns1"], "ns1 must still be present in the cache")
+	assert.Equal(t, 1, seen["ns2"], "ns2 must still be present in the cache")
+	assert.Equal(t, 1, seen["ns3"], "ns3 must still be present in the cache")
+
+	// The returned slice must also be independent of the cache: mutating it
+	// must not affect subsequent reads.
+	if len(again) > 0 {
+		again[0] = nil
+	}
+	final, err := store.ListRuleGroupsForUserAndNamespace(context.Background(), "user", "")
+	assert.NoError(t, err)
+	assert.Equal(t, 3, len(final))
+	for _, g := range final {
+		assert.NotNil(t, g, "cache entry must not be nil after caller mutates returned slice")
+	}
+}

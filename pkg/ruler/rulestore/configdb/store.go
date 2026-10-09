@@ -73,7 +73,19 @@ func (c *ConfigRuleStore) ListAllRuleGroups(ctx context.Context) (map[string]rul
 
 	c.since = getLatestConfigID(configs, c.since)
 
-	return c.ruleGroupList, nil
+	// Return a defensive copy of the cache so callers cannot mutate the
+	// cached map or its slices in place. Without this, filtering done by
+	// callers (e.g. ListRuleGroupsForUserAndNamespace) via `append(list[:i],
+	// list[i+1:]...)` would corrupt the shared backing array and silently
+	// drop tenant rule groups until the tenant's config ID changes.
+	out := make(map[string]rulespb.RuleGroupList, len(c.ruleGroupList))
+	for user, groups := range c.ruleGroupList {
+		cp := make(rulespb.RuleGroupList, len(groups))
+		copy(cp, groups)
+		out[user] = cp
+	}
+
+	return out, nil
 }
 
 // getLatestConfigID gets the latest configs ID.
@@ -94,20 +106,16 @@ func (c *ConfigRuleStore) ListRuleGroupsForUserAndNamespace(ctx context.Context,
 		return nil, err
 	}
 
-	if namespace == "" {
-		return r[userID], nil
-	}
-
-	list := r[userID]
-	for ix := 0; ix < len(list); {
-		if list[ix].GetNamespace() != namespace {
-			list = append(list[:ix], list[ix+1:]...)
-		} else {
-			ix++
+	// Never hand out or mutate the cached slice; build a filtered copy so
+	// that filtering here cannot corrupt the shared cache backing array.
+	cached := r[userID]
+	out := make(rulespb.RuleGroupList, 0, len(cached))
+	for _, g := range cached {
+		if namespace == "" || g.GetNamespace() == namespace {
+			out = append(out, g)
 		}
 	}
-
-	return list, nil
+	return out, nil
 }
 
 func (c *ConfigRuleStore) LoadRuleGroups(ctx context.Context, groupsToLoad map[string]rulespb.RuleGroupList) error {
