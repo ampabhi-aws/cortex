@@ -304,6 +304,19 @@ func (am *MultitenantAlertmanager) ListAllConfigs(w http.ResponseWriter, r *http
 	<-done
 }
 
+// ValidateAlertmanagerConfig is an exported wrapper around validateAlertmanagerConfig
+// that accepts a raw YAML Alertmanager configuration string, parses it and runs the
+// recursive Cortex-specific validator so that *_file receiver settings (and other
+// disallowed fields) cannot be stored by configuration backends that do not perform
+// this validation themselves (e.g. the legacy configs-service write path).
+func ValidateAlertmanagerConfig(rawCfg string) error {
+	amCfg, err := config.Load(rawCfg)
+	if err != nil {
+		return err
+	}
+	return validateAlertmanagerConfig(amCfg)
+}
+
 // validateAlertmanagerConfig recursively scans the input config looking for data types for which
 // we have a specific validation and, whenever encountered, it runs their validation. Returns the
 // first error or nil if validation succeeds.
