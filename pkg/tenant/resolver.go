@@ -83,6 +83,16 @@ func (t *SingleResolver) TenantID(ctx context.Context) (string, error) {
 		return "", err
 	}
 
+	// Enforce the documented tenant-ID character set everywhere, not only in
+	// federation mode. Historically SingleResolver only rejected path-escaping
+	// characters, which allowed e.g. ':' and '|' inside a tenant ID. Downstream
+	// consumers (results cache key, log/metric labels, filesystem paths) assume
+	// the documented safe charset, so accepting the broader set made field
+	// injection into those identifiers possible (see CWE-140).
+	if err := ValidTenantID(id); err != nil {
+		return "", err
+	}
+
 	if containsUnsafePathSegments(id) {
 		return "", errInvalidTenantID
 	}
