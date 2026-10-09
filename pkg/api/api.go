@@ -48,6 +48,12 @@ type Config struct {
 	AlertmanagerHTTPPrefix string `yaml:"alertmanager_http_prefix"`
 	PrometheusHTTPPrefix   string `yaml:"prometheus_http_prefix"`
 
+	// EnableDestructiveTenantAPI gates registration of the irreversible
+	// `/purger/delete_tenant` admin endpoint. It is OFF by default: operators
+	// must opt in explicitly (analogous to Prometheus' --web.enable-admin-api)
+	// before a destructive tenant-wide erasure request can even be accepted.
+	EnableDestructiveTenantAPI bool `yaml:"enable_destructive_tenant_api"`
+
 	// The following configs are injected by the upstream caller.
 	ServerPrefix       string               `yaml:"-"`
 	LegacyHTTPPrefix   string               `yaml:"-"`
@@ -71,6 +77,7 @@ type Config struct {
 func (cfg *Config) RegisterFlags(f *flag.FlagSet) {
 	f.BoolVar(&cfg.ResponseCompression, "api.response-compression-enabled", false, "Use GZIP compression for API responses. Some endpoints serve large YAML or JSON blobs which can benefit from compression.")
 	f.Var(&cfg.HTTPRequestHeadersToLog, "api.http-request-headers-to-log", "Which HTTP Request headers to add to logs")
+	f.BoolVar(&cfg.EnableDestructiveTenantAPI, "api.enable-destructive-tenant-api", false, "Enable the destructive tenant-deletion admin API (POST /purger/delete_tenant and DELETE /purger/delete_tenant). Off by default because the endpoint irreversibly removes every stored block for the calling tenant.")
 	cfg.RegisterFlagsWithPrefix("", f)
 }
 
@@ -276,8 +283,19 @@ func (a *API) RegisterIngester(i Ingester, pushConfig distributor.Config) {
 }
 
 func (a *API) RegisterTenantDeletion(api *purger.TenantDeletionAPI) {
-	a.RegisterRoute("/purger/delete_tenant", http.HandlerFunc(api.DeleteTenant), true, "POST")
+	// The status endpoint is read-only and safe to expose unconditionally.
 	a.RegisterRoute("/purger/delete_tenant_status", http.HandlerFunc(api.DeleteTenantStatus), true, "GET")
+
+	// The destructive endpoints are only registered when the operator has
+	// opted in explicitly. When disabled, requests return 404 from the mux
+	// instead of reaching the handler.
+	if !a.cfg.EnableDestructiveTenantAPI {
+		level.Info(a.logger).Log("msg", "destructive tenant-deletion API is disabled; set -api.enable-destructive-tenant-api=true to enable")
+		return
+	}
+	a.indexPage.AddLink(SectionDangerous, "/purger/delete_tenant", "Request destruction of all data for the calling tenant (Dangerous, Irreversible)")
+	a.RegisterRoute("/purger/delete_tenant", http.HandlerFunc(api.DeleteTenant), true, "POST")
+	a.RegisterRoute("/purger/delete_tenant", http.HandlerFunc(api.CancelTenantDeletion), true, "DELETE")
 }
 
 // RegisterRuler registers routes associated with the Ruler service.

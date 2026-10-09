@@ -178,6 +178,7 @@ type Config struct {
 	CleanupConcurrency                    int                      `yaml:"cleanup_concurrency"`
 	DeletionDelay                         time.Duration            `yaml:"deletion_delay"`
 	TenantCleanupDelay                    time.Duration            `yaml:"tenant_cleanup_delay"`
+	TenantDeletionGracePeriod             time.Duration            `yaml:"tenant_deletion_grace_period"`
 	SkipBlocksWithOutOfOrderChunksEnabled bool                     `yaml:"skip_blocks_with_out_of_order_chunks_enabled"`
 	BlockFilesConcurrency                 int                      `yaml:"block_files_concurrency"`
 	BlocksFetchConcurrency                int                      `yaml:"blocks_fetch_concurrency"`
@@ -232,6 +233,7 @@ func (cfg *Config) RegisterFlags(f *flag.FlagSet) {
 		"If not 0, blocks will be marked for deletion and compactor component will permanently delete blocks marked for deletion from the bucket. "+
 		"If 0, blocks will be deleted straight away. Note that deleting blocks immediately can cause query failures.")
 	f.DurationVar(&cfg.TenantCleanupDelay, "compactor.tenant-cleanup-delay", 6*time.Hour, "For tenants marked for deletion, this is time between deleting of last block, and doing final cleanup (marker files, debug files) of the tenant.")
+	f.DurationVar(&cfg.TenantDeletionGracePeriod, "compactor.tenant-deletion-grace-period", 24*time.Hour, "Grace period that must elapse between a tenant deletion mark being created and the compactor hard-deleting the tenant's blocks. Set to 0 to disable (not recommended) and delete immediately on the next cleanup tick. During this window, DELETE /purger/delete_tenant can abort the deletion.")
 	f.BoolVar(&cfg.BlockDeletionMarksMigrationEnabled, "compactor.block-deletion-marks-migration-enabled", false, "When enabled, at compactor startup the bucket will be scanned and all found deletion marks inside the block location will be copied to the markers global location too. This option can (and should) be safely disabled as soon as the compactor has successfully run at least once.")
 	f.BoolVar(&cfg.SkipBlocksWithOutOfOrderChunksEnabled, "compactor.skip-blocks-with-out-of-order-chunks-enabled", false, "When enabled, mark blocks containing index with out-of-order chunks for no compact instead of halting the compaction.")
 	f.IntVar(&cfg.BlockFilesConcurrency, "compactor.block-files-concurrency", 10, "Number of goroutines to use when fetching/uploading block files from object storage.")
@@ -500,6 +502,7 @@ func (c *Compactor) starting(ctx context.Context) error {
 		CleanupConcurrency:                 c.compactorCfg.CleanupConcurrency,
 		BlockDeletionMarksMigrationEnabled: c.compactorCfg.BlockDeletionMarksMigrationEnabled,
 		TenantCleanupDelay:                 c.compactorCfg.TenantCleanupDelay,
+		TenantDeletionGracePeriod:          c.compactorCfg.TenantDeletionGracePeriod,
 	}, c.bucketClient, c.usersScanner, c.cfgProvider, c.parentLogger, c.registerer)
 
 	// Initialize the compactors ring if sharding is enabled.

@@ -49,6 +49,20 @@ func WriteTenantDeletionMark(ctx context.Context, bkt objstore.Bucket, userID st
 	return errors.Wrap(bkt.Upload(ctx, TenantDeletionMarkPath, bytes.NewReader(data)), "upload tenant deletion mark")
 }
 
+// DeleteTenantDeletionMark removes the tenant deletion mark object (if any)
+// for the given user. Not finding the object is not an error -- the operation
+// is idempotent so a cancel request against an un-marked tenant succeeds.
+func DeleteTenantDeletionMark(ctx context.Context, bkt objstore.Bucket, userID string, cfgProvider bucket.TenantConfigProvider) error {
+	userBkt := bucket.NewUserBucketClient(userID, bkt, cfgProvider)
+	if err := userBkt.Delete(ctx, TenantDeletionMarkPath); err != nil {
+		if userBkt.IsObjNotFoundErr(err) {
+			return nil
+		}
+		return errors.Wrap(err, "delete tenant deletion mark")
+	}
+	return nil
+}
+
 // Returns tenant deletion mark for given user, if it exists. If it doesn't exist, returns nil mark, and no error.
 func ReadTenantDeletionMark(ctx context.Context, bkt objstore.BucketReader, userID string) (*TenantDeletionMark, error) {
 	markerFile := path.Join(userID, TenantDeletionMarkPath)
