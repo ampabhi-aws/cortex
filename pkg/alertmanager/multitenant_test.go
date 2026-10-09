@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"io"
 	"math/rand"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"net/http/pprof"
@@ -368,11 +369,48 @@ templates:
 	require.False(t, fileExists(t, filepath.Join(user3Dir, templatesDir, "second.tpl")))
 }
 
-func TestMultitenantAlertmanager_FirewallShouldBlockHTTPBasedReceiversWhenEnabled(t *testing.T) {
+func TestMultitenantAlertmanager_FirewallShouldBlockReceiversWhenEnabled(t *testing.T) {
+	// startHTTPBackend returns an address of a local HTTP server, a close function and a
+	// probe that reports whether the server received a request.
+	startHTTPBackend := func(t *testing.T) (addr string, closeFn func(), invoked func() bool) {
+		t.Helper()
+		serverInvoked := atomic.NewBool(false)
+		server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+			serverInvoked.Store(true)
+			writer.WriteHeader(http.StatusOK)
+		}))
+		return fmt.Sprintf("http://%s", server.Listener.Addr().String()), server.Close, func() bool { return serverInvoked.Load() }
+	}
+
+	// startTCPBackend returns an address of a local TCP server that accepts connections
+	// and records whether any connection has been established. It is used to exercise the
+	// SMTP (email) receiver dial path without implementing the SMTP protocol itself: the
+	// alertmanager will fail the SMTP handshake, but the connection attempt is what we're
+	// looking for.
+	startTCPBackend := func(t *testing.T) (addr string, closeFn func(), invoked func() bool) {
+		t.Helper()
+		serverInvoked := atomic.NewBool(false)
+		listener, err := net.Listen("tcp", "127.0.0.1:0")
+		require.NoError(t, err)
+		go func() {
+			for {
+				conn, err := listener.Accept()
+				if err != nil {
+					return
+				}
+				serverInvoked.Store(true)
+				_ = conn.Close()
+			}
+		}()
+		return listener.Addr().String(), func() { _ = listener.Close() }, func() bool { return serverInvoked.Load() }
+	}
+
 	tests := map[string]struct {
-		getAlertmanagerConfig func(backendURL string) string
+		startBackend          func(t *testing.T) (addr string, closeFn func(), invoked func() bool)
+		getAlertmanagerConfig func(backend string) string
 	}{
 		"webhook": {
+			startBackend: startHTTPBackend,
 			getAlertmanagerConfig: func(backendURL string) string {
 				return fmt.Sprintf(`
 route:
@@ -388,6 +426,7 @@ receivers:
 			},
 		},
 		"pagerduty": {
+			startBackend: startHTTPBackend,
 			getAlertmanagerConfig: func(backendURL string) string {
 				return fmt.Sprintf(`
 route:
@@ -404,6 +443,7 @@ receivers:
 			},
 		},
 		"slack": {
+			startBackend: startHTTPBackend,
 			getAlertmanagerConfig: func(backendURL string) string {
 				return fmt.Sprintf(`
 route:
@@ -420,6 +460,7 @@ receivers:
 			},
 		},
 		"opsgenie": {
+			startBackend: startHTTPBackend,
 			getAlertmanagerConfig: func(backendURL string) string {
 				return fmt.Sprintf(`
 route:
@@ -436,6 +477,7 @@ receivers:
 			},
 		},
 		"wechat": {
+			startBackend: startHTTPBackend,
 			getAlertmanagerConfig: func(backendURL string) string {
 				return fmt.Sprintf(`
 route:
@@ -452,6 +494,31 @@ receivers:
 `, backendURL)
 			},
 		},
+		// Email dials the configured smarthost directly using the firewall-wrapped dialer,
+		// so it must honour -alertmanager.receivers-firewall-block-private-addresses too.
+		// The backend is a plain TCP listener because we only care about the dial attempt.
+		"email": {
+			startBackend: startTCPBackend,
+			getAlertmanagerConfig: func(backend string) string {
+				return fmt.Sprintf(`
+global:
+  smtp_smarthost: %s
+  smtp_from: test@example.com
+  smtp_require_tls: false
+  smtp_hello: cortex-test
+
+route:
+  receiver: email
+  group_wait: 0s
+  group_interval: 1s
+
+receivers:
+  - name: email
+    email_configs:
+      - to: victim@example.com
+`, backend)
+			},
+		},
 	}
 
 	for receiverName, testData := range tests {
@@ -465,17 +532,13 @@ receivers:
 
 				ctx := context.Background()
 				userID := "user-1"
-				serverInvoked := atomic.NewBool(false)
 
-				// Create a local HTTP server to test whether the request is received.
-				server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
-					serverInvoked.Store(true)
-					writer.WriteHeader(http.StatusOK)
-				}))
-				defer server.Close()
+				// Create a local backend to test whether the request is received.
+				backendAddr, closeBackend, backendInvoked := testData.startBackend(t)
+				defer closeBackend()
 
 				// Create the alertmanager config.
-				alertmanagerCfg := testData.getAlertmanagerConfig(fmt.Sprintf("http://%s", server.Listener.Addr().String()))
+				alertmanagerCfg := testData.getAlertmanagerConfig(backendAddr)
 
 				// Store the alertmanager config in the bucket.
 				store := prepareInMemoryAlertStore()
@@ -545,13 +608,13 @@ receivers:
 				// asynchronously, we should pool it for a short period.
 				deadline := time.Now().Add(3 * time.Second)
 				for {
-					if time.Now().After(deadline) || serverInvoked.Load() {
+					if time.Now().After(deadline) || backendInvoked() {
 						break
 					}
 					time.Sleep(100 * time.Millisecond)
 				}
 
-				assert.Equal(t, !firewallEnabled, serverInvoked.Load())
+				assert.Equal(t, !firewallEnabled, backendInvoked())
 
 				// Print all alertmanager logs to have more information if this test fails in CI.
 				t.Logf("Alertmanager logs:\n%s", logs.String())

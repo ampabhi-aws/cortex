@@ -41,16 +41,36 @@ import (
 	"github.com/prometheus/alertmanager/types"
 )
 
+// DialContextFunc is the function signature used to open a TCP connection to the SMTP
+// smarthost. It mirrors (*net.Dialer).DialContext so a restricted dialer (e.g. the
+// Cortex per-tenant FirewallDialer) can be injected at construction time.
+type DialContextFunc func(ctx context.Context, network, address string) (net.Conn, error)
+
+// Option configures an Email notifier.
+type Option func(*Email)
+
+// WithDialContextFunc configures the Email notifier to use the provided dial function
+// for opening TCP connections to the SMTP smarthost. This allows callers to enforce a
+// network firewall (block private/loopback/link-local addresses or operator-provided
+// CIDRs) by resolution time. When no option is provided a bare net.Dialer{} is used,
+// preserving upstream behaviour.
+func WithDialContextFunc(f DialContextFunc) Option {
+	return func(e *Email) {
+		e.dialContext = f
+	}
+}
+
 // Email implements a Notifier for email notifications.
 type Email struct {
-	conf     *config.EmailConfig
-	tmpl     *template.Template
-	logger   log.Logger
-	hostname string
+	conf        *config.EmailConfig
+	tmpl        *template.Template
+	logger      log.Logger
+	hostname    string
+	dialContext DialContextFunc
 }
 
 // New returns a new Email notifier.
-func New(c *config.EmailConfig, t *template.Template, l log.Logger) *Email {
+func New(c *config.EmailConfig, t *template.Template, l log.Logger, opts ...Option) *Email {
 	if _, ok := c.Headers["Subject"]; !ok {
 		c.Headers["Subject"] = config.DefaultEmailSubject
 	}
@@ -66,7 +86,11 @@ func New(c *config.EmailConfig, t *template.Template, l log.Logger) *Email {
 	if err != nil {
 		h = "localhost.localdomain"
 	}
-	return &Email{conf: c, tmpl: t, logger: l, hostname: h}
+	e := &Email{conf: c, tmpl: t, logger: l, hostname: h}
+	for _, opt := range opts {
+		opt(e)
+	}
+	return e
 }
 
 // auth resolves a string of authentication mechanisms.
@@ -131,18 +155,36 @@ func (n *Email) Notify(ctx context.Context, as ...*types.Alert) (bool, error) {
 			tlsConfig.ServerName = n.conf.Smarthost.Host
 		}
 
-		conn, err = tls.Dial("tcp", n.conf.Smarthost.String(), tlsConfig)
-		if err != nil {
-			return true, errors.Wrap(err, "establish TLS connection to server")
+		// Honour the injected dial function (e.g. the Cortex per-tenant firewall) by
+		// opening a plain TCP connection through it first and then wrapping it in TLS.
+		// Falling back to tls.Dial preserves upstream behaviour when no custom dialer
+		// is configured.
+		if n.dialContext != nil {
+			rawConn, err := n.dialContext(ctx, "tcp", n.conf.Smarthost.String())
+			if err != nil {
+				return true, errors.Wrap(err, "establish connection to server")
+			}
+			tlsConn := tls.Client(rawConn, tlsConfig)
+			if err := tlsConn.HandshakeContext(ctx); err != nil {
+				rawConn.Close()
+				return true, errors.Wrap(err, "establish TLS connection to server")
+			}
+			conn = tlsConn
+		} else {
+			conn, err = tls.Dial("tcp", n.conf.Smarthost.String(), tlsConfig)
+			if err != nil {
+				return true, errors.Wrap(err, "establish TLS connection to server")
+			}
 		}
 	} else {
-		var (
-			d   = net.Dialer{}
-			err error
-		)
-		conn, err = d.DialContext(ctx, "tcp", n.conf.Smarthost.String())
-		if err != nil {
-			return true, errors.Wrap(err, "establish connection to server")
+		dial := n.dialContext
+		if dial == nil {
+			dial = (&net.Dialer{}).DialContext
+		}
+		var dialErr error
+		conn, dialErr = dial(ctx, "tcp", n.conf.Smarthost.String())
+		if dialErr != nil {
+			return true, errors.Wrap(dialErr, "establish connection to server")
 		}
 	}
 	c, err = smtp.NewClient(conn, n.conf.Smarthost.Host)
