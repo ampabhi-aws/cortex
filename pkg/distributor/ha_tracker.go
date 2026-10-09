@@ -116,6 +116,13 @@ type haTracker struct {
 	electedLock sync.RWMutex
 	elected     map[string]ReplicaDesc         // Replicas we are accepting samples from. Key = "user/cluster".
 	clusters    map[string]map[string]struct{} // Known clusters with elected replicas per user. First key = user, second key = cluster name.
+	// pending holds per-user cluster-name reservations for in-flight CAS writes.
+	// Entries are added by reserveCluster (synchronously, under the write lock) and
+	// are removed either when the CAS fails or when the watch callback confirms
+	// the cluster has been accepted into c.clusters. It plugs the TOCTOU window
+	// between the max-clusters admission check and the asynchronous KV watch that
+	// populates c.clusters.
+	pending     map[string]map[string]struct{} // First key = user, second key = cluster name.
 
 	electedReplicaChanges         *prometheus.CounterVec
 	electedReplicaTimestamp       *prometheus.GaugeVec
@@ -143,6 +150,7 @@ func newHATracker(cfg HATrackerConfig, limits haTrackerLimits, reg prometheus.Re
 		limits:              limits,
 		elected:             map[string]ReplicaDesc{},
 		clusters:            map[string]map[string]struct{}{},
+		pending:             map[string]map[string]struct{}{},
 
 		electedReplicaChanges: promauto.With(reg).NewCounterVec(prometheus.CounterOpts{
 			Name: "cortex_ha_tracker_elected_replica_changes_total",
@@ -242,6 +250,13 @@ func (c *haTracker) loop(ctx context.Context) error {
 					delete(c.clusters, user)
 				}
 			}
+			// Clear any stale reservation for the deleted cluster.
+			if userPending := c.pending[user]; userPending != nil {
+				delete(userPending, cluster)
+				if len(userPending) == 0 {
+					delete(c.pending, user)
+				}
+			}
 			return true
 		}
 
@@ -254,6 +269,14 @@ func (c *haTracker) loop(ctx context.Context) error {
 				c.clusters[user] = map[string]struct{}{}
 			}
 			c.clusters[user][cluster] = struct{}{}
+		}
+		// Clear any in-flight reservation now that the KV watch has confirmed
+		// the cluster: the admission count is sourced from c.clusters again.
+		if userPending := c.pending[user]; userPending != nil {
+			delete(userPending, cluster)
+			if len(userPending) == 0 {
+				delete(c.pending, user)
+			}
 		}
 		c.elected[key] = *replica
 		c.electedReplicaTimestamp.WithLabelValues(user, cluster).Set(float64(replica.ReceivedAt / 1000))
@@ -378,7 +401,6 @@ func (c *haTracker) checkReplica(ctx context.Context, userID, cluster, replica s
 
 	c.electedLock.RLock()
 	entry, ok := c.elected[key]
-	clusters := len(c.clusters[userID])
 	c.electedLock.RUnlock()
 
 	if ok && now.Sub(timestamp.Time(entry.ReceivedAt)) < c.cfg.UpdateTimeout+c.updateTimeoutJitter {
@@ -388,16 +410,23 @@ func (c *haTracker) checkReplica(ctx context.Context, userID, cluster, replica s
 		return nil
 	}
 
-	if !ok {
-		// If we don't know about this cluster yet and we have reached the limit for number of clusters, we error out now.
-		if limit := c.limits.MaxHAClusters(userID); limit > 0 && clusters+1 > limit {
-			return tooManyClustersError{limit: limit}
-		}
+	// Reserve a slot synchronously before writing to the KV store. The
+	// reservation closes the TOCTOU window between the admission check and the
+	// asynchronous WatchPrefix callback that populates c.clusters. The
+	// reservation is released below on CAS failure, and by the watch callback
+	// once the cluster is observed in c.clusters.
+	limit := c.limits.MaxHAClusters(userID)
+	reserved, err := c.reserveCluster(userID, cluster, limit)
+	if err != nil {
+		return err
 	}
 
-	err := c.checkKVStore(ctx, key, replica, now)
+	err = c.checkKVStore(ctx, key, replica, now)
 	c.kvCASCalls.WithLabelValues(userID, cluster).Inc()
 	if err != nil {
+		if reserved {
+			c.releaseReservation(userID, cluster)
+		}
 		// The callback within checkKVStore will return a replicasNotMatchError if the sample is being deduped,
 		// otherwise there may have been an actual error CAS'ing that we should log.
 		if !errors.Is(err, replicasNotMatchError{}) {
@@ -405,6 +434,50 @@ func (c *haTracker) checkReplica(ctx context.Context, userID, cluster, replica s
 		}
 	}
 	return err
+}
+
+// reserveCluster enforces the per-user HA cluster limit synchronously and
+// records an in-flight reservation so concurrent callers see the slot as
+// taken before the asynchronous WatchPrefix callback has updated c.clusters.
+// It returns (true, nil) if a new reservation was recorded, (false, nil) if
+// the cluster is already known (either admitted or already reserved) and the
+// caller should proceed without recording an additional reservation, and
+// (false, tooManyClustersError{}) when admission is rejected.
+func (c *haTracker) reserveCluster(userID, cluster string, limit int) (bool, error) {
+	c.electedLock.Lock()
+	defer c.electedLock.Unlock()
+
+	if _, ok := c.clusters[userID][cluster]; ok {
+		return false, nil
+	}
+	if _, ok := c.pending[userID][cluster]; ok {
+		return false, nil
+	}
+	if limit > 0 && len(c.clusters[userID])+len(c.pending[userID]) >= limit {
+		return false, tooManyClustersError{limit: limit}
+	}
+	if c.pending[userID] == nil {
+		c.pending[userID] = map[string]struct{}{}
+	}
+	c.pending[userID][cluster] = struct{}{}
+	return true, nil
+}
+
+// releaseReservation drops a pending reservation that was recorded by
+// reserveCluster. Used on CAS failure so a rejected admission doesn't
+// permanently occupy a slot. The watch callback also clears pending entries
+// when it observes the cluster becoming known.
+func (c *haTracker) releaseReservation(userID, cluster string) {
+	c.electedLock.Lock()
+	defer c.electedLock.Unlock()
+	userPending := c.pending[userID]
+	if userPending == nil {
+		return
+	}
+	delete(userPending, cluster)
+	if len(userPending) == 0 {
+		delete(c.pending, userID)
+	}
 }
 
 func (c *haTracker) checkKVStore(ctx context.Context, key, replica string, now time.Time) error {
