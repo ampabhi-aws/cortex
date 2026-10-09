@@ -9,6 +9,15 @@ import (
 type HttpgrpcHeadersCarrier httpgrpc.HTTPRequest
 
 func (c *HttpgrpcHeadersCarrier) Set(key, val string) {
+	// Replace any existing values for this key so that an injected trace context cannot
+	// be shadowed by a client-supplied duplicate header. ForeachKey iterates in slice
+	// order, so appending would let an attacker-controlled value be seen first.
+	for _, h := range c.Headers {
+		if h.Key == key {
+			h.Values = []string{val}
+			return
+		}
+	}
 	c.Headers = append(c.Headers, &httpgrpc.Header{
 		Key:    key,
 		Values: []string{val},

@@ -279,7 +279,12 @@ func (s *Scheduler) enqueueRequest(frontendContext context.Context, frontendAddr
 	tracer := opentracing.GlobalTracer()
 	parentSpanContext, err := httpgrpcutil.GetParentSpanForRequest(tracer, msg.HttpRequest)
 	if err != nil {
-		return err
+		// Tenants can supply arbitrary tracing headers (e.g. a malformed `uber-trace-id`),
+		// which must not be able to fail the enqueue. Mirror the querier's behaviour and
+		// proceed without a parent span. Previously this returned the error, which the
+		// scheduler surfaced as Status=ERROR and crashed frontends with a nil deref.
+		level.Debug(s.log).Log("msg", "ignoring unparseable trace context", "err", err)
+		parentSpanContext = nil
 	}
 
 	userID := msg.GetUserID()
