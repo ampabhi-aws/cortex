@@ -105,7 +105,7 @@ func TestSingleResolver(t *testing.T) {
 }
 
 func TestMultiResolver(t *testing.T) {
-	r := NewMultiResolver()
+	r := NewMultiResolver(0)
 	for _, tc := range append(commonResolverTestCases, []resolverTestCase{
 		{
 			name:        "multi-tenant",
@@ -146,4 +146,30 @@ func TestMultiResolver(t *testing.T) {
 	}...) {
 		t.Run(tc.name, tc.test(r))
 	}
+}
+
+func TestMultiResolverMaxTenants(t *testing.T) {
+	r := NewMultiResolver(2)
+
+	t.Run("within-limit", func(t *testing.T) {
+		ctx := user.InjectOrgID(context.Background(), "tenant-a|tenant-b")
+		ids, err := r.TenantIDs(ctx)
+		assert.NoError(t, err)
+		assert.Equal(t, []string{"tenant-a", "tenant-b"}, ids)
+	})
+
+	t.Run("exceeds-limit", func(t *testing.T) {
+		ctx := user.InjectOrgID(context.Background(), "tenant-a|tenant-b|tenant-c")
+		ids, err := r.TenantIDs(ctx)
+		assert.Nil(t, ids)
+		assert.EqualError(t, err, "too many tenant IDs present (3), max 2")
+	})
+
+	t.Run("zero-disables-limit", func(t *testing.T) {
+		unbounded := NewMultiResolver(0)
+		ctx := user.InjectOrgID(context.Background(), "tenant-a|tenant-b|tenant-c|tenant-d")
+		ids, err := unbounded.TenantIDs(ctx)
+		assert.NoError(t, err)
+		assert.Equal(t, []string{"tenant-a", "tenant-b", "tenant-c", "tenant-d"}, ids)
+	})
 }
