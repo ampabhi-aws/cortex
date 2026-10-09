@@ -1125,6 +1125,12 @@ func (m *KV) MergeRemoteState(data []byte, join bool) {
 	kvPair := KeyValuePair{}
 
 	var err error
+	// maxKVPairSize caps the length declared by the 4-byte big-endian prefix in
+	// front of each KV pair, preventing an unauthenticated peer from forcing a
+	// huge allocation here (and, on 32-bit targets, from passing the length
+	// guard with a negative int() cast). The cap mirrors the inbound packet
+	// limit used by the TCP transport.
+	const maxKVPairSize = 10 * 1024 * 1024
 	// Data contains individual KV pairs (encoded as protobuf messages), each prefixed with 4 bytes length of KV pair:
 	// [4-bytes length of marshalled KV pair] [marshalled KV pair] [4-bytes length] [KV pair]...
 	for len(data) > 0 {
@@ -1137,7 +1143,15 @@ func (m *KV) MergeRemoteState(data []byte, join bool) {
 
 		data = data[4:]
 
-		if len(data) < int(kvPairLength) {
+		if uint64(kvPairLength) > uint64(maxKVPairSize) {
+			err = fmt.Errorf("KV Pair length %d exceeds maximum %d", kvPairLength, maxKVPairSize)
+			break
+		}
+
+		// Compare as uint64 so this guard is correct on 32-bit builds where
+		// int(kvPairLength) could otherwise wrap negative for lengths >
+		// 0x7FFFFFFF and let data[:kvPairLength] panic below.
+		if uint64(len(data)) < uint64(kvPairLength) {
 			err = fmt.Errorf("not enough data left for next KV Pair, expected %d, remaining %d bytes", kvPairLength, len(data))
 			break
 		}
