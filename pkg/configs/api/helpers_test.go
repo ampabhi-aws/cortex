@@ -31,6 +31,9 @@ func setup(t *testing.T) {
 		Notifications: NotificationsConfig{
 			DisableEmail: true,
 		},
+		// Tests exercise the internal /private/api/prom/configs/* endpoints,
+		// so opt in explicitly. Production defaults the flag to false.
+		EnableInternalAllTenantConfigsAPI: true,
 	})
 	counter = 0
 }
@@ -42,6 +45,7 @@ func setupWithEmailEnabled(t *testing.T) {
 		Notifications: NotificationsConfig{
 			DisableEmail: false,
 		},
+		EnableInternalAllTenantConfigsAPI: true,
 	})
 	counter = 0
 }

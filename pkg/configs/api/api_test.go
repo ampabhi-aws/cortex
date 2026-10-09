@@ -4,11 +4,13 @@ import (
 	"encoding/json"
 	"fmt"
 	"net/http"
+	"net/http/httptest"
 	"os"
 	"path"
 	"strings"
 	"testing"
 
+	"github.com/cortexproject/cortex/pkg/configs/db/dbtest"
 	"github.com/cortexproject/cortex/pkg/configs/userconfig"
 
 	"github.com/stretchr/testify/assert"
@@ -220,6 +222,32 @@ func Test_GetConfigs_IncludesNewerConfigsAndExcludesOlder(t *testing.T) {
 		assert.Equal(t, ConfigsView{Configs: map[string]userconfig.View{
 			userID3: config3,
 		}}, found)
+	}
+}
+
+// The internal /private/api/prom/configs/* endpoints must fail closed when
+// the operator has not explicitly opted in via
+// -configs.enable-internal-all-tenant-api, because the handler itself does
+// no authentication and the response contains every tenant's rule files and
+// raw Alertmanager YAML (which commonly embeds third-party notification
+// credentials).
+func Test_GetAllConfigs_DisabledByDefault(t *testing.T) {
+	database = dbtest.Setup(t)
+	defer dbtest.Cleanup(t, database)
+
+	disabled := New(database, Config{
+		Notifications: NotificationsConfig{DisableEmail: true},
+		// EnableInternalAllTenantConfigsAPI left at its zero value (false).
+	})
+
+	for _, c := range allClients {
+		for _, urlPath := range []string{c.PrivateEndpoint, c.PrivateEndpoint + "?since=0"} {
+			w := httptest.NewRecorder()
+			r, err := http.NewRequest("GET", urlPath, nil)
+			require.NoError(t, err)
+			disabled.ServeHTTP(w, r)
+			assert.Equal(t, http.StatusNotFound, w.Code, "endpoint %s must fail closed when disabled", urlPath)
+		}
 	}
 }
 
