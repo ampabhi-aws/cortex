@@ -17,6 +17,25 @@ var (
 	expectedSamplesPerSeries   = 10
 	expectedExemplarsPerSeries = 1
 
+	// maxTimeseriesPerRequest bounds the number of Timeseries elements that may
+	// appear in a single WriteRequest. It defends against protobuf object-inflation
+	// bombs where a tiny snappy-compressed body decodes into tens of millions of
+	// repeated (often empty) Timeseries elements, each of which would otherwise
+	// cost ~1 KB of heap via the pooled allocator. Configurable through the
+	// -distributor.max-timeseries-per-request flag; 0 disables the limit (not
+	// recommended).
+	maxTimeseriesPerRequest = 100000
+
+	// ErrTooManyTimeseries is returned by PreallocWriteRequest.Unmarshal when a
+	// request carries more than maxTimeseriesPerRequest Timeseries elements.
+	ErrTooManyTimeseries = fmt.Errorf("too many timeseries in write request")
+
+	// errEmptyTimeseries is returned from PreallocTimeseries.Unmarshal when the
+	// element is degenerate (no labels and no samples/exemplars on the wire).
+	// We treat it as a short-circuit sentinel so we never allocate a pooled
+	// TimeSeries for it.
+	errEmptyTimeseries = fmt.Errorf("empty timeseries in write request")
+
 	/*
 		We cannot pool these as pointer-to-slice because the place we use them is in WriteRequest which is generated from Protobuf
 		and we don't have an option to make it a pointer. There is overhead here 24 bytes of garbage every time a PreallocTimeseries
@@ -28,13 +47,16 @@ var (
 		},
 	}
 
+	// timeSeriesPool stores *TimeSeries with nil Labels/Samples/Exemplars slices.
+	// Keeping the pooled object lazy means an empty wire element costs ~80 B
+	// (the TimeSeries struct) instead of ~1 KB of eagerly allocated slice
+	// backing arrays. The generated TimeSeries.Unmarshal appends into these
+	// fields, which is a no-op on nil slices, so correctness is preserved for
+	// well-formed requests and the slices grow to the size actually required
+	// by the bytes on the wire.
 	timeSeriesPool = sync.Pool{
 		New: func() interface{} {
-			return &TimeSeries{
-				Labels:    make([]LabelAdapter, 0, expectedLabels),
-				Samples:   make([]Sample, 0, expectedSamplesPerSeries),
-				Exemplars: make([]Exemplar, 0, expectedExemplarsPerSeries),
-			}
+			return &TimeSeries{}
 		},
 	}
 )
@@ -48,6 +70,7 @@ func (PreallocConfig) RegisterFlags(f *flag.FlagSet) {
 	f.IntVar(&expectedTimeseries, "ingester-client.expected-timeseries", expectedTimeseries, "Expected number of timeseries per request, used for preallocations.")
 	f.IntVar(&expectedLabels, "ingester-client.expected-labels", expectedLabels, "Expected number of labels per timeseries, used for preallocations.")
 	f.IntVar(&expectedSamplesPerSeries, "ingester-client.expected-samples-per-series", expectedSamplesPerSeries, "Expected number of samples per timeseries, used for preallocations.")
+	f.IntVar(&maxTimeseriesPerRequest, "distributor.max-timeseries-per-request", maxTimeseriesPerRequest, "Maximum number of timeseries elements allowed in a single remote_write request. Protects the distributor from protobuf object-inflation bombs that decode into millions of empty Timeseries elements. 0 disables the limit (not recommended).")
 }
 
 // PreallocWriteRequest is a WriteRequest which preallocs slices on Unmarshal.
@@ -56,9 +79,125 @@ type PreallocWriteRequest struct {
 }
 
 // Unmarshal implements proto.Message.
+//
+// Before invoking the generated unmarshaler, we do a cheap single-pass scan of
+// the protobuf wire bytes and count how many Timeseries elements (field 1,
+// wire type 2) are present. If the count exceeds maxTimeseriesPerRequest we
+// bail out immediately, so an object-inflation bomb (tens of millions of
+// repeated 2-byte empty elements) never triggers any heap allocation for its
+// backing TimeSeries objects or for growing the Timeseries backing array.
 func (p *PreallocWriteRequest) Unmarshal(dAtA []byte) error {
+	if maxTimeseriesPerRequest > 0 {
+		if n, err := countTimeseries(dAtA, maxTimeseriesPerRequest); err != nil {
+			return err
+		} else if n > maxTimeseriesPerRequest {
+			return fmt.Errorf("%w: >%d (limit: %d)", ErrTooManyTimeseries, maxTimeseriesPerRequest, maxTimeseriesPerRequest)
+		}
+	}
 	p.Timeseries = PreallocTimeseriesSliceFromPool()
-	return p.WriteRequest.Unmarshal(dAtA)
+	if err := p.WriteRequest.Unmarshal(dAtA); err != nil {
+		return err
+	}
+	if maxTimeseriesPerRequest > 0 && len(p.Timeseries) > maxTimeseriesPerRequest {
+		return fmt.Errorf("%w: %d (limit: %d)", ErrTooManyTimeseries, len(p.Timeseries), maxTimeseriesPerRequest)
+	}
+	return nil
+}
+
+// countTimeseries walks the top-level fields of a WriteRequest wire-format
+// message and counts how many Timeseries elements (field tag 1, wire type 2)
+// it contains. It stops as soon as the count exceeds limit (returning
+// limit+1) so a malicious payload with billions of elements is rejected
+// without a full linear scan being completed. Only the top level is walked;
+// nested message bodies are skipped by their length prefix without being
+// descended into, so this is O(number of top-level fields), not O(bytes).
+// Any wire-format error is returned to the caller so the generated
+// unmarshaler is never asked to parse clearly malformed input.
+func countTimeseries(dAtA []byte, limit int) (int, error) {
+	l := len(dAtA)
+	iNdEx := 0
+	count := 0
+	for iNdEx < l {
+		var wire uint64
+		for shift := uint(0); ; shift += 7 {
+			if shift >= 64 {
+				return count, ErrIntOverflowCortex
+			}
+			if iNdEx >= l {
+				return count, io.ErrUnexpectedEOF
+			}
+			b := dAtA[iNdEx]
+			iNdEx++
+			wire |= uint64(b&0x7F) << shift
+			if b < 0x80 {
+				break
+			}
+		}
+		fieldNum := int32(wire >> 3)
+		wireType := int(wire & 0x7)
+		if fieldNum == 1 && wireType == 2 {
+			count++
+			if count > limit {
+				return count, nil
+			}
+		}
+		switch wireType {
+		case 0: // varint
+			for shift := uint(0); ; shift += 7 {
+				if shift >= 64 {
+					return count, ErrIntOverflowCortex
+				}
+				if iNdEx >= l {
+					return count, io.ErrUnexpectedEOF
+				}
+				b := dAtA[iNdEx]
+				iNdEx++
+				if b < 0x80 {
+					break
+				}
+			}
+		case 1: // fixed64
+			if iNdEx+8 > l {
+				return count, io.ErrUnexpectedEOF
+			}
+			iNdEx += 8
+		case 2: // length-delimited
+			var msglen int
+			for shift := uint(0); ; shift += 7 {
+				if shift >= 64 {
+					return count, ErrIntOverflowCortex
+				}
+				if iNdEx >= l {
+					return count, io.ErrUnexpectedEOF
+				}
+				b := dAtA[iNdEx]
+				iNdEx++
+				msglen |= int(b&0x7F) << shift
+				if b < 0x80 {
+					break
+				}
+			}
+			if msglen < 0 {
+				return count, ErrInvalidLengthCortex
+			}
+			postIndex := iNdEx + msglen
+			if postIndex < 0 || postIndex > l {
+				return count, io.ErrUnexpectedEOF
+			}
+			iNdEx = postIndex
+		case 5: // fixed32
+			if iNdEx+4 > l {
+				return count, io.ErrUnexpectedEOF
+			}
+			iNdEx += 4
+		default:
+			// Delegate unknown / group wire types to the generated unmarshaler
+			// by stopping the pre-scan here. We return the count collected so
+			// far; the generated code will produce the appropriate error.
+			return count, nil
+		}
+	}
+	return count, nil
 }
 
 // PreallocTimeseries is a TimeSeries which preallocs slices on Unmarshal.
@@ -67,7 +206,15 @@ type PreallocTimeseries struct {
 }
 
 // Unmarshal implements proto.Message.
+//
+// Degenerate elements (empty wire body, i.e. no labels and no samples) are
+// rejected cheaply BEFORE a pooled *TimeSeries is materialised. This blocks
+// protobuf object-inflation bombs that send a repeated 2-byte pattern
+// (0x0a 0x00) and would otherwise cost ~1 KB of heap per 2 wire bytes.
 func (p *PreallocTimeseries) Unmarshal(dAtA []byte) error {
+	if len(dAtA) == 0 {
+		return errEmptyTimeseries
+	}
 	p.TimeSeries = TimeseriesFromPool()
 	return p.TimeSeries.Unmarshal(dAtA)
 }
@@ -276,7 +423,9 @@ func PreallocTimeseriesSliceFromPool() []PreallocTimeseries {
 // ReuseSlice puts the slice back into a sync.Pool for reuse.
 func ReuseSlice(ts []PreallocTimeseries) {
 	for i := range ts {
-		ReuseTimeseries(ts[i].TimeSeries)
+		if ts[i].TimeSeries != nil {
+			ReuseTimeseries(ts[i].TimeSeries)
+		}
 	}
 
 	slicePool.Put(ts[:0]) //nolint:staticcheck //see comment on slicePool for more details
@@ -290,6 +439,9 @@ func TimeseriesFromPool() *TimeSeries {
 
 // ReuseTimeseries puts the timeseries back into a sync.Pool for reuse.
 func ReuseTimeseries(ts *TimeSeries) {
+	if ts == nil {
+		return
+	}
 	// Name and Value may point into a large gRPC buffer, so clear the reference to allow GC
 	for i := 0; i < len(ts.Labels); i++ {
 		ts.Labels[i].Name = ""
