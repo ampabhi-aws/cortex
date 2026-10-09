@@ -188,16 +188,45 @@ func ValidateLabels(cfg LabelValidationConfig, userID string, ls []cortexpb.Labe
 		}
 	}
 
+	maxLabelNameLength := cfg.MaxLabelNameLength(userID)
+	maxLabelValueLength := cfg.MaxLabelValueLength(userID)
+	maxLabelsSizeBytes := cfg.MaxLabelsSizeBytes(userID)
+
+	// Enforce per-label length and total size limits BEFORE the label-count
+	// check so a series that exceeds both the count and some length limit can
+	// never reach an error formatter with oversized label values. Without this,
+	// the count check fires first and the resulting error message would render
+	// the entire (potentially up to -distributor.max-recv-msg-size) label set.
+	if maxLabelNameLength > 0 || maxLabelValueLength > 0 {
+		for _, l := range ls {
+			if maxLabelNameLength > 0 && len(l.Name) > maxLabelNameLength {
+				DiscardedSamples.WithLabelValues(labelNameTooLong, userID).Inc()
+				return newLabelNameTooLongError(ls, l.Name, maxLabelNameLength)
+			}
+			if maxLabelValueLength > 0 && len(l.Value) > maxLabelValueLength {
+				DiscardedSamples.WithLabelValues(labelValueTooLong, userID).Inc()
+				return newLabelValueTooLongError(ls, l.Name, l.Value, maxLabelValueLength)
+			}
+		}
+	}
+	if maxLabelsSizeBytes > 0 {
+		preLabelsSizeBytes := 0
+		for _, l := range ls {
+			preLabelsSizeBytes += l.Size()
+			if preLabelsSizeBytes > maxLabelsSizeBytes {
+				DiscardedSamples.WithLabelValues(labelsSizeBytesExceeded, userID).Inc()
+				return labelSizeBytesExceededError(ls, preLabelsSizeBytes, maxLabelsSizeBytes)
+			}
+		}
+	}
+
 	numLabelNames := len(ls)
 	if numLabelNames > cfg.MaxLabelNamesPerSeries(userID) {
 		DiscardedSamples.WithLabelValues(maxLabelNamesPerSeries, userID).Inc()
 		return newTooManyLabelsError(ls, cfg.MaxLabelNamesPerSeries(userID))
 	}
 
-	maxLabelNameLength := cfg.MaxLabelNameLength(userID)
-	maxLabelValueLength := cfg.MaxLabelValueLength(userID)
 	lastLabelName := ""
-	maxLabelsSizeBytes := cfg.MaxLabelsSizeBytes(userID)
 	labelsSizeBytes := 0
 
 	for _, l := range ls {

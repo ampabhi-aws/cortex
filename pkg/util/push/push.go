@@ -47,10 +47,21 @@ func Handler(maxRecvMsgSize int, sourceIPs *middleware.SourceIPExtractor, push F
 				http.Error(w, err.Error(), http.StatusInternalServerError)
 				return
 			}
-			if resp.GetCode() != 202 {
-				level.Error(logger).Log("msg", "push error", "err", err)
+			// Truncate the response body before it is logged or written back to
+			// the caller. Validation errors can embed tenant-supplied label data
+			// that, under adversarial inputs, has reached hundreds of MB; writing
+			// that verbatim to the shared process log (holding the synchronous
+			// logger mutex) or echoing it to the HTTP response amplifies a small
+			// snappy-compressed request into a log/heap DoS.
+			msg := string(resp.Body)
+			const maxPushErrorMsgLen = 2048
+			if len(msg) > maxPushErrorMsgLen {
+				msg = msg[:maxPushErrorMsgLen] + "...(truncated)"
 			}
-			http.Error(w, string(resp.Body), int(resp.Code))
+			if resp.GetCode() != 202 {
+				level.Error(logger).Log("msg", "push error", "err", msg)
+			}
+			http.Error(w, msg, int(resp.Code))
 		}
 	})
 }
