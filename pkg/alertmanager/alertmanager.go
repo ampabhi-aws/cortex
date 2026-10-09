@@ -100,6 +100,7 @@ type Alertmanager struct {
 	wg              sync.WaitGroup
 	mux             *http.ServeMux
 	registry        *prometheus.Registry
+	silenceLimiter  *silenceLimiter
 
 	// Pipeline created during last ApplyConfig call. Used for testing only.
 	lastPipeline notify.Stage
@@ -273,6 +274,18 @@ func New(cfg *Config, reg *prometheus.Registry) (*Alertmanager, error) {
 
 	ui.Register(router, webReload, log.With(am.logger, "component", "ui"))
 	am.mux = am.api.Register(router, am.cfg.ExternalURL.Path)
+
+	// Wrap the mux with per-tenant silence limits. Silences are the only tenant-controlled input
+	// that has no store-level callback in upstream Alertmanager, so we enforce bounds at the HTTP
+	// layer before the request reaches silences.Set() and the broadcast/replication path.
+	if am.cfg.Limits != nil {
+		silenceLim := newSilenceLimiter(am.cfg.UserID, am.cfg.Limits, am.silences, log.With(am.logger, "component", "silence-limiter"), am.registry)
+		am.silenceLimiter = silenceLim
+		wrapped := silenceLim.wrap(am.mux)
+		wrappedMux := http.NewServeMux()
+		wrappedMux.Handle("/", wrapped)
+		am.mux = wrappedMux
+	}
 
 	// Override some extra paths registered in the router (eg. /metrics which by default exposes prometheus.DefaultRegisterer).
 	// Entire router is registered in Mux to "/" path, so there is no conflict with overwriting specific paths.

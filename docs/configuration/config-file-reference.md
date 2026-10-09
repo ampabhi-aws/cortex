@@ -2829,6 +2829,23 @@ The `limits_config` configures default and per-tenant limits imposed by Cortex s
 # alerts will fail with a log message and metric increment. 0 = no limit.
 # CLI flag: -alertmanager.max-alerts-size-bytes
 [alertmanager_max_alerts_size_bytes: <int> | default = 0]
+
+# Maximum number of active or pending silences that a single tenant can have.
+# Creating more silences will fail with a 4xx response. 0 = no limit.
+# CLI flag: -alertmanager.max-silences-count
+[alertmanager_max_silences_count: <int> | default = 0]
+
+# Maximum size in bytes of a single tenant silence (sum of matcher names,
+# matcher values, comment and createdBy). Larger silences are rejected with a
+# 4xx response. 0 = no limit.
+# CLI flag: -alertmanager.max-silence-size-bytes
+[alertmanager_max_silence_size_bytes: <int> | default = 0]
+
+# Maximum duration (relative to now) for which a silence can mute alerts.
+# Silences requesting a longer duration will have their endsAt clamped to this
+# value. 0 = no limit.
+# CLI flag: -alertmanager.max-silence-duration
+[alertmanager_max_silence_duration: <duration> | default = 0s]
 ```
 
 ### `redis_config`
