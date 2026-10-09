@@ -2,6 +2,8 @@ package queryrange
 
 import (
 	"context"
+	"crypto/hmac"
+	"crypto/sha256"
 	"flag"
 	"fmt"
 	"net/http"
@@ -49,9 +51,16 @@ type CacheGenNumberLoader interface {
 
 // ResultsCacheConfig is the config for the results cache.
 type ResultsCacheConfig struct {
-	CacheConfig                cache.Config `yaml:"cache"`
-	Compression                string       `yaml:"compression"`
-	CacheQueryableSamplesStats bool         `yaml:"cache_queryable_samples_stats"`
+	CacheConfig                cache.Config   `yaml:"cache"`
+	Compression                string         `yaml:"compression"`
+	CacheQueryableSamplesStats bool           `yaml:"cache_queryable_samples_stats"`
+	// AuthKey, when set, enables HMAC-SHA256 authentication of cached payloads.
+	// It is intended as a defense-in-depth control for shared/untrusted cache
+	// backends (e.g. memcached) where the wire protocol offers no TLS or
+	// authentication and an attacker with access to the cache port could
+	// otherwise forge cached query responses. When empty, cached entries are
+	// stored and consumed without authentication (backwards compatible).
+	AuthKey flagext.Secret `yaml:"auth_key"`
 }
 
 // RegisterFlags registers flags.
@@ -60,6 +69,7 @@ func (cfg *ResultsCacheConfig) RegisterFlags(f *flag.FlagSet) {
 
 	f.StringVar(&cfg.Compression, "frontend.compression", "", "Use compression in results cache. Supported values are: 'snappy' and '' (disable compression).")
 	f.BoolVar(&cfg.CacheQueryableSamplesStats, "frontend.cache-queryable-samples-stats", false, "Cache Statistics queryable samples on results cache.")
+	f.Var(&cfg.AuthKey, "frontend.results-cache.auth-key", "Shared secret used to authenticate cached query results with HMAC-SHA256. Set to a cluster-wide secret when the results cache is backed by a cache the Cortex processes do not fully trust (for example memcached, which does not offer TLS or SASL). When empty, cached results are not authenticated and an attacker with write access to the cache can poison query responses.")
 	//lint:ignore faillint Need to pass the global logger like this for warning on deprecated methods
 	flagext.DeprecatedFlag(f, "frontend.cache-split-interval", "Deprecated: The maximum interval expected for each request, results will be cached per single interval. This behavior is now determined by querier.split-queries-by-interval.", util_log.Logger)
 }
@@ -600,8 +610,54 @@ func (s resultsCache) filterRecentExtents(req tripperware.Request, maxCacheFresh
 	return extents, nil
 }
 
+// resultsCacheAuthVersion is the leading byte of an authenticated cached
+// payload. Values that do not start with this byte are treated as unauthenticated.
+const resultsCacheAuthVersion byte = 0x01
+
+// resultsCacheAuthPrefixLen is the length of the authentication envelope header:
+// one version byte followed by the HMAC-SHA256 tag.
+const resultsCacheAuthPrefixLen = 1 + sha256.Size
+
+// authSealResultsCache wraps a serialized CachedResponse with an HMAC-SHA256
+// envelope keyed by the configured auth secret. The MAC covers the hashed
+// cache key and the serialized payload so an attacker who can write to the
+// cache cannot forge an entry for a target key without the secret.
+func authSealResultsCache(authKey, hashedKey string, payload []byte) []byte {
+	mac := hmac.New(sha256.New, []byte(authKey))
+	_, _ = mac.Write([]byte(hashedKey))
+	_, _ = mac.Write(payload)
+	tag := mac.Sum(nil)
+
+	out := make([]byte, 0, resultsCacheAuthPrefixLen+len(payload))
+	out = append(out, resultsCacheAuthVersion)
+	out = append(out, tag...)
+	out = append(out, payload...)
+	return out
+}
+
+// authOpenResultsCache verifies the HMAC-SHA256 envelope produced by
+// authSealResultsCache and returns the inner payload. It returns ok=false
+// if the envelope is malformed or the MAC does not verify, which must cause
+// the caller to discard the cache entry.
+func authOpenResultsCache(authKey, hashedKey string, buf []byte) ([]byte, bool) {
+	if len(buf) < resultsCacheAuthPrefixLen || buf[0] != resultsCacheAuthVersion {
+		return nil, false
+	}
+	tag := buf[1:resultsCacheAuthPrefixLen]
+	payload := buf[resultsCacheAuthPrefixLen:]
+
+	mac := hmac.New(sha256.New, []byte(authKey))
+	_, _ = mac.Write([]byte(hashedKey))
+	_, _ = mac.Write(payload)
+	if !hmac.Equal(tag, mac.Sum(nil)) {
+		return nil, false
+	}
+	return payload, true
+}
+
 func (s resultsCache) get(ctx context.Context, key string) ([]Extent, bool) {
-	found, bufs, _ := s.cache.Fetch(ctx, []string{cache.HashKey(key)})
+	hashedKey := cache.HashKey(key)
+	found, bufs, _ := s.cache.Fetch(ctx, []string{hashedKey})
 	if len(found) != 1 {
 		return nil, false
 	}
@@ -612,7 +668,21 @@ func (s resultsCache) get(ctx context.Context, key string) ([]Extent, bool) {
 
 	log.LogFields(otlog.Int("bytes", len(bufs[0])))
 
-	if err := proto.Unmarshal(bufs[0], &resp); err != nil {
+	payload := bufs[0]
+	if s.cfg.AuthKey.Value != "" {
+		verified, ok := authOpenResultsCache(s.cfg.AuthKey.Value, hashedKey, payload)
+		if !ok {
+			// The entry does not carry a valid HMAC under our key. It may have
+			// been written by an attacker with access to the cache, by a peer
+			// using a different auth key, or by an older version of Cortex
+			// that did not authenticate entries. Either way, we must not trust it.
+			level.Warn(log).Log("msg", "discarding results cache entry: HMAC verification failed")
+			return nil, false
+		}
+		payload = verified
+	}
+
+	if err := proto.Unmarshal(payload, &resp); err != nil {
 		level.Error(log).Log("msg", "error unmarshalling cached value", "err", err)
 		log.Error(err)
 		return nil, false
@@ -642,7 +712,12 @@ func (s resultsCache) put(ctx context.Context, key string, extents []Extent) {
 		return
 	}
 
-	s.cache.Store(ctx, []string{cache.HashKey(key)}, [][]byte{buf})
+	hashedKey := cache.HashKey(key)
+	if s.cfg.AuthKey.Value != "" {
+		buf = authSealResultsCache(s.cfg.AuthKey.Value, hashedKey, buf)
+	}
+
+	s.cache.Store(ctx, []string{hashedKey}, [][]byte{buf})
 }
 
 func jaegerSpanID(ctx context.Context) string {
