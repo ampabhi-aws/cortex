@@ -4,7 +4,9 @@ import (
 	"context"
 	"flag"
 	"io"
+	"net"
 	"net/http"
+	"strings"
 	"sync"
 	"time"
 
@@ -19,6 +21,7 @@ import (
 	"github.com/weaveworks/common/middleware"
 	"github.com/weaveworks/common/user"
 	"google.golang.org/grpc"
+	"google.golang.org/grpc/peer"
 
 	"github.com/cortexproject/cortex/pkg/frontend/v2/frontendv2pb"
 	"github.com/cortexproject/cortex/pkg/scheduler/queue"
@@ -83,11 +86,21 @@ type Config struct {
 	MaxOutstandingPerTenant int               `yaml:"max_outstanding_requests_per_tenant"`
 	QuerierForgetDelay      time.Duration     `yaml:"querier_forget_delay"`
 	GRPCClientConfig        grpcclient.Config `yaml:"grpc_client_config" doc:"description=This configures the gRPC client used to report errors back to the query-frontend."`
+
+	// RequireFrontendAddressMatchesPeer enforces that the self-reported
+	// FrontendAddress sent in the INIT message resolves to (or shares the host
+	// component of) the actual gRPC peer address of the connection. This is a
+	// defense-in-depth check against spoofed FrontendAddress values that would
+	// cause the querier to return the response (containing another tenant's
+	// data) to an attacker-chosen host. Default is false for backward
+	// compatibility; strongly recommended in production.
+	RequireFrontendAddressMatchesPeer bool `yaml:"require_frontend_address_matches_peer"`
 }
 
 func (cfg *Config) RegisterFlags(f *flag.FlagSet) {
 	f.IntVar(&cfg.MaxOutstandingPerTenant, "query-scheduler.max-outstanding-requests-per-tenant", 100, "Maximum number of outstanding requests per tenant per query-scheduler. In-flight requests above this limit will fail with HTTP response status code 429.")
 	f.DurationVar(&cfg.QuerierForgetDelay, "query-scheduler.querier-forget-delay", 0, "If a querier disconnects without sending notification about graceful shutdown, the query-scheduler will keep the querier in the tenant's shard until the forget delay has passed. This feature is useful to reduce the blast radius when shuffle-sharding is enabled.")
+	f.BoolVar(&cfg.RequireFrontendAddressMatchesPeer, "query-scheduler.require-frontend-address-matches-peer", false, "If true, the query-scheduler rejects FrontendLoop streams whose INIT FrontendAddress host does not match the gRPC peer address of the connection. This prevents a caller from asserting an arbitrary address to which a querier will later be told to send query responses. Recommended when the scheduler gRPC port is reachable by anything other than trusted frontends.")
 	cfg.GRPCClientConfig.RegisterFlagsWithPrefix("query-scheduler.grpc-client-config", f)
 }
 
@@ -236,6 +249,16 @@ func (s *Scheduler) frontendConnected(frontend schedulerpb.SchedulerForFrontend_
 		return "", nil, errors.New("no frontend address")
 	}
 
+	// Defense-in-depth: optionally require that the self-advertised
+	// FrontendAddress host matches the actual gRPC peer. A caller cannot then
+	// cause the querier to deliver query results to an attacker-chosen host.
+	if s.cfg.RequireFrontendAddressMatchesPeer {
+		if err := validateFrontendAddressMatchesPeer(frontend.Context(), msg.FrontendAddress); err != nil {
+			level.Warn(s.log).Log("msg", "rejecting frontend connection: advertised FrontendAddress does not match gRPC peer", "frontend_address", msg.FrontendAddress, "err", err)
+			return "", nil, err
+		}
+	}
+
 	s.connectedFrontendsMu.Lock()
 	defer s.connectedFrontendsMu.Unlock()
 
@@ -283,6 +306,15 @@ func (s *Scheduler) enqueueRequest(frontendContext context.Context, frontendAddr
 	}
 
 	userID := msg.GetUserID()
+
+	// Defense-in-depth: if the forwarded HTTP request carries an X-Scope-OrgID
+	// header, require it to match msg.UserID. This stops a caller from
+	// enqueuing work under tenant A while the forwarded HTTP request (which the
+	// querier's auth middleware re-reads) asserts tenant B. Mirrors the
+	// per-user guard in pkg/frontend/v2/frontend.go QueryResult.
+	if err := validateRequestUserIDMatchesHeader(userID, msg.HttpRequest); err != nil {
+		return err
+	}
 
 	req := &schedulerRequest{
 		frontendAddress: frontendAddr,
@@ -397,6 +429,73 @@ func (s *Scheduler) NotifyQuerierShutdown(_ context.Context, req *schedulerpb.No
 	s.requestQueue.NotifyQuerierShutdown(req.GetQuerierID())
 
 	return &schedulerpb.NotifyQuerierShutdownResponse{}, nil
+}
+
+// validateFrontendAddressMatchesPeer verifies that the host portion of the
+// self-advertised FrontendAddress matches the gRPC peer address of the
+// connection. The port is intentionally not compared: the advertised port is
+// the frontend's server port, while the peer port is the ephemeral client
+// port.
+func validateFrontendAddressMatchesPeer(ctx context.Context, frontendAddress string) error {
+	advertisedHost, _, err := net.SplitHostPort(frontendAddress)
+	if err != nil {
+		// If it's not host:port, treat the whole value as the host.
+		advertisedHost = frontendAddress
+	}
+	advertisedHost = strings.TrimSpace(advertisedHost)
+	if advertisedHost == "" {
+		return errors.New("empty frontend address host")
+	}
+
+	p, ok := peer.FromContext(ctx)
+	if !ok || p == nil || p.Addr == nil {
+		return errors.New("no gRPC peer address on frontend connection")
+	}
+	peerHost, _, err := net.SplitHostPort(p.Addr.String())
+	if err != nil {
+		peerHost = p.Addr.String()
+	}
+	if strings.EqualFold(advertisedHost, peerHost) {
+		return nil
+	}
+
+	// Allow the advertised host to be a hostname that resolves to the peer IP.
+	if ips, err := net.LookupHost(advertisedHost); err == nil {
+		for _, ip := range ips {
+			if strings.EqualFold(ip, peerHost) {
+				return nil
+			}
+		}
+	}
+
+	return errors.Errorf("frontend address %q does not match peer %q", frontendAddress, peerHost)
+}
+
+// validateRequestUserIDMatchesHeader rejects FrontendToScheduler messages where
+// the HttpRequest's X-Scope-OrgID header disagrees with the per-message UserID.
+// If the header is absent, no check is performed (preserves the historical
+// contract that one FrontendLoop stream multiplexes many tenants).
+func validateRequestUserIDMatchesHeader(userID string, req *httpgrpc.HTTPRequest) error {
+	if req == nil {
+		return nil
+	}
+	for _, h := range req.Headers {
+		if h == nil {
+			continue
+		}
+		if !strings.EqualFold(h.Key, user.OrgIDHeaderName) {
+			continue
+		}
+		for _, v := range h.Values {
+			if v == "" {
+				continue
+			}
+			if v != userID {
+				return errors.Errorf("FrontendToScheduler.UserID %q does not match HttpRequest X-Scope-OrgID header %q", userID, v)
+			}
+		}
+	}
+	return nil
 }
 
 func (s *Scheduler) forwardRequestToQuerier(querier schedulerpb.SchedulerForQuerier_QuerierLoopServer, req *schedulerRequest) error {

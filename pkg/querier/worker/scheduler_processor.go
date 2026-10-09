@@ -38,6 +38,8 @@ func newSchedulerProcessor(cfg Config, handler RequestHandler, log log.Logger, r
 		querierID:      cfg.QuerierID,
 		grpcConfig:     cfg.GRPCClientConfig,
 
+		frontendAddressAllowlist: newFrontendAddressAllowlist(cfg.FrontendAddressAllowlist),
+
 		frontendClientRequestDuration: promauto.With(reg).NewHistogramVec(prometheus.HistogramOpts{
 			Name:    "cortex_querier_query_frontend_request_duration_seconds",
 			Help:    "Time spend doing requests to frontend.",
@@ -67,6 +69,8 @@ type schedulerProcessor struct {
 	grpcConfig     grpcclient.Config
 	maxMessageSize int
 	querierID      string
+
+	frontendAddressAllowlist *frontendAddressAllowlist
 
 	frontendPool                  *client.Pool
 	frontendClientRequestDuration *prometheus.HistogramVec
@@ -182,6 +186,10 @@ func (sp *schedulerProcessor) runRequest(ctx context.Context, logger log.Logger,
 
 	c, err := sp.frontendPool.GetClientFor(frontendAddress)
 	if err == nil {
+		if allowErr := sp.frontendAddressAllowlist.check(frontendAddress); allowErr != nil {
+			level.Error(logger).Log("msg", "refusing to send query result to disallowed frontend address", "frontend", frontendAddress, "err", allowErr)
+			return
+		}
 		// Response is empty and uninteresting.
 		_, err = c.(frontendv2pb.FrontendForQuerierClient).QueryResult(ctx, &frontendv2pb.QueryResultRequest{
 			QueryID:      queryID,
