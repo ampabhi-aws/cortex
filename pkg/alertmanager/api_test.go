@@ -613,6 +613,10 @@ func TestMultitenantAlertmanager_DeleteUserConfig(t *testing.T) {
 }
 
 func TestAMConfigListUserConfig(t *testing.T) {
+	// Each tenant's config contains a secret-bearing field (bearer_token in
+	// webhook http_config). The admin list endpoint must redact those fields
+	// before returning them in a cross-tenant dump; the non-sensitive fields
+	// must still be present so the dump remains operationally useful.
 	testCases := map[string]*UserConfig{
 		"user1": {
 			AlertmanagerConfig: `
@@ -627,7 +631,8 @@ receivers:
 - name: route1
   webhook_configs:
   - send_resolved: true
-    http_config: {}
+    http_config:
+      bearer_token: user1-super-secret-token
     url: http://alertmanager/api/notifications?orgId=1&rrid=7
     max_alerts: 0
 `,
@@ -645,7 +650,8 @@ receivers:
 - name: route1
   webhook_configs:
   - send_resolved: true
-    http_config: {}
+    http_config:
+      bearer_token: user2-super-secret-token
     url: http://alertmanager/api/notifications?orgId=2&rrid=7
     max_alerts: 0
 `,
@@ -690,9 +696,28 @@ receivers:
 	require.Equal(t, "application/yaml", resp.Header.Get("Content-Type"))
 	body, err := io.ReadAll(resp.Body)
 	require.NoError(t, err)
-	old, err := yaml.Marshal(testCases)
-	require.NoError(t, err)
-	require.YAMLEq(t, string(old), string(body))
+
+	// Secrets must never appear in the cross-tenant admin dump.
+	require.NotContains(t, string(body), "user1-super-secret-token")
+	require.NotContains(t, string(body), "user2-super-secret-token")
+
+	// The dumped YAML must parse back as a map keyed by tenant
+	// (StreamWriteYAMLResponse writes consecutive top-level maps that
+	// combine into a single YAML document). Each map value's
+	// alertmanager_config must still parse and must still contain the
+	// non-sensitive route/receiver data.
+	got := map[string]*UserConfig{}
+	require.NoError(t, yaml.Unmarshal(body, &got))
+	for _, u := range []string{"user1", "user2"} {
+		require.Contains(t, got, u)
+		require.NotEmpty(t, got[u].AlertmanagerConfig, "redacted config for %s must not be empty", u)
+		parsed, perr := config.Load(got[u].AlertmanagerConfig)
+		require.NoError(t, perr, "redacted config for %s must still parse", u)
+		require.NotNil(t, parsed.Route)
+		require.Equal(t, "route1", parsed.Route.Receiver)
+		require.Len(t, parsed.Receivers, 1)
+		require.Equal(t, "route1", parsed.Receivers[0].Name)
+	}
 }
 
 func TestValidateAlertmanagerConfig(t *testing.T) {

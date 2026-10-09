@@ -446,6 +446,18 @@ GET /ruler/rule_groups
 
 List all tenant rules. This endpoint is not part of ruler-API and is always available regardless of whether ruler-API is enabled or not. It should not be exposed to end users. This endpoint returns a YAML dictionary with all the rule groups for each tenant and `200` status code on success.
 
+> **Warning**
+> This is a cross-tenant admin dump. Starting with the hardened route
+> registration (`API.RegisterAdminRoute`), this endpoint is only served when
+> an admin authorization middleware is explicitly configured on the
+> `api` module (`-api.http-admin-auth-middleware`), is wrapped in both the
+> tenant and admin middlewares, and SHOULD be bound to a separate
+> internal-only listener. For builds that predate the fix, operators MUST
+> block `/ruler/rule_groups` at the authenticating proxy for any caller
+> that is not a trusted operator — the handler does not resolve a tenant
+> and will return every tenant's rules to any caller that can reach the
+> HTTP listener.
+
 ### List rules
 
 ```
@@ -685,6 +697,27 @@ GET /multitenant_alertmanager/configs
 ```
 
 List all Alertmanager configurations. This endpoint is not part of alertmanager-API and is always available regardless of whether alertmanager-API is enabled or not. It should not be exposed to end users. This endpoint returns a YAML dictionary with all the Alertmanager configurations and `200` status code on success.
+
+> **Warning**
+> This is a cross-tenant admin dump. Starting with the hardened route
+> registration (`API.RegisterAdminRoute`), this endpoint is only served
+> when an admin authorization middleware is explicitly configured on the
+> `api` module (`-api.http-admin-auth-middleware`), is wrapped in both
+> the tenant and admin middlewares, and SHOULD be bound to a separate
+> internal-only listener. Returned configurations are additionally
+> post-processed through the prometheus/alertmanager config parser so
+> that fields typed as `Secret` / `SecretURL` (slack `api_url`, webhook
+> `bearer_token`, basic-auth `password`, SMTP `auth_password`,
+> PagerDuty `routing_key`, VictorOps `api_key`, …) are redacted to the
+> literal string `<secret>`.
+>
+> For builds that predate the fix, operators MUST block
+> `/multitenant_alertmanager/configs`, `/ruler/rule_groups`,
+> `/distributor/all_user_stats` and `/all_user_stats` at the
+> authenticating proxy for any caller that is not a trusted operator —
+> the handlers do not resolve a tenant and will stream every tenant's
+> configuration (including receiver credentials) to any caller that can
+> reach the HTTP listener.
 
 ### Alertmanager ring status
 

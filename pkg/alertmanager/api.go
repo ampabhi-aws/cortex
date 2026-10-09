@@ -283,10 +283,19 @@ func (am *MultitenantAlertmanager) ListAllConfigs(w http.ResponseWriter, r *http
 		} else if err != nil {
 			return errors.Wrapf(err, "failed to fetch alertmanager config for user %s", userID)
 		}
+		// Defence in depth: never return cfg.RawConfig verbatim on the
+		// cross-tenant admin dump. Parse the alertmanager config and
+		// re-marshal it: fields typed as config.Secret / config.SecretURL
+		// (slack_api_url, api_key, auth_password, bearer_token,
+		// routing_key, smtp_auth_password, …) implement MarshalYAML to
+		// emit the literal "<secret>", so credentials cannot leak even to
+		// an authorised admin caller. If parsing fails we fall back to an
+		// empty config body rather than streaming the raw YAML.
+		redactedConfig := redactAlertmanagerConfigSecrets(cfg.RawConfig, logger, userID)
 		data := map[string]*UserConfig{
 			userID: {
 				TemplateFiles:      alertspb.ParseTemplates(cfg),
-				AlertmanagerConfig: cfg.RawConfig,
+				AlertmanagerConfig: redactedConfig,
 			},
 		}
 
@@ -302,6 +311,31 @@ func (am *MultitenantAlertmanager) ListAllConfigs(w http.ResponseWriter, r *http
 	}
 	close(iter)
 	<-done
+}
+
+// redactAlertmanagerConfigSecrets returns a YAML representation of the given
+// Alertmanager configuration with secret-bearing fields replaced by the
+// literal "<secret>". It parses the raw YAML into prometheus/alertmanager's
+// config.Config — whose Secret / SecretURL types implement MarshalYAML to
+// emit <secret> — and marshals it back out. On parse failure it returns an
+// empty string: in the cross-tenant admin dump path we fail closed (serve
+// no body for that tenant) rather than leak the untrusted raw YAML, which
+// may contain receiver credentials in plaintext.
+func redactAlertmanagerConfigSecrets(rawConfig string, logger log.Logger, userID string) string {
+	if rawConfig == "" {
+		return ""
+	}
+	parsed, err := config.Load(rawConfig)
+	if err != nil || parsed == nil {
+		level.Warn(logger).Log("msg", "redacting alertmanager config: failed to parse, dropping body", "user", userID, "err", err)
+		return ""
+	}
+	out, err := yaml.Marshal(parsed)
+	if err != nil {
+		level.Warn(logger).Log("msg", "redacting alertmanager config: failed to marshal, dropping body", "user", userID, "err", err)
+		return ""
+	}
+	return string(out)
 }
 
 // validateAlertmanagerConfig recursively scans the input config looking for data types for which
