@@ -214,6 +214,20 @@ lint:
 		./pkg/querier/... \
 		./pkg/ruler/...
 
+	# Ensure all generated .pb.go skip* functions use the depth-bounded iterative
+	# template (gogo-protobuf post-fix). The pre-fix template recurses on groups
+	# and lets a crafted remote-write body crash the process with a Go stack
+	# overflow (CVE-class: CWE-674). Any skip* function that does not contain
+	# 'depth++' is still using the vulnerable recursive template.
+	@missing=$$(for f in $$(grep -rl 'func skip.*(dAtA \[\]byte)' pkg --include=*.pb.go); do \
+		grep -q 'depth++' $$f || echo $$f; \
+	done); \
+	if [ -n "$$missing" ]; then \
+		echo "ERROR: the following generated protobuf files still use the pre-fix recursive skip template (missing depth++); regenerate with current gogo-protobuf:"; \
+		echo "$$missing"; \
+		exit 1; \
+	fi
+
 test:
 	go test -tags netgo -timeout 30m -race -count 1 ./...
 
