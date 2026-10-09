@@ -29,6 +29,8 @@ type DefaultMultiTenantManager struct {
 
 	mapper *mapper
 
+	limits RulesLimits
+
 	// Structs for holding per-user Prometheus rules Managers
 	// and a corresponding metrics struct
 	userManagerMtx     sync.Mutex
@@ -47,7 +49,7 @@ type DefaultMultiTenantManager struct {
 	logger                        log.Logger
 }
 
-func NewDefaultMultiTenantManager(cfg Config, managerFactory ManagerFactory, reg prometheus.Registerer, logger log.Logger) (*DefaultMultiTenantManager, error) {
+func NewDefaultMultiTenantManager(cfg Config, managerFactory ManagerFactory, reg prometheus.Registerer, logger log.Logger, limits RulesLimits) (*DefaultMultiTenantManager, error) {
 	ncfg, err := buildNotifierConfig(&cfg)
 	if err != nil {
 		return nil, err
@@ -66,6 +68,7 @@ func NewDefaultMultiTenantManager(cfg Config, managerFactory ManagerFactory, reg
 		mapper:             newMapper(cfg.RulePath, logger),
 		userManagers:       map[string]RulesManager{},
 		userManagerMetrics: userManagerMetrics,
+		limits:             limits,
 		managersTotal: promauto.With(reg).NewGauge(prometheus.GaugeOpts{
 			Namespace: "cortex",
 			Name:      "ruler_managers_total",
@@ -123,6 +126,11 @@ func (r *DefaultMultiTenantManager) SyncRuleGroups(ctx context.Context, ruleGrou
 // syncRulesToManager maps the rule files to disk, detects any changes and will create/update the
 // the users Prometheus Rules Manager.
 func (r *DefaultMultiTenantManager) syncRulesToManager(ctx context.Context, user string, groups rulespb.RuleGroupList) {
+	// Enforce the per-tenant minimum evaluation interval on the evaluation path
+	// too, so rule groups that were persisted before the write-time check
+	// (or via the legacy configs service) cannot bypass it.
+	r.clampGroupIntervals(user, groups)
+
 	// Map the files to disk and return the file names to be passed to the users manager if they
 	// have been updated
 	update, files, err := r.mapper.MapRules(user, groups.Formatted())
@@ -158,6 +166,37 @@ func (r *DefaultMultiTenantManager) syncRulesToManager(ctx context.Context, user
 
 		r.lastReloadSuccessful.WithLabelValues(user).Set(1)
 		r.lastReloadSuccessfulTimestamp.WithLabelValues(user).SetToCurrentTime()
+	}
+}
+
+// clampGroupIntervals raises each rule group's evaluation interval up to the
+// per-tenant minimum configured via -ruler.min-rule-evaluation-interval. A
+// stored interval of 0 ("use the operator default") is left untouched; the
+// Prometheus manager will substitute the configured EvaluationInterval. A
+// per-tenant minimum of 0 disables the clamp.
+func (r *DefaultMultiTenantManager) clampGroupIntervals(user string, groups rulespb.RuleGroupList) {
+	if r.limits == nil {
+		return
+	}
+	min := r.limits.RulerMinRuleEvaluationInterval(user)
+	if min <= 0 {
+		return
+	}
+	for _, g := range groups {
+		if g == nil {
+			continue
+		}
+		if g.Interval > 0 && g.Interval < min {
+			level.Warn(r.logger).Log(
+				"msg", "rule group evaluation interval is below the per-user minimum, clamping",
+				"user", user,
+				"group", g.Name,
+				"namespace", g.Namespace,
+				"configured_interval", g.Interval,
+				"min_interval", min,
+			)
+			g.Interval = min
+		}
 	}
 }
 
