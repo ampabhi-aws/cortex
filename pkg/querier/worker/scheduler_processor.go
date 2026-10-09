@@ -3,7 +3,9 @@ package worker
 import (
 	"context"
 	"fmt"
+	"net"
 	"net/http"
+	"sync"
 	"time"
 
 	"github.com/go-kit/log"
@@ -30,6 +32,13 @@ import (
 	"github.com/cortexproject/cortex/pkg/util/services"
 )
 
+// maxFrontendPoolSize caps how many distinct frontend addresses a querier
+// will concurrently keep gRPC connections to. The frontend address is
+// attacker-influenced (see pkg/scheduler/scheduler.go frontendConnected);
+// this cap prevents a hostile scheduler/frontend from exhausting sockets
+// and memory on the querier.
+const maxFrontendPoolSize = 256
+
 func newSchedulerProcessor(cfg Config, handler RequestHandler, log log.Logger, reg prometheus.Registerer) (*schedulerProcessor, []services.Service) {
 	p := &schedulerProcessor{
 		log:            log,
@@ -37,12 +46,7 @@ func newSchedulerProcessor(cfg Config, handler RequestHandler, log log.Logger, r
 		maxMessageSize: cfg.GRPCClientConfig.MaxSendMsgSize,
 		querierID:      cfg.QuerierID,
 		grpcConfig:     cfg.GRPCClientConfig,
-
-		frontendClientRequestDuration: promauto.With(reg).NewHistogramVec(prometheus.HistogramOpts{
-			Name:    "cortex_querier_query_frontend_request_duration_seconds",
-			Help:    "Time spend doing requests to frontend.",
-			Buckets: prometheus.ExponentialBuckets(0.001, 4, 6),
-		}, []string{"operation", "status_code"}),
+		recentFrontends: map[string]time.Time{},
 	}
 
 	frontendClientsGauge := promauto.With(reg).NewGauge(prometheus.GaugeOpts{
@@ -50,13 +54,23 @@ func newSchedulerProcessor(cfg Config, handler RequestHandler, log log.Logger, r
 		Help: "The current number of clients connected to query-frontend.",
 	})
 
+	p.frontendClientRequestDuration = promauto.With(reg).NewHistogramVec(prometheus.HistogramOpts{
+		Name:    "cortex_querier_query_frontend_request_duration_seconds",
+		Help:    "Time spend doing requests to frontend.",
+		Buckets: prometheus.ExponentialBuckets(0.001, 4, 6),
+	}, []string{"operation", "status_code"})
+
 	poolConfig := client.PoolConfig{
 		CheckInterval:      5 * time.Second,
 		HealthCheckEnabled: true,
 		HealthCheckTimeout: 1 * time.Second,
 	}
 
-	p.frontendPool = client.NewPool("frontend", poolConfig, nil, p.createFrontendClient, frontendClientsGauge, log)
+	// Supply a discovery function so the pool can evict frontend addresses
+	// we have not seen on the scheduler stream recently. Without this,
+	// removeStaleClients was a no-op (discovery was nil) and black-holed
+	// attacker-supplied addresses only drained via sequential health checks.
+	p.frontendPool = client.NewPool("frontend", poolConfig, p.recentFrontendDiscovery, p.createFrontendClient, frontendClientsGauge, log)
 	return p, []services.Service{p.frontendPool}
 }
 
@@ -70,6 +84,13 @@ type schedulerProcessor struct {
 
 	frontendPool                  *client.Pool
 	frontendClientRequestDuration *prometheus.HistogramVec
+
+	// recentFrontends tracks frontend addresses the scheduler has recently
+	// asked this querier to contact. It feeds the frontend pool discovery
+	// so stale/attacker-supplied addresses are evicted and the pool size is
+	// bounded.
+	recentFrontendsMu sync.Mutex
+	recentFrontends   map[string]time.Time
 }
 
 // notifyShutdown implements processor.
@@ -152,6 +173,25 @@ func (sp *schedulerProcessor) querierLoop(c schedulerpb.SchedulerForQuerier_Quer
 }
 
 func (sp *schedulerProcessor) runRequest(ctx context.Context, logger log.Logger, queryID uint64, frontendAddress string, statsEnabled bool, request *httpgrpc.HTTPRequest) {
+	if err := validateFrontendAddress(frontendAddress); err != nil {
+		// The scheduler is responsible for only handing us legitimate
+		// frontend addresses; refuse to dial anything that is clearly
+		// unsafe (malformed, loopback that is not us, link-local metadata,
+		// multicast, unspecified). This is defense in depth against a
+		// compromised or buggy scheduler.
+		level.Error(logger).Log("msg", "refusing to dial unsafe frontend address", "frontend", frontendAddress, "err", err)
+		return
+	}
+
+	// Bound the frontend client pool so a scheduler that funnels an
+	// unbounded set of distinct addresses to us cannot exhaust sockets.
+	if sp.frontendPool.Count() >= maxFrontendPoolSize {
+		if _, known := sp.lookupRecentFrontend(frontendAddress); !known {
+			level.Error(logger).Log("msg", "refusing to dial frontend: pool at capacity", "frontend", frontendAddress, "size", sp.frontendPool.Count(), "max", maxFrontendPoolSize)
+			return
+		}
+	}
+
 	var stats *querier_stats.Stats
 	if statsEnabled {
 		stats, ctx = querier_stats.ContextWithEmptyStats(ctx)
@@ -182,6 +222,7 @@ func (sp *schedulerProcessor) runRequest(ctx context.Context, logger log.Logger,
 
 	c, err := sp.frontendPool.GetClientFor(frontendAddress)
 	if err == nil {
+		sp.rememberFrontend(frontendAddress)
 		// Response is empty and uninteresting.
 		_, err = c.(frontendv2pb.FrontendForQuerierClient).QueryResult(ctx, &frontendv2pb.QueryResultRequest{
 			QueryID:      queryID,
@@ -225,4 +266,86 @@ type frontendClient struct {
 
 func (fc *frontendClient) Close() error {
 	return fc.conn.Close()
+}
+
+// recentFrontendWindow bounds how long an address that has not been handed to
+// runRequest will remain in the pool. It should be larger than the pool's
+// CheckInterval (5s) and the typical query duration.
+const recentFrontendWindow = 2 * time.Minute
+
+// lookupRecentFrontend reports whether addr is in the recent-use set.
+func (sp *schedulerProcessor) lookupRecentFrontend(addr string) (time.Time, bool) {
+	sp.recentFrontendsMu.Lock()
+	defer sp.recentFrontendsMu.Unlock()
+	t, ok := sp.recentFrontends[addr]
+	return t, ok
+}
+
+// rememberFrontend records that the scheduler asked us to contact
+// frontendAddress, so that recentFrontendDiscovery (fed into Pool.discovery)
+// does not evict a currently-in-use client.
+func (sp *schedulerProcessor) rememberFrontend(addr string) {
+	sp.recentFrontendsMu.Lock()
+	defer sp.recentFrontendsMu.Unlock()
+	now := time.Now()
+	sp.recentFrontends[addr] = now
+	if len(sp.recentFrontends) > maxFrontendPoolSize*2 {
+		// Keep the map bounded. Drop entries older than the window.
+		for k, t := range sp.recentFrontends {
+			if now.Sub(t) > recentFrontendWindow {
+				delete(sp.recentFrontends, k)
+			}
+		}
+	}
+}
+
+// recentFrontendDiscovery returns the set of frontend addresses the scheduler
+// has recently asked this querier to contact. Pool.removeStaleClients uses
+// this list to evict unknown addresses, so a scheduler that stops advertising
+// an address causes the connection to be closed quickly.
+func (sp *schedulerProcessor) recentFrontendDiscovery() ([]string, error) {
+	sp.recentFrontendsMu.Lock()
+	defer sp.recentFrontendsMu.Unlock()
+	now := time.Now()
+	addrs := make([]string, 0, len(sp.recentFrontends))
+	for addr, t := range sp.recentFrontends {
+		if now.Sub(t) > recentFrontendWindow {
+			delete(sp.recentFrontends, addr)
+			continue
+		}
+		addrs = append(addrs, addr)
+	}
+	return addrs, nil
+}
+
+// validateFrontendAddress enforces defense-in-depth checks on the
+// scheduler-asserted frontend address before the querier dials it. It
+// requires a well-formed host:port and rejects obviously unsafe targets
+// such as link-local metadata (169.254.0.0/16), multicast and the
+// unspecified address. Loopback is allowed only when the host is a literal
+// IP; we intentionally do not resolve DNS names here (the scheduler-side
+// peer-identity check already pins the address to the frontend's peer IP).
+func validateFrontendAddress(addr string) error {
+	if addr == "" {
+		return fmt.Errorf("empty frontend address")
+	}
+	host, port, err := net.SplitHostPort(addr)
+	if err != nil {
+		return fmt.Errorf("malformed frontend address %q: %w", addr, err)
+	}
+	if host == "" || port == "" {
+		return fmt.Errorf("frontend address %q missing host or port", addr)
+	}
+	if ip := net.ParseIP(host); ip != nil {
+		if ip.IsUnspecified() {
+			return fmt.Errorf("frontend address %q uses unspecified IP", addr)
+		}
+		if ip.IsLinkLocalUnicast() || ip.IsLinkLocalMulticast() {
+			return fmt.Errorf("frontend address %q uses link-local IP (metadata or discovery range)", addr)
+		}
+		if ip.IsMulticast() {
+			return fmt.Errorf("frontend address %q uses multicast IP", addr)
+		}
+	}
+	return nil
 }
