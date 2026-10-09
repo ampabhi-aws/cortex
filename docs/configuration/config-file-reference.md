@@ -86,6 +86,13 @@ api:
   # CLI flag: -api.http-request-headers-to-log
   [http_request_headers_to_log: <list of string> | default = []]
 
+  # Enable the ingester's debug HTTP push endpoint (/ingester/push). This
+  # endpoint bypasses distributor validation and per-tenant ingestion rate
+  # limits and writes directly to the local ingester's TSDB; it is intended
+  # for testing and debugging only and must not be exposed to tenants.
+  # CLI flag: -api.enable-ingester-push-endpoint
+  [enable_ingester_push_endpoint: <boolean> | default = false]
+
 # The server_config configures the HTTP and gRPC server of the launched
 # service(s).
 [server: <server_config>]
