@@ -15,6 +15,7 @@ import (
 	"google.golang.org/grpc"
 
 	"github.com/cortexproject/cortex/pkg/util"
+	"github.com/cortexproject/cortex/pkg/util/flagext"
 	"github.com/cortexproject/cortex/pkg/util/grpcclient"
 	"github.com/cortexproject/cortex/pkg/util/services"
 )
@@ -30,6 +31,15 @@ type Config struct {
 
 	QuerierID string `yaml:"id"`
 
+	// FrontendAddressAllowlist, if non-empty, restricts the set of frontend
+	// addresses the querier is willing to dial to deliver query results. Each
+	// entry may be a host ("frontend-0"), host:port ("frontend-0:9095"), or
+	// IP/CIDR ("10.0.0.0/8"). When used with the query-scheduler, this is a
+	// defense-in-depth measure against a scheduler forwarding an
+	// attacker-chosen FrontendAddress that would cause the querier to leak the
+	// query response to that address.
+	FrontendAddressAllowlist flagext.StringSliceCSV `yaml:"frontend_address_allowlist"`
+
 	GRPCClientConfig grpcclient.Config `yaml:"grpc_client_config"`
 }
 
@@ -42,6 +52,7 @@ func (cfg *Config) RegisterFlags(f *flag.FlagSet) {
 	f.IntVar(&cfg.Parallelism, "querier.worker-parallelism", 10, "Number of simultaneous queries to process per query-frontend or query-scheduler.")
 	f.BoolVar(&cfg.MatchMaxConcurrency, "querier.worker-match-max-concurrent", false, "Force worker concurrency to match the -querier.max-concurrent option. Overrides querier.worker-parallelism.")
 	f.StringVar(&cfg.QuerierID, "querier.id", "", "Querier ID, sent to frontend service to identify requests from the same querier. Defaults to hostname.")
+	f.Var(&cfg.FrontendAddressAllowlist, "querier.frontend-address-allowlist", "Comma-separated list of frontend addresses the querier is allowed to dial when returning results. Entries may be a host, host:port, IP, or CIDR. Empty (default) allows any address the scheduler advertises, which preserves historical behavior but is unsafe if the scheduler gRPC port is reachable by untrusted parties.")
 
 	cfg.GRPCClientConfig.RegisterFlagsWithPrefix("querier.frontend-client", f)
 }
