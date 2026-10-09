@@ -34,6 +34,9 @@ func setupScheduler(t *testing.T, reg prometheus.Registerer) (*Scheduler, schedu
 	cfg := Config{}
 	flagext.DefaultValues(&cfg)
 	cfg.MaxOutstandingPerTenant = testMaxOutstandingPerTenant
+	// Tests use symbolic (non host:port) frontend identifiers and run over
+	// loopback; disable peer-identity validation so the fixture keeps working.
+	cfg.DisableFrontendAddressValidation = true
 
 	s, err := NewScheduler(cfg, &limits{queriers: 2}, log.NewNopLogger(), reg)
 	require.NoError(t, err)
@@ -500,6 +503,66 @@ type limits struct {
 
 func (l limits) MaxQueriersPerUser(_ string) int {
 	return l.queriers
+}
+
+// TestFrontendAddressValidation exercises the SSRF hardening added to
+// Scheduler.frontendConnected: the asserted INIT.FrontendAddress must be a
+// well-formed host:port and (when validation is enabled) its host must match
+// the gRPC peer's remote IP.
+func TestFrontendAddressValidation(t *testing.T) {
+	cfg := Config{}
+	flagext.DefaultValues(&cfg)
+	cfg.MaxOutstandingPerTenant = testMaxOutstandingPerTenant
+	// Validation is on by default; make it explicit.
+	cfg.DisableFrontendAddressValidation = false
+
+	s, err := NewScheduler(cfg, &limits{queriers: 2}, log.NewNopLogger(), nil)
+	require.NoError(t, err)
+
+	server := grpc.NewServer()
+	schedulerpb.RegisterSchedulerForFrontendServer(server, s)
+	schedulerpb.RegisterSchedulerForQuerierServer(server, s)
+
+	require.NoError(t, services.StartAndAwaitRunning(context.Background(), s))
+	t.Cleanup(func() { _ = services.StopAndAwaitTerminated(context.Background(), s) })
+
+	l, err := net.Listen("tcp", "127.0.0.1:0")
+	require.NoError(t, err)
+	go func() { _ = server.Serve(l) }()
+	t.Cleanup(func() { _ = l.Close() })
+
+	c, err := grpc.Dial(l.Addr().String(), grpc.WithTransportCredentials(insecure.NewCredentials()))
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = c.Close() })
+	fc := schedulerpb.NewSchedulerForFrontendClient(c)
+
+	// Case 1: a symbolic (non host:port) address is rejected.
+	{
+		loop, err := fc.FrontendLoop(context.Background())
+		require.NoError(t, err)
+		require.NoError(t, loop.Send(&schedulerpb.FrontendToScheduler{Type: schedulerpb.INIT, FrontendAddress: "frontend-12345"}))
+		_, err = loop.Recv()
+		require.Error(t, err)
+	}
+
+	// Case 2: an attacker-chosen host:port that does not match the gRPC peer is rejected.
+	{
+		loop, err := fc.FrontendLoop(context.Background())
+		require.NoError(t, err)
+		require.NoError(t, loop.Send(&schedulerpb.FrontendToScheduler{Type: schedulerpb.INIT, FrontendAddress: "169.254.169.254:80"}))
+		_, err = loop.Recv()
+		require.Error(t, err)
+	}
+
+	// Case 3: an address whose host matches the gRPC peer (loopback) is accepted.
+	{
+		loop, err := fc.FrontendLoop(context.Background())
+		require.NoError(t, err)
+		require.NoError(t, loop.Send(&schedulerpb.FrontendToScheduler{Type: schedulerpb.INIT, FrontendAddress: "127.0.0.1:9999"}))
+		msg, err := loop.Recv()
+		require.NoError(t, err)
+		require.Equal(t, schedulerpb.OK, msg.Status)
+	}
 }
 
 type frontendMock struct {
