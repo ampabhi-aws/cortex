@@ -55,11 +55,34 @@ func WithSourceIPs(sourceIPs string, l log.Logger) log.Logger {
 	return log.With(l, "sourceIPs", sourceIPs)
 }
 
-// HeadersFromContext enables the logging of specified HTTP Headers that have been added to a context
+// sanitizeHeaderLogKey returns a logfmt-safe key for a header name. Any rune
+// that logfmt's keyRuneFilter would strip (<= space, '=', '"') is replaced
+// with '_'. If the resulting key would be empty, a fallback is used. This
+// guarantees kitlog.With is never fed a key that would make logfmtLogger
+// drop the whole log record.
+func sanitizeHeaderLogKey(name string) string {
+	out := make([]rune, 0, len(name))
+	for _, r := range name {
+		if r > ' ' && r != '=' && r != '"' {
+			out = append(out, r)
+		} else {
+			out = append(out, '_')
+		}
+	}
+	if len(out) == 0 {
+		return "http_header"
+	}
+	return string(out)
+}
+
+// HeadersFromContext enables the logging of specified HTTP Headers that have been added to a context.
+// Keys are prefixed with "http_header_" and sanitised so that a hostile value
+// in the propagated map cannot forge well-known log fields or produce a key
+// that logfmt refuses to encode.
 func headersFromContext(ctx context.Context, l log.Logger) log.Logger {
 	headerContentsMap := HeaderMapFromContext(ctx)
 	for header, contents := range headerContentsMap {
-		l = kitlog.With(l, header, contents)
+		l = kitlog.With(l, "http_header_"+sanitizeHeaderLogKey(header), contents)
 	}
 	return l
 }

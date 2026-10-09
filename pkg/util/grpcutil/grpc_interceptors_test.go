@@ -68,7 +68,7 @@ func TestGRPCHeaderInjectionForHTTPPropagationServerInterceptor(t *testing.T) {
 
 	md, ok := metadata.FromOutgoingContext(ctx)
 	require.True(t, ok)
-	ctx = util_log.ContextWithHeaderMapFromMetadata(ctx, md)
+	ctx = util_log.ContextWithHeaderMapFromMetadata(ctx, md, []string{"Test1", "TestHeader2"})
 
 	headersMap := util_log.HeaderMapFromContext(ctx)
 
@@ -77,7 +77,6 @@ func TestGRPCHeaderInjectionForHTTPPropagationServerInterceptor(t *testing.T) {
 
 	assert.Equal(t, "Results", headersMap["Test1"])
 	assert.Equal(t, "Results2", headersMap["TestHeader2"])
-
 }
 
 func TestGRPCHeaderDifferentLengthsForHTTPPropagationServerInterceptor(t *testing.T) {
@@ -86,7 +85,27 @@ func TestGRPCHeaderDifferentLengthsForHTTPPropagationServerInterceptor(t *testin
 	ctx = metadata.AppendToOutgoingContext(ctx, util_log.HeaderPropagationStringForRequestLogging, "Results")
 	ctx = metadata.AppendToOutgoingContext(ctx, util_log.HeaderPropagationStringForRequestLogging, "Results2")
 
-	ctx = extractForwardedHeadersFromMetadata(ctx)
+	ctx = extractForwardedHeadersFromMetadata(ctx, []string{"Test123"})
 
 	assert.Nil(t, util_log.HeaderMapFromContext(ctx))
+}
+
+func TestExtractForwardedHeadersFromMetadataFiltersUnknownKeys(t *testing.T) {
+	ctx := context.Background()
+	ctx = metadata.AppendToOutgoingContext(ctx,
+		util_log.HeaderPropagationStringForRequestLogging, "AllowedHeader",
+		util_log.HeaderPropagationStringForRequestLogging, "ok",
+	)
+	md, _ := metadata.FromOutgoingContext(ctx)
+	ctx = metadata.NewIncomingContext(ctx, md)
+
+	// With an empty allowlist, nothing is accepted.
+	got := extractForwardedHeadersFromMetadata(ctx, nil)
+	assert.Nil(t, util_log.HeaderMapFromContext(got))
+
+	// With the key on the allowlist, it is accepted.
+	got = extractForwardedHeadersFromMetadata(ctx, []string{"AllowedHeader"})
+	headerMap := util_log.HeaderMapFromContext(got)
+	require.NotNil(t, headerMap)
+	assert.Equal(t, "ok", headerMap["AllowedHeader"])
 }
