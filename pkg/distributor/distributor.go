@@ -484,8 +484,21 @@ func (d *Distributor) checkSample(ctx context.Context, userID, cluster, replica 
 		return false, nil
 	}
 
+	// Bound BOTH HA label values before they reach the KV store / metrics.
 	// If replica label is too long, don't use it. We accept the sample here, but it will fail validation later anyway.
-	if len(replica) > d.limits.MaxLabelValueLength(userID) {
+	maxLen := d.limits.MaxLabelValueLength(userID)
+	if len(replica) > maxLen {
+		return false, nil
+	}
+	// The cluster value is used as part of the KV store key and as a metric label
+	// dimension (see haTracker.checkReplica). Without this guard an attacker-controlled
+	// label value could create unbounded KV keys and Prometheus metric series, since
+	// validation.ValidateLabels runs later in the per-series loop and does not undo
+	// those side effects. Reject anything that is too long, is not a valid Prometheus
+	// label value (so control bytes / invalid UTF-8 do not reach /metrics), or that
+	// contains path separators (so a tenant cannot shape the KV key hierarchy).
+	if len(cluster) > maxLen || !model.LabelValue(cluster).IsValid() || strings.ContainsAny(cluster, "/\\") {
+		// Accept the sample but do not track it: it will fail label validation later anyway.
 		return false, nil
 	}
 
