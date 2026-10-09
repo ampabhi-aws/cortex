@@ -33,7 +33,7 @@ func TestApiStatusCodes(t *testing.T) {
 	}{
 		{
 			err:            errors.New("some random error"),
-			expectedString: "some random error",
+			expectedString: "internal server error executing query",
 			expectedCode:   500,
 		},
 
@@ -75,16 +75,16 @@ func TestApiStatusCodes(t *testing.T) {
 			expectedCode:   422,
 		},
 
-		// 505 is translated to 500
+		// 505 is translated to 500 and the raw error is redacted.
 		{
 			err:            httpgrpc.Errorf(http.StatusHTTPVersionNotSupported, "test"),
-			expectedString: "test",
+			expectedString: "internal server error executing query",
 			expectedCode:   500,
 		},
 
 		{
 			err:            context.DeadlineExceeded,
-			expectedString: "context deadline exceeded",
+			expectedString: "internal server error executing query",
 			expectedCode:   500,
 		},
 

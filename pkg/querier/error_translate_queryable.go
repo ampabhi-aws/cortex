@@ -5,12 +5,22 @@ import (
 
 	"github.com/cortexproject/cortex/pkg/util/validation"
 
+	"github.com/go-kit/log/level"
 	"github.com/gogo/status"
 	"github.com/pkg/errors"
 	"github.com/prometheus/prometheus/model/labels"
 	"github.com/prometheus/prometheus/promql"
 	"github.com/prometheus/prometheus/storage"
+
+	util_log "github.com/cortexproject/cortex/pkg/util/log"
 )
+
+// errInternalQuery is the opaque message returned to tenants for internal/unknown
+// errors. The original error is logged server-side so operators can still correlate
+// it with traces and spans. This avoids leaking internal identifiers such as
+// store-gateway ring addresses (IP:port) and object-storage block ULIDs into the
+// HTTP response body of the Prometheus-compatible query API.
+const errInternalQuery = "internal server error executing query"
 
 // TranslateToPromqlAPIError converts error to one of promql.Errors for consumption in PromQL API.
 // PromQL API only recognizes few errors, and converts everything else to HTTP status code 422.
@@ -58,13 +68,17 @@ func TranslateToPromqlAPIError(err error) error {
 				// Return directly, will be mapped to 422
 				return err
 			} else if code >= 500 && code < 599 {
-				// Wrap into ErrStorage for mapping to 500
-				return promql.ErrStorage{Err: err}
+				// Internal: log the detail server-side, return an opaque message to the caller
+				// so internal identifiers (store-gateway addresses, block ULIDs, etc.) do not
+				// leak into the HTTP response body.
+				level.Warn(util_log.Logger).Log("msg", "internal query error", "err", err)
+				return promql.ErrStorage{Err: errors.New(errInternalQuery)}
 			}
 		}
 
-		// All other errors will be returned as 500.
-		return promql.ErrStorage{Err: err}
+		// All other errors are internal: log the detail, return an opaque message.
+		level.Warn(util_log.Logger).Log("msg", "internal query error", "err", err)
+		return promql.ErrStorage{Err: errors.New(errInternalQuery)}
 	}
 }
 
