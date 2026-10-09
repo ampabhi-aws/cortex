@@ -2,15 +2,35 @@ package querier
 
 import (
 	"context"
+	"crypto/rand"
+	"fmt"
 
-	"github.com/cortexproject/cortex/pkg/util/validation"
-
+	"github.com/go-kit/log/level"
 	"github.com/gogo/status"
+	"github.com/oklog/ulid"
 	"github.com/pkg/errors"
 	"github.com/prometheus/prometheus/model/labels"
 	"github.com/prometheus/prometheus/promql"
 	"github.com/prometheus/prometheus/storage"
+
+	util_log "github.com/cortexproject/cortex/pkg/util/log"
+	"github.com/cortexproject/cortex/pkg/util/validation"
 )
+
+// genericInternalErrorMsg is the stable, tenant-safe message returned for
+// internal errors. It must not include any infrastructure identifiers
+// (store-gateway addresses, object-store keys/endpoints, block ULIDs, etc.).
+const genericInternalErrorMsg = "internal error, see server logs"
+
+// redactInternalError logs the detailed error once with a correlation ID and
+// returns a sanitised error carrying only a stable message plus that ID. The
+// returned error is intended to be wrapped in promql.ErrStorage so Prometheus'
+// API maps it to HTTP 500 while exposing no internal detail to tenants.
+func redactInternalError(err error) error {
+	id := ulid.MustNew(ulid.Now(), rand.Reader).String()
+	level.Error(util_log.Logger).Log("msg", "query failed", "error_id", id, "err", err)
+	return fmt.Errorf("%s (error_id=%s)", genericInternalErrorMsg, id)
+}
 
 // TranslateToPromqlAPIError converts error to one of promql.Errors for consumption in PromQL API.
 // PromQL API only recognizes few errors, and converts everything else to HTTP status code 422.
@@ -23,6 +43,16 @@ import (
 //	anything else is mapped to 422
 //
 // Querier code produces different kinds of errors, and we want to map them to above-mentioned HTTP status codes correctly.
+//
+// This function is also the sanitisation point between Cortex's internal
+// query fan-out and the tenant-facing Prometheus HTTP API. Errors that are
+// tenant-actionable (limit errors, PromQL engine errors, 4xx gRPC/HTTP
+// statuses, context cancellation) are returned verbatim because their text is
+// already safe. All other errors — which may contain internal topology or
+// storage identifiers such as store-gateway instance addresses, object-store
+// bucket/endpoint/key text, or block ULIDs — are logged with a correlation ID
+// and replaced with a generic message before being wrapped in
+// promql.ErrStorage, so the response body carries only the correlation ID.
 //
 // Details:
 // - vendor/github.com/prometheus/prometheus/web/api/v1/api.go, respondError function only accepts *apiError types.
@@ -37,7 +67,7 @@ func TranslateToPromqlAPIError(err error) error {
 		// Don't translate those, just in case we use them internally.
 		return err
 	case validation.LimitError:
-		// This will be returned with status code 422 by Prometheus API.
+		// Tenant-actionable (limits, duplicate samples, etc.) — safe to return verbatim.
 		return err
 	default:
 		if errors.Is(err, context.Canceled) {
@@ -55,16 +85,21 @@ func TranslateToPromqlAPIError(err error) error {
 
 			// Treat these as HTTP status codes, even though they are supposed to be grpc codes.
 			if code >= 400 && code < 500 {
-				// Return directly, will be mapped to 422
+				// Tenant-caused (bad request / not found / etc.). The upstream
+				// producer is expected to have crafted a tenant-safe message —
+				// return directly, will be mapped to 422.
 				return err
 			} else if code >= 500 && code < 599 {
-				// Wrap into ErrStorage for mapping to 500
-				return promql.ErrStorage{Err: err}
+				// Server-side failure. Redact: the original message may carry
+				// internal topology (gRPC dial strings with IP:port, bucket
+				// endpoints/keys, etc.).
+				return promql.ErrStorage{Err: redactInternalError(err)}
 			}
 		}
 
-		// All other errors will be returned as 500.
-		return promql.ErrStorage{Err: err}
+		// All other errors will be returned as 500. Redact for the same reason
+		// as the 5xx branch above.
+		return promql.ErrStorage{Err: redactInternalError(err)}
 	}
 }
 
