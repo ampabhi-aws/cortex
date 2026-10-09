@@ -2,9 +2,10 @@ package v2
 
 import (
 	"context"
+	cryptorand "crypto/rand"
+	"encoding/binary"
 	"flag"
 	"fmt"
-	"math/rand"
 	"net/http"
 	"sync"
 	"time"
@@ -16,7 +17,6 @@ import (
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/promauto"
 	"github.com/weaveworks/common/httpgrpc"
-	"go.uber.org/atomic"
 
 	"github.com/cortexproject/cortex/pkg/frontend/v2/frontendv2pb"
 	"github.com/cortexproject/cortex/pkg/querier/stats"
@@ -62,8 +62,6 @@ type Frontend struct {
 
 	cfg Config
 	log log.Logger
-
-	lastQueryID atomic.Uint64
 
 	// frontend workers will read from this channel, and send request to scheduler.
 	requestsCh chan *frontendRequest
@@ -116,10 +114,12 @@ func NewFrontend(cfg Config, log log.Logger, reg prometheus.Registerer) (*Fronte
 		schedulerWorkers: schedulerWorkers,
 		requests:         newRequestsInProgress(),
 	}
-	// Randomize to avoid getting responses from queries sent before restart, which could lead to mixing results
-	// between different queries. Note that frontend verifies the user, so it cannot leak results between tenants.
-	// This isn't perfect, but better than nothing.
-	f.lastQueryID.Store(rand.Uint64())
+	// Query IDs are generated per request from crypto/rand (see generateQueryID
+	// below): using a fresh unpredictable 64-bit value for every request prevents a
+	// caller that can reach the scheduler plane from guessing a live QueryID
+	// (previously QueryIDs were seeded once from math/rand and then incremented,
+	// which made them trivially predictable; see finding
+	// 01a11d640c4575099c897742cbef0b17).
 
 	promauto.With(reg).NewGaugeFunc(prometheus.GaugeOpts{
 		Name: "cortex_query_frontend_queries_in_progress",
@@ -172,7 +172,6 @@ func (f *Frontend) RoundTripGRPC(ctx context.Context, req *httpgrpc.HTTPRequest)
 	defer cancel()
 
 	freq := &frontendRequest{
-		queryID:      f.lastQueryID.Inc(),
 		request:      req,
 		userID:       userID,
 		statsEnabled: stats.IsEnabled(ctx),
@@ -185,7 +184,8 @@ func (f *Frontend) RoundTripGRPC(ctx context.Context, req *httpgrpc.HTTPRequest)
 		response: make(chan *frontendv2pb.QueryResultRequest, 1),
 	}
 
-	f.requests.put(freq)
+	// Insert into the in-progress map, picking an unused unpredictable 64-bit QueryID.
+	freq.queryID = f.requests.putWithRandomID(freq)
 	defer f.requests.delete(freq.queryID)
 
 	retries := f.cfg.WorkerConcurrency + 1 // To make sure we hit at least two different schedulers.
@@ -304,6 +304,24 @@ func (r *requestsInProgress) put(req *frontendRequest) {
 	r.requests[req.queryID] = req
 }
 
+// putWithRandomID inserts req under a freshly generated unpredictable 64-bit QueryID
+// and returns that ID. It retries on the vanishingly unlikely event of a collision
+// with an already in-flight request.
+func (r *requestsInProgress) putWithRandomID(req *frontendRequest) uint64 {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+
+	for {
+		id := generateQueryID()
+		if _, exists := r.requests[id]; exists {
+			continue
+		}
+		req.queryID = id
+		r.requests[id] = req
+		return id
+	}
+}
+
 func (r *requestsInProgress) delete(queryID uint64) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
@@ -316,4 +334,18 @@ func (r *requestsInProgress) get(queryID uint64) *frontendRequest {
 	defer r.mu.Unlock()
 
 	return r.requests[queryID]
+}
+
+// generateQueryID returns an unpredictable 64-bit value sourced from crypto/rand. We
+// use it to pick frontend-side QueryIDs so that an attacker who can reach the
+// scheduler plane cannot guess a live QueryID and cancel or overwrite it. If the OS
+// RNG unexpectedly fails we panic rather than silently fall back to predictable
+// values; this matches the behaviour of other security-sensitive callers of
+// crypto/rand.
+func generateQueryID() uint64 {
+	var b [8]byte
+	if _, err := cryptorand.Read(b[:]); err != nil {
+		panic(fmt.Sprintf("frontend v2: failed to read from crypto/rand to generate query ID: %v", err))
+	}
+	return binary.BigEndian.Uint64(b[:])
 }
