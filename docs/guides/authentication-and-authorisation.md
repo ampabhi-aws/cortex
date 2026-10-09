@@ -51,3 +51,36 @@ This can help to run Cortex in a trusted environment where you want to separate 
 into distinct namespaces by some criteria (e.g. teams, applications, etc).
 
 Be advised that **cortex-tenant** is a third-party community project and it's not maintained by Cortex team.
+
+### Blocking debug, metrics and admin endpoints at the reverse proxy
+
+Cortex exposes a number of operator endpoints on the same HTTP listener as the
+tenant data-path (`/api/v1/push`, `/prometheus/api/v1/*`). These endpoints do
+not have an in-process authentication layer and must be blocked at the
+authenticating reverse proxy that fronts Cortex. In particular, the following
+path prefixes must not be reachable by tenants:
+
+- `/debug/*` — includes `/debug/pprof/*` (Go pprof, mounted by the vendored
+  weaveworks server when `-server.register-instrumentation=true`) and
+  `/debug/fgprof` (mounted by Cortex when `-api.enable-profiling=true`). These
+  handlers can leak process memory (heap, allocs), full goroutine stacks,
+  process argv (which may include credentials passed as command-line flags)
+  and provide a CPU/latency denial-of-service lever via
+  `?seconds=` on sampling profilers.
+- `/metrics` — Prometheus scrape endpoint, mounted by the vendored
+  weaveworks server when `-server.register-instrumentation=true`.
+- `/config` and `/runtime_config` — the running configuration. `flagext.Secret`
+  values are masked here, but any secret the operator did not wrap in
+  `flagext.Secret` would be printed in cleartext.
+- `/` — the admin index page listing every registered admin endpoint.
+- `/ingester/shutdown`, `/ingester/flush`, `/<prefix>/ring` — destructive or
+  topology-mutating operator endpoints.
+
+As of Cortex, `-server.register-instrumentation` defaults to `false` and the
+Cortex-registered `/debug/fgprof` endpoint is not mounted unless
+`-api.enable-profiling=true` is set. Operators who re-enable either of these
+flags must still block the paths above at the external reverse proxy, and
+should strongly prefer exposing `/metrics` and profiling handlers on a
+separate, access-controlled listener (for example a sidecar that scrapes the
+process locally, or a cluster-internal admin port) rather than on the
+tenant-facing API port.

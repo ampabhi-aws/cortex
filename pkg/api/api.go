@@ -48,6 +48,13 @@ type Config struct {
 	AlertmanagerHTTPPrefix string `yaml:"alertmanager_http_prefix"`
 	PrometheusHTTPPrefix   string `yaml:"prometheus_http_prefix"`
 
+	// EnableProfiling controls whether the Cortex-registered profiling
+	// endpoint (/debug/fgprof) is mounted on the HTTP router. It defaults
+	// to false so that profiling handlers are never exposed on the
+	// tenant-facing API port unless the operator explicitly opts in. When
+	// enabled, the handler is wrapped with the configured auth middleware.
+	EnableProfiling bool `yaml:"enable_profiling"`
+
 	// The following configs are injected by the upstream caller.
 	ServerPrefix       string               `yaml:"-"`
 	LegacyHTTPPrefix   string               `yaml:"-"`
@@ -71,6 +78,7 @@ type Config struct {
 func (cfg *Config) RegisterFlags(f *flag.FlagSet) {
 	f.BoolVar(&cfg.ResponseCompression, "api.response-compression-enabled", false, "Use GZIP compression for API responses. Some endpoints serve large YAML or JSON blobs which can benefit from compression.")
 	f.Var(&cfg.HTTPRequestHeadersToLog, "api.http-request-headers-to-log", "Which HTTP Request headers to add to logs")
+	f.BoolVar(&cfg.EnableProfiling, "api.enable-profiling", false, "If true, mount the Cortex /debug/fgprof profiling endpoint on the HTTP router. Defaults to false; when enabled the endpoint is wrapped with the configured auth middleware. Operators are responsible for additionally blocking /debug/*, /metrics, /config, /runtime_config and / at an external reverse proxy.")
 	cfg.RegisterFlagsWithPrefix("", f)
 }
 
@@ -219,7 +227,16 @@ func (a *API) RegisterAPI(httpPathPrefix string, actualCfg interface{}, defaultC
 
 	a.RegisterRoute("/config", a.cfg.configHandler(actualCfg, defaultCfg), false, "GET")
 	a.RegisterRoute("/", indexHandler(httpPathPrefix, a.indexPage), false, "GET")
-	a.RegisterRoute("/debug/fgprof", fgprof.Handler(), false, "GET")
+
+	// /debug/fgprof is an operator profiling endpoint. It is only mounted
+	// when explicitly enabled via -api.enable-profiling, and even then it
+	// is wrapped with the configured auth middleware so it is not exposed
+	// unauthenticated on the tenant-facing router. Operators must still
+	// block /debug/*, /metrics, /config, /runtime_config and / at the
+	// external reverse proxy that fronts Cortex.
+	if a.cfg.EnableProfiling {
+		a.RegisterRoute("/debug/fgprof", fgprof.Handler(), true, "GET")
+	}
 }
 
 // RegisterRuntimeConfig registers the endpoints associates with the runtime configuration
