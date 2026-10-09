@@ -141,9 +141,20 @@ type CacheSplitter interface {
 type constSplitter time.Duration
 
 // GenerateCacheKey generates a cache key based on the userID, Request and interval.
+//
+// Each variable-length field (tenant ID and PromQL query) is length-prefixed so
+// that no field content can shift the boundary between fields. This prevents
+// cross-tenant key collisions when a tenant ID or metric name happens to
+// contain the ':' character that was previously used as a bare separator
+// (e.g. tenant "team:prod" + query "up" vs tenant "team" + query "prod:up"
+// used to produce byte-identical keys). The envelope's stored Key is also
+// unambiguous, so the `resp.Key != key` guard in get() is now tenant-explicit.
 func (t constSplitter) GenerateCacheKey(userID string, r tripperware.Request) string {
 	currentInterval := r.GetStart() / int64(time.Duration(t)/time.Millisecond)
-	return fmt.Sprintf("%s:%s:%d:%d", userID, r.GetQuery(), r.GetStep(), currentInterval)
+	return fmt.Sprintf("%d/%s/%d/%s/%d/%d",
+		len(userID), userID,
+		len(r.GetQuery()), r.GetQuery(),
+		r.GetStep(), currentInterval)
 }
 
 // ShouldCacheFn checks whether the current request should go to cache

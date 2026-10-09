@@ -87,6 +87,15 @@ func (t *SingleResolver) TenantID(ctx context.Context) (string, error) {
 		return "", errInvalidTenantID
 	}
 
+	// Defense in depth: apply the documented tenant-ID allow-list on the
+	// single-tenant path as well as the multi-tenant path. This prevents
+	// characters such as ':' and '|' from appearing in tenant IDs, so they
+	// cannot collide with downstream cache-key, label, or path separators
+	// (see pkg/querier/tripperware/queryrange/results_cache.go).
+	if err := ValidTenantID(id); err != nil {
+		return "", err
+	}
+
 	return id, nil
 }
 
