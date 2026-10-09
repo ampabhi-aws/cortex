@@ -65,12 +65,26 @@ type Config struct {
 
 	// Allows and is used to configure the addition of HTTP Header fields to logs
 	HTTPRequestHeadersToLog flagext.StringSlice `yaml:"http_request_headers_to_log"`
+
+	// EnableIngesterPushEndpoint controls whether the ingester's HTTP push
+	// endpoint (`/ingester/push`) is registered. This endpoint is intended for
+	// testing and debugging only: it bypasses distributor-side validation
+	// (ValidateLabels/ValidateSample/ValidateExemplar), per-tenant ingestion
+	// rate limits, HA deduplication and the configured replication factor,
+	// writing directly to the local ingester's TSDB. In the default
+	// `-target=all` single-binary deployment the ingester shares the HTTP
+	// listener with the distributor, so exposing this route lets any tenant
+	// that can reach `/api/v1/push` also bypass those controls (CWE-420).
+	// It is OFF by default; operators must opt in explicitly, and even then
+	// the Cortex HTTP port must not be exposed directly to tenants.
+	EnableIngesterPushEndpoint bool `yaml:"enable_ingester_push_endpoint"`
 }
 
 // RegisterFlags adds the flags required to config this to the given FlagSet.
 func (cfg *Config) RegisterFlags(f *flag.FlagSet) {
 	f.BoolVar(&cfg.ResponseCompression, "api.response-compression-enabled", false, "Use GZIP compression for API responses. Some endpoints serve large YAML or JSON blobs which can benefit from compression.")
 	f.Var(&cfg.HTTPRequestHeadersToLog, "api.http-request-headers-to-log", "Which HTTP Request headers to add to logs")
+	f.BoolVar(&cfg.EnableIngesterPushEndpoint, "api.enable-ingester-push-endpoint", false, "Enable the ingester's debug HTTP push endpoint (/ingester/push). This endpoint bypasses distributor validation and per-tenant ingestion rate limits and writes directly to the local ingester's TSDB; it is intended for testing and debugging only and must not be exposed to tenants.")
 	cfg.RegisterFlagsWithPrefix("", f)
 }
 
@@ -267,12 +281,20 @@ func (a *API) RegisterIngester(i Ingester, pushConfig distributor.Config) {
 	a.indexPage.AddLink(SectionDangerous, "/ingester/shutdown", "Trigger Ingester Shutdown (Dangerous)")
 	a.RegisterRoute("/ingester/flush", http.HandlerFunc(i.FlushHandler), false, "GET", "POST")
 	a.RegisterRoute("/ingester/shutdown", http.HandlerFunc(i.ShutdownHandler), false, "GET", "POST")
-	a.RegisterRoute("/ingester/push", push.Handler(pushConfig.MaxRecvMsgSize, a.sourceIPs, i.Push), true, "POST") // For testing and debugging.
+
+	// The ingester's HTTP push endpoint bypasses distributor-side validation
+	// and per-tenant ingestion rate limits (CWE-420: Unprotected Alternate
+	// Channel). It is registered only when explicitly opted in via
+	// -api.enable-ingester-push-endpoint, and the bare `/push` alias is never
+	// registered because in the default `-target=all` deployment it collides
+	// with the tenant write path served by the distributor.
+	if a.cfg.EnableIngesterPushEndpoint {
+		a.RegisterRoute("/ingester/push", push.Handler(pushConfig.MaxRecvMsgSize, a.sourceIPs, i.Push), true, "POST") // For testing and debugging.
+	}
 
 	// Legacy Routes
 	a.RegisterRoute("/flush", http.HandlerFunc(i.FlushHandler), false, "GET", "POST")
 	a.RegisterRoute("/shutdown", http.HandlerFunc(i.ShutdownHandler), false, "GET", "POST")
-	a.RegisterRoute("/push", push.Handler(pushConfig.MaxRecvMsgSize, a.sourceIPs, i.Push), true, "POST") // For testing and debugging.
 }
 
 func (a *API) RegisterTenantDeletion(api *purger.TenantDeletionAPI) {
