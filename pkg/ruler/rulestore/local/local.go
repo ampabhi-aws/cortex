@@ -5,12 +5,21 @@ import (
 	"flag"
 	"os"
 	"path/filepath"
+	"strings"
 
 	"github.com/pkg/errors"
 	promRules "github.com/prometheus/prometheus/rules"
 
 	"github.com/cortexproject/cortex/pkg/ruler/rulespb"
 )
+
+// errInvalidNamespace is returned when the caller-provided namespace would
+// escape the per-tenant rule directory (for example `../other-tenant/rules`).
+// This is a defence-in-depth check: the ruler API layer already validates the
+// namespace in parseNamespace, but we re-check here so that any future caller
+// of this store cannot be tricked into reading files outside the configured
+// rule directory.
+var errInvalidNamespace = errors.New("invalid namespace")
 
 const (
 	Name = "local"
@@ -168,7 +177,18 @@ func (l *Client) loadAllRulesGroupsForUser(ctx context.Context, userID string) (
 }
 
 func (l *Client) loadAllRulesGroupsForUserAndNamespace(_ context.Context, userID string, namespace string) (rulespb.RuleGroupList, error) {
-	filename := filepath.Join(l.cfg.Directory, userID, namespace)
+	base := filepath.Join(l.cfg.Directory, userID)
+	filename := filepath.Join(base, namespace)
+
+	// Defence-in-depth: reject any namespace that escapes the per-tenant
+	// base directory once path separators and `..` elements are resolved by
+	// filepath.Join. The API layer already validates the namespace, but we
+	// enforce containment here too so that no caller of this store can read
+	// files outside <directory>/<userID>/.
+	rel, err := filepath.Rel(base, filename)
+	if err != nil || rel == ".." || strings.HasPrefix(rel, ".."+string(os.PathSeparator)) {
+		return nil, errInvalidNamespace
+	}
 
 	rulegroups, allErrors := l.loader.Load(filename)
 	if len(allErrors) > 0 {

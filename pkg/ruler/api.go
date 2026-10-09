@@ -288,7 +288,28 @@ var (
 	ErrNoRuleGroups = errors.New("no rule groups found")
 	// ErrBadRuleGroup is returned when the provided rule group can not be unmarshalled
 	ErrBadRuleGroup = errors.New("unable to decoded rule group")
+	// ErrInvalidNamespace signals that the namespace URL parameter contained
+	// unsafe characters (path separators, NUL, or `.`/`..` references) or
+	// exceeded the maximum allowed length.
+	ErrInvalidNamespace = errors.New("invalid namespace")
+	// ErrInvalidGroupName signals that the group name URL parameter contained
+	// unsafe characters or exceeded the maximum allowed length.
+	ErrInvalidGroupName = errors.New("invalid group name")
 )
+
+// validatePathComponent rejects values that would be unsafe to join into a
+// filesystem path (either directly or through a cleaned `filepath.Join`): the
+// empty string, directory references (`.`/`..`), values containing path
+// separators or NUL bytes, and values longer than 255 bytes (the common
+// filesystem component limit). This mirrors the tenant-ID guard in
+// pkg/tenant/resolver.go that was added for CVE-2021-36157.
+func validatePathComponent(s string) error {
+	if s == "" || s == "." || s == ".." ||
+		strings.ContainsAny(s, "/\\\x00") || len(s) > 255 {
+		return ErrInvalidNamespace
+	}
+	return nil
+}
 
 func marshalAndSend(output interface{}, w http.ResponseWriter, logger log.Logger) {
 	d, err := yaml.Marshal(&output)
@@ -324,7 +345,10 @@ func respondAccepted(w http.ResponseWriter, logger log.Logger) {
 }
 
 // parseNamespace parses the namespace from the provided set of params, in this
-// api these params are derived from the url path
+// api these params are derived from the url path. The namespace is
+// percent-decoded and then validated as a single safe path component so that
+// attacker-controlled values cannot traverse out of the per-tenant rule
+// directory when the local rule-store backend is in use.
 func parseNamespace(params map[string]string) (string, error) {
 	namespace, exists := params["namespace"]
 	if !exists {
@@ -336,11 +360,16 @@ func parseNamespace(params map[string]string) (string, error) {
 		return "", err
 	}
 
+	if err := validatePathComponent(namespace); err != nil {
+		return "", ErrInvalidNamespace
+	}
+
 	return namespace, nil
 }
 
 // parseGroupName parses the group name from the provided set of params, in this
-// api these params are derived from the url path
+// api these params are derived from the url path. Like the namespace, the
+// group name is validated as a single safe path component.
 func parseGroupName(params map[string]string) (string, error) {
 	groupName, exists := params["groupName"]
 	if !exists {
@@ -350,6 +379,10 @@ func parseGroupName(params map[string]string) (string, error) {
 	groupName, err := url.PathUnescape(groupName)
 	if err != nil {
 		return "", err
+	}
+
+	if err := validatePathComponent(groupName); err != nil {
+		return "", ErrInvalidGroupName
 	}
 
 	return groupName, nil
@@ -395,7 +428,12 @@ func (a *API) ListRules(w http.ResponseWriter, req *http.Request) {
 	level.Debug(logger).Log("msg", "retrieving rule groups with namespace", "userID", userID, "namespace", namespace)
 	rgs, err := a.store.ListRuleGroupsForUserAndNamespace(req.Context(), userID, namespace)
 	if err != nil {
-		http.Error(w, err.Error(), http.StatusBadRequest)
+		// Do not reflect the raw store error to the client: on the local
+		// backend it contains absolute filesystem paths and os/yaml error
+		// fragments that would leak file existence, permission state and
+		// content snippets. Log it and return a generic message.
+		level.Warn(logger).Log("msg", "unable to list rule groups", "userID", userID, "namespace", namespace, "err", err)
+		http.Error(w, "unable to list rule groups", http.StatusBadRequest)
 		return
 	}
 
