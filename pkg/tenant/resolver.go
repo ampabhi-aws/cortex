@@ -76,6 +76,24 @@ func containsUnsafePathSegments(id string) bool {
 
 var errInvalidTenantID = errors.New("invalid tenant ID")
 
+// validTenantIDForPath performs the per-ID tenant validation that is shared
+// between SingleResolver and MultiResolver so the two paths cannot drift.
+// It enforces the documented charset + 150-byte limit (ValidTenantID) and
+// rejects relative-path references and path separators
+// (containsUnsafePathSegments). Because the full charset also rejects the
+// '|' federation separator, a single-tenant value accepted here cannot be
+// re-interpreted as multiple tenants when tenant-federation is later
+// enabled.
+func validTenantIDForPath(id string) error {
+	if err := ValidTenantID(id); err != nil {
+		return err
+	}
+	if containsUnsafePathSegments(id) {
+		return errInvalidTenantID
+	}
+	return nil
+}
+
 func (t *SingleResolver) TenantID(ctx context.Context) (string, error) {
 	//lint:ignore faillint wrapper around upstream method
 	id, err := user.ExtractOrgID(ctx)
@@ -83,8 +101,8 @@ func (t *SingleResolver) TenantID(ctx context.Context) (string, error) {
 		return "", err
 	}
 
-	if containsUnsafePathSegments(id) {
-		return "", errInvalidTenantID
+	if err := validTenantIDForPath(id); err != nil {
+		return "", err
 	}
 
 	return id, nil
@@ -131,11 +149,8 @@ func (t *MultiResolver) TenantIDs(ctx context.Context) ([]string, error) {
 
 	orgIDs := strings.Split(orgID, tenantIDsLabelSeparator)
 	for _, orgID := range orgIDs {
-		if err := ValidTenantID(orgID); err != nil {
+		if err := validTenantIDForPath(orgID); err != nil {
 			return nil, err
-		}
-		if containsUnsafePathSegments(orgID) {
-			return nil, errInvalidTenantID
 		}
 	}
 
