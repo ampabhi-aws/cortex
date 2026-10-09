@@ -188,7 +188,7 @@ func (q roundTripper) Do(ctx context.Context, r Request) (Response, error) {
 	}
 
 	if headerMap := util_log.HeaderMapFromContext(ctx); headerMap != nil {
-		util_log.InjectHeadersIntoHTTPRequest(headerMap, request)
+		util_log.InjectHeadersIntoHTTPRequest(headerMap, request, q.headers)
 	}
 
 	if err := user.InjectOrgIDIntoHTTPRequest(ctx, request); err != nil {

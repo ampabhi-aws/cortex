@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"net/http"
 	"os"
+	"strings"
 
 	"github.com/go-kit/log"
 	kitlog "github.com/go-kit/log"
@@ -34,6 +35,14 @@ var (
 		Help: "Total number of log messages.",
 	}, []string{"level"})
 
+	// logEncodingErrors counts log records that the underlying go-kit logger
+	// dropped because of an encoding error (e.g. an invalid logfmt key). This
+	// makes silently-suppressed log lines detectable via metrics.
+	logEncodingErrors = prometheus.NewCounter(prometheus.CounterOpts{
+		Name: "log_messages_encoding_errors_total",
+		Help: "Total number of log records dropped by the underlying go-kit logger due to encoding errors.",
+	})
+
 	supportedLevels = []level.Value{
 		level.DebugValue(),
 		level.InfoValue(),
@@ -44,6 +53,7 @@ var (
 
 func init() {
 	prometheus.MustRegister(logMessages)
+	prometheus.MustRegister(logEncodingErrors)
 }
 
 // InitLogger initialises the global gokit logger (util_log.Logger) and overrides the
@@ -93,8 +103,13 @@ func NewPrometheusLogger(l logging.Level, format logging.Format) (log.Logger, er
 }
 
 // Log increments the appropriate Prometheus counter depending on the log level.
+// If the underlying logger returns an error (for example because a key cannot
+// be encoded in logfmt), the error is surfaced on a counter so that silently
+// dropped records are observable in metrics.
 func (pl *PrometheusLogger) Log(kv ...interface{}) error {
-	pl.logger.Log(kv...)
+	if err := pl.logger.Log(kv...); err != nil {
+		logEncodingErrors.Inc()
+	}
 	l := "unknown"
 	for i := 1; i < len(kv); i += 2 {
 		if v, ok := kv[i].(level.Value); ok {
@@ -149,23 +164,79 @@ func ContextWithHeaderMap(ctx context.Context, headerMap map[string]string) cont
 	return context.WithValue(ctx, headerMapContextKey, headerMap)
 }
 
-// InjectHeadersIntoHTTPRequest injects the logging header map from the context into the request headers.
-func InjectHeadersIntoHTTPRequest(headerMap map[string]string, request *http.Request) {
+// IsValidLogKey reports whether a header name can safely be used as a logfmt
+// key. It mirrors the keyRuneFilter in go-logfmt: any rune <= ' ', '=' or '"'
+// is stripped. If the result is empty the key would be rejected by the logfmt
+// encoder with ErrInvalidKey, which causes go-kit's logfmtLogger to drop the
+// whole log record silently.
+func IsValidLogKey(key string) bool {
+	for _, r := range key {
+		if r > ' ' && r != '=' && r != '"' {
+			return true
+		}
+	}
+	return false
+}
+
+// allowedHeaderSet lower-cases the operator-supplied allowlist into a lookup
+// set for case-insensitive matching against incoming header names.
+func allowedHeaderSet(allowed []string) map[string]struct{} {
+	allow := make(map[string]struct{}, len(allowed))
+	for _, a := range allowed {
+		allow[strings.ToLower(a)] = struct{}{}
+	}
+	return allow
+}
+
+// InjectHeadersIntoHTTPRequest injects the logging header map from the context
+// into the request headers. When allowed is non-nil, only headers whose names
+// appear on the operator allowlist are forwarded; this prevents a caller-
+// supplied logging header map from being used as a generic HTTP header-
+// injection primitive against internal services. Passing a nil allowlist
+// preserves the historical "forward everything" behaviour for callers that
+// have already filtered the map upstream.
+func InjectHeadersIntoHTTPRequest(headerMap map[string]string, request *http.Request, allowed ...[]string) {
+	var allow map[string]struct{}
+	if len(allowed) > 0 && allowed[0] != nil {
+		allow = allowedHeaderSet(allowed[0])
+	}
 	for header, contents := range headerMap {
+		if allow != nil {
+			if _, ok := allow[strings.ToLower(header)]; !ok {
+				continue
+			}
+		}
 		request.Header.Add(header, contents)
 	}
 }
 
-func ContextWithHeaderMapFromMetadata(ctx context.Context, md metadata.MD) context.Context {
+// ContextWithHeaderMapFromMetadata derives the per-request logging header map
+// from gRPC metadata. It filters the caller-supplied map against the operator
+// allowlist and discards any header whose name cannot be encoded as a logfmt
+// key, so that a hostile peer cannot forge arbitrary log fields, suppress log
+// records, or inject headers into downstream HTTP requests through this path.
+// A nil/empty allowlist drops the entire map.
+func ContextWithHeaderMapFromMetadata(ctx context.Context, md metadata.MD, allowed []string) context.Context {
 	headersSlice, ok := md[HeaderPropagationStringForRequestLogging]
 	if !ok || len(headersSlice)%2 == 1 {
 		return ctx
 	}
 
+	allow := allowedHeaderSet(allowed)
 	headerMap := make(map[string]string)
-	for i := 0; i < len(headersSlice); i += 2 {
-		headerMap[headersSlice[i]] = headersSlice[i+1]
+	for i := 0; i+1 < len(headersSlice); i += 2 {
+		k := headersSlice[i]
+		if _, ok := allow[strings.ToLower(k)]; !ok {
+			continue
+		}
+		if !IsValidLogKey(k) {
+			continue
+		}
+		headerMap[k] = headersSlice[i+1]
 	}
 
+	if len(headerMap) == 0 {
+		return ctx
+	}
 	return ContextWithHeaderMap(ctx, headerMap)
 }
