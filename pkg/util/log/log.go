@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"net/http"
 	"os"
+	"strings"
 
 	"github.com/go-kit/log"
 	kitlog "github.com/go-kit/log"
@@ -21,6 +22,17 @@ const (
 	headerMapContextKey contextKey = 0
 
 	HeaderPropagationStringForRequestLogging string = "x-http-header-forwarding-logging"
+
+	// maxForwardedHeaders caps the number of HTTP header name/value pairs that may be
+	// propagated via gRPC metadata for request logging. The value is intentionally small
+	// because the feature only exists to carry the headers named by
+	// `-api.http-request-headers-to-log`, which operators are unlikely to configure in
+	// large numbers.
+	maxForwardedHeaders = 32
+
+	// maxForwardedHeaderValueLen bounds the length of each propagated header value
+	// to prevent log-volume amplification by an untrusted gRPC peer.
+	maxForwardedHeaderValueLen = 256
 )
 
 var (
@@ -156,16 +168,48 @@ func InjectHeadersIntoHTTPRequest(headerMap map[string]string, request *http.Req
 	}
 }
 
-func ContextWithHeaderMapFromMetadata(ctx context.Context, md metadata.MD) context.Context {
+// ContextWithHeaderMapFromMetadata extracts the gRPC metadata key
+// HeaderPropagationStringForRequestLogging into a header map stored on the returned
+// context, filtered against the locally configured allowlist (typically
+// cfg.API.HTTPRequestHeadersToLog). The remote peer controls the keys and values of
+// the metadata entry, so without this filter it could inject arbitrary structured
+// fields into every log line of the RPC, forging `level`/`ts`/`caller` and amplifying
+// log volume (CWE-117). We therefore (a) drop keys that are not on the allowlist,
+// (b) cap the number of accepted pairs, and (c) truncate each value.
+func ContextWithHeaderMapFromMetadata(ctx context.Context, md metadata.MD, allowed []string) context.Context {
 	headersSlice, ok := md[HeaderPropagationStringForRequestLogging]
-	if !ok || len(headersSlice)%2 == 1 {
+	if !ok || len(headersSlice)%2 == 1 || len(headersSlice) > 2*maxForwardedHeaders {
 		return ctx
+	}
+
+	if len(allowed) == 0 {
+		// Nothing is permitted — do not trust the peer-supplied map.
+		return ctx
+	}
+
+	allow := make(map[string]string, len(allowed))
+	for _, a := range allowed {
+		allow[strings.ToLower(a)] = a
 	}
 
 	headerMap := make(map[string]string)
 	for i := 0; i < len(headersSlice); i += 2 {
-		headerMap[headersSlice[i]] = headersSlice[i+1]
+		key, ok := allow[strings.ToLower(headersSlice[i])]
+		if !ok {
+			// Drop unexpected keys instead of logging them. This prevents the peer from
+			// forging structured-log fields such as `level`, `ts`, `caller`, `msg` or
+			// `org_id`.
+			continue
+		}
+		val := headersSlice[i+1]
+		if len(val) > maxForwardedHeaderValueLen {
+			val = val[:maxForwardedHeaderValueLen]
+		}
+		headerMap[key] = val
 	}
 
+	if len(headerMap) == 0 {
+		return ctx
+	}
 	return ContextWithHeaderMap(ctx, headerMap)
 }
