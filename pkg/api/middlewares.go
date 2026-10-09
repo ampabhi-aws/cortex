@@ -4,6 +4,8 @@ import (
 	"context"
 	"net/http"
 
+	"github.com/go-kit/log"
+	"github.com/go-kit/log/level"
 	"github.com/weaveworks/common/middleware"
 
 	"github.com/cortexproject/cortex/pkg/purger"
@@ -59,5 +61,34 @@ func (h HTTPHeaderMiddleware) Wrap(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		ctx := h.InjectTargetHeadersIntoHTTPRequest(r)
 		next.ServeHTTP(w, r.WithContext(ctx))
+	})
+}
+
+// denyAllAdminMiddleware returns a middleware that short-circuits every
+// request with HTTP 403. It is used as the fail-closed default for
+// administrative endpoints (/config, /runtime_config) when the operator
+// has not injected a real admin credential check (mTLS, bearer token or
+// allowlisted admin identity).
+func denyAllAdminMiddleware(logger log.Logger) middleware.Interface {
+	return middleware.Func(func(next http.Handler) http.Handler {
+		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			if logger != nil {
+				level.Warn(logger).Log(
+					"msg", "denying request to admin endpoint: no HTTPAdminMiddleware configured",
+					"path", r.URL.Path,
+					"remote", r.RemoteAddr,
+				)
+			}
+			http.Error(w, "forbidden: administrative endpoint requires an admin credential check; configure HTTPAdminMiddleware or set -api.admin-endpoints-require-auth=false (not recommended)", http.StatusForbidden)
+		})
+	})
+}
+
+// passthroughAdminMiddleware is the opt-out middleware for operators that
+// disable admin-endpoint authorization because the HTTP listener is isolated
+// by other means (for example a dedicated admin network).
+func passthroughAdminMiddleware() middleware.Interface {
+	return middleware.Func(func(next http.Handler) http.Handler {
+		return next
 	})
 }

@@ -48,10 +48,19 @@ type Config struct {
 	AlertmanagerHTTPPrefix string `yaml:"alertmanager_http_prefix"`
 	PrometheusHTTPPrefix   string `yaml:"prometheus_http_prefix"`
 
+	// AdminEndpointsRequireAuth, when true (the default), protects administrative
+	// routes such as /config and /runtime_config with HTTPAdminMiddleware. These
+	// endpoints disclose cortex.Config (which may include credential-bearing
+	// fields) and the full tenant list, so they must not be reachable from the
+	// tenant-facing HTTP listener by default. Set to false only on networks
+	// where the HTTP listener is isolated by other means.
+	AdminEndpointsRequireAuth bool `yaml:"admin_endpoints_require_auth"`
+
 	// The following configs are injected by the upstream caller.
-	ServerPrefix       string               `yaml:"-"`
-	LegacyHTTPPrefix   string               `yaml:"-"`
-	HTTPAuthMiddleware middleware.Interface `yaml:"-"`
+	ServerPrefix        string               `yaml:"-"`
+	LegacyHTTPPrefix    string               `yaml:"-"`
+	HTTPAuthMiddleware  middleware.Interface `yaml:"-"`
+	HTTPAdminMiddleware middleware.Interface `yaml:"-"`
 
 	// This allows downstream projects to wrap the distributor push function
 	// and access the deserialized write requests before/after they are pushed.
@@ -70,6 +79,7 @@ type Config struct {
 // RegisterFlags adds the flags required to config this to the given FlagSet.
 func (cfg *Config) RegisterFlags(f *flag.FlagSet) {
 	f.BoolVar(&cfg.ResponseCompression, "api.response-compression-enabled", false, "Use GZIP compression for API responses. Some endpoints serve large YAML or JSON blobs which can benefit from compression.")
+	f.BoolVar(&cfg.AdminEndpointsRequireAuth, "api.admin-endpoints-require-auth", true, "Require administrative authorization (HTTPAdminMiddleware) for /config and /runtime_config. When no admin middleware is injected these endpoints fail closed with HTTP 403, preventing unauthenticated disclosure of plaintext credentials and tenant identifiers. Disable only if the HTTP listener is isolated from untrusted networks.")
 	f.Var(&cfg.HTTPRequestHeadersToLog, "api.http-request-headers-to-log", "Which HTTP Request headers to add to logs")
 	cfg.RegisterFlagsWithPrefix("", f)
 }
@@ -91,6 +101,7 @@ func (cfg *Config) wrapDistributorPush(d *distributor.Distributor) push.Func {
 
 type API struct {
 	AuthMiddleware       middleware.Interface
+	AdminMiddleware      middleware.Interface
 	cfg                  Config
 	server               *server.Server
 	logger               log.Logger
@@ -114,17 +125,28 @@ func New(cfg Config, serverCfg server.Config, s *server.Server, logger log.Logge
 	}
 
 	api := &API{
-		cfg:            cfg,
-		AuthMiddleware: cfg.HTTPAuthMiddleware,
-		server:         s,
-		logger:         logger,
-		sourceIPs:      sourceIPs,
-		indexPage:      newIndexPageContent(),
+		cfg:             cfg,
+		AuthMiddleware:  cfg.HTTPAuthMiddleware,
+		AdminMiddleware: cfg.HTTPAdminMiddleware,
+		server:          s,
+		logger:          logger,
+		sourceIPs:       sourceIPs,
+		indexPage:       newIndexPageContent(),
 	}
 
 	// If no authentication middleware is present in the config, use the default authentication middleware.
 	if cfg.HTTPAuthMiddleware == nil {
 		api.AuthMiddleware = middleware.AuthenticateUser
+	}
+	// If admin authentication is required but no admin middleware was injected,
+	// install a fail-closed deny-all middleware so admin endpoints cannot leak
+	// credentials or tenant identifiers to anonymous callers.
+	if api.AdminMiddleware == nil {
+		if cfg.AdminEndpointsRequireAuth {
+			api.AdminMiddleware = denyAllAdminMiddleware(logger)
+		} else {
+			api.AdminMiddleware = passthroughAdminMiddleware()
+		}
 	}
 	if len(cfg.HTTPRequestHeadersToLog) > 0 {
 		api.HTTPHeaderMiddleware = &HTTPHeaderMiddleware{TargetHeaders: cfg.HTTPRequestHeadersToLog}
@@ -217,7 +239,11 @@ func (a *API) RegisterAPI(httpPathPrefix string, actualCfg interface{}, defaultC
 	a.indexPage.AddLink(SectionAdminEndpoints, "/config", "Current Config (including the default values)")
 	a.indexPage.AddLink(SectionAdminEndpoints, "/config?mode=diff", "Current Config (show only values that differ from the defaults)")
 
-	a.RegisterRoute("/config", a.cfg.configHandler(actualCfg, defaultCfg), false, "GET")
+	// /config returns the entire cortex.Config, which can include credential
+	// fields and the full internal topology. Gate it behind the admin
+	// middleware so that unauthenticated callers on the tenant-facing listener
+	// cannot pull it (the default admin middleware fails closed with 403).
+	a.RegisterRoute("/config", a.AdminMiddleware.Wrap(a.cfg.configHandler(actualCfg, defaultCfg)), false, "GET")
 	a.RegisterRoute("/", indexHandler(httpPathPrefix, a.indexPage), false, "GET")
 	a.RegisterRoute("/debug/fgprof", fgprof.Handler(), false, "GET")
 }
@@ -227,7 +253,11 @@ func (a *API) RegisterRuntimeConfig(runtimeConfigHandler http.HandlerFunc) {
 	a.indexPage.AddLink(SectionAdminEndpoints, "/runtime_config", "Current Runtime Config (incl. Overrides)")
 	a.indexPage.AddLink(SectionAdminEndpoints, "/runtime_config?mode=diff", "Current Runtime Config (show only values that differ from the defaults)")
 
-	a.RegisterRoute("/runtime_config", runtimeConfigHandler, false, "GET")
+	// /runtime_config exposes the complete tenant-limits map (every tenant ID
+	// in the installation). Because tenant IDs are the only credential the
+	// auth middleware checks, this is enumeration-grade data and must be
+	// restricted to admins.
+	a.RegisterRoute("/runtime_config", a.AdminMiddleware.Wrap(runtimeConfigHandler), false, "GET")
 }
 
 // RegisterDistributor registers the endpoints associated with the distributor.
