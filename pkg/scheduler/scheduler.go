@@ -284,6 +284,16 @@ func (s *Scheduler) enqueueRequest(frontendContext context.Context, frontendAddr
 
 	userID := msg.GetUserID()
 
+	// Enforce tenant self-consistency between the outer asserted UserID and
+	// the X-Scope-OrgID header inside the embedded HTTP request. The scheduler
+	// forwards the request body verbatim to a querier that will rebuild a real
+	// http.Request from it; letting the two diverge would turn this hop into a
+	// cross-tenant identity primitive. See
+	// pkg/util/httpgrpcutil.EnforceTenantConsistency for details.
+	if err := httpgrpcutil.EnforceTenantConsistency(msg.HttpRequest, userID); err != nil {
+		return err
+	}
+
 	req := &schedulerRequest{
 		frontendAddress: frontendAddr,
 		userID:          msg.UserID,
