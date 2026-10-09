@@ -3008,6 +3008,15 @@ api:
     # Disable WebHook notifications for Alertmanager.
     # CLI flag: -configs.notifications.disable-webhook
     [disable_webhook: <boolean> | default = false]
+
+  # Enable the internal cross-tenant GET /private/api/prom/configs/{rules,alertmanager}
+  # endpoints used by the ruler/alertmanager configdb clients. These endpoints are
+  # unauthenticated and return every tenant's rule files and raw Alertmanager YAML
+  # (including any embedded notification credentials); only enable them when the HTTP
+  # listener is restricted to a trusted internal network or placed behind an
+  # authenticating proxy. Disabled by default.
+  # CLI flag: -configs.enable-internal-all-tenant-api
+  [enable_internal_all_tenant_configs_api: <boolean> | default = false]
 ```
 
 ### `configstore_config`

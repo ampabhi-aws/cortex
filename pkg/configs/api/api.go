@@ -35,6 +35,19 @@ var (
 // Config configures Configs API
 type Config struct {
 	Notifications NotificationsConfig `yaml:"notifications"`
+
+	// EnableInternalAllTenantConfigsAPI controls whether the internal
+	// cross-tenant endpoints GET /private/api/prom/configs/{rules,alertmanager}
+	// are served. These endpoints return every tenant's rule files and raw
+	// Alertmanager YAML (which commonly embeds third-party notification
+	// credentials such as Slack webhooks, PagerDuty / OpsGenie keys and SMTP
+	// passwords) in a single response, and are intended for use only by the
+	// ruler / alertmanager configdb clients inside a trusted network. The
+	// handler itself performs no authentication, so operators must either
+	// place these routes behind an authenticating proxy (restricted to
+	// internal callers) or leave them disabled. Fails closed by default:
+	// when disabled, requests return 404 Not Found.
+	EnableInternalAllTenantConfigsAPI bool `yaml:"enable_internal_all_tenant_configs_api"`
 }
 
 // NotificationsConfig configures Alertmanager notifications method.
@@ -47,6 +60,7 @@ type NotificationsConfig struct {
 func (cfg *Config) RegisterFlags(f *flag.FlagSet) {
 	f.BoolVar(&cfg.Notifications.DisableEmail, "configs.notifications.disable-email", false, "Disable Email notifications for Alertmanager.")
 	f.BoolVar(&cfg.Notifications.DisableWebHook, "configs.notifications.disable-webhook", false, "Disable WebHook notifications for Alertmanager.")
+	f.BoolVar(&cfg.EnableInternalAllTenantConfigsAPI, "configs.enable-internal-all-tenant-api", false, "Enable the internal cross-tenant GET /private/api/prom/configs/{rules,alertmanager} endpoints used by the ruler/alertmanager configdb clients. These endpoints are unauthenticated and return every tenant's rule files and raw Alertmanager YAML (including any embedded notification credentials); only enable them when the HTTP listener is restricted to a trusted internal network or placed behind an authenticating proxy. Disabled by default.")
 }
 
 // API implements the configs api.
@@ -264,9 +278,27 @@ type ConfigsView struct {
 }
 
 func (a *API) getConfigs(w http.ResponseWriter, r *http.Request) {
+	logger := util_log.WithContext(r.Context(), util_log.Logger)
+
+	// Fail closed: the /private/api/prom/configs/* endpoints return every
+	// tenant's rule files and Alertmanager YAML (including any embedded
+	// third-party notification secrets) and perform no authentication of
+	// their own, so they must only be served when the operator has
+	// explicitly opted in via -configs.enable-internal-all-tenant-api after
+	// confirming that the HTTP listener is restricted to trusted internal
+	// callers (or placed behind an authenticating proxy).
+	if !a.cfg.EnableInternalAllTenantConfigsAPI {
+		level.Warn(logger).Log(
+			"msg", "rejecting request to disabled internal all-tenant configs endpoint; enable with -configs.enable-internal-all-tenant-api only on a trusted/internal listener",
+			"path", r.URL.Path,
+			"remote", r.RemoteAddr,
+		)
+		http.Error(w, "not found", http.StatusNotFound)
+		return
+	}
+
 	var cfgs map[string]userconfig.View
 	var cfgErr error
-	logger := util_log.WithContext(r.Context(), util_log.Logger)
 	rawSince := r.FormValue("since")
 	if rawSince == "" {
 		cfgs, cfgErr = a.db.GetAllConfigs(r.Context())
