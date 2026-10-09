@@ -3,6 +3,7 @@ package api
 import (
 	"context"
 	"net/http"
+	"net/http/httptest"
 	"testing"
 
 	"github.com/stretchr/testify/require"
@@ -71,4 +72,37 @@ func TestExistingHeaderInContextIsNotOverridden(t *testing.T) {
 
 	require.Equal(t, contentsMap, util_log.HeaderMapFromContext(ctx))
 
+}
+
+func TestDenyAllAdminMiddleware_ReturnsForbidden(t *testing.T) {
+	mw := denyAllAdminMiddleware(nil)
+
+	reached := false
+	next := http.HandlerFunc(func(_ http.ResponseWriter, _ *http.Request) {
+		reached = true
+	})
+
+	req := httptest.NewRequest(http.MethodGet, "/config", nil)
+	rec := httptest.NewRecorder()
+	mw.Wrap(next).ServeHTTP(rec, req)
+
+	require.Equal(t, http.StatusForbidden, rec.Code)
+	require.False(t, reached, "deny-all middleware must not call next")
+}
+
+func TestPassthroughAdminMiddleware_ForwardsRequest(t *testing.T) {
+	mw := passthroughAdminMiddleware()
+
+	reached := false
+	next := http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		reached = true
+		w.WriteHeader(http.StatusTeapot)
+	})
+
+	req := httptest.NewRequest(http.MethodGet, "/config", nil)
+	rec := httptest.NewRecorder()
+	mw.Wrap(next).ServeHTTP(rec, req)
+
+	require.True(t, reached, "passthrough middleware must forward to next")
+	require.Equal(t, http.StatusTeapot, rec.Code)
 }
