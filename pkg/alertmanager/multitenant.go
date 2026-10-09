@@ -59,6 +59,7 @@ var (
 	errInvalidExternalURL                  = errors.New("the configured external URL is invalid: should not end with /")
 	errShardingUnsupportedStorage          = errors.New("the configured alertmanager storage backend is not supported when sharding is enabled")
 	errZoneAwarenessEnabledWithoutZoneInfo = errors.New("the configured alertmanager has zone awareness enabled but zone is not set")
+	errAlertmanagerNotOwnedHere            = errors.New("alertmanager for this tenant is not served by this instance")
 )
 
 // MultitenantAlertmanagerConfig is the configuration for a multitenant Alertmanager.
@@ -1023,8 +1024,21 @@ func (am *MultitenantAlertmanager) serveRequest(w http.ResponseWriter, req *http
 		return
 	}
 
+	// Ownership gate: in sharded mode, if this instance does not own the tenant,
+	// refuse to serve the request locally instead of initialising a fallback
+	// Alertmanager (which would otherwise overwrite the tenant's stored config).
+	if am.cfg.ShardingEnabled && !am.isUserOwned(userID) {
+		http.Error(w, errAlertmanagerNotOwnedHere.Error(), http.StatusServiceUnavailable)
+		return
+	}
+
 	if am.fallbackConfig != "" {
-		userAM, err = am.alertmanagerFromFallbackConfig(userID)
+		userAM, err = am.alertmanagerFromFallbackConfig(req.Context(), userID)
+		if err == errAlertmanagerNotOwnedHere {
+			level.Error(am.logger).Log("msg", "not initializing Alertmanager", "user", userID, "err", err)
+			http.Error(w, errAlertmanagerNotOwnedHere.Error(), http.StatusServiceUnavailable)
+			return
+		}
 		if err != nil {
 			level.Error(am.logger).Log("msg", "unable to initialize the Alertmanager with a fallback configuration", "user", userID, "err", err)
 			http.Error(w, "Failed to initialize the Alertmanager", http.StatusInternalServerError)
@@ -1039,17 +1053,33 @@ func (am *MultitenantAlertmanager) serveRequest(w http.ResponseWriter, req *http
 	http.Error(w, "the Alertmanager is not configured", http.StatusNotFound)
 }
 
-func (am *MultitenantAlertmanager) alertmanagerFromFallbackConfig(userID string) (*Alertmanager, error) {
-	// Upload an empty config so that the Alertmanager is no de-activated in the next poll
+func (am *MultitenantAlertmanager) alertmanagerFromFallbackConfig(ctx context.Context, userID string) (*Alertmanager, error) {
+	// Refuse to materialise a fallback Alertmanager (which would overwrite the
+	// tenant's stored config with an empty placeholder) on an instance that
+	// does not own the tenant under sharding. Owned-ness is the primary
+	// invariant; the exists-check below is defence-in-depth.
+	if am.cfg.ShardingEnabled && !am.isUserOwned(userID) {
+		return nil, errAlertmanagerNotOwnedHere
+	}
+
+	// Only create the placeholder config if the tenant has none at all.
+	// If a config already exists, do NOT overwrite it with an empty one — that
+	// would destroy the tenant's routes, receivers, templates and notifier
+	// credentials in object storage.
+	if _, err := am.store.GetAlertConfig(ctx, userID); err == nil {
+		return nil, errAlertmanagerNotOwnedHere
+	} else if !errors.Is(err, alertspb.ErrNotFound) {
+		return nil, err
+	}
+
+	// Upload an empty config so that the Alertmanager is not de-activated in the next poll.
 	cfgDesc := alertspb.ToProto("", nil, userID)
-	err := am.store.SetAlertConfig(context.Background(), cfgDesc)
-	if err != nil {
+	if err := am.store.SetAlertConfig(ctx, cfgDesc); err != nil {
 		return nil, err
 	}
 
 	// Calling setConfig with an empty configuration will use the fallback config.
-	err = am.setConfig(cfgDesc)
-	if err != nil {
+	if err := am.setConfig(cfgDesc); err != nil {
 		return nil, err
 	}
 
