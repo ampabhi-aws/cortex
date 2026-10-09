@@ -38,11 +38,6 @@ func (d *FirewallDialer) control(_, address string, _ syscall.RawConn) error {
 	blockPrivateAddresses := d.cfgProvider.BlockPrivateAddresses()
 	blockCIDRNetworks := d.cfgProvider.BlockCIDRNetworks()
 
-	// Skip any control if no firewall has been configured.
-	if !blockPrivateAddresses && len(blockCIDRNetworks) == 0 {
-		return nil
-	}
-
 	host, _, err := net.SplitHostPort(address)
 	if err != nil {
 		return errInvalidAddress
@@ -54,7 +49,21 @@ func (d *FirewallDialer) control(_, address string, _ syscall.RawConn) error {
 		return errBlockedAddress
 	}
 
-	if blockPrivateAddresses && (isPrivate(ip) || isLocal(ip)) {
+	// Always block loopback and link-local addresses, regardless of whether a
+	// firewall has been explicitly configured. These addresses are never a
+	// legitimate destination for a tenant-controlled notification receiver and
+	// their reachability enables SSRF against the host (eg. cloud metadata
+	// endpoint 169.254.169.254) or the Cortex process itself.
+	if isLocal(ip) {
+		return errBlockedAddress
+	}
+
+	// Skip any further control if no firewall has been configured.
+	if !blockPrivateAddresses && len(blockCIDRNetworks) == 0 {
+		return nil
+	}
+
+	if blockPrivateAddresses && isPrivate(ip) {
 		return errBlockedAddress
 	}
 

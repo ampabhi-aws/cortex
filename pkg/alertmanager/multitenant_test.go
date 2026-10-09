@@ -541,8 +541,11 @@ receivers:
 					assert.Equal(t, http.StatusOK, w.Code)
 				}
 
-				// Ensure the server endpoint has not been called if firewall is enabled. Since the alert is delivered
-				// asynchronously, we should pool it for a short period.
+					// Ensure the server endpoint has not been called. Since loopback addresses are
+				// now unconditionally blocked by the firewall dialer (regardless of
+				// AlertmanagerReceiversBlockPrivateAddresses), the server should never be
+				// reached via a tenant-controlled webhook pointing at 127.0.0.1. Since the
+				// alert is delivered asynchronously, we should pool it for a short period.
 				deadline := time.Now().Add(3 * time.Second)
 				for {
 					if time.Now().After(deadline) || serverInvoked.Load() {
@@ -551,7 +554,7 @@ receivers:
 					time.Sleep(100 * time.Millisecond)
 				}
 
-				assert.Equal(t, !firewallEnabled, serverInvoked.Load())
+				assert.False(t, serverInvoked.Load())
 
 				// Print all alertmanager logs to have more information if this test fails in CI.
 				t.Logf("Alertmanager logs:\n%s", logs.String())
