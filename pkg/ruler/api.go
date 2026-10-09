@@ -495,6 +495,17 @@ func (a *API) CreateRuleGroup(w http.ResponseWriter, req *http.Request) {
 		return
 	}
 
+	// Clamp the tenant-supplied per-group result limit to the per-tenant
+	// maximum (if configured). This makes the operator's cap a hard ceiling
+	// instead of a per-tenant preference and prevents a tenant from either
+	// omitting `limit` entirely or setting it above the policy ceiling to
+	// drive the ruler into unbounded buffering.
+	if maxOutputSeries := a.ruler.limits.RulerMaxRuleOutputSeries(userID); maxOutputSeries > 0 {
+		if rg.Limit == 0 || rg.Limit > maxOutputSeries {
+			rg.Limit = maxOutputSeries
+		}
+	}
+
 	rgProto := rulespb.ToProto(userID, namespace, rg)
 
 	level.Debug(logger).Log("msg", "attempting to store rulegroup", "userID", userID, "group", rgProto.String())

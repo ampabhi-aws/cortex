@@ -19,6 +19,7 @@ func ToProto(user string, namespace string, rl rulefmt.RuleGroup) *RuleGroupDesc
 		Interval:  time.Duration(rl.Interval),
 		Rules:     formattedRuleToProto(rl.Rules),
 		User:      user,
+		Limit:     int64(rl.Limit),
 	}
 	return &rg
 }
@@ -44,6 +45,7 @@ func FromProto(rg *RuleGroupDesc) rulefmt.RuleGroup {
 	formattedRuleGroup := rulefmt.RuleGroup{
 		Name:     rg.GetName(),
 		Interval: model.Duration(rg.Interval),
+		Limit:    int(rg.GetLimit()),
 		Rules:    make([]rulefmt.RuleNode, len(rg.GetRules())),
 	}
 
