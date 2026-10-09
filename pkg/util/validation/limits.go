@@ -113,6 +113,9 @@ type Limits struct {
 	AlertmanagerMaxDispatcherAggregationGroups int `yaml:"alertmanager_max_dispatcher_aggregation_groups" json:"alertmanager_max_dispatcher_aggregation_groups"`
 	AlertmanagerMaxAlertsCount                 int `yaml:"alertmanager_max_alerts_count" json:"alertmanager_max_alerts_count"`
 	AlertmanagerMaxAlertsSizeBytes             int `yaml:"alertmanager_max_alerts_size_bytes" json:"alertmanager_max_alerts_size_bytes"`
+	AlertmanagerMaxSilencesCount               int           `yaml:"alertmanager_max_silences_count" json:"alertmanager_max_silences_count"`
+	AlertmanagerMaxSilenceSizeBytes            int           `yaml:"alertmanager_max_silence_size_bytes" json:"alertmanager_max_silence_size_bytes"`
+	AlertmanagerMaxSilenceDuration             time.Duration `yaml:"alertmanager_max_silence_duration" json:"alertmanager_max_silence_duration"`
 }
 
 // RegisterFlags adds the flags required to config this to the given FlagSet
@@ -188,6 +191,9 @@ func (l *Limits) RegisterFlags(f *flag.FlagSet) {
 	f.IntVar(&l.AlertmanagerMaxDispatcherAggregationGroups, "alertmanager.max-dispatcher-aggregation-groups", 0, "Maximum number of aggregation groups in Alertmanager's dispatcher that a tenant can have. Each active aggregation group uses single goroutine. When the limit is reached, dispatcher will not dispatch alerts that belong to additional aggregation groups, but existing groups will keep working properly. 0 = no limit.")
 	f.IntVar(&l.AlertmanagerMaxAlertsCount, "alertmanager.max-alerts-count", 0, "Maximum number of alerts that a single user can have. Inserting more alerts will fail with a log message and metric increment. 0 = no limit.")
 	f.IntVar(&l.AlertmanagerMaxAlertsSizeBytes, "alertmanager.max-alerts-size-bytes", 0, "Maximum total size of alerts that a single user can have, alert size is the sum of the bytes of its labels, annotations and generatorURL. Inserting more alerts will fail with a log message and metric increment. 0 = no limit.")
+	f.IntVar(&l.AlertmanagerMaxSilencesCount, "alertmanager.max-silences-count", 0, "Maximum number of active or pending silences that a single tenant can have. Creating more silences will fail with a 4xx response. 0 = no limit.")
+	f.IntVar(&l.AlertmanagerMaxSilenceSizeBytes, "alertmanager.max-silence-size-bytes", 0, "Maximum size in bytes of a single tenant silence (sum of matcher names, matcher values, comment and createdBy). Larger silences are rejected with a 4xx response. 0 = no limit.")
+	f.DurationVar(&l.AlertmanagerMaxSilenceDuration, "alertmanager.max-silence-duration", 0, "Maximum duration (relative to now) for which a silence can mute alerts. Silences requesting a longer duration will have their endsAt clamped to this value. 0 = no limit.")
 }
 
 // Validate the limits config and returns an error if the validation
@@ -623,6 +629,18 @@ func (o *Overrides) AlertmanagerMaxAlertsCount(userID string) int {
 
 func (o *Overrides) AlertmanagerMaxAlertsSizeBytes(userID string) int {
 	return o.getOverridesForUser(userID).AlertmanagerMaxAlertsSizeBytes
+}
+
+func (o *Overrides) AlertmanagerMaxSilencesCount(userID string) int {
+	return o.getOverridesForUser(userID).AlertmanagerMaxSilencesCount
+}
+
+func (o *Overrides) AlertmanagerMaxSilenceSizeBytes(userID string) int {
+	return o.getOverridesForUser(userID).AlertmanagerMaxSilenceSizeBytes
+}
+
+func (o *Overrides) AlertmanagerMaxSilenceDuration(userID string) time.Duration {
+	return o.getOverridesForUser(userID).AlertmanagerMaxSilenceDuration
 }
 
 func (o *Overrides) getOverridesForUser(userID string) *Limits {

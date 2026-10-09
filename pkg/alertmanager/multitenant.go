@@ -219,6 +219,17 @@ type Limits interface {
 	// AlertmanagerMaxAlertsSizeBytes returns total max size of alerts that tenant can have active at the same time. 0 = no limit.
 	// Size of the alert is computed from alert labels, annotations and generator URL.
 	AlertmanagerMaxAlertsSizeBytes(tenant string) int
+
+	// AlertmanagerMaxSilencesCount returns the maximum number of active or pending silences that a tenant can have. 0 = no limit.
+	AlertmanagerMaxSilencesCount(tenant string) int
+
+	// AlertmanagerMaxSilenceSizeBytes returns the maximum size in bytes of a single tenant silence (matcher names/values,
+	// comment and createdBy are summed). 0 = no limit.
+	AlertmanagerMaxSilenceSizeBytes(tenant string) int
+
+	// AlertmanagerMaxSilenceDuration returns the maximum silence duration (EndsAt-StartsAt / EndsAt-now) a tenant can request.
+	// 0 disables the clamp. Silences requesting a longer duration are clamped to this value to cap the retention effect.
+	AlertmanagerMaxSilenceDuration(tenant string) time.Duration
 }
 
 // A MultitenantAlertmanager manages Alertmanager instances for multiple
