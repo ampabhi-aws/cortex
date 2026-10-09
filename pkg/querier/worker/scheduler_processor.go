@@ -3,7 +3,9 @@ package worker
 import (
 	"context"
 	"fmt"
+	"net"
 	"net/http"
+	"strings"
 	"time"
 
 	"github.com/go-kit/log"
@@ -180,6 +182,11 @@ func (sp *schedulerProcessor) runRequest(ctx context.Context, logger log.Logger,
 		}
 	}
 
+	if err := validateFrontendAddress(frontendAddress); err != nil {
+		level.Error(logger).Log("msg", "refusing to notify frontend: invalid address asserted by scheduler", "err", err, "frontend", frontendAddress)
+		return
+	}
+
 	c, err := sp.frontendPool.GetClientFor(frontendAddress)
 	if err == nil {
 		// Response is empty and uninteresting.
@@ -225,4 +232,29 @@ type frontendClient struct {
 
 func (fc *frontendClient) Close() error {
 	return fc.conn.Close()
+}
+
+// validateFrontendAddress ensures that an address the scheduler asked us to
+// dial is a plain host:port literal, so that an attacker-controlled scheduler
+// (or a scheduler being driven by an attacker-controlled FrontendLoop client)
+// cannot steer the querier's frontend pool at arbitrary gRPC resolver targets
+// (dns:///, unix:///, passthrough:///...).
+func validateFrontendAddress(addr string) error {
+	if addr == "" {
+		return fmt.Errorf("invalid frontend address: empty")
+	}
+	if strings.ContainsAny(addr, " \t\r\n\x00") {
+		return fmt.Errorf("invalid frontend address: contains whitespace or control characters")
+	}
+	if strings.Contains(addr, "://") {
+		return fmt.Errorf("invalid frontend address: must be host:port, scheme not allowed")
+	}
+	host, port, err := net.SplitHostPort(addr)
+	if err != nil {
+		return fmt.Errorf("invalid frontend address: must be host:port")
+	}
+	if host == "" || port == "" {
+		return fmt.Errorf("invalid frontend address: host and port must be non-empty")
+	}
+	return nil
 }
