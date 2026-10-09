@@ -75,8 +75,14 @@ func (m *mapper) MapRules(user string, ruleConfigs map[string][]rulefmt.RuleGrou
 
 	// user rule files will be stored as `/<path>/<userid>/<encoded filename>`
 	path := filepath.Join(m.Path, user)
-	err := m.FS.MkdirAll(path, 0777)
+	err := m.FS.MkdirAll(path, 0700)
 	if err != nil {
+		return false, nil, err
+	}
+	// mkdir(2) applies the process umask, so enforce the intended mode
+	// explicitly to prevent a permissive inherited umask from widening
+	// permissions on this per-tenant rules directory (CWE-276).
+	if err := m.FS.Chmod(path, 0700); err != nil {
 		return false, nil, err
 	}
 
@@ -152,7 +158,7 @@ func (m *mapper) writeRuleGroupsIfNewer(groups []rulefmt.RuleGroup, filename str
 	}
 
 	level.Info(m.logger).Log("msg", "updating rule file", "file", filename)
-	err = afero.WriteFile(m.FS, filename, d, 0777)
+	err = afero.WriteFile(m.FS, filename, d, 0600)
 	if err != nil {
 		return false, err
 	}
