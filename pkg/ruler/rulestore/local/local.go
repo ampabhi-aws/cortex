@@ -168,7 +168,16 @@ func (l *Client) loadAllRulesGroupsForUser(ctx context.Context, userID string) (
 }
 
 func (l *Client) loadAllRulesGroupsForUserAndNamespace(_ context.Context, userID string, namespace string) (rulespb.RuleGroupList, error) {
-	filename := filepath.Join(l.cfg.Directory, userID, namespace)
+	// Defence-in-depth: the API layer validates the namespace path component,
+	// but ensure the resolved filename stays inside the per-user directory so
+	// that a traversal segment (e.g. ".." after URL decoding) cannot escape
+	// the tenant's rules directory. Mirrors the Alertmanager template loader
+	// guard in pkg/alertmanager/multitenant.go.
+	userDir := filepath.Join(l.cfg.Directory, userID)
+	filename := filepath.Clean(filepath.Join(userDir, namespace))
+	if filepath.Dir(filename) != filepath.Clean(userDir) {
+		return nil, errors.New("invalid namespace")
+	}
 
 	rulegroups, allErrors := l.loader.Load(filename)
 	if len(allErrors) > 0 {
