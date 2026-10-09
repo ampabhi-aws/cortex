@@ -32,6 +32,12 @@ var (
 	ErrWebhookNotificationsAreDisabled = errors.New("webhook notifications are disabled")
 )
 
+// maxConfigSize caps the request body accepted by the configs API handlers
+// so that an attacker cannot force the process to buffer unbounded bytes in
+// the Go heap. 1 MiB is comfortably above any real Alertmanager/rules config
+// payload observed in practice.
+const maxConfigSize = 1 << 20
+
 // Config configures Configs API
 type Config struct {
 	Notifications NotificationsConfig `yaml:"notifications"`
@@ -154,6 +160,11 @@ func (a *API) setConfig(w http.ResponseWriter, r *http.Request) {
 	}
 	logger := util_log.WithContext(r.Context(), util_log.Logger)
 
+	// Cap the request body before any decoder reads from it, so that neither
+	// json.Decoder nor yaml.Decoder can be used to force the process to
+	// buffer unbounded bytes in memory (CWE-770).
+	r.Body = http.MaxBytesReader(w, r.Body, maxConfigSize)
+
 	var cfg userconfig.Config
 	switch parseConfigFormat(r.Header.Get("Content-Type"), FormatJSON) {
 	case FormatJSON:
@@ -203,18 +214,36 @@ func (a *API) setConfig(w http.ResponseWriter, r *http.Request) {
 
 func (a *API) validateAlertmanagerConfig(w http.ResponseWriter, r *http.Request) {
 	logger := util_log.WithContext(r.Context(), util_log.Logger)
-	cfg, err := io.ReadAll(r.Body)
+
+	// Require an identity so the work is attributable and rate-limitable,
+	// matching every other handler in this file (getConfig / setConfig /
+	// deactivateConfig / restoreConfig) and the modern Alertmanager API
+	// (pkg/alertmanager/api.go SetUserConfig).
+	if _, _, err := tenant.ExtractTenantIDFromHTTPRequest(r); err != nil {
+		http.Error(w, err.Error(), http.StatusUnauthorized)
+		return
+	}
+
+	// Cap the body before reading it into memory so a handful of concurrent
+	// multi-gigabyte chunked POSTs cannot OOM-kill the process (CWE-770).
+	cfg, err := io.ReadAll(http.MaxBytesReader(w, r.Body, maxConfigSize))
 	if err != nil {
-		level.Error(logger).Log("msg", "error reading request body", "err", err)
-		http.Error(w, err.Error(), http.StatusInternalServerError)
+		level.Warn(logger).Log("msg", "error reading request body", "err", err)
+		http.Error(w, "configuration too large or unreadable", http.StatusBadRequest)
 		return
 	}
 
 	if err = validateAlertmanagerConfig(string(cfg), a.cfg.Notifications); err != nil {
+		// Do not echo operator-policy error text (e.g. "email notifications are
+		// disabled" / "webhook notifications are disabled") back to the caller:
+		// that leaks the operator's -configs.notifications.disable-* settings.
+		// Log the real reason server-side and return a generic validation
+		// error.
+		level.Info(logger).Log("msg", "invalid Alertmanager config", "err", err)
 		w.WriteHeader(http.StatusBadRequest)
 		util.WriteJSONResponse(w, map[string]string{
 			"status": "error",
-			"error":  err.Error(),
+			"error":  "invalid Alertmanager configuration",
 		})
 		return
 	}
