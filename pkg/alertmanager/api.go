@@ -59,7 +59,7 @@ func (am *MultitenantAlertmanager) GetUserConfig(w http.ResponseWriter, r *http.
 	userID, err := tenant.TenantID(r.Context())
 	if err != nil {
 		level.Error(logger).Log("msg", errNoOrgID, "err", err.Error())
-		http.Error(w, fmt.Sprintf("%s: %s", errNoOrgID, err.Error()), http.StatusUnauthorized)
+		http.Error(w, errNoOrgID, http.StatusUnauthorized)
 		return
 	}
 
@@ -68,7 +68,8 @@ func (am *MultitenantAlertmanager) GetUserConfig(w http.ResponseWriter, r *http.
 		if err == alertspb.ErrNotFound {
 			http.Error(w, err.Error(), http.StatusNotFound)
 		} else {
-			http.Error(w, err.Error(), http.StatusInternalServerError)
+			level.Error(logger).Log("msg", errReadingConfiguration, "user", userID, "err", err)
+			http.Error(w, errReadingConfiguration, http.StatusInternalServerError)
 		}
 		return
 	}
@@ -80,13 +81,13 @@ func (am *MultitenantAlertmanager) GetUserConfig(w http.ResponseWriter, r *http.
 
 	if err != nil {
 		level.Error(logger).Log("msg", errMarshallingYAML, "err", err, "user", userID)
-		http.Error(w, fmt.Sprintf("%s: %s", errMarshallingYAML, err.Error()), http.StatusInternalServerError)
+		http.Error(w, errMarshallingYAML, http.StatusInternalServerError)
 		return
 	}
 
 	w.Header().Set("Content-Type", "application/yaml")
 	if _, err := w.Write(d); err != nil {
-		http.Error(w, err.Error(), http.StatusInternalServerError)
+		level.Error(logger).Log("msg", "error writing alertmanager config response", "user", userID, "err", err)
 		return
 	}
 }
@@ -96,7 +97,7 @@ func (am *MultitenantAlertmanager) SetUserConfig(w http.ResponseWriter, r *http.
 	userID, err := tenant.TenantID(r.Context())
 	if err != nil {
 		level.Error(logger).Log("msg", errNoOrgID, "err", err.Error())
-		http.Error(w, fmt.Sprintf("%s: %s", errNoOrgID, err.Error()), http.StatusUnauthorized)
+		http.Error(w, errNoOrgID, http.StatusUnauthorized)
 		return
 	}
 
@@ -113,7 +114,7 @@ func (am *MultitenantAlertmanager) SetUserConfig(w http.ResponseWriter, r *http.
 	payload, err := io.ReadAll(input)
 	if err != nil {
 		level.Error(logger).Log("msg", errReadingConfiguration, "err", err.Error())
-		http.Error(w, fmt.Sprintf("%s: %s", errReadingConfiguration, err.Error()), http.StatusBadRequest)
+		http.Error(w, errReadingConfiguration, http.StatusBadRequest)
 		return
 	}
 
@@ -128,6 +129,7 @@ func (am *MultitenantAlertmanager) SetUserConfig(w http.ResponseWriter, r *http.
 	err = yaml.Unmarshal(payload, cfg)
 	if err != nil {
 		level.Error(logger).Log("msg", errMarshallingYAML, "err", err.Error())
+		// The parse error describes the tenant's own payload, so expose it.
 		http.Error(w, fmt.Sprintf("%s: %s", errMarshallingYAML, err.Error()), http.StatusBadRequest)
 		return
 	}
@@ -135,14 +137,15 @@ func (am *MultitenantAlertmanager) SetUserConfig(w http.ResponseWriter, r *http.
 	cfgDesc := alertspb.ToProto(cfg.AlertmanagerConfig, cfg.TemplateFiles, userID)
 	if err := validateUserConfig(logger, cfgDesc, am.limits, userID); err != nil {
 		level.Warn(logger).Log("msg", errValidatingConfig, "err", err.Error())
+		// Validation errors describe the tenant's own payload, so expose them.
 		http.Error(w, fmt.Sprintf("%s: %s", errValidatingConfig, err.Error()), http.StatusBadRequest)
 		return
 	}
 
 	err = am.store.SetAlertConfig(r.Context(), cfgDesc)
 	if err != nil {
-		level.Error(logger).Log("msg", errStoringConfiguration, "err", err.Error())
-		http.Error(w, fmt.Sprintf("%s: %s", errStoringConfiguration, err.Error()), http.StatusInternalServerError)
+		level.Error(logger).Log("msg", errStoringConfiguration, "user", userID, "err", err.Error())
+		http.Error(w, errStoringConfiguration, http.StatusInternalServerError)
 		return
 	}
 
@@ -156,14 +159,14 @@ func (am *MultitenantAlertmanager) DeleteUserConfig(w http.ResponseWriter, r *ht
 	userID, err := tenant.TenantID(r.Context())
 	if err != nil {
 		level.Error(logger).Log("msg", errNoOrgID, "err", err.Error())
-		http.Error(w, fmt.Sprintf("%s: %s", errNoOrgID, err.Error()), http.StatusUnauthorized)
+		http.Error(w, errNoOrgID, http.StatusUnauthorized)
 		return
 	}
 
 	err = am.store.DeleteAlertConfig(r.Context(), userID)
 	if err != nil {
-		level.Error(logger).Log("msg", errDeletingConfiguration, "err", err.Error())
-		http.Error(w, fmt.Sprintf("%s: %s", errDeletingConfiguration, err.Error()), http.StatusInternalServerError)
+		level.Error(logger).Log("msg", errDeletingConfiguration, "user", userID, "err", err.Error())
+		http.Error(w, errDeletingConfiguration, http.StatusInternalServerError)
 		return
 	}
 
@@ -264,7 +267,7 @@ func (am *MultitenantAlertmanager) ListAllConfigs(w http.ResponseWriter, r *http
 	userIDs, err := am.store.ListAllUsers(r.Context())
 	if err != nil {
 		level.Error(logger).Log("msg", "failed to list users of alertmanager", "err", err)
-		http.Error(w, fmt.Sprintf("%s: %s", errListAllUser, err.Error()), http.StatusInternalServerError)
+		http.Error(w, errListAllUser, http.StatusInternalServerError)
 		return
 	}
 

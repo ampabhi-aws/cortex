@@ -62,13 +62,15 @@ func (b *BucketRuleStore) getRuleGroup(ctx context.Context, userID, namespace, g
 	}
 
 	if err != nil {
-		return nil, errors.Wrapf(err, "failed to get rule group %s", objectKey)
+		level.Error(b.logger).Log("msg", "failed to get rule group", "user", userID, "key", objectKey, "err", err)
+		return nil, errors.Wrapf(err, "failed to get rule group for namespace %q group %q", namespace, groupName)
 	}
 	defer func() { _ = reader.Close() }()
 
 	buf, err := io.ReadAll(reader)
 	if err != nil {
-		return nil, errors.Wrapf(err, "failed to read rule group %s", objectKey)
+		level.Error(b.logger).Log("msg", "failed to read rule group", "user", userID, "key", objectKey, "err", err)
+		return nil, errors.Wrapf(err, "failed to read rule group for namespace %q group %q", namespace, groupName)
 	}
 
 	if rg == nil {
@@ -79,7 +81,8 @@ func (b *BucketRuleStore) getRuleGroup(ctx context.Context, userID, namespace, g
 
 	err = proto.Unmarshal(buf, rg)
 	if err != nil {
-		return nil, errors.Wrapf(err, "failed to unmarshal rule group %s", objectKey)
+		level.Error(b.logger).Log("msg", "failed to unmarshal rule group", "user", userID, "key", objectKey, "err", err)
+		return nil, errors.Wrapf(err, "failed to unmarshal rule group for namespace %q group %q", namespace, groupName)
 	}
 
 	return rg, nil

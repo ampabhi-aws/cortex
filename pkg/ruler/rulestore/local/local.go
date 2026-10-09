@@ -48,7 +48,7 @@ func (l *Client) ListAllUsers(ctx context.Context) ([]string, error) {
 	root := l.cfg.Directory
 	infos, err := os.ReadDir(root)
 	if err != nil {
-		return nil, errors.Wrapf(err, "unable to read dir %s", root)
+		return nil, errors.Wrap(err, "unable to read rules root directory")
 	}
 
 	var result []string
@@ -134,7 +134,7 @@ func (l *Client) loadAllRulesGroupsForUser(ctx context.Context, userID string) (
 	root := filepath.Join(l.cfg.Directory, userID)
 	dirEntries, err := os.ReadDir(root)
 	if err != nil {
-		return nil, errors.Wrapf(err, "unable to read rule dir %s", root)
+		return nil, errors.Wrap(err, "unable to read rule dir for user")
 	}
 
 	for _, info := range dirEntries {
@@ -145,11 +145,11 @@ func (l *Client) loadAllRulesGroupsForUser(ctx context.Context, userID string) (
 		if info.Type()&os.ModeSymlink != 0 {
 			// os.ReadDir only returns result of LStat. Calling Stat resolves symlink.
 			path := filepath.Join(root, info.Name())
-			deRefInfo, err := os.Stat(path)
+			derefInfo, err := os.Stat(path)
 			if err != nil {
-				return nil, errors.Wrapf(err, "unable to stat rule file %s", path)
+				return nil, errors.Wrap(err, "unable to stat rule file")
 			}
-			isDir = deRefInfo.IsDir()
+			isDir = derefInfo.IsDir()
 		}
 
 		if isDir {
@@ -158,7 +158,7 @@ func (l *Client) loadAllRulesGroupsForUser(ctx context.Context, userID string) (
 
 		list, err := l.loadAllRulesGroupsForUserAndNamespace(ctx, userID, namespace)
 		if err != nil {
-			return nil, errors.Wrapf(err, "failed to list rule group for user %s and namespace %s", userID, namespace)
+			return nil, errors.Wrapf(err, "failed to list rule group for namespace %q", namespace)
 		}
 
 		allLists = append(allLists, list...)
@@ -172,7 +172,11 @@ func (l *Client) loadAllRulesGroupsForUserAndNamespace(_ context.Context, userID
 
 	rulegroups, allErrors := l.loader.Load(filename)
 	if len(allErrors) > 0 {
-		return nil, errors.Wrapf(allErrors[0], "error parsing %s", filename)
+		// Deliberately avoid embedding the resolved host path (filename) in the
+		// error that may propagate to API responses; use the logical namespace
+		// instead. The resolved path is still available via the ruler store
+		// logs.
+		return nil, errors.Wrapf(allErrors[0], "error parsing namespace %q", namespace)
 	}
 
 	var list rulespb.RuleGroupList

@@ -291,7 +291,7 @@ func TestRuler_DeleteNamespace(t *testing.T) {
 
 	router.ServeHTTP(w, req)
 	require.Equal(t, http.StatusInternalServerError, w.Code)
-	require.Equal(t, "{\"status\":\"error\",\"data\":null,\"errorType\":\"server_error\",\"error\":\"unable to delete rg\"}", w.Body.String())
+	require.Equal(t, "{\"status\":\"error\",\"data\":null,\"errorType\":\"server_error\",\"error\":\"unable to delete namespace\"}", w.Body.String())
 }
 
 func TestRuler_LimitsPerGroup(t *testing.T) {
