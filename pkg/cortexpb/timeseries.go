@@ -1,6 +1,7 @@
 package cortexpb
 
 import (
+	"errors"
 	"flag"
 	"fmt"
 	"io"
@@ -11,11 +12,33 @@ import (
 	"github.com/prometheus/prometheus/model/labels"
 )
 
+// minPreallocatedTimeseriesSize is the minimum size (in bytes) of a serialized
+// TimeSeries sub-message below which it is cheaper to allocate a zero-value
+// *TimeSeries (lazily grown by the generated Unmarshal code) than to take a
+// pre-sized object from timeSeriesPool. Taking a pooled object eagerly
+// allocates Labels/Samples/Exemplars backing arrays sized for a typical
+// series (~928B on amd64), so for tiny/empty series the pool costs orders of
+// magnitude more memory than the actual decoded payload.
+const minPreallocatedTimeseriesSize = 64
+
+// ErrTooManySeriesPerRequest is returned by PreallocWriteRequest.Unmarshal when
+// the decoded WriteRequest contains more TimeSeries than the configured
+// per-request limit (-distributor.max-series-per-write-request).
+var ErrTooManySeriesPerRequest = errors.New("too many timeseries in write request")
+
 var (
 	expectedTimeseries         = 100
 	expectedLabels             = 20
 	expectedSamplesPerSeries   = 10
 	expectedExemplarsPerSeries = 1
+
+	// maxSeriesPerWriteRequest caps the number of TimeSeries that may appear in
+	// a single decoded WriteRequest. It defends against a decode-time memory
+	// amplification attack where a small snappy-compressed body expands into
+	// millions of empty TimeSeries entries, each of which eagerly allocates
+	// ~928B via the timeSeriesPool. 0 disables the limit (unlimited, legacy
+	// behaviour).
+	maxSeriesPerWriteRequest = 100000
 
 	/*
 		We cannot pool these as pointer-to-slice because the place we use them is in WriteRequest which is generated from Protobuf
@@ -48,6 +71,13 @@ func (PreallocConfig) RegisterFlags(f *flag.FlagSet) {
 	f.IntVar(&expectedTimeseries, "ingester-client.expected-timeseries", expectedTimeseries, "Expected number of timeseries per request, used for preallocations.")
 	f.IntVar(&expectedLabels, "ingester-client.expected-labels", expectedLabels, "Expected number of labels per timeseries, used for preallocations.")
 	f.IntVar(&expectedSamplesPerSeries, "ingester-client.expected-samples-per-series", expectedSamplesPerSeries, "Expected number of samples per timeseries, used for preallocations.")
+	f.IntVar(&maxSeriesPerWriteRequest, "distributor.max-series-per-write-request", maxSeriesPerWriteRequest, "Maximum number of timeseries accepted in a single remote-write request. The request is rejected during decoding if it contains more series than this limit. 0 to disable (not recommended; a single request can OOM the process).")
+}
+
+// SetMaxSeriesPerWriteRequest overrides the per-request series limit at runtime.
+// Primarily intended for tests.
+func SetMaxSeriesPerWriteRequest(n int) {
+	maxSeriesPerWriteRequest = n
 }
 
 // PreallocWriteRequest is a WriteRequest which preallocs slices on Unmarshal.
@@ -58,7 +88,18 @@ type PreallocWriteRequest struct {
 // Unmarshal implements proto.Message.
 func (p *PreallocWriteRequest) Unmarshal(dAtA []byte) error {
 	p.Timeseries = PreallocTimeseriesSliceFromPool()
-	return p.WriteRequest.Unmarshal(dAtA)
+	if err := p.WriteRequest.Unmarshal(dAtA); err != nil {
+		return err
+	}
+	// Reject requests whose decoded object graph exceeds the configured
+	// per-request series cap. This bounds the heap paid by a single request
+	// (each pooled *TimeSeries eagerly allocates ~928B of backing arrays).
+	if maxSeriesPerWriteRequest > 0 && len(p.Timeseries) > maxSeriesPerWriteRequest {
+		ReuseSlice(p.Timeseries)
+		p.Timeseries = nil
+		return ErrTooManySeriesPerRequest
+	}
+	return nil
 }
 
 // PreallocTimeseries is a TimeSeries which preallocs slices on Unmarshal.
@@ -68,7 +109,16 @@ type PreallocTimeseries struct {
 
 // Unmarshal implements proto.Message.
 func (p *PreallocTimeseries) Unmarshal(dAtA []byte) error {
-	p.TimeSeries = TimeseriesFromPool()
+	// Only pay the pooled preallocation cost (Labels cap 20, Samples cap 10,
+	// Exemplars cap 1 -- ~928B on amd64) for series whose encoded form is
+	// large enough to plausibly use it. Tiny or empty sub-messages (e.g. the
+	// 2-byte `0x0a 0x00` memory-bomb payload) get a bare *TimeSeries whose
+	// slices grow lazily inside the generated Unmarshal.
+	if len(dAtA) < minPreallocatedTimeseriesSize {
+		p.TimeSeries = &TimeSeries{}
+	} else {
+		p.TimeSeries = TimeseriesFromPool()
+	}
 	return p.TimeSeries.Unmarshal(dAtA)
 }
 
