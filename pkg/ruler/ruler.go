@@ -125,6 +125,41 @@ type Config struct {
 	DisableRuleGroupLabel bool `yaml:"disable_rule_group_label"`
 }
 
+// MarshalYAML implements yaml.Marshaler. It strips userinfo (credentials embedded
+// as "user:password@") from AlertmanagerURL(s) before marshalling the running
+// config so that credentials passed via -ruler.alertmanager-url do not leak
+// through endpoints like /config that dump the configuration.
+func (cfg Config) MarshalYAML() (interface{}, error) {
+	type plain Config
+	c := plain(cfg)
+	c.AlertmanagerURL = redactAlertmanagerURLUserinfo(c.AlertmanagerURL)
+	return c, nil
+}
+
+// redactAlertmanagerURLUserinfo removes any user:password@ userinfo component
+// from the (possibly comma-separated) list of Alertmanager URLs. If a URL
+// fails to parse it is passed through unchanged so marshalling is lossless
+// even for malformed input.
+func redactAlertmanagerURLUserinfo(raw string) string {
+	if raw == "" {
+		return raw
+	}
+	parts := strings.Split(raw, ",")
+	for i, p := range parts {
+		u, err := url.Parse(p)
+		if err != nil || u.User == nil {
+			continue
+		}
+		if _, hasPassword := u.User.Password(); hasPassword {
+			u.User = url.UserPassword(u.User.Username(), "xxxxx")
+		} else {
+			u.User = url.User(u.User.Username())
+		}
+		parts[i] = u.String()
+	}
+	return strings.Join(parts, ",")
+}
+
 // Validate config and returns error on failure
 func (cfg *Config) Validate(limits validation.Limits, log log.Logger) error {
 	if !util.StringsContain(supportedShardingStrategies, cfg.ShardingStrategy) {
@@ -161,7 +196,7 @@ func (cfg *Config) RegisterFlags(f *flag.FlagSet) {
 	f.DurationVar(&cfg.EvaluationInterval, "ruler.evaluation-interval", 1*time.Minute, "How frequently to evaluate rules")
 	f.DurationVar(&cfg.PollInterval, "ruler.poll-interval", 1*time.Minute, "How frequently to poll for rule changes")
 
-	f.StringVar(&cfg.AlertmanagerURL, "ruler.alertmanager-url", "", "Comma-separated list of URL(s) of the Alertmanager(s) to send notifications to. Each Alertmanager URL is treated as a separate group in the configuration. Multiple Alertmanagers in HA per group can be supported by using DNS resolution via -ruler.alertmanager-discovery.")
+	f.StringVar(&cfg.AlertmanagerURL, "ruler.alertmanager-url", "", "Comma-separated list of URL(s) of the Alertmanager(s) to send notifications to. Each Alertmanager URL is treated as a separate group in the configuration. Multiple Alertmanagers in HA per group can be supported by using DNS resolution via -ruler.alertmanager-discovery. Credentials embedded in the URL (user:password@) are supported but discouraged — prefer -ruler.alertmanager-client.basic-auth-username and -ruler.alertmanager-client.basic-auth-password, whose values are redacted when the running config is marshalled.")
 	f.BoolVar(&cfg.AlertmanagerDiscovery, "ruler.alertmanager-discovery", false, "Use DNS SRV records to discover Alertmanager hosts.")
 	f.DurationVar(&cfg.AlertmanagerRefreshInterval, "ruler.alertmanager-refresh-interval", 1*time.Minute, "How long to wait between refreshing DNS resolutions of Alertmanager hosts.")
 	f.BoolVar(&cfg.AlertmanangerEnableV2API, "ruler.alertmanager-use-v2", false, "If enabled requests to Alertmanager will utilize the V2 API.")
