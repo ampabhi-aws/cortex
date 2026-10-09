@@ -834,7 +834,18 @@ func (i *Ingester) updateActiveSeries() {
 // ShutdownHandler triggers the following set of operations in order:
 //   - Change the state of ring to stop accepting writes.
 //   - Flush all the chunks.
-func (i *Ingester) ShutdownHandler(w http.ResponseWriter, _ *http.Request) {
+//
+// Defence in depth: only POST is accepted. This endpoint is destructive
+// (unregisters the ingester from the ring and stops the ingester service)
+// and must not be reachable via GET so that it cannot be triggered by a link
+// prefetcher, an <img> tag, or an unauthenticated crawler. The route is also
+// registered behind the auth middleware; this is a last-line check.
+func (i *Ingester) ShutdownHandler(w http.ResponseWriter, r *http.Request) {
+	if r != nil && r.Method != "" && r.Method != http.MethodPost {
+		http.Error(w, "POST required", http.StatusMethodNotAllowed)
+		return
+	}
+
 	originalFlush := i.lifecycler.FlushOnShutdown()
 	// We want to flush the chunks if transfer fails irrespective of original flag.
 	i.lifecycler.SetFlushOnShutdown(true)
@@ -2482,6 +2493,16 @@ const (
 
 // Blocks version of Flush handler. It force-compacts blocks, and triggers shipping.
 func (i *Ingester) flushHandler(w http.ResponseWriter, r *http.Request) {
+	// Defence in depth: this endpoint is destructive (force-compact + ship of
+	// another tenant's TSDB head blocks) and must not be reachable via GET so
+	// that it cannot be triggered by a link prefetcher, an <img> tag, or an
+	// unauthenticated crawler. The route is also registered behind the auth
+	// middleware; this is a last-line check.
+	if r.Method != http.MethodPost {
+		http.Error(w, "POST required", http.StatusMethodNotAllowed)
+		return
+	}
+
 	err := r.ParseForm()
 	if err != nil {
 		level.Warn(logutil.WithContext(r.Context(), i.logger)).Log("msg", "failed to parse HTTP request in flush handler", "err", err)

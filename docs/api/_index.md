@@ -28,8 +28,8 @@ For the sake of clarity, in this document we have grouped API endpoints by servi
 | [Remote write](#remote-write) | Distributor | `POST /api/v1/push` |
 | [Tenants stats](#tenants-stats) | Distributor | `GET /distributor/all_user_stats` |
 | [HA tracker status](#ha-tracker-status) | Distributor | `GET /distributor/ha_tracker` |
-| [Flush blocks](#flush-blocks) | Ingester | `GET,POST /ingester/flush` |
-| [Shutdown](#shutdown) | Ingester | `GET,POST /ingester/shutdown` |
+| [Flush blocks](#flush-blocks) | Ingester | `POST /ingester/flush` |
+| [Shutdown](#shutdown) | Ingester | `POST /ingester/shutdown` |
 | [Ingesters ring status](#ingesters-ring-status) | Ingester | `GET /ingester/ring` |
 | [Instant query](#instant-query) | Querier, Query-frontend | `GET,POST <prometheus-http-prefix>/api/v1/query` |
 | [Range query](#range-query) | Querier, Query-frontend | `GET,POST <prometheus-http-prefix>/api/v1/query_range` |
@@ -246,10 +246,7 @@ Displays a web page with the current status of the HA tracker, including the ele
 ### Flush blocks
 
 ```
-GET,POST /ingester/flush
-
-# Legacy
-GET,POST /flush
+POST /ingester/flush
 ```
 
 Triggers a flush of the in-memory time series data to the long-term storage. This endpoint triggers the flush also when `-ingester.flush-on-shutdown-with-wal-enabled` or `-blocks-storage.tsdb.flush-blocks-on-shutdown` are disabled.
@@ -258,18 +255,19 @@ This endpoint accepts `tenant` parameter to specify tenant whose blocks are comp
 
 Flush endpoint now also accepts `wait=true` parameter, which makes the call synchronous – it will only return after flushing has finished. Note that returned status code does not reflect the result of flush operation.
 
+This endpoint is destructive to resource utilisation and only accepts `POST`; the previously-supported `GET` method and the legacy `/flush` alias have been removed to prevent cross-site triggering (link prefetchers, `<img>` tags, crawlers). Deployments should expose this endpoint only via an authenticated administrative path.
+
 ### Shutdown
 
 ```
-GET,POST /ingester/shutdown
-
-# Legacy
-GET,POST /shutdown
+POST /ingester/shutdown
 ```
 
 Flushes in-memory time series data from ingester to the long-term storage, and shuts down the ingester service. Notice that the other Cortex services are still running, and the operator (or any automation) is expected to terminate the process with a `SIGINT` / `SIGTERM` signal after the shutdown endpoint returns. In the meantime, `/ready` will not return 200. This endpoint will unregister the ingester from the ring even if `-ingester.unregister-on-shutdown` is disabled.
 
 _This API endpoint is usually used by scale down automations._
+
+This endpoint is destructive (it unregisters the ingester from the ring and stops the ingester service) and only accepts `POST`; the previously-supported `GET` method and the legacy `/shutdown` alias have been removed to prevent cross-site triggering. Deployments should expose this endpoint only via an authenticated administrative path.
 
 ### Ingesters ring status
 
