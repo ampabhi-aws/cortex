@@ -279,9 +279,19 @@ type MultitenantAlertmanager struct {
 
 // NewMultitenantAlertmanager creates a new MultitenantAlertmanager.
 func NewMultitenantAlertmanager(cfg *MultitenantAlertmanagerConfig, store alertstore.AlertStore, limits Limits, logger log.Logger, registerer prometheus.Registerer) (*MultitenantAlertmanager, error) {
-	err := os.MkdirAll(cfg.DataDir, 0777)
+	// Create the Alertmanager data directory with owner-only permissions. The
+	// per-tenant subdirectories under this path hold notification templates,
+	// silence snapshots and notification-log snapshots, none of which should
+	// be readable by other local principals (e.g. sidecar containers sharing
+	// the volume). os.MkdirAll will not tighten the mode on a pre-existing
+	// directory, so we explicitly Chmod it on startup to migrate deployments
+	// upgraded from a release that created it 0777.
+	err := os.MkdirAll(cfg.DataDir, 0700)
 	if err != nil {
 		return nil, fmt.Errorf("unable to create Alertmanager data directory %q: %s", cfg.DataDir, err)
+	}
+	if err := os.Chmod(cfg.DataDir, 0700); err != nil {
+		return nil, fmt.Errorf("unable to set permissions on Alertmanager data directory %q: %s", cfg.DataDir, err)
 	}
 
 	if cfg.ExternalURL.URL == nil {
@@ -525,9 +535,14 @@ func (am *MultitenantAlertmanager) migrateStateFilesToPerTenantDirectories() err
 
 	for userID, files := range st {
 		tenantDir := am.getTenantDirectory(userID)
-		err := os.MkdirAll(tenantDir, 0777)
+		err := os.MkdirAll(tenantDir, 0700)
 		if err != nil {
 			return errors.Wrapf(err, "failed to create per-tenant directory %v", tenantDir)
+		}
+		// Tighten the permissions even if the directory already existed with a
+		// more permissive mode (e.g. 0777/0755 from a previous Cortex version).
+		if err := os.Chmod(tenantDir, 0700); err != nil {
+			return errors.Wrapf(err, "failed to set permissions on per-tenant directory %v", tenantDir)
 		}
 
 		errs := tsdb_errors.NewMulti()
@@ -927,9 +942,14 @@ func (am *MultitenantAlertmanager) newAlertmanager(userID string, amConfig *amco
 	reg := prometheus.NewRegistry()
 
 	tenantDir := am.getTenantDirectory(userID)
-	err := os.MkdirAll(tenantDir, 0777)
+	err := os.MkdirAll(tenantDir, 0700)
 	if err != nil {
 		return nil, errors.Wrapf(err, "failed to create per-tenant directory %v", tenantDir)
+	}
+	// Tighten the permissions even if the directory already existed with a
+	// more permissive mode (e.g. 0777/0755 from a previous Cortex version).
+	if err := os.Chmod(tenantDir, 0700); err != nil {
+		return nil, errors.Wrapf(err, "failed to set permissions on per-tenant directory %v", tenantDir)
 	}
 
 	newAM, err := New(&Config{
@@ -1337,9 +1357,12 @@ func safeTemplateFilepath(dir, templateName string) (string, error) {
 // Returns true, if file content has changed (new or updated file), false if file with the same name
 // and content was already stored locally.
 func storeTemplateFile(templateFilepath, content string) (bool, error) {
-	// Make sure the directory exists.
+	// Make sure the directory exists. Template files frequently contain
+	// tenant-authored content (webhook URLs, runbook links, occasionally
+	// credentials pasted into Slack/webhook bodies), so neither the directory
+	// nor the files themselves should be world-readable.
 	dir := filepath.Dir(templateFilepath)
-	err := os.MkdirAll(dir, 0755)
+	err := os.MkdirAll(dir, 0700)
 	if err != nil {
 		return false, fmt.Errorf("unable to create Alertmanager templates directory %q: %s", dir, err)
 	}
@@ -1351,7 +1374,7 @@ func storeTemplateFile(templateFilepath, content string) (bool, error) {
 		return false, err
 	}
 
-	if err := os.WriteFile(templateFilepath, []byte(content), 0644); err != nil {
+	if err := os.WriteFile(templateFilepath, []byte(content), 0600); err != nil {
 		return false, fmt.Errorf("unable to create Alertmanager template file %q: %s", templateFilepath, err)
 	}
 

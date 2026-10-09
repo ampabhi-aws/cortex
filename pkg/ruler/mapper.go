@@ -74,9 +74,17 @@ func (m *mapper) MapRules(user string, ruleConfigs map[string][]rulefmt.RuleGrou
 	filenames := []string{}
 
 	// user rule files will be stored as `/<path>/<userid>/<encoded filename>`
+	// Create the per-tenant directory with owner-only permissions. Rule files
+	// may embed tenant-sensitive content and should not be readable by other
+	// local principals sharing the data volume. Chmod explicitly in case the
+	// directory already exists with a looser mode (os.MkdirAll does not
+	// tighten the mode on existing directories).
 	path := filepath.Join(m.Path, user)
-	err := m.FS.MkdirAll(path, 0777)
+	err := m.FS.MkdirAll(path, 0700)
 	if err != nil {
+		return false, nil, err
+	}
+	if err := m.FS.Chmod(path, 0700); err != nil {
 		return false, nil, err
 	}
 
