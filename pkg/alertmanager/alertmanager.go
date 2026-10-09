@@ -302,9 +302,20 @@ func (am *Alertmanager) WaitInitialStateSync(ctx context.Context) error {
 
 // clusterWait returns a function that inspects the current peer state and returns
 // a duration of one base timeout for each peer with a higher ID than ourselves.
-func clusterWait(position func() int, timeout time.Duration) func() time.Duration {
+// A negative position (reported by GetPositionForUser when this instance is not one of the
+// user's replicas, or the ring could not be read) is mapped to the maximum delay (last to
+// notify) rather than zero, so a non-replica cannot defeat notification deduplication by
+// notifying immediately with no inter-replica delay.
+func clusterWait(position func() int, timeout time.Duration, maxPosition int) func() time.Duration {
+	if maxPosition < 1 {
+		maxPosition = 1
+	}
 	return func() time.Duration {
-		return time.Duration(position()) * timeout
+		p := position()
+		if p < 0 {
+			p = maxPosition
+		}
+		return time.Duration(p) * timeout
 	}
 }
 
@@ -340,7 +351,7 @@ func (am *Alertmanager) ApplyConfig(userID string, conf *config.Config, rawCfg s
 
 	am.inhibitor = inhibit.NewInhibitor(am.alerts, conf.InhibitRules, am.marker, log.With(am.logger, "component", "inhibitor"))
 
-	waitFunc := clusterWait(am.state.Position, am.cfg.PeerTimeout)
+	waitFunc := clusterWait(am.state.Position, am.cfg.PeerTimeout, am.cfg.ReplicationFactor)
 
 	timeoutFunc := func(d time.Duration) time.Duration {
 		if d < notify.MinTimeout {

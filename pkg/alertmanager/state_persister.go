@@ -98,8 +98,14 @@ func (s *statePersister) iteration(ctx context.Context) error {
 }
 
 func (s *statePersister) persist(ctx context.Context) (err error) {
-	// Only the replica at position zero should write the state.
-	if s.state.Position() != 0 {
+	// Only the replica at position zero should write the state. A negative position means this instance is
+	// not one of the user's replicas (or the ring could not be read): refuse to act as primary so a
+	// non-replica cannot silently overwrite the tenant's authoritative state snapshot.
+	pos := s.state.Position()
+	if pos != 0 {
+		if pos < 0 {
+			level.Warn(s.logger).Log("msg", "not a replica for user; skipping state persistence", "user", s.userID)
+		}
 		return nil
 	}
 
