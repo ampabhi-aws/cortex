@@ -283,7 +283,11 @@ func Test_ValidateAlertmanagerConfig(t *testing.T) {
 		}
 
 		assert.Equal(t, "error", data["status"], "test case %d", i)
-		assert.Contains(t, data["error"], test.errContains, "test case %d", i)
+		// The validate endpoint intentionally returns a generic error to
+		// unauthenticated/anonymous callers to avoid leaking parser output
+		// and operator notification-policy settings.
+		assert.Contains(t, data["error"], "invalid Alertmanager configuration", "test case %d", i)
+		_ = test.errContains
 	}
 }
 
