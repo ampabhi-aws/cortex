@@ -591,7 +591,12 @@ func (t *Cortex) initConfig() (serv services.Service, err error) {
 	}
 
 	t.ConfigAPI = configAPI.New(t.ConfigDB, t.Cfg.Configs.API)
-	t.ConfigAPI.RegisterRoutes(t.Server.HTTP)
+	// Register through pkg/api so the shared auth middleware is applied to
+	// the tenant-facing routes. The aggregate /private/* routes are gated
+	// inside the handler by a shared bearer token (-configs.private-api-token)
+	// and fail closed when no token is configured, which prevents
+	// unauthenticated cross-tenant disclosure of Alertmanager secrets.
+	t.API.RegisterConfigsAPI(t.ConfigAPI)
 	return services.NewIdleService(nil, func(_ error) error {
 		t.ConfigDB.Close()
 		return nil

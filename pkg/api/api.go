@@ -18,6 +18,7 @@ import (
 	"github.com/cortexproject/cortex/pkg/alertmanager"
 	"github.com/cortexproject/cortex/pkg/alertmanager/alertmanagerpb"
 	"github.com/cortexproject/cortex/pkg/compactor"
+	configs_api "github.com/cortexproject/cortex/pkg/configs/api"
 	"github.com/cortexproject/cortex/pkg/cortexpb"
 	"github.com/cortexproject/cortex/pkg/distributor"
 	"github.com/cortexproject/cortex/pkg/distributor/distributorpb"
@@ -322,6 +323,36 @@ func (a *API) RegisterRulerAPI(r *ruler.API) {
 	a.RegisterRoute(path.Join(a.cfg.LegacyHTTPPrefix, "/rules/{namespace}"), http.HandlerFunc(r.CreateRuleGroup), true, "POST")
 	a.RegisterRoute(path.Join(a.cfg.LegacyHTTPPrefix, "/rules/{namespace}/{groupName}"), http.HandlerFunc(r.DeleteRuleGroup), true, "DELETE")
 	a.RegisterRoute(path.Join(a.cfg.LegacyHTTPPrefix, "/rules/{namespace}"), http.HandlerFunc(r.DeleteNamespace), true, "DELETE")
+}
+
+// RegisterConfigsAPI registers the deprecated configs service HTTP routes
+// through the pkg/api plumbing so the standard auth middleware is applied.
+//
+// The tenant-facing /api/prom/configs/* routes are registered with auth=true,
+// matching every other tenant-scoped endpoint, so handlers can rely on an
+// X-Scope-OrgID being present on the context. The aggregate
+// /private/api/prom/configs/* routes are registered with auth=false (there is
+// no tenant to extract) and are gated inside the handler by a shared bearer
+// token (configs.PrivateAPIToken). When no token is configured the handler
+// fails closed, which prevents the historical unauthenticated cross-tenant
+// dump of every tenant's Alertmanager configuration (CWE-1220).
+func (a *API) RegisterConfigsAPI(c *configs_api.API) {
+	for _, route := range c.UserRoutes() {
+		auth := true
+		if route.Path == "/" {
+			// The admin index page carries no tenant state and historically was
+			// unauthenticated; keep that behaviour.
+			auth = false
+		}
+		a.RegisterRoute(route.Path, http.HandlerFunc(route.Handler), auth, route.Method)
+	}
+	for _, route := range c.PrivateRoutes() {
+		// Not wrapped in AuthMiddleware: the aggregate endpoints are not
+		// tenant-scoped and must not be reachable with a self-asserted
+		// X-Scope-OrgID. Access is gated by a shared bearer token enforced
+		// inside the handler itself.
+		a.RegisterRoute(route.Path, http.HandlerFunc(route.Handler), false, route.Method)
+	}
 }
 
 // RegisterRing registers the ring UI page associated with the distributor for writes.
