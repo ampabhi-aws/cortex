@@ -279,7 +279,7 @@ type MultitenantAlertmanager struct {
 
 // NewMultitenantAlertmanager creates a new MultitenantAlertmanager.
 func NewMultitenantAlertmanager(cfg *MultitenantAlertmanagerConfig, store alertstore.AlertStore, limits Limits, logger log.Logger, registerer prometheus.Registerer) (*MultitenantAlertmanager, error) {
-	err := os.MkdirAll(cfg.DataDir, 0777)
+	err := os.MkdirAll(cfg.DataDir, 0750)
 	if err != nil {
 		return nil, fmt.Errorf("unable to create Alertmanager data directory %q: %s", cfg.DataDir, err)
 	}
@@ -525,7 +525,7 @@ func (am *MultitenantAlertmanager) migrateStateFilesToPerTenantDirectories() err
 
 	for userID, files := range st {
 		tenantDir := am.getTenantDirectory(userID)
-		err := os.MkdirAll(tenantDir, 0777)
+		err := os.MkdirAll(tenantDir, 0750)
 		if err != nil {
 			return errors.Wrapf(err, "failed to create per-tenant directory %v", tenantDir)
 		}
@@ -927,7 +927,7 @@ func (am *MultitenantAlertmanager) newAlertmanager(userID string, amConfig *amco
 	reg := prometheus.NewRegistry()
 
 	tenantDir := am.getTenantDirectory(userID)
-	err := os.MkdirAll(tenantDir, 0777)
+	err := os.MkdirAll(tenantDir, 0750)
 	if err != nil {
 		return nil, errors.Wrapf(err, "failed to create per-tenant directory %v", tenantDir)
 	}
