@@ -576,6 +576,14 @@ func (t *Cortex) initRuler() (serv services.Service, err error) {
 	// Expose HTTP/GRPC endpoints for the Ruler service
 	t.API.RegisterRuler(t.Ruler)
 
+	// The /ruler/rule_groups endpoint streams every tenant's rule groups
+	// without performing tenant extraction or authorization. Only register
+	// it when the operator has explicitly opted in, so an unprotected
+	// tenant-facing HTTP listener cannot leak cluster-wide rule config.
+	if t.Cfg.Ruler.EnableListAllRulesEndpoint {
+		t.API.RegisterRulerListAllRules(t.Ruler)
+	}
+
 	// If the API is enabled, register the Ruler API
 	if t.Cfg.Ruler.EnableAPI {
 		t.API.RegisterRulerAPI(ruler.NewAPI(t.Ruler, t.RulerStorage, util_log.Logger))

@@ -2,6 +2,8 @@
 
 ## master / unreleased
 
+* [CHANGE] Ruler: the `GET /ruler/rule_groups` endpoint, which lists every tenant's rule groups and is not authenticated or tenant-scoped, is now disabled by default. It must be explicitly enabled with the new `-ruler.enable-list-all-rules-endpoint` flag (YAML `ruler.enable_list_all_rules_endpoint`). Only enable it when the Cortex HTTP listener is restricted to trusted operators.
+
   **This release removes support for chunks storage. See below for more.**
 * [CHANGE] Remove support for chunks storage entirely. If you are using chunks storage on a previous version, you must [migrate your data](https://github.com/cortexproject/cortex/blob/v1.11.1/docs/blocks-storage/migrate-from-chunks-to-blocks.md) on version 1.12 or earlier. Before upgrading to this release, you should also remove any deprecated chunks-related configuration, as this release will no longer accept that. The following flags are gone:
   - `-dynamodb.*`
