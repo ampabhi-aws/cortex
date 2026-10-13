@@ -48,6 +48,15 @@ type Config struct {
 	AlertmanagerHTTPPrefix string `yaml:"alertmanager_http_prefix"`
 	PrometheusHTTPPrefix   string `yaml:"prometheus_http_prefix"`
 
+	// AdminEndpointsEnabled gates the cross-tenant "admin" HTTP endpoints that
+	// enumerate every tenant's control-plane data (Alertmanager configs, rule
+	// groups, user stats, HA-tracker state, raw memberlist KV contents). These
+	// endpoints have no in-process authentication/authorization and must not be
+	// exposed to tenants. They are disabled by default; operators that run a
+	// trusted admin-only listener (or have other compensating controls) can set
+	// this flag to true to re-enable them.
+	AdminEndpointsEnabled bool `yaml:"admin_endpoints_enabled"`
+
 	// The following configs are injected by the upstream caller.
 	ServerPrefix       string               `yaml:"-"`
 	LegacyHTTPPrefix   string               `yaml:"-"`
@@ -71,6 +80,7 @@ type Config struct {
 func (cfg *Config) RegisterFlags(f *flag.FlagSet) {
 	f.BoolVar(&cfg.ResponseCompression, "api.response-compression-enabled", false, "Use GZIP compression for API responses. Some endpoints serve large YAML or JSON blobs which can benefit from compression.")
 	f.Var(&cfg.HTTPRequestHeadersToLog, "api.http-request-headers-to-log", "Which HTTP Request headers to add to logs")
+	f.BoolVar(&cfg.AdminEndpointsEnabled, "api.admin-endpoints-enabled", false, "Enable the cross-tenant admin HTTP endpoints (e.g. /multitenant_alertmanager/configs, /ruler/rule_groups, /distributor/all_user_stats, /distributor/ha_tracker, /memberlist). These endpoints have no in-process authentication and expose every tenant's control-plane data (including secrets stored in Alertmanager configurations); they should only be enabled on a listener that is not reachable by tenants.")
 	cfg.RegisterFlagsWithPrefix("", f)
 }
 
@@ -158,6 +168,30 @@ func (a *API) RegisterRoute(path string, handler http.Handler, auth bool, method
 	a.server.HTTP.Path(path).Methods(methods...).Handler(handler)
 }
 
+// adminEndpointDisabledHandler returns 404 when admin endpoints are disabled,
+// matching the response an operator would see on a listener that never
+// registered the route in the first place.
+func adminEndpointDisabledHandler() http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		http.Error(w, "admin endpoint disabled", http.StatusNotFound)
+	})
+}
+
+// RegisterAdminRoute registers a cross-tenant "admin" route that must not be
+// served on a tenant-facing listener without an external control. When
+// `-api.admin-endpoints-enabled=false` (the default) the route is still
+// registered on the mux but short-circuits to 404 so the admin surface is
+// not exposed. When enabled the real handler is installed. The underlying
+// `auth` flag has no security value here (it only propagates the
+// caller-supplied X-Scope-OrgID header into the request context) but is
+// kept so operators can combine this gate with their own middleware.
+func (a *API) RegisterAdminRoute(path string, handler http.Handler, auth bool, method string, methods ...string) {
+	if !a.cfg.AdminEndpointsEnabled {
+		handler = adminEndpointDisabledHandler()
+	}
+	a.RegisterRoute(path, handler, auth, method, methods...)
+}
+
 func (a *API) RegisterRoutesWithPrefix(prefix string, handler http.Handler, auth bool, methods ...string) {
 	level.Debug(a.logger).Log("msg", "api: registering route", "methods", strings.Join(methods, ","), "prefix", prefix, "auth", auth)
 	if auth {
@@ -187,7 +221,7 @@ func (a *API) RegisterAlertmanager(am *alertmanager.MultitenantAlertmanager, tar
 	a.indexPage.AddLink(SectionAdminEndpoints, "/multitenant_alertmanager/ring", "Alertmanager Ring Status")
 	// Ensure this route is registered before the prefixed AM route
 	a.RegisterRoute("/multitenant_alertmanager/status", am.GetStatusHandler(), false, "GET")
-	a.RegisterRoute("/multitenant_alertmanager/configs", http.HandlerFunc(am.ListAllConfigs), false, "GET")
+	a.RegisterAdminRoute("/multitenant_alertmanager/configs", http.HandlerFunc(am.ListAllConfigs), false, "GET")
 	a.RegisterRoute("/multitenant_alertmanager/ring", http.HandlerFunc(am.RingHandler), false, "GET", "POST")
 	a.RegisterRoute("/multitenant_alertmanager/delete_tenant_config", http.HandlerFunc(am.DeleteUserConfig), true, "POST")
 
@@ -241,13 +275,13 @@ func (a *API) RegisterDistributor(d *distributor.Distributor, pushConfig distrib
 	a.indexPage.AddLink(SectionAdminEndpoints, "/distributor/ha_tracker", "HA Tracking Status")
 
 	a.RegisterRoute("/distributor/ring", d, false, "GET", "POST")
-	a.RegisterRoute("/distributor/all_user_stats", http.HandlerFunc(d.AllUserStatsHandler), false, "GET")
-	a.RegisterRoute("/distributor/ha_tracker", d.HATracker, false, "GET")
+	a.RegisterAdminRoute("/distributor/all_user_stats", http.HandlerFunc(d.AllUserStatsHandler), false, "GET")
+	a.RegisterAdminRoute("/distributor/ha_tracker", d.HATracker, false, "GET")
 
 	// Legacy Routes
 	a.RegisterRoute(path.Join(a.cfg.LegacyHTTPPrefix, "/push"), push.Handler(pushConfig.MaxRecvMsgSize, a.sourceIPs, a.cfg.wrapDistributorPush(d)), true, "POST")
-	a.RegisterRoute("/all_user_stats", http.HandlerFunc(d.AllUserStatsHandler), false, "GET")
-	a.RegisterRoute("/ha-tracker", d.HATracker, false, "GET")
+	a.RegisterAdminRoute("/all_user_stats", http.HandlerFunc(d.AllUserStatsHandler), false, "GET")
+	a.RegisterAdminRoute("/ha-tracker", d.HATracker, false, "GET")
 }
 
 // Ingester is defined as an interface to allow for alternative implementations
@@ -292,7 +326,7 @@ func (a *API) RegisterRuler(r *ruler.Ruler) {
 	a.RegisterRoute("/ruler_ring", r, false, "GET", "POST")
 
 	// List all user rule groups
-	a.RegisterRoute("/ruler/rule_groups", http.HandlerFunc(r.ListAllRules), false, "GET")
+	a.RegisterAdminRoute("/ruler/rule_groups", http.HandlerFunc(r.ListAllRules), false, "GET")
 
 	ruler.RegisterRulerServer(a.server.GRPC, r)
 }
@@ -416,5 +450,5 @@ func (a *API) RegisterServiceMapHandler(handler http.Handler) {
 
 func (a *API) RegisterMemberlistKV(handler http.Handler) {
 	a.indexPage.AddLink(SectionAdminEndpoints, "/memberlist", "Memberlist Status")
-	a.RegisterRoute("/memberlist", handler, false, "GET")
+	a.RegisterAdminRoute("/memberlist", handler, false, "GET")
 }

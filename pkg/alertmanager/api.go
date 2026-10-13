@@ -8,6 +8,7 @@ import (
 	"os"
 	"path/filepath"
 	"reflect"
+	"regexp"
 
 	"github.com/go-kit/log"
 	"github.com/go-kit/log/level"
@@ -286,7 +287,7 @@ func (am *MultitenantAlertmanager) ListAllConfigs(w http.ResponseWriter, r *http
 		data := map[string]*UserConfig{
 			userID: {
 				TemplateFiles:      alertspb.ParseTemplates(cfg),
-				AlertmanagerConfig: cfg.RawConfig,
+				AlertmanagerConfig: redactAlertmanagerConfigSecrets(cfg.RawConfig),
 			},
 		}
 
@@ -302,6 +303,78 @@ func (am *MultitenantAlertmanager) ListAllConfigs(w http.ResponseWriter, r *http
 	}
 	close(iter)
 	<-done
+}
+
+// redactedSecretValue replaces the value of secret-bearing Alertmanager YAML
+// keys when emitting a cross-tenant configuration listing.
+const redactedSecretValue = "<secret>"
+
+// alertmanagerSecretKeys is the set of YAML scalar keys that upstream
+// Alertmanager treats as secrets (either via the `config.Secret` /
+// `config.SecretURL` types or via documented password/token fields). Values
+// of these keys are redacted before the cross-tenant
+// `/multitenant_alertmanager/configs` listing is written so operator-side
+// enumeration of this endpoint cannot leak Slack webhook URLs, bearer
+// tokens, SMTP passwords, OpsGenie/VictorOps/PagerDuty keys, etc.
+var alertmanagerSecretKeys = []string{
+	"api_key",
+	"api_secret",
+	"api_url",
+	"auth_password",
+	"auth_secret",
+	"bearer_token",
+	"credentials",
+	"opsgenie_api_key",
+	"password",
+	"routing_key",
+	"secret_key",
+	"service_key",
+	"slack_api_url",
+	"smtp_auth_password",
+	"smtp_auth_secret",
+	"victorops_api_key",
+	"wechat_api_secret",
+}
+
+var alertmanagerSecretRedactRe = buildAlertmanagerSecretRedactRegexp()
+
+func buildAlertmanagerSecretRedactRegexp() *regexp.Regexp {
+	// Match any of the known secret keys at a YAML scalar position:
+	//   leading indent, `<key>:`, optional whitespace, then a scalar value
+	//   that is NOT the empty string, a map (`{`) or a sequence (`[`). We
+	//   intentionally leave list-of-strings style secrets alone -- the
+	//   Alertmanager schema only uses the above keys for scalar secrets.
+	alt := ""
+	for i, k := range alertmanagerSecretKeys {
+		if i > 0 {
+			alt += "|"
+		}
+		alt += regexp.QuoteMeta(k)
+	}
+	return regexp.MustCompile(`(?m)^(\s*(?:- +)?(?:` + alt + `)\s*:[ \t]*)(?:"[^"\n]*"|'[^'\n]*'|[^\s#!&*{}\[\]|>][^\n#]*?)[ \t]*(#.*)?$`)
+}
+
+// redactAlertmanagerConfigSecrets rewrites `raw` so values of known
+// secret-bearing YAML keys are replaced with the literal string `<secret>`.
+// Non-secret fields and overall YAML structure are preserved verbatim so
+// legitimate operator inspection of other configuration still works. If
+// `raw` is empty it is returned unchanged.
+func redactAlertmanagerConfigSecrets(raw string) string {
+	if raw == "" {
+		return raw
+	}
+	return alertmanagerSecretRedactRe.ReplaceAllStringFunc(raw, func(match string) string {
+		sub := alertmanagerSecretRedactRe.FindStringSubmatch(match)
+		if len(sub) < 3 {
+			return match
+		}
+		prefix := sub[1]
+		trailingComment := sub[2]
+		if trailingComment != "" {
+			return prefix + redactedSecretValue + " " + trailingComment
+		}
+		return prefix + redactedSecretValue
+	})
 }
 
 // validateAlertmanagerConfig recursively scans the input config looking for data types for which
