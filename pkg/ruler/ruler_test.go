@@ -102,6 +102,10 @@ func (r ruleLimits) RulerMaxRulesPerRuleGroup(_ string) int {
 	return r.maxRulesPerRuleGroup
 }
 
+func (r ruleLimits) RulerMaxRuleGroupSizeBytes(_ string) int {
+	return 0
+}
+
 func newEmptyQueryable() storage.Queryable {
 	return storage.QueryableFunc(func(ctx context.Context, mint, maxt int64) (storage.Querier, error) {
 		return emptyQuerier{}, nil

@@ -86,6 +86,7 @@ type Limits struct {
 	RulerTenantShardSize        int            `yaml:"ruler_tenant_shard_size" json:"ruler_tenant_shard_size"`
 	RulerMaxRulesPerRuleGroup   int            `yaml:"ruler_max_rules_per_rule_group" json:"ruler_max_rules_per_rule_group"`
 	RulerMaxRuleGroupsPerTenant int            `yaml:"ruler_max_rule_groups_per_tenant" json:"ruler_max_rule_groups_per_tenant"`
+	RulerMaxRuleGroupSizeBytes  int            `yaml:"ruler_max_rule_group_size_bytes" json:"ruler_max_rule_group_size_bytes"`
 
 	// Store-gateway.
 	StoreGatewayTenantShardSize int `yaml:"store_gateway_tenant_shard_size" json:"store_gateway_tenant_shard_size"`
@@ -165,6 +166,7 @@ func (l *Limits) RegisterFlags(f *flag.FlagSet) {
 	f.IntVar(&l.RulerTenantShardSize, "ruler.tenant-shard-size", 0, "The default tenant's shard size when the shuffle-sharding strategy is used by ruler. When this setting is specified in the per-tenant overrides, a value of 0 disables shuffle sharding for the tenant.")
 	f.IntVar(&l.RulerMaxRulesPerRuleGroup, "ruler.max-rules-per-rule-group", 0, "Maximum number of rules per rule group per-tenant. 0 to disable.")
 	f.IntVar(&l.RulerMaxRuleGroupsPerTenant, "ruler.max-rule-groups-per-tenant", 0, "Maximum number of rule groups per-tenant. 0 to disable.")
+	f.IntVar(&l.RulerMaxRuleGroupSizeBytes, "ruler.max-rule-group-size-bytes", 0, "Maximum size (in bytes) of the request body a tenant can upload to the ruler's rule-group configuration API. 0 = no limit.")
 
 	f.Var(&l.CompactorBlocksRetentionPeriod, "compactor.blocks-retention-period", "Delete blocks containing samples older than the specified retention period. 0 to disable.")
 	f.IntVar(&l.CompactorTenantShardSize, "compactor.tenant-shard-size", 0, "The default tenant's shard size when the shuffle-sharding strategy is used by the compactor. When this setting is specified in the per-tenant overrides, a value of 0 disables shuffle sharding for the tenant.")
@@ -514,6 +516,12 @@ func (o *Overrides) RulerMaxRulesPerRuleGroup(userID string) int {
 // RulerMaxRuleGroupsPerTenant returns the maximum number of rule groups for a given user.
 func (o *Overrides) RulerMaxRuleGroupsPerTenant(userID string) int {
 	return o.getOverridesForUser(userID).RulerMaxRuleGroupsPerTenant
+}
+
+// RulerMaxRuleGroupSizeBytes returns the maximum size (in bytes) of a rule-group
+// configuration a tenant can upload via the ruler API. 0 means no limit.
+func (o *Overrides) RulerMaxRuleGroupSizeBytes(userID string) int {
+	return o.getOverridesForUser(userID).RulerMaxRuleGroupSizeBytes
 }
 
 // StoreGatewayTenantShardSize returns the store-gateway shard size for a given user.
