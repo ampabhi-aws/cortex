@@ -213,8 +213,17 @@ func (cfg *TSDBConfig) Validate() error {
 }
 
 // BlocksDir returns the directory path where TSDB blocks and wal should be
-// stored by the ingester
+// stored by the ingester.
+//
+// It panics if userID is empty: the tenant resolver is expected to reject
+// empty tenant IDs upstream, and silently returning cfg.Dir would collapse
+// the empty tenant's TSDB onto the shared parent directory of every tenant
+// (filepath.Join cleans away empty segments). Failing closed here prevents
+// cross-tenant data corruption if an empty userID ever reaches this helper.
 func (cfg *TSDBConfig) BlocksDir(userID string) string {
+	if userID == "" {
+		panic("tsdb.BlocksDir called with empty userID")
+	}
 	return filepath.Join(cfg.Dir, userID)
 }
 

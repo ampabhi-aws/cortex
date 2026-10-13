@@ -83,6 +83,12 @@ func (t *SingleResolver) TenantID(ctx context.Context) (string, error) {
 		return "", err
 	}
 
+	// Reject an empty tenant ID so it cannot collapse per-tenant key-space
+	// paths/prefixes onto the shared parent namespace.
+	if id == "" {
+		return "", errTenantIDEmpty
+	}
+
 	if containsUnsafePathSegments(id) {
 		return "", errInvalidTenantID
 	}
@@ -131,6 +137,13 @@ func (t *MultiResolver) TenantIDs(ctx context.Context) ([]string, error) {
 
 	orgIDs := strings.Split(orgID, tenantIDsLabelSeparator)
 	for _, orgID := range orgIDs {
+		// Reject empty segments (e.g. the header value "|", "a|" or "||b")
+		// before NormalizeTenantIDs dedups them away. An empty tenant ID
+		// would otherwise collapse per-tenant key-space paths/prefixes
+		// onto the shared parent namespace of all tenants.
+		if orgID == "" {
+			return nil, errTenantIDEmpty
+		}
 		if err := ValidTenantID(orgID); err != nil {
 			return nil, err
 		}
