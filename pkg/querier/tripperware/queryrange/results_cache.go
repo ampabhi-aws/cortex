@@ -140,10 +140,21 @@ type CacheSplitter interface {
 // constSplitter is a utility for using a constant split interval when determining cache keys
 type constSplitter time.Duration
 
+// resultsCacheKeyPrefix namespaces results-cache keys so they cannot collide
+// with chunk/index cache keys when they share a memcached/redis cluster.
+const resultsCacheKeyPrefix = "rc:"
+
 // GenerateCacheKey generates a cache key based on the userID, Request and interval.
+//
+// The key is built by length-prefixing the tenant ID and the query so that
+// combinations such as userID="a"/query="b:up" and userID="a:b"/query="up"
+// cannot produce byte-identical keys. Without the length prefixes a user
+// whose tenant ID contains ':' could read or poison another tenant's cached
+// results via the shared results cache (see CWE-140).
 func (t constSplitter) GenerateCacheKey(userID string, r tripperware.Request) string {
 	currentInterval := r.GetStart() / int64(time.Duration(t)/time.Millisecond)
-	return fmt.Sprintf("%s:%s:%d:%d", userID, r.GetQuery(), r.GetStep(), currentInterval)
+	query := r.GetQuery()
+	return fmt.Sprintf("%s%d:%s:%d:%s:%d:%d", resultsCacheKeyPrefix, len(userID), userID, len(query), query, r.GetStep(), currentInterval)
 }
 
 // ShouldCacheFn checks whether the current request should go to cache
