@@ -87,6 +87,15 @@ func (t *SingleResolver) TenantID(ctx context.Context) (string, error) {
 		return "", errInvalidTenantID
 	}
 
+	// Reject the tenant-federation separator inside a single tenant ID so that
+	// the identity cannot be silently reinterpreted as a list of tenants if the
+	// MultiResolver is later installed (-tenant-federation.enabled). See
+	// https://cortexmetrics.io/docs/guides/limitations/#tenant-id-naming - '|'
+	// is not in the documented safe character set.
+	if strings.Contains(id, tenantIDsLabelSeparator) {
+		return "", errInvalidTenantID
+	}
+
 	return id, nil
 }
 
