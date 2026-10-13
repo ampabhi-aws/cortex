@@ -47,18 +47,29 @@ func (s *UsersScanner) ScanUsers(ctx context.Context) (users, markedForDeletion 
 	for ix := 0; ix < len(users); {
 		userID := users[ix]
 
-		// Check if it's owned by this instance.
+		// Check if it's owned by this instance. Fail closed: if we cannot determine
+		// ownership, drop the user from the list so that destructive cleanup
+		// callbacks do not run on a tenant we may not own (which would otherwise
+		// let multiple replicas race on the same tenant during a ring outage).
 		owned, err := s.isOwned(userID)
 		if err != nil {
-			level.Warn(s.logger).Log("msg", "unable to check if user is owned by this shard", "user", userID, "err", err)
+			level.Warn(s.logger).Log("msg", "unable to check if user is owned by this shard, skipping", "user", userID, "err", err)
+			users = append(users[:ix], users[ix+1:]...)
+			continue
 		} else if !owned {
 			users = append(users[:ix], users[ix+1:]...)
 			continue
 		}
 
+		// Check whether the tenant is marked for deletion. Fail closed: if we
+		// cannot determine the deletion state, skip the tenant entirely rather
+		// than treating it as active, so we never run cleanUser on a tenant that
+		// may actually be marked for deletion.
 		deletionMarkExists, err := TenantDeletionMarkExists(ctx, s.bucketClient, userID)
 		if err != nil {
-			level.Warn(s.logger).Log("msg", "unable to check if user is marked for deletion", "user", userID, "err", err)
+			level.Warn(s.logger).Log("msg", "unable to check if user is marked for deletion, skipping", "user", userID, "err", err)
+			users = append(users[:ix], users[ix+1:]...)
+			continue
 		} else if deletionMarkExists {
 			users = append(users[:ix], users[ix+1:]...)
 			markedForDeletion = append(markedForDeletion, userID)

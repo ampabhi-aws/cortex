@@ -31,11 +31,9 @@ func TestUsersScanner_ScanUsers_ShouldReturnedOwnedUsersOnly(t *testing.T) {
 
 }
 
-func TestUsersScanner_ScanUsers_ShouldReturnUsersForWhichOwnerCheckOrTenantDeletionCheckFailed(t *testing.T) {
-	expected := []string{"user-1", "user-2"}
-
+func TestUsersScanner_ScanUsers_ShouldSkipUsersForWhichOwnerCheckOrTenantDeletionCheckFailed(t *testing.T) {
 	bucketClient := &bucket.ClientMock{}
-	bucketClient.MockIter("", expected, nil)
+	bucketClient.MockIter("", []string{"user-1", "user-2"}, nil)
 	bucketClient.MockExists(path.Join("user-1", TenantDeletionMarkPath), false, nil)
 	bucketClient.MockExists(path.Join("user-2", TenantDeletionMarkPath), false, errors.New("fail"))
 
@@ -46,6 +44,10 @@ func TestUsersScanner_ScanUsers_ShouldReturnUsersForWhichOwnerCheckOrTenantDelet
 	s := NewUsersScanner(bucketClient, isOwned, log.NewNopLogger())
 	actual, deleted, err := s.ScanUsers(context.Background())
 	require.NoError(t, err)
-	assert.Equal(t, expected, actual)
+	// Fail closed: users whose ownership or deletion-mark check fails must be
+	// dropped from the active list so destructive cleanup callbacks do not run
+	// on them. The deletion-mark error path must also not route them into the
+	// markedForDeletion list.
+	assert.Empty(t, actual)
 	assert.Empty(t, deleted)
 }
