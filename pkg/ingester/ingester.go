@@ -1557,9 +1557,25 @@ func (i *Ingester) UserStats(ctx context.Context, req *client.UserStatsRequest) 
 }
 
 // AllUserStats returns ingestion statistics for all users known to this ingester.
-func (i *Ingester) AllUserStats(_ context.Context, _ *client.UserStatsRequest) (*client.UsersStatsResponse, error) {
+//
+// AllUserStats is a cross-tenant RPC used by the operator-facing
+// /distributor/all_user_stats admin page. To stop a tenant that reaches the
+// ingester gRPC listener from using this method to enumerate every other
+// tenant's ID, in-memory series count and ingestion rate, the handler
+// requires the caller to present the dedicated control-plane org ID
+// (client.AllUserStatsAdminOrgID). Any caller that presents a real tenant
+// org ID - or no org ID at all - is rejected with PermissionDenied.
+func (i *Ingester) AllUserStats(ctx context.Context, _ *client.UserStatsRequest) (*client.UsersStatsResponse, error) {
 	if err := i.checkRunning(); err != nil {
 		return nil, err
+	}
+
+	orgID, err := tenant.TenantID(ctx)
+	if err != nil {
+		return nil, err
+	}
+	if orgID != client.AllUserStatsAdminOrgID {
+		return nil, status.Error(codes.PermissionDenied, "AllUserStats is restricted to the control-plane admin principal")
 	}
 
 	i.stoppedMtx.RLock()
