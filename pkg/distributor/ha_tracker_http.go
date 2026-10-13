@@ -9,6 +9,7 @@ import (
 
 	"github.com/prometheus/prometheus/model/timestamp"
 
+	"github.com/cortexproject/cortex/pkg/tenant"
 	"github.com/cortexproject/cortex/pkg/util"
 )
 
@@ -56,6 +57,14 @@ func init() {
 }
 
 func (h *haTracker) ServeHTTP(w http.ResponseWriter, req *http.Request) {
+	// Scope the output to the authenticated tenant to avoid cross-tenant
+	// disclosure of HA cluster/replica identifiers and election metadata.
+	userID, err := tenant.TenantID(req.Context())
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusUnauthorized)
+		return
+	}
+
 	h.electedLock.RLock()
 	type replica struct {
 		UserID       string        `json:"userID"`
@@ -69,6 +78,9 @@ func (h *haTracker) ServeHTTP(w http.ResponseWriter, req *http.Request) {
 	electedReplicas := []replica{}
 	for key, desc := range h.elected {
 		chunks := strings.SplitN(key, "/", 2)
+		if len(chunks) < 2 || chunks[0] != userID {
+			continue
+		}
 
 		electedReplicas = append(electedReplicas, replica{
 			UserID:       chunks[0],
