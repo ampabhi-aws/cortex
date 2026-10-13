@@ -265,13 +265,20 @@ func (a *API) RegisterIngester(i Ingester, pushConfig distributor.Config) {
 
 	a.indexPage.AddLink(SectionDangerous, "/ingester/flush", "Trigger a Flush of data from Ingester to storage")
 	a.indexPage.AddLink(SectionDangerous, "/ingester/shutdown", "Trigger Ingester Shutdown (Dangerous)")
-	a.RegisterRoute("/ingester/flush", http.HandlerFunc(i.FlushHandler), false, "GET", "POST")
-	a.RegisterRoute("/ingester/shutdown", http.HandlerFunc(i.ShutdownHandler), false, "GET", "POST")
+	// Destructive lifecycle endpoints are restricted to POST only. Allowing GET
+	// made them trivially triggerable by a browser navigation / cross-origin
+	// <img>/<link>/<form> navigation (no CSRF token is validated), which could
+	// stop an ingester (unregistering it from the ring) or force compaction/
+	// shipping for an arbitrary tenant from any browser that can reach the
+	// HTTP listener. Scale-down automation and the integration test suite call
+	// these endpoints with POST, which continues to work.
+	a.RegisterRoute("/ingester/flush", http.HandlerFunc(i.FlushHandler), false, "POST")
+	a.RegisterRoute("/ingester/shutdown", http.HandlerFunc(i.ShutdownHandler), false, "POST")
 	a.RegisterRoute("/ingester/push", push.Handler(pushConfig.MaxRecvMsgSize, a.sourceIPs, i.Push), true, "POST") // For testing and debugging.
 
 	// Legacy Routes
-	a.RegisterRoute("/flush", http.HandlerFunc(i.FlushHandler), false, "GET", "POST")
-	a.RegisterRoute("/shutdown", http.HandlerFunc(i.ShutdownHandler), false, "GET", "POST")
+	a.RegisterRoute("/flush", http.HandlerFunc(i.FlushHandler), false, "POST")
+	a.RegisterRoute("/shutdown", http.HandlerFunc(i.ShutdownHandler), false, "POST")
 	a.RegisterRoute("/push", push.Handler(pushConfig.MaxRecvMsgSize, a.sourceIPs, i.Push), true, "POST") // For testing and debugging.
 }
 
