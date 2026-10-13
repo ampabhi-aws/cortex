@@ -7,6 +7,7 @@ import (
 	"html/template"
 	"math"
 	"net/http"
+	"net/url"
 	"sort"
 	"strings"
 	"time"
@@ -25,7 +26,6 @@ const pageContent = `
 		<h1>Ring Status</h1>
 		<p>Current time: {{ .Now }}</p>
 		<form action="" method="POST">
-			<input type="hidden" name="csrf_token" value="$__CSRF_TOKEN_PLACEHOLDER__">
 			<table width="100%" border="1">
 				<thead>
 					<tr>
@@ -90,6 +90,38 @@ func init() {
 	pageTemplate = template.Must(t.Parse(pageContent))
 }
 
+// checkSameOrigin verifies that any Origin or Referer header on the request
+// points at the same host as req.Host. Browsers always attach at least one of
+// these on cross-site POSTs they initiate, so matching them rejects
+// cross-site-request-forgery attempts against this handler without relying on
+// cookies, sessions, or an in-product auth layer that Cortex does not ship.
+// A request with neither header is treated as non-browser traffic (e.g.
+// operator curl) and permitted; operators are expected to front Cortex with
+// an external auth layer as documented.
+func checkSameOrigin(req *http.Request) error {
+	check := func(headerName, raw string) error {
+		u, err := url.Parse(raw)
+		if err != nil {
+			return fmt.Errorf("invalid %s header %q: %w", headerName, raw, err)
+		}
+		if u.Host == "" {
+			return fmt.Errorf("%s header %q has no host", headerName, raw)
+		}
+		if !strings.EqualFold(u.Host, req.Host) {
+			return fmt.Errorf("%s host %q does not match request host %q", headerName, u.Host, req.Host)
+		}
+		return nil
+	}
+
+	if origin := req.Header.Get("Origin"); origin != "" && origin != "null" {
+		return check("Origin", origin)
+	}
+	if referer := req.Header.Get("Referer"); referer != "" {
+		return check("Referer", referer)
+	}
+	return nil
+}
+
 func (r *Ring) forget(ctx context.Context, id string) error {
 	unregister := func(in interface{}) (out interface{}, retry bool, err error) {
 		if in == nil {
@@ -123,6 +155,18 @@ type httpResponse struct {
 
 func (r *Ring) ServeHTTP(w http.ResponseWriter, req *http.Request) {
 	if req.Method == http.MethodPost {
+		// Reject browser-driven cross-site POSTs by requiring the request's
+		// Origin/Referer (if present) to match the request Host. Non-browser
+		// callers that omit both headers are allowed through, matching the
+		// documented operator-tooling use of this admin endpoint; placing an
+		// authenticating reverse proxy in front of Cortex remains required to
+		// restrict who can invoke it (see docs/guides/security.md).
+		if err := checkSameOrigin(req); err != nil {
+			level.Warn(r.logger).Log("msg", "rejecting cross-origin POST to ring page", "err", err)
+			http.Error(w, "cross-origin request rejected", http.StatusForbidden)
+			return
+		}
+
 		ingesterID := req.FormValue("forget")
 		if err := r.forget(req.Context(), ingesterID); err != nil {
 			level.Error(r.logger).Log("msg", "error forgetting instance", "err", err)
