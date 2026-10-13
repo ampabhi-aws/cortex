@@ -92,6 +92,12 @@ func (cfg *Config) Validate() error {
 		}
 	}
 
+	if cfg.Backend == Filesystem {
+		if err := cfg.Filesystem.Validate(); err != nil {
+			return err
+		}
+	}
+
 	return nil
 }
 
