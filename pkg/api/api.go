@@ -267,12 +267,18 @@ func (a *API) RegisterIngester(i Ingester, pushConfig distributor.Config) {
 	a.indexPage.AddLink(SectionDangerous, "/ingester/shutdown", "Trigger Ingester Shutdown (Dangerous)")
 	a.RegisterRoute("/ingester/flush", http.HandlerFunc(i.FlushHandler), false, "GET", "POST")
 	a.RegisterRoute("/ingester/shutdown", http.HandlerFunc(i.ShutdownHandler), false, "GET", "POST")
-	a.RegisterRoute("/ingester/push", push.Handler(pushConfig.MaxRecvMsgSize, a.sourceIPs, i.Push), true, "POST") // For testing and debugging.
+	// The HTTP /ingester/push and legacy /push debug routes were removed: they
+	// delivered an attacker-supplied WriteRequest straight to Ingester.Push,
+	// bypassing all distributor-side validation (label name/value limits,
+	// sorted/duplicate label-name checks, metric-name validation, per-tenant
+	// ingestion rate limit, and the creation_grace_period bound on future
+	// timestamps). The intended production entry point is the gRPC
+	// cortex.Ingester/Push service registered above, which is reachable only on
+	// the server's gRPC listener (not the tenant-authenticated HTTP listener).
 
 	// Legacy Routes
 	a.RegisterRoute("/flush", http.HandlerFunc(i.FlushHandler), false, "GET", "POST")
 	a.RegisterRoute("/shutdown", http.HandlerFunc(i.ShutdownHandler), false, "GET", "POST")
-	a.RegisterRoute("/push", push.Handler(pushConfig.MaxRecvMsgSize, a.sourceIPs, i.Push), true, "POST") // For testing and debugging.
 }
 
 func (a *API) RegisterTenantDeletion(api *purger.TenantDeletionAPI) {
