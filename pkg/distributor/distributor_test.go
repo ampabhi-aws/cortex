@@ -1565,15 +1565,17 @@ func TestDistributor_Push_ExemplarValidation(t *testing.T) {
 		},
 		"rejects exemplar with no labels": {
 			req:    makeWriteRequestExemplar([]string{model.MetricNameLabel, "test"}, 1000, []string{}),
-			errMsg: `exemplar missing labels, timestamp: 1000 series: {__name__="test"} labels: {}`,
+			errMsg: `exemplar missing labels, timestamp: 1000 series: "{__name__=\"test\"}" labels: "{}"`,
 		},
 		"rejects exemplar with no timestamp": {
 			req:    makeWriteRequestExemplar([]string{model.MetricNameLabel, "test"}, 0, []string{"foo", "bar"}),
-			errMsg: `exemplar missing timestamp, timestamp: 0 series: {__name__="test"} labels: {foo="bar"}`,
+			errMsg: `exemplar missing timestamp, timestamp: 0 series: "{__name__=\"test\"}" labels: "{foo=\"bar\"}"`,
 		},
 		"rejects exemplar with too long labelset": {
 			req:    makeWriteRequestExemplar([]string{model.MetricNameLabel, "test"}, 1000, []string{"foo", strings.Repeat("0", 126)}),
-			errMsg: fmt.Sprintf(`exemplar combined labelset exceeds 128 characters, timestamp: 1000 series: {__name__="test"} labels: {foo="%s"}`, strings.Repeat("0", 126)),
+			// The series/labels portion is now rendered with %.200q (same as the
+			// other validation errors). Only match on the stable prefix.
+			errMsg: `exemplar combined labelset exceeds 128 characters, timestamp: 1000 series: "{__name__=\"test\"}" labels:`,
 		},
 		"rejects exemplar with too many series labels": {
 			req:    makeWriteRequestExemplar(manyLabels, 0, nil),
@@ -3002,7 +3004,7 @@ func TestDistributorValidation(t *testing.T) {
 				TimestampMs: int64(now),
 				Value:       2,
 			}},
-			err: httpgrpc.Errorf(http.StatusBadRequest, `series has too many labels (actual: 3, limit: 2) series: 'testmetric{foo2="bar2", foo="bar"}'`),
+			err: httpgrpc.Errorf(http.StatusBadRequest, `series has too many labels (actual: 3, limit: 2) series: "testmetric{foo=\"bar\", foo2=\"bar2\"}"`),
 		},
 		// Test multiple validation fails return the first one.
 		{
@@ -3014,7 +3016,7 @@ func TestDistributorValidation(t *testing.T) {
 				{TimestampMs: int64(now), Value: 2},
 				{TimestampMs: int64(past), Value: 2},
 			},
-			err: httpgrpc.Errorf(http.StatusBadRequest, `series has too many labels (actual: 3, limit: 2) series: 'testmetric{foo2="bar2", foo="bar"}'`),
+			err: httpgrpc.Errorf(http.StatusBadRequest, `series has too many labels (actual: 3, limit: 2) series: "testmetric{foo=\"bar\", foo2=\"bar2\"}"`),
 		},
 		// Test metadata validation fails
 		{
