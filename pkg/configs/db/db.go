@@ -29,6 +29,40 @@ func (cfg *Config) RegisterFlags(f *flag.FlagSet) {
 	f.StringVar(&cfg.PasswordFile, "configs.database.password-file", "", "File containing password (username goes in URI)")
 }
 
+// redactedURI returns the configured URI with any userinfo password replaced
+// by a mask. If the URI cannot be parsed as a URL (for example when it is
+// empty or uses a non-URL form) it is returned unchanged, except that an
+// unparseable value that visibly contains userinfo is masked defensively.
+func redactedURI(uri string) string {
+	if uri == "" {
+		return uri
+	}
+	u, err := url.Parse(uri)
+	if err != nil {
+		return uri
+	}
+	if u.User == nil {
+		return uri
+	}
+	if _, hasPassword := u.User.Password(); !hasPassword {
+		return uri
+	}
+	u.User = url.UserPassword(u.User.Username(), "********")
+	return u.String()
+}
+
+// MarshalYAML implements yaml.Marshaler. It masks any password embedded in
+// the database URI so that the credential is not leaked by handlers (such as
+// GET /config) that marshal the Cortex configuration.
+func (cfg Config) MarshalYAML() (interface{}, error) {
+	// Use a local alias type to avoid infinite recursion while reusing the
+	// struct's yaml tags.
+	type plain Config
+	redacted := plain(cfg)
+	redacted.URI = redactedURI(cfg.URI)
+	return redacted, nil
+}
+
 // DB is the interface for the database.
 type DB interface {
 	// GetRulesConfig gets the user's ruler config
