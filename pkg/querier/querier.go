@@ -308,6 +308,14 @@ func (q querier) Select(sortSeries bool, sp *storage.SelectHints, matchers ...*l
 		// In this case, the query time range has already been validated when the querier has been
 		// created.
 		return q.metadataQuerier.Select(true, sp, matchers...)
+	} else {
+		// Avoid mutating caller-owned SelectHints. The caller (e.g. the
+		// PromQL engine, or the tenant-federation merge querier that may
+		// share the same hints across concurrent per-tenant children) may
+		// read the hints after this call returns, so operate on a local
+		// copy before writing back the per-tenant clamped time range.
+		spCopy := *sp
+		sp = &spCopy
 	}
 
 	userID, err := tenant.TenantID(ctx)
