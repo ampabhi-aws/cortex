@@ -43,8 +43,27 @@ func TestFirewallDialer(t *testing.T) {
 			cases: []testCase{
 				{"localhost", true},
 				{"127.0.0.1", true},
+				{"0.0.0.0", true},                  // Unspecified IPv4 (connects to loopback on Linux)
+				{"::", true},                       // Unspecified IPv6
 				{"192.168.0.1", true},
 				{"10.0.0.1", true},
+				{"100.64.0.1", true},               // RFC 6598 CGNAT
+				{"100.127.255.255", true},          // RFC 6598 CGNAT upper edge
+				{"100.63.255.255", false},          // Just below RFC 6598
+				{"100.128.0.0", false},             // Just above RFC 6598
+				{"192.0.0.1", true},                // RFC 5736 (192.0.0.0/24)
+				{"192.0.2.1", true},                // RFC 5737 TEST-NET-1
+				{"198.51.100.1", true},             // RFC 5737 TEST-NET-2
+				{"203.0.113.1", true},              // RFC 5737 TEST-NET-3
+				{"198.18.0.1", true},               // RFC 2544 benchmarking
+				{"198.19.255.255", true},           // RFC 2544 benchmarking upper
+				{"239.0.0.1", true},                // IPv4 multicast
+				{"255.255.255.255", true},          // IPv4 limited broadcast
+				{"ff02::1", true},                  // IPv6 link-local multicast
+				{"ff01::1", true},                  // IPv6 interface-local multicast
+				{"ff0e::1", true},                  // IPv6 global multicast
+				{"2002:7f00:1::", true},            // 6to4 embedding 127.0.0.1
+				{"64:ff9b::7f00:1", true},          // NAT64 well-known prefix
 				{"google.com", false},
 				{"172.217.168.78", false},
 				{"fdf8:f53b:82e4::53", true},       // Local
