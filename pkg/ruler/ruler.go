@@ -196,8 +196,10 @@ type MultiTenantManager interface {
 	GetRules(userID string) []*promRules.Group
 	// Stop stops all Manager components.
 	Stop()
-	// ValidateRuleGroup validates a rulegroup
-	ValidateRuleGroup(rulefmt.RuleGroup) []error
+	// ValidateRuleGroup validates a rulegroup for the given tenant. The tenant ID
+	// is required so per-tenant limits (such as the minimum allowed evaluation
+	// interval) can be looked up and enforced during validation.
+	ValidateRuleGroup(userID string, g rulefmt.RuleGroup) []error
 }
 
 // Ruler evaluates rules.
