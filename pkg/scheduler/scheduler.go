@@ -337,6 +337,16 @@ func (s *Scheduler) QuerierLoop(querier schedulerpb.SchedulerForQuerier_QuerierL
 	}
 
 	querierID := resp.GetQuerierID()
+	if querierID == "" {
+		// Reject empty IDs: without a non-empty worker identity we cannot
+		// correctly track the connection in the shared queue (empty is a
+		// usable key but every anonymous client would collapse onto the same
+		// entry and happily receive queries). Requiring a non-empty ID also
+		// prevents the trivial "omit QuerierID" bypass of any downstream
+		// per-worker authorization. Legitimate queriers always set this via
+		// -querier.id (defaulting to hostname).
+		return errors.New("empty QuerierID")
+	}
 
 	s.requestQueue.RegisterQuerierConnection(querierID)
 	defer s.requestQueue.UnregisterQuerierConnection(querierID)

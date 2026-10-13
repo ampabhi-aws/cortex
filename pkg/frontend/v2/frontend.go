@@ -34,6 +34,13 @@ type Config struct {
 	WorkerConcurrency int               `yaml:"scheduler_worker_concurrency"`
 	GRPCClientConfig  grpcclient.Config `yaml:"grpc_client_config"`
 
+	// ClusterAuthToken, if set, is attached as outgoing gRPC metadata on all
+	// FrontendLoop RPCs to the query-scheduler. It is populated from the
+	// top-level `-auth.cluster-token` option and must match the token the
+	// scheduler was configured with. Not registered as a flag here to avoid a
+	// duplicate knob; see pkg/cortex/cortex.go.
+	ClusterAuthToken string `yaml:"-"`
+
 	// Used to find local IP address, that is sent to scheduler and querier-worker.
 	InfNames []string `yaml:"instance_interface_names"`
 

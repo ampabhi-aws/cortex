@@ -23,6 +23,7 @@ import (
 	"github.com/cortexproject/cortex/pkg/ring/client"
 	"github.com/cortexproject/cortex/pkg/scheduler/schedulerpb"
 	"github.com/cortexproject/cortex/pkg/util/backoff"
+	"github.com/cortexproject/cortex/pkg/util/fakeauth"
 	"github.com/cortexproject/cortex/pkg/util/grpcclient"
 	"github.com/cortexproject/cortex/pkg/util/httpgrpcutil"
 	util_log "github.com/cortexproject/cortex/pkg/util/log"
@@ -32,11 +33,12 @@ import (
 
 func newSchedulerProcessor(cfg Config, handler RequestHandler, log log.Logger, reg prometheus.Registerer) (*schedulerProcessor, []services.Service) {
 	p := &schedulerProcessor{
-		log:            log,
-		handler:        handler,
-		maxMessageSize: cfg.GRPCClientConfig.MaxSendMsgSize,
-		querierID:      cfg.QuerierID,
-		grpcConfig:     cfg.GRPCClientConfig,
+		log:              log,
+		handler:          handler,
+		maxMessageSize:   cfg.GRPCClientConfig.MaxSendMsgSize,
+		querierID:        cfg.QuerierID,
+		grpcConfig:       cfg.GRPCClientConfig,
+		clusterAuthToken: cfg.ClusterAuthToken,
 
 		frontendClientRequestDuration: promauto.With(reg).NewHistogramVec(prometheus.HistogramOpts{
 			Name:    "cortex_querier_query_frontend_request_duration_seconds",
@@ -62,11 +64,12 @@ func newSchedulerProcessor(cfg Config, handler RequestHandler, log log.Logger, r
 
 // Handles incoming queries from query-scheduler.
 type schedulerProcessor struct {
-	log            log.Logger
-	handler        RequestHandler
-	grpcConfig     grpcclient.Config
-	maxMessageSize int
-	querierID      string
+	log              log.Logger
+	handler          RequestHandler
+	grpcConfig       grpcclient.Config
+	maxMessageSize   int
+	querierID        string
+	clusterAuthToken string
 
 	frontendPool                  *client.Pool
 	frontendClientRequestDuration *prometheus.HistogramVec
@@ -76,6 +79,7 @@ type schedulerProcessor struct {
 func (sp *schedulerProcessor) notifyShutdown(ctx context.Context, conn *grpc.ClientConn, address string) {
 	client := schedulerpb.NewSchedulerForQuerierClient(conn)
 
+	ctx = fakeauth.WithClusterAuthToken(ctx, sp.clusterAuthToken)
 	req := &schedulerpb.NotifyQuerierShutdownRequest{QuerierID: sp.querierID}
 	if _, err := client.NotifyQuerierShutdown(ctx, req); err != nil {
 		// Since we're shutting down there's nothing we can do except logging it.
@@ -85,6 +89,7 @@ func (sp *schedulerProcessor) notifyShutdown(ctx context.Context, conn *grpc.Cli
 
 func (sp *schedulerProcessor) processQueriesOnSingleStream(ctx context.Context, conn *grpc.ClientConn, address string) {
 	schedulerClient := schedulerpb.NewSchedulerForQuerierClient(conn)
+	ctx = fakeauth.WithClusterAuthToken(ctx, sp.clusterAuthToken)
 
 	backoff := backoff.New(ctx, processorBackoffConfig)
 	for backoff.Ongoing() {
