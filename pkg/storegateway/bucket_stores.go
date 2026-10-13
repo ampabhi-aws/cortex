@@ -393,6 +393,12 @@ func isEmptyBucketStore(bs *store.BucketStore) bool {
 }
 
 func (u *BucketStores) syncDirForUser(userID string) string {
+	if userID == "" {
+		// Fail closed: an empty userID would collapse the per-tenant sync
+		// directory onto the shared parent (filepath.Join cleans away empty
+		// segments). The tenant resolver should reject empty IDs upstream.
+		panic("BucketStores.syncDirForUser called with empty userID")
+	}
 	return filepath.Join(u.cfg.BucketStore.SyncDir, userID)
 }
 
