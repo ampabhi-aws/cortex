@@ -1,6 +1,7 @@
 package distributor
 
 import (
+	"bytes"
 	"encoding/json"
 	"fmt"
 	"html/template"
@@ -85,7 +86,7 @@ func (d *Distributor) AllUserStatsHandler(w http.ResponseWriter, r *http.Request
 		return
 	}
 
-	util.RenderHTTPResponse(w, struct {
+	v := struct {
 		Now               time.Time     `json:"now"`
 		Stats             []UserIDStats `json:"stats"`
 		ReplicationFactor int           `json:"replicationFactor"`
@@ -93,5 +94,26 @@ func (d *Distributor) AllUserStatsHandler(w http.ResponseWriter, r *http.Request
 		Now:               time.Now(),
 		Stats:             stats,
 		ReplicationFactor: d.ingestersRing.ReplicationFactor(),
-	}, tmpl, r)
+	}
+	renderPage(w, r, v)
+}
+
+// renderPage mirrors util.RenderHTTPResponse but substitutes the CSRF
+// token placeholder in the rendered HTML so admin forms carry a real token.
+// This handler is GET-only, but keeping the hidden token here means that if a
+// POST action is added in the future, CSRF validation can be enforced by
+// calling util.CheckCSRF.
+func renderPage(w http.ResponseWriter, r *http.Request, v interface{}) {
+	accept := r.Header.Get("Accept")
+	if strings.Contains(accept, "application/json") {
+		util.WriteJSONResponse(w, v)
+		return
+	}
+	var buf bytes.Buffer
+	if err := tmpl.Execute(&buf, v); err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	util.SetCSRFCookie(w)
+	_, _ = w.Write(util.InjectCSRFToken(buf.Bytes()))
 }
