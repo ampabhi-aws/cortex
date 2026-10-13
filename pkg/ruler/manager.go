@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"net/http"
 	"sync"
+	"time"
 
 	"github.com/go-kit/log"
 	"github.com/go-kit/log/level"
@@ -26,6 +27,7 @@ type DefaultMultiTenantManager struct {
 	cfg            Config
 	notifierCfg    *config.Config
 	managerFactory ManagerFactory
+	limits         RulesLimits
 
 	mapper *mapper
 
@@ -47,7 +49,7 @@ type DefaultMultiTenantManager struct {
 	logger                        log.Logger
 }
 
-func NewDefaultMultiTenantManager(cfg Config, managerFactory ManagerFactory, reg prometheus.Registerer, logger log.Logger) (*DefaultMultiTenantManager, error) {
+func NewDefaultMultiTenantManager(cfg Config, managerFactory ManagerFactory, reg prometheus.Registerer, logger log.Logger, limits RulesLimits) (*DefaultMultiTenantManager, error) {
 	ncfg, err := buildNotifierConfig(&cfg)
 	if err != nil {
 		return nil, err
@@ -62,6 +64,7 @@ func NewDefaultMultiTenantManager(cfg Config, managerFactory ManagerFactory, reg
 		cfg:                cfg,
 		notifierCfg:        ncfg,
 		managerFactory:     managerFactory,
+		limits:             limits,
 		notifiers:          map[string]*rulerNotifier{},
 		mapper:             newMapper(cfg.RulePath, logger),
 		userManagers:       map[string]RulesManager{},
@@ -267,7 +270,7 @@ func (r *DefaultMultiTenantManager) Stop() {
 	r.mapper.cleanup()
 }
 
-func (*DefaultMultiTenantManager) ValidateRuleGroup(g rulefmt.RuleGroup) []error {
+func (r *DefaultMultiTenantManager) ValidateRuleGroup(userID string, g rulefmt.RuleGroup) []error {
 	var errs []error
 
 	if g.Name == "" {
@@ -278,6 +281,16 @@ func (*DefaultMultiTenantManager) ValidateRuleGroup(g rulefmt.RuleGroup) []error
 	if len(g.Rules) == 0 {
 		errs = append(errs, fmt.Errorf("invalid rules config: rule group '%s' has no rules", g.Name))
 		return errs
+	}
+
+	// Reject tenant-supplied evaluation intervals that would amplify ruler load
+	// below the configured per-tenant minimum. A zero interval means "inherit the
+	// operator default (-ruler.evaluation-interval)" and is always allowed.
+	if r.limits != nil && g.Interval != 0 {
+		if minInterval := r.limits.RulerMinRuleEvaluationInterval(userID); minInterval > 0 && time.Duration(g.Interval) < minInterval {
+			errs = append(errs, fmt.Errorf("invalid rules config: rule group '%s' interval %s is below the minimum allowed evaluation interval of %s", g.Name, time.Duration(g.Interval), minInterval))
+			return errs
+		}
 	}
 
 	for i, r := range g.Rules {
