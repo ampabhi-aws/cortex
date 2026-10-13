@@ -67,30 +67,89 @@ func (d *FirewallDialer) control(_, address string, _ syscall.RawConn) error {
 	return nil
 }
 
+// isLocal reports whether ip is a local address that must not be reachable
+// via tenant-controlled receiver endpoints. This covers:
+//   - the unspecified address (0.0.0.0, ::) which on Linux resolves to loopback
+//     when used as a connect destination;
+//   - loopback (127.0.0.0/8, ::1);
+//   - link-local unicast and multicast (169.254.0.0/16, fe80::/10, 224.0.0.0/24, ff02::/16);
+//   - interface-local multicast (ff01::/16);
+//   - any IPv4/IPv6 multicast (224.0.0.0/4, ff00::/8);
+//   - the IPv4 limited broadcast address 255.255.255.255.
 func isLocal(ip net.IP) bool {
-	return ip.IsLoopback() || ip.IsLinkLocalUnicast() || ip.IsLinkLocalMulticast()
+	if ip.IsUnspecified() ||
+		ip.IsLoopback() ||
+		ip.IsLinkLocalUnicast() ||
+		ip.IsLinkLocalMulticast() ||
+		ip.IsInterfaceLocalMulticast() ||
+		ip.IsMulticast() {
+		return true
+	}
+	// Limited broadcast (255.255.255.255).
+	if ip4 := ip.To4(); ip4 != nil {
+		if ip4[0] == 0xff && ip4[1] == 0xff && ip4[2] == 0xff && ip4[3] == 0xff {
+			return true
+		}
+	}
+	return false
 }
 
-// isPrivate reports whether ip is a private address, according to
-// RFC 1918 (IPv4 addresses) and RFC 4193 (IPv6 addresses).
-//
-// This function has been copied from golang and should be removed once
-// we'll upgrade to go 1.17. See: https://github.com/golang/go/pull/42793
+// isPrivate reports whether ip is a private, shared, or otherwise non-globally
+// routable address that must not be reachable via tenant-controlled receiver
+// endpoints when the firewall is enabled. This covers:
+//   - RFC 1918 private IPv4 ranges (10/8, 172.16/12, 192.168/16);
+//   - RFC 6598 shared address space / CGNAT (100.64.0.0/10);
+//   - RFC 5736 IETF protocol assignments (192.0.0.0/24);
+//   - RFC 5737 documentation ranges (192.0.2.0/24, 198.51.100.0/24, 203.0.113.0/24);
+//   - RFC 2544 benchmarking (198.18.0.0/15);
+//   - RFC 4193 unique local IPv6 addresses (fc00::/7);
+//   - 6to4 (2002::/16) and NAT64 well-known prefix (64:ff9b::/96) which can
+//     map back to internal IPv4 destinations.
 func isPrivate(ip net.IP) bool {
 	if ip4 := ip.To4(); ip4 != nil {
-		// Following RFC 4193, Section 3. Local IPv6 Unicast Addresses which says:
-		//   The Internet Assigned Numbers Authority (IANA) has reserved the
-		//   following three blocks of the IPv4 address space for private internets:
-		//     10.0.0.0        -   10.255.255.255  (10/8 prefix)
-		//     172.16.0.0      -   172.31.255.255  (172.16/12 prefix)
-		//     192.168.0.0     -   192.168.255.255 (192.168/16 prefix)
-		return ip4[0] == 10 ||
-			(ip4[0] == 172 && ip4[1]&0xf0 == 16) ||
-			(ip4[0] == 192 && ip4[1] == 168)
+		switch {
+		// RFC 1918 (10/8, 172.16/12, 192.168/16).
+		case ip4[0] == 10:
+			return true
+		case ip4[0] == 172 && ip4[1]&0xf0 == 16:
+			return true
+		case ip4[0] == 192 && ip4[1] == 168:
+			return true
+		// RFC 6598 shared address space (100.64.0.0/10).
+		case ip4[0] == 100 && ip4[1]&0xc0 == 64:
+			return true
+		// RFC 5736 IETF protocol assignments (192.0.0.0/24).
+		case ip4[0] == 192 && ip4[1] == 0 && ip4[2] == 0:
+			return true
+		// RFC 5737 documentation ranges.
+		case ip4[0] == 192 && ip4[1] == 0 && ip4[2] == 2:
+			return true
+		case ip4[0] == 198 && ip4[1] == 51 && ip4[2] == 100:
+			return true
+		case ip4[0] == 203 && ip4[1] == 0 && ip4[2] == 113:
+			return true
+		// RFC 2544 benchmarking (198.18.0.0/15).
+		case ip4[0] == 198 && ip4[1]&0xfe == 18:
+			return true
+		}
+		return false
 	}
-	// Following RFC 4193, Section 3. Private Address Space which says:
-	//   The Internet Assigned Numbers Authority (IANA) has reserved the
-	//   following block of the IPv6 address space for local internets:
-	//     FC00::  -  FDFF:FFFF:FFFF:FFFF:FFFF:FFFF:FFFF:FFFF (FC00::/7 prefix)
-	return len(ip) == net.IPv6len && ip[0]&0xfe == 0xfc
+	if len(ip) != net.IPv6len {
+		return false
+	}
+	// RFC 4193 unique local IPv6 (fc00::/7).
+	if ip[0]&0xfe == 0xfc {
+		return true
+	}
+	// 6to4 (2002::/16) — may embed internal IPv4 destinations.
+	if ip[0] == 0x20 && ip[1] == 0x02 {
+		return true
+	}
+	// NAT64 well-known prefix (64:ff9b::/96).
+	if ip[0] == 0x00 && ip[1] == 0x64 && ip[2] == 0xff && ip[3] == 0x9b &&
+		ip[4] == 0 && ip[5] == 0 && ip[6] == 0 && ip[7] == 0 &&
+		ip[8] == 0 && ip[9] == 0 && ip[10] == 0 && ip[11] == 0 {
+		return true
+	}
+	return false
 }
