@@ -1,6 +1,7 @@
 package api
 
 import (
+	"crypto/subtle"
 	"database/sql"
 	"encoding/json"
 	"errors"
@@ -35,6 +36,16 @@ var (
 // Config configures Configs API
 type Config struct {
 	Notifications NotificationsConfig `yaml:"notifications"`
+
+	// PrivateAdminToken, when set to a non-empty value, requires requests to the
+	// cross-tenant /private/api/prom/configs/* endpoints to present a matching
+	// bearer token (via the Authorization header or the X-Configs-Admin-Token
+	// header). When empty, these endpoints are left ungated at the application
+	// layer, matching Cortex's historical behaviour where operators restrict
+	// cross-tenant admin paths with a reverse proxy. Operators that expose the
+	// configs service on a network reachable by untrusted callers should set
+	// this to a strong secret.
+	PrivateAdminToken string `yaml:"private_admin_token"`
 }
 
 // NotificationsConfig configures Alertmanager notifications method.
@@ -47,6 +58,7 @@ type NotificationsConfig struct {
 func (cfg *Config) RegisterFlags(f *flag.FlagSet) {
 	f.BoolVar(&cfg.Notifications.DisableEmail, "configs.notifications.disable-email", false, "Disable Email notifications for Alertmanager.")
 	f.BoolVar(&cfg.Notifications.DisableWebHook, "configs.notifications.disable-webhook", false, "Disable WebHook notifications for Alertmanager.")
+	f.StringVar(&cfg.PrivateAdminToken, "configs.api.private-admin-token", "", "When set, requires requests to the cross-tenant /private/api/prom/configs/* endpoints to present this bearer token via the Authorization or X-Configs-Admin-Token header. When empty, the endpoints are not gated at the application layer and operators are expected to restrict them with a reverse proxy.")
 }
 
 // API implements the configs api.
@@ -81,29 +93,102 @@ func (a *API) admin(w http.ResponseWriter, r *http.Request) {
 `)
 }
 
-// RegisterRoutes registers the configs API HTTP routes with the provided Router.
-func (a *API) RegisterRoutes(r *mux.Router) {
-	for _, route := range []struct {
-		name, method, path string
-		handler            http.HandlerFunc
-	}{
-		{"root", "GET", "/", a.admin},
+// Route describes a single HTTP route exposed by the configs API.
+type Route struct {
+	Name    string
+	Method  string
+	Path    string
+	Handler http.HandlerFunc
+	// Auth indicates the route serves tenant-scoped data and should be
+	// wrapped by the deployment's authentication middleware (which, in
+	// Cortex, requires an X-Scope-OrgID header). It is advisory for
+	// callers that register routes through pkg/api.API.RegisterRoute.
+	Auth bool
+	// Admin indicates the route serves cross-tenant data and should be
+	// restricted to administrative callers (e.g. the configdb client used
+	// by the ruler/alertmanager, or a reverse proxy). Handlers for admin
+	// routes are returned already wrapped with any configured admin-token
+	// check so this behaviour applies regardless of how the route is
+	// mounted.
+	Admin bool
+}
+
+// Routes returns the HTTP routes exposed by the configs API. Each returned
+// Handler is already wrapped with any configured administrative gating for
+// cross-tenant routes, so callers can mount them unmodified on any router.
+func (a *API) Routes() []Route {
+	admin := func(h http.HandlerFunc) http.HandlerFunc {
+		return a.requirePrivateAdmin(h)
+	}
+	return []Route{
+		{"root", "GET", "/", a.admin, false, false},
 		// Dedicated APIs for updating rules config. In the future, these *must*
 		// be used.
-		{"get_rules", "GET", "/api/prom/configs/rules", a.getConfig},
-		{"set_rules", "POST", "/api/prom/configs/rules", a.setConfig},
-		{"get_templates", "GET", "/api/prom/configs/templates", a.getConfig},
-		{"set_templates", "POST", "/api/prom/configs/templates", a.setConfig},
-		{"get_alertmanager_config", "GET", "/api/prom/configs/alertmanager", a.getConfig},
-		{"set_alertmanager_config", "POST", "/api/prom/configs/alertmanager", a.setConfig},
-		{"validate_alertmanager_config", "POST", "/api/prom/configs/alertmanager/validate", a.validateAlertmanagerConfig},
-		{"deactivate_config", "DELETE", "/api/prom/configs/deactivate", a.deactivateConfig},
-		{"restore_config", "POST", "/api/prom/configs/restore", a.restoreConfig},
-		// Internal APIs.
-		{"private_get_rules", "GET", "/private/api/prom/configs/rules", a.getConfigs},
-		{"private_get_alertmanager_config", "GET", "/private/api/prom/configs/alertmanager", a.getConfigs},
-	} {
-		r.Handle(route.path, route.handler).Methods(route.method).Name(route.name)
+		{"get_rules", "GET", "/api/prom/configs/rules", a.getConfig, true, false},
+		{"set_rules", "POST", "/api/prom/configs/rules", a.setConfig, true, false},
+		{"get_templates", "GET", "/api/prom/configs/templates", a.getConfig, true, false},
+		{"set_templates", "POST", "/api/prom/configs/templates", a.setConfig, true, false},
+		{"get_alertmanager_config", "GET", "/api/prom/configs/alertmanager", a.getConfig, true, false},
+		{"set_alertmanager_config", "POST", "/api/prom/configs/alertmanager", a.setConfig, true, false},
+		{"validate_alertmanager_config", "POST", "/api/prom/configs/alertmanager/validate", a.validateAlertmanagerConfig, true, false},
+		{"deactivate_config", "DELETE", "/api/prom/configs/deactivate", a.deactivateConfig, true, false},
+		{"restore_config", "POST", "/api/prom/configs/restore", a.restoreConfig, true, false},
+		// Internal APIs that return every tenant's configuration. They are
+		// administrative endpoints — the handler intentionally ignores the
+		// per-request tenant ID. We wrap them with requirePrivateAdmin so
+		// they are gated whenever an admin token is configured.
+		{"private_get_rules", "GET", "/private/api/prom/configs/rules", admin(a.getConfigs), false, true},
+		{"private_get_alertmanager_config", "GET", "/private/api/prom/configs/alertmanager", admin(a.getConfigs), false, true},
+	}
+}
+
+// requirePrivateAdmin returns a handler that enforces the configured
+// administrative token on cross-tenant /private/* endpoints. When no token is
+// configured the handler is returned unchanged so existing deployments that
+// rely on an external reverse proxy for access control continue to work.
+func (a *API) requirePrivateAdmin(h http.HandlerFunc) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		token := a.cfg.PrivateAdminToken
+		if token != "" {
+			if !validAdminToken(r, token) {
+				http.Error(w, "forbidden", http.StatusForbidden)
+				return
+			}
+		}
+		h(w, r)
+	}
+}
+
+// validAdminToken returns true when the request presents the expected admin
+// token via either the Authorization: Bearer header or the
+// X-Configs-Admin-Token header. Comparison is constant-time.
+func validAdminToken(r *http.Request, expected string) bool {
+	if got := r.Header.Get("X-Configs-Admin-Token"); got != "" {
+		if subtle.ConstantTimeCompare([]byte(got), []byte(expected)) == 1 {
+			return true
+		}
+	}
+	if auth := r.Header.Get("Authorization"); auth != "" {
+		const prefix = "Bearer "
+		if len(auth) > len(prefix) && strings.EqualFold(auth[:len(prefix)], prefix) {
+			if subtle.ConstantTimeCompare([]byte(auth[len(prefix):]), []byte(expected)) == 1 {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+// RegisterRoutes registers the configs API HTTP routes with the provided Router.
+//
+// Deployments that want the routes to participate in the shared Cortex
+// middleware stack should instead call pkg/api.API.RegisterConfigAPI, which
+// mounts them via API.RegisterRoute with the correct auth flag. This method
+// is retained for in-process callers (e.g. New, tests) that only need a
+// standalone mux.
+func (a *API) RegisterRoutes(r *mux.Router) {
+	for _, route := range a.Routes() {
+		r.Handle(route.Path, route.Handler).Methods(route.Method).Name(route.Name)
 	}
 }
 
