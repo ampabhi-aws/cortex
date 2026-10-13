@@ -1024,7 +1024,18 @@ func (am *MultitenantAlertmanager) serveRequest(w http.ResponseWriter, req *http
 	}
 
 	if am.fallbackConfig != "" {
-		userAM, err = am.alertmanagerFromFallbackConfig(userID)
+		// When sharding is enabled, only the ring-owning replicas may provision
+		// a per-tenant Alertmanager from the fallback config. If this instance
+		// does not own the tenant we must not create per-tenant state (store
+		// object + running Alertmanager + metric registry) nor write to the
+		// store; the request must be served by an owner via the Distributor.
+		if am.cfg.ShardingEnabled && !am.isUserOwned(userID) {
+			level.Debug(am.logger).Log("msg", "refusing to initialize fallback Alertmanager on non-owning instance", "user", userID, "path", req.URL.Path)
+			http.Error(w, "the Alertmanager is not configured", http.StatusNotFound)
+			return
+		}
+
+		userAM, err = am.alertmanagerFromFallbackConfig(req.Context(), userID)
 		if err != nil {
 			level.Error(am.logger).Log("msg", "unable to initialize the Alertmanager with a fallback configuration", "user", userID, "err", err)
 			http.Error(w, "Failed to initialize the Alertmanager", http.StatusInternalServerError)
@@ -1039,18 +1050,34 @@ func (am *MultitenantAlertmanager) serveRequest(w http.ResponseWriter, req *http
 	http.Error(w, "the Alertmanager is not configured", http.StatusNotFound)
 }
 
-func (am *MultitenantAlertmanager) alertmanagerFromFallbackConfig(userID string) (*Alertmanager, error) {
-	// Upload an empty config so that the Alertmanager is no de-activated in the next poll
-	cfgDesc := alertspb.ToProto("", nil, userID)
-	err := am.store.SetAlertConfig(context.Background(), cfgDesc)
-	if err != nil {
-		return nil, err
-	}
-
-	// Calling setConfig with an empty configuration will use the fallback config.
-	err = am.setConfig(cfgDesc)
-	if err != nil {
-		return nil, err
+func (am *MultitenantAlertmanager) alertmanagerFromFallbackConfig(ctx context.Context, userID string) (*Alertmanager, error) {
+	// Before writing anything, read the tenant's existing configuration from the
+	// alert store. Only upload the empty placeholder when no configuration exists;
+	// otherwise we would clobber a stored tenant config (routes, receivers,
+	// templates) with an empty one on a blind Upload.
+	existingCfg, err := am.store.GetAlertConfig(ctx, userID)
+	switch {
+	case errors.Is(err, alertspb.ErrNotFound):
+		// No configuration in storage: safe to upload the empty placeholder so
+		// that the owning replica keeps the Alertmanager loaded on the next poll.
+		cfgDesc := alertspb.ToProto("", nil, userID)
+		if err := am.store.SetAlertConfig(ctx, cfgDesc); err != nil {
+			return nil, err
+		}
+		if err := am.setConfig(cfgDesc); err != nil {
+			return nil, err
+		}
+	case err != nil:
+		return nil, errors.Wrapf(err, "failed to read alertmanager configuration for user %s", userID)
+	default:
+		// A configuration already exists in storage. Do NOT overwrite it with an
+		// empty placeholder: apply what is stored (or let setConfig fall back if
+		// the stored config is itself empty). This both preserves the tenant's
+		// routes/receivers/templates and lets the per-tenant Alertmanager be
+		// available for this request without a store round-trip through poll.
+		if err := am.setConfig(existingCfg); err != nil {
+			return nil, err
+		}
 	}
 
 	am.alertmanagersMtx.Lock()
