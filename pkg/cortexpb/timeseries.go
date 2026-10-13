@@ -28,13 +28,19 @@ var (
 		},
 	}
 
+	// timeSeriesPool returns TimeSeries values whose per-field slices are
+	// NOT eagerly preallocated. The generated Unmarshal code grows them with
+	// append() based on the actual wire content, so starting from nil slices
+	// adds no measurable overhead for real requests while removing a
+	// content-independent ~900B heap footprint per sub-message. That
+	// amplification previously let a crafted remote_write body of tens of
+	// empty TimeSeries elements inflate into tens of GB of live heap during
+	// Unmarshal (before any per-tenant or instance limit was evaluated),
+	// OOM-killing the shared distributor process. See the "Unbounded
+	// per-message pre-allocation in PreallocTimeseries.Unmarshal" finding.
 	timeSeriesPool = sync.Pool{
 		New: func() interface{} {
-			return &TimeSeries{
-				Labels:    make([]LabelAdapter, 0, expectedLabels),
-				Samples:   make([]Sample, 0, expectedSamplesPerSeries),
-				Exemplars: make([]Exemplar, 0, expectedExemplarsPerSeries),
-			}
+			return &TimeSeries{}
 		},
 	}
 )
