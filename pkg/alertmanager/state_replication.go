@@ -144,15 +144,18 @@ func (s *state) AddState(key string, cs cluster.State, _ prometheus.Registerer) 
 
 // MergePartialState merges a received partial message with an internal state.
 func (s *state) MergePartialState(p *clusterpb.Part) error {
-	s.partialStateMergesTotal.WithLabelValues(p.Key).Inc()
-
 	s.mtx.Lock()
 	defer s.mtx.Unlock()
+	// Validate the peer-supplied key against the known state set BEFORE touching
+	// any metric. Otherwise an attacker able to call UpdateState could allocate
+	// an unbounded number of permanently-retained CounterVec children by sending
+	// random Part.Key values, growing the process heap and per-scrape cost.
 	st, ok := s.states[p.Key]
 	if !ok {
-		s.partialStateMergesFailed.WithLabelValues(p.Key).Inc()
 		return fmt.Errorf("key not found while merging")
 	}
+
+	s.partialStateMergesTotal.WithLabelValues(p.Key).Inc()
 
 	if err := st.Merge(p.Data); err != nil {
 		s.partialStateMergesFailed.WithLabelValues(p.Key).Inc()
