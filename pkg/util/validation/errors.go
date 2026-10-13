@@ -115,22 +115,49 @@ func newLabelsNotSortedError(series []cortexpb.LabelAdapter, labelName string) V
 	}
 }
 
+// maxErrorLabelSetLabels bounds how many labels from an offending series are
+// retained on a validation error. The message is further truncated by the
+// %.200q verb; this cap exists so the error does not retain or format the
+// full attacker-sized label slice.
+const maxErrorLabelSetLabels = 10
+
+// truncateLabelSetForError returns a copy of ls limited to at most
+// maxErrorLabelSetLabels entries. A copy is returned so the error does not
+// pin the original (potentially huge) slice.
+func truncateLabelSetForError(ls []cortexpb.LabelAdapter) []cortexpb.LabelAdapter {
+	if len(ls) <= maxErrorLabelSetLabels {
+		out := make([]cortexpb.LabelAdapter, len(ls))
+		copy(out, ls)
+		return out
+	}
+	out := make([]cortexpb.LabelAdapter, maxErrorLabelSetLabels)
+	copy(out, ls[:maxErrorLabelSetLabels])
+	return out
+}
+
 type tooManyLabelsError struct {
+	// series holds a bounded copy of the offending label set for the error
+	// message. actual is the real label count.
 	series []cortexpb.LabelAdapter
+	actual int
 	limit  int
 }
 
 func newTooManyLabelsError(series []cortexpb.LabelAdapter, limit int) ValidationError {
 	return &tooManyLabelsError{
-		series: series,
+		series: truncateLabelSetForError(series),
+		actual: len(series),
 		limit:  limit,
 	}
 }
 
 func (e *tooManyLabelsError) Error() string {
+	// Format only the (already-truncated) sample stored on the error, and apply
+	// the same %.200q truncation other validation errors use so the final
+	// message cannot be dominated by an attacker-controlled label set.
 	return fmt.Sprintf(
-		"series has too many labels (actual: %d, limit: %d) series: '%s'",
-		len(e.series), e.limit, cortexpb.FromLabelAdaptersToMetric(e.series).String())
+		"series has too many labels (actual: %d, limit: %d) series: %.200q",
+		e.actual, e.limit, formatLabelSet(e.series))
 }
 
 type noMetricNameError struct{}
@@ -193,7 +220,12 @@ type exemplarValidationError struct {
 }
 
 func (e *exemplarValidationError) Error() string {
-	return fmt.Sprintf(e.message, e.timestamp, cortexpb.FromLabelAdaptersToLabels(e.seriesLabels).String(), cortexpb.FromLabelAdaptersToLabels(e.exemplarLabels).String())
+	// Apply the same %.200q truncation other validation errors use. The
+	// message format strings used by this error type end with
+	// "... series: %s labels: %s"; we substitute %.200q so a huge series
+	// label set cannot produce a huge error message.
+	msg := strings.Replace(e.message, "series: %s labels: %s", "series: %.200q labels: %.200q", 1)
+	return fmt.Sprintf(msg, e.timestamp, formatLabelSet(e.seriesLabels), formatLabelSet(e.exemplarLabels))
 }
 
 func newExemplarEmtpyLabelsError(seriesLabels []cortexpb.LabelAdapter, exemplarLabels []cortexpb.LabelAdapter, timestamp int64) ValidationError {
@@ -225,28 +257,49 @@ func newExemplarLabelLengthError(seriesLabels []cortexpb.LabelAdapter, exemplarL
 	}
 }
 
+// formatLabelSetMaxBytes bounds the output size of formatLabelSet so that
+// attacker-sized label slices do not produce multi-hundred-megabyte strings
+// that are later truncated by %.200q. The value is comfortably larger than
+// any %.200q-truncated message a caller could emit.
+const formatLabelSetMaxBytes = 1024
+
 // formatLabelSet formats label adapters as a metric name with labels, while preserving
 // label order, and keeping duplicates. If there are multiple "__name__" labels, only
 // first one is used as metric name, other ones will be included as regular labels.
+// It stops appending once the output exceeds formatLabelSetMaxBytes and marks the
+// result as truncated, so callers cannot be forced to materialize an unbounded string.
 func formatLabelSet(ls []cortexpb.LabelAdapter) string {
 	metricName, hasMetricName := "", false
 
-	labelStrings := make([]string, 0, len(ls))
+	var b strings.Builder
+	first := true
+	truncated := false
 	for _, l := range ls {
 		if l.Name == model.MetricNameLabel && !hasMetricName && l.Value != "" {
 			metricName = l.Value
 			hasMetricName = true
-		} else {
-			labelStrings = append(labelStrings, fmt.Sprintf("%s=%q", l.Name, l.Value))
+			continue
 		}
+		if b.Len() >= formatLabelSetMaxBytes {
+			truncated = true
+			break
+		}
+		if !first {
+			b.WriteString(", ")
+		}
+		first = false
+		fmt.Fprintf(&b, "%s=%q", l.Name, l.Value)
 	}
 
-	if len(labelStrings) == 0 {
+	if b.Len() == 0 {
 		if hasMetricName {
 			return metricName
 		}
 		return "{}"
 	}
 
-	return fmt.Sprintf("%s{%s}", metricName, strings.Join(labelStrings, ", "))
+	if truncated {
+		b.WriteString(", ...")
+	}
+	return fmt.Sprintf("%s{%s}", metricName, b.String())
 }
