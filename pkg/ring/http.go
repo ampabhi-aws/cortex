@@ -1,6 +1,7 @@
 package ring
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"fmt"
@@ -12,6 +13,8 @@ import (
 	"time"
 
 	"github.com/go-kit/log/level"
+
+	"github.com/cortexproject/cortex/pkg/util"
 )
 
 const pageContent = `
@@ -123,6 +126,12 @@ type httpResponse struct {
 
 func (r *Ring) ServeHTTP(w http.ResponseWriter, req *http.Request) {
 	if req.Method == http.MethodPost {
+		// CSRF protection: reject cross-site or token-less POSTs before touching
+		// the shared ring KV store. CheckCSRF validates Origin/Referer against
+		// Host and verifies the double-submit cookie/form token.
+		if !util.CheckCSRF(w, req) {
+			return
+		}
 		ingesterID := req.FormValue("forget")
 		if err := r.forget(req.Context(), ingesterID); err != nil {
 			level.Error(r.logger).Log("msg", "error forgetting instance", "err", err)
@@ -197,9 +206,17 @@ func renderHTTPResponse(w http.ResponseWriter, v httpResponse, t *template.Templ
 		return
 	}
 
-	err := t.Execute(w, v)
-	if err != nil {
+	// Render to a buffer so we can substitute the CSRF token placeholder in
+	// the hidden form input before emitting the body, and set the paired
+	// CSRF cookie on the response.
+	var buf bytes.Buffer
+	if err := t.Execute(&buf, v); err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	util.SetCSRFCookie(w)
+	if _, err := w.Write(util.InjectCSRFToken(buf.Bytes())); err != nil {
+		return
 	}
 }
 
