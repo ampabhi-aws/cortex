@@ -553,6 +553,9 @@ func (d *Distributor) Push(ctx context.Context, req *cortexpb.WriteRequest) (*co
 	if err != nil {
 		return nil, err
 	}
+	if userID == "" {
+		return nil, user.ErrNoOrgID
+	}
 
 	// We will report *this* request in the error too.
 	inflight := d.inflightPushRequests.Inc()

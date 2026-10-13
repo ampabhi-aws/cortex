@@ -215,6 +215,16 @@ func (cfg *TSDBConfig) Validate() error {
 // BlocksDir returns the directory path where TSDB blocks and wal should be
 // stored by the ingester
 func (cfg *TSDBConfig) BlocksDir(userID string) string {
+	// Defensive guard: an empty userID would collapse to cfg.Dir itself
+	// (filepath.Join(dir, "") == dir), i.e. the shared root data directory
+	// that holds every tenant's TSDB subdirectory. Return an empty string so
+	// callers that forget to validate the tenant ID surface the error
+	// instead of silently writing a phantom tenant's data into the shared
+	// root. Validation of the tenant ID is performed in the tenant resolver
+	// and in Distributor.Push / Ingester.Push.
+	if userID == "" {
+		return ""
+	}
 	return filepath.Join(cfg.Dir, userID)
 }
 

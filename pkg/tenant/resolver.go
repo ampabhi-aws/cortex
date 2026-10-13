@@ -83,6 +83,10 @@ func (t *SingleResolver) TenantID(ctx context.Context) (string, error) {
 		return "", err
 	}
 
+	if id == "" {
+		return "", user.ErrNoOrgID
+	}
+
 	if containsUnsafePathSegments(id) {
 		return "", errInvalidTenantID
 	}
@@ -139,7 +143,11 @@ func (t *MultiResolver) TenantIDs(ctx context.Context) ([]string, error) {
 		}
 	}
 
-	return NormalizeTenantIDs(orgIDs), nil
+	normalized := NormalizeTenantIDs(orgIDs)
+	if len(normalized) == 0 {
+		return nil, errEmptyTenantID
+	}
+	return normalized, nil
 }
 
 // ExtractTenantIDFromHTTPRequest extracts a single TenantID through a given

@@ -31,6 +31,7 @@ import (
 	"github.com/thanos-io/thanos/pkg/shipper"
 	"github.com/thanos-io/thanos/pkg/store/storepb"
 	"github.com/weaveworks/common/httpgrpc"
+	"github.com/weaveworks/common/user"
 	"go.uber.org/atomic"
 	"golang.org/x/sync/errgroup"
 	"google.golang.org/grpc/codes"
@@ -904,6 +905,9 @@ func (i *Ingester) Push(ctx context.Context, req *cortexpb.WriteRequest) (*corte
 	userID, err := tenant.TenantID(ctx)
 	if err != nil {
 		return nil, err
+	}
+	if userID == "" {
+		return nil, user.ErrNoOrgID
 	}
 
 	il := i.getInstanceLimits()
