@@ -1,9 +1,21 @@
 package codec
 
 import (
+	"fmt"
+
 	"github.com/gogo/protobuf/proto"
 	"github.com/golang/snappy"
 )
+
+// MaxDecodedSize is the maximum allowed size, in bytes, of a snappy-decoded
+// value handed to Proto.Decode. It bounds the allocation performed by
+// snappy.Decode (which allocates make([]byte, dLen) from the declared decoded
+// length in the attacker-controlled block header before validating the body),
+// to protect against decompression-bomb inputs delivered via the memberlist
+// gossip transport or other KV backends. 64 MiB is well above legitimate
+// ring/HA-tracker payloads and well below the 4 GiB that an unbounded varint
+// header would otherwise request.
+const MaxDecodedSize = 64 * 1024 * 1024
 
 // Codec allows KV clients to serialise and deserialise values.
 type Codec interface {
@@ -32,7 +44,19 @@ func (p Proto) CodecID() string {
 // Decode implements Codec
 func (p Proto) Decode(bytes []byte) (interface{}, error) {
 	out := p.factory()
-	bytes, err := snappy.Decode(nil, bytes)
+	// Bound the declared decoded size before calling snappy.Decode, which
+	// otherwise allocates make([]byte, dLen) from the attacker-supplied
+	// length header prior to validating the compressed body. Without this
+	// guard, a ~30-byte input with a varint claiming ~4 GiB would force a
+	// multi-gigabyte allocation. See MaxDecodedSize for rationale.
+	decodedLen, err := snappy.DecodedLen(bytes)
+	if err != nil {
+		return nil, err
+	}
+	if decodedLen > MaxDecodedSize {
+		return nil, fmt.Errorf("snappy-decoded size %d exceeds maximum allowed %d", decodedLen, MaxDecodedSize)
+	}
+	bytes, err = snappy.Decode(nil, bytes)
 	if err != nil {
 		return nil, err
 	}
