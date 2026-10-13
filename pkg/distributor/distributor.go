@@ -1206,7 +1206,14 @@ func (d *Distributor) AllUserStats(ctx context.Context) ([]UserIDStats, error) {
 	perUserTotals := make(map[string]UserStats)
 
 	req := &ingester_client.UserStatsRequest{}
-	ctx = user.InjectOrgID(ctx, "1") // fake: ingester insists on having an org ID
+	// Require an authenticated caller: the handler for this endpoint exposes
+	// per-tenant statistics for every tenant, so it must only be reachable by
+	// an operator identity. We no longer inject a fake org ID here; instead we
+	// require that the caller already carries one (populated by the HTTP auth
+	// middleware when auth is enabled on the route).
+	if _, err := user.ExtractOrgID(ctx); err != nil {
+		return nil, err
+	}
 	// Not using d.ForReplicationSet(), so we can fail after first error.
 	replicationSet, err := d.ingestersRing.GetAllHealthy(ring.Read)
 	if err != nil {
