@@ -5,6 +5,7 @@ import (
 	"errors"
 	"net/http"
 	"strings"
+	"unicode"
 
 	"github.com/weaveworks/common/user"
 )
@@ -74,7 +75,36 @@ func containsUnsafePathSegments(id string) bool {
 	return strings.ContainsAny(id, "\\/")
 }
 
-var errInvalidTenantID = errors.New("invalid tenant ID")
+// tenantIDMaxLength caps the tenant ID length so unvalidated IDs cannot
+// expand per-tenant metric label cardinality or active-user map memory.
+// It matches the limit enforced by ValidTenantID for the multi-tenant path
+// and the documented tenant-ID naming rules.
+const tenantIDMaxLength = 150
+
+var (
+	errInvalidTenantID       = errors.New("invalid tenant ID")
+	errEmptyTenantID         = errors.New("empty tenant ID")
+	errTenantIDTooLongSingle = errors.New("tenant ID is too long: max 150 characters")
+)
+
+// containsUnsafeSingleTenantChars rejects characters that would otherwise be
+// accepted by the lenient single-tenant character set but create ambiguity
+// between the single-tenant and multi-tenant interpretations (`|`) or allow
+// cache-key / log / metric component separators to be injected into a tenant
+// ID (`:`, whitespace, control characters). Rejecting these preserves the
+// documented wider character set for the single-tenant path while closing
+// cache-key collisions and label-injection vectors.
+func containsUnsafeSingleTenantChars(id string) bool {
+	for _, r := range id {
+		if r == '|' || r == ':' {
+			return true
+		}
+		if unicode.IsSpace(r) || unicode.IsControl(r) {
+			return true
+		}
+	}
+	return false
+}
 
 func (t *SingleResolver) TenantID(ctx context.Context) (string, error) {
 	//lint:ignore faillint wrapper around upstream method
@@ -83,7 +113,19 @@ func (t *SingleResolver) TenantID(ctx context.Context) (string, error) {
 		return "", err
 	}
 
+	if id == "" {
+		return "", errEmptyTenantID
+	}
+
+	if len(id) > tenantIDMaxLength {
+		return "", errTenantIDTooLongSingle
+	}
+
 	if containsUnsafePathSegments(id) {
+		return "", errInvalidTenantID
+	}
+
+	if containsUnsafeSingleTenantChars(id) {
 		return "", errInvalidTenantID
 	}
 
