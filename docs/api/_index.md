@@ -961,3 +961,25 @@ POST /api/prom/configs/restore
 Re-enable configs for the authenticated tenant, after being previously deactivated.
 
 _Requires [authentication](#authentication)._
+
+### Internal configs endpoints
+
+```
+GET /private/api/prom/configs/rules
+GET /private/api/prom/configs/alertmanager
+```
+
+**These endpoints must never be exposed to end users.** They are intended for
+the in-cluster ruler and alertmanager to poll every tenant's rules and
+Alertmanager configuration (including Alertmanager YAML with embedded receiver
+secrets such as bearer tokens, SMTP passwords and Slack/PagerDuty webhook
+URLs). They return a JSON map keyed by tenant ID with no per-request tenant
+scoping and therefore disclose every tenant's data in a single response.
+
+Operators are responsible for ensuring the configs service HTTP listener is
+not reachable from untrusted networks and that any shared ingress / reverse
+proxy blocks the `/private/*` path family. When `-configs.internal-auth-token`
+is set on the configs service, callers of these two endpoints must present a
+matching `Authorization: Bearer <token>` header or the request is rejected
+with `401 Unauthorized`; the ruler and alertmanager configs clients send the
+token configured via their respective `configs.internal-auth-token` flags.
