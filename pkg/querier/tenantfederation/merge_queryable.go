@@ -322,8 +322,17 @@ func (m *mergeQuerier) Select(sortSeries bool, hints *storage.SelectHints, match
 		if !ok {
 			return fmt.Errorf("unexpected type %T", jobIntf)
 		}
+		// Give each per-tenant child its own copy of the hints so that
+		// concurrent per-tenant Select calls do not race on, or clobber
+		// each other's, tenant-specific clamped time ranges written back
+		// into *storage.SelectHints by the downstream querier.
+		var childHints *storage.SelectHints
+		if hints != nil {
+			h := *hints
+			childHints = &h
+		}
 		seriesSets[job.pos] = &addLabelsSeriesSet{
-			upstream: job.querier.Select(sortSeries, hints, filteredMatchers...),
+			upstream: job.querier.Select(sortSeries, childHints, filteredMatchers...),
 			labels: labels.Labels{
 				{
 					Name:  m.idLabelName,
