@@ -6,6 +6,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"path"
+	"strings"
 	"testing"
 
 	"github.com/go-kit/log"
@@ -18,26 +19,88 @@ import (
 
 func TestDeleteTenant(t *testing.T) {
 	bkt := objstore.NewInMemBucket()
-	api := newTenantDeletionAPI(bkt, nil, log.NewNopLogger())
 
-	{
+	t.Run("disabled by default", func(t *testing.T) {
+		api := newTenantDeletionAPI(bkt, nil, Config{}, log.NewNopLogger())
+
+		ctx := user.InjectOrgID(context.Background(), "fake")
+		req := httptest.NewRequest(http.MethodPost, "/purger/delete_tenant", nil).WithContext(ctx)
 		resp := httptest.NewRecorder()
-		api.DeleteTenant(resp, &http.Request{})
+		api.DeleteTenant(resp, req)
+		require.Equal(t, http.StatusNotFound, resp.Code)
+		require.Empty(t, bkt.Objects())
+	})
+
+	cfg := Config{EnableTenantDeletionAPI: true}
+	api := newTenantDeletionAPI(bkt, nil, cfg, log.NewNopLogger())
+
+	t.Run("missing X-Scope-OrgID", func(t *testing.T) {
+		resp := httptest.NewRecorder()
+		api.DeleteTenant(resp, httptest.NewRequest(http.MethodPost, "/purger/delete_tenant", nil))
 		require.Equal(t, http.StatusUnauthorized, resp.Code)
-	}
+	})
 
-	{
-		ctx := context.Background()
-		ctx = user.InjectOrgID(ctx, "fake")
-
-		req := &http.Request{}
+	t.Run("missing confirmation parameter", func(t *testing.T) {
+		ctx := user.InjectOrgID(context.Background(), "fake")
+		req := httptest.NewRequest(http.MethodPost, "/purger/delete_tenant", nil).WithContext(ctx)
 		resp := httptest.NewRecorder()
-		api.DeleteTenant(resp, req.WithContext(ctx))
+		api.DeleteTenant(resp, req)
+		require.Equal(t, http.StatusBadRequest, resp.Code)
+	})
 
+	t.Run("mismatched confirmation parameter", func(t *testing.T) {
+		ctx := user.InjectOrgID(context.Background(), "fake")
+		form := strings.NewReader("tenant_id=other")
+		req := httptest.NewRequest(http.MethodPost, "/purger/delete_tenant", form).WithContext(ctx)
+		req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+		resp := httptest.NewRecorder()
+		api.DeleteTenant(resp, req)
+		require.Equal(t, http.StatusBadRequest, resp.Code)
+	})
+
+	t.Run("matching confirmation parameter writes mark", func(t *testing.T) {
+		ctx := user.InjectOrgID(context.Background(), "fake")
+		form := strings.NewReader("tenant_id=fake")
+		req := httptest.NewRequest(http.MethodPost, "/purger/delete_tenant", form).WithContext(ctx)
+		req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+		resp := httptest.NewRecorder()
+		api.DeleteTenant(resp, req)
 		require.Equal(t, http.StatusOK, resp.Code)
 		objs := bkt.Objects()
 		require.NotNil(t, objs[path.Join("fake", tsdb.TenantDeletionMarkPath)])
-	}
+	})
+
+	t.Run("cancel delete tenant removes mark", func(t *testing.T) {
+		ctx := user.InjectOrgID(context.Background(), "fake")
+		form := strings.NewReader("tenant_id=fake")
+		req := httptest.NewRequest(http.MethodPost, "/purger/cancel_delete_tenant", form).WithContext(ctx)
+		req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+		resp := httptest.NewRecorder()
+		api.CancelDeleteTenant(resp, req)
+		require.Equal(t, http.StatusOK, resp.Code)
+		require.Nil(t, bkt.Objects()[path.Join("fake", tsdb.TenantDeletionMarkPath)])
+	})
+
+	t.Run("cancel delete tenant is idempotent", func(t *testing.T) {
+		ctx := user.InjectOrgID(context.Background(), "fake")
+		form := strings.NewReader("tenant_id=fake")
+		req := httptest.NewRequest(http.MethodPost, "/purger/cancel_delete_tenant", form).WithContext(ctx)
+		req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+		resp := httptest.NewRecorder()
+		api.CancelDeleteTenant(resp, req)
+		require.Equal(t, http.StatusOK, resp.Code)
+	})
+
+	t.Run("cancel delete tenant disabled by default", func(t *testing.T) {
+		api := newTenantDeletionAPI(bkt, nil, Config{}, log.NewNopLogger())
+		ctx := user.InjectOrgID(context.Background(), "fake")
+		form := strings.NewReader("tenant_id=fake")
+		req := httptest.NewRequest(http.MethodPost, "/purger/cancel_delete_tenant", form).WithContext(ctx)
+		req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+		resp := httptest.NewRecorder()
+		api.CancelDeleteTenant(resp, req)
+		require.Equal(t, http.StatusNotFound, resp.Code)
+	})
 }
 
 func TestDeleteTenantStatus(t *testing.T) {
@@ -80,7 +143,7 @@ func TestDeleteTenantStatus(t *testing.T) {
 				require.NoError(t, bkt.Upload(context.Background(), objName, bytes.NewReader(data)))
 			}
 
-			api := newTenantDeletionAPI(bkt, nil, log.NewNopLogger())
+			api := newTenantDeletionAPI(bkt, nil, Config{}, log.NewNopLogger())
 
 			res, err := api.isBlocksForUserDeleted(context.Background(), username)
 			require.NoError(t, err)
