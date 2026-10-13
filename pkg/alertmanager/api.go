@@ -45,6 +45,7 @@ var (
 	errTLSFileNotAllowed             = errors.New("setting TLS ca_file, cert_file and key_file is not allowed")
 	errSlackAPIURLFileNotAllowed     = errors.New("setting Slack api_url_file and global slack_api_url_file is not allowed")
 	errVictorOpsAPIKeyFileNotAllowed = errors.New("setting VictorOps api_key_file is not allowed")
+	errEmailSmarthostInvalid         = errors.New("email smarthost is not a valid host:port address")
 )
 
 // UserConfig is used to communicate a users alertmanager configs
@@ -350,6 +351,11 @@ func validateAlertmanagerConfig(cfg interface{}) error {
 		if err := validateVictorOpsConfig(v.Interface().(config.VictorOpsConfig)); err != nil {
 			return err
 		}
+
+	case reflect.TypeOf(config.EmailConfig{}):
+		if err := validateEmailConfig(v.Interface().(config.EmailConfig)); err != nil {
+			return err
+		}
 	}
 
 	// If the input config is a struct, recursively iterate on all fields.
@@ -446,6 +452,23 @@ func validateSlackConfig(cfg config.SlackConfig) error {
 func validateVictorOpsConfig(cfg config.VictorOpsConfig) error {
 	if cfg.APIKeyFile != "" {
 		return errVictorOpsAPIKeyFileNotAllowed
+	}
+	return nil
+}
+
+// validateEmailConfig validates the Email config and returns an error if it contains
+// settings not allowed by Cortex. It ensures the smarthost is set to a valid
+// host:port address so that configurations relying on a non-existent global
+// smarthost are rejected at upload time. Egress to the smarthost is still
+// constrained at dial-time by the per-tenant FirewallDialer.
+func validateEmailConfig(cfg config.EmailConfig) error {
+	// Only validate when the smarthost has been set on the receiver. An empty
+	// smarthost means the global smarthost (operator-controlled) is used.
+	if cfg.Smarthost.Host == "" && cfg.Smarthost.Port == "" {
+		return nil
+	}
+	if cfg.Smarthost.Host == "" || cfg.Smarthost.Port == "" {
+		return errEmailSmarthostInvalid
 	}
 	return nil
 }

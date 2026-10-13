@@ -47,10 +47,16 @@ type Email struct {
 	tmpl     *template.Template
 	logger   log.Logger
 	hostname string
+
+	// dialContext, when non-nil, is used instead of the default net.Dialer /
+	// tls.Dial for the SMTP connection. It allows callers to inject a
+	// per-tenant egress firewall (e.g. Cortex's FirewallDialer) that
+	// otherwise cannot be reached from the SMTP code path.
+	dialContext commoncfg.DialContextFunc
 }
 
 // New returns a new Email notifier.
-func New(c *config.EmailConfig, t *template.Template, l log.Logger) *Email {
+func New(c *config.EmailConfig, t *template.Template, l log.Logger, httpOpts ...commoncfg.HTTPClientOption) *Email {
 	if _, ok := c.Headers["Subject"]; !ok {
 		c.Headers["Subject"] = config.DefaultEmailSubject
 	}
@@ -66,7 +72,13 @@ func New(c *config.EmailConfig, t *template.Template, l log.Logger) *Email {
 	if err != nil {
 		h = "localhost.localdomain"
 	}
-	return &Email{conf: c, tmpl: t, logger: l, hostname: h}
+	return &Email{
+		conf:        c,
+		tmpl:        t,
+		logger:      l,
+		hostname:    h,
+		dialContext: commoncfg.DialContextFuncFromOptions(httpOpts),
+	}
 }
 
 // auth resolves a string of authentication mechanisms.
@@ -131,16 +143,36 @@ func (n *Email) Notify(ctx context.Context, as ...*types.Alert) (bool, error) {
 			tlsConfig.ServerName = n.conf.Smarthost.Host
 		}
 
-		conn, err = tls.Dial("tcp", n.conf.Smarthost.String(), tlsConfig)
-		if err != nil {
-			return true, errors.Wrap(err, "establish TLS connection to server")
+		if n.dialContext != nil {
+			// Dial through the injected (firewall-aware) dialer first, then
+			// wrap the resulting net.Conn with a TLS client. This keeps the
+			// egress firewall effective for implicit-TLS SMTP (port 465).
+			rawConn, err := n.dialContext(ctx, "tcp", n.conf.Smarthost.String())
+			if err != nil {
+				return true, errors.Wrap(err, "establish connection to server")
+			}
+			tlsConn := tls.Client(rawConn, tlsConfig)
+			if err := tlsConn.Handshake(); err != nil {
+				rawConn.Close()
+				return true, errors.Wrap(err, "establish TLS connection to server")
+			}
+			conn = tlsConn
+		} else {
+			conn, err = tls.Dial("tcp", n.conf.Smarthost.String(), tlsConfig)
+			if err != nil {
+				return true, errors.Wrap(err, "establish TLS connection to server")
+			}
 		}
 	} else {
 		var (
 			d   = net.Dialer{}
 			err error
 		)
-		conn, err = d.DialContext(ctx, "tcp", n.conf.Smarthost.String())
+		if n.dialContext != nil {
+			conn, err = n.dialContext(ctx, "tcp", n.conf.Smarthost.String())
+		} else {
+			conn, err = d.DialContext(ctx, "tcp", n.conf.Smarthost.String())
+		}
 		if err != nil {
 			return true, errors.Wrap(err, "establish connection to server")
 		}
