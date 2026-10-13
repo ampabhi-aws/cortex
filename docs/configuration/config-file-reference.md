@@ -2799,7 +2799,7 @@ The `limits_config` configures default and per-tenant limits imposed by Cortex s
 # Maximum size of configuration file for Alertmanager that tenant can upload via
 # Alertmanager API. 0 = no limit.
 # CLI flag: -alertmanager.max-config-size-bytes
-[alertmanager_max_config_size_bytes: <int> | default = 0]
+[alertmanager_max_config_size_bytes: <int> | default = 2097152]
 
 # Maximum number of templates in tenant's Alertmanager configuration uploaded
 # via Alertmanager API. 0 = no limit.

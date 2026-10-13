@@ -28,12 +28,29 @@ type rateLimitedNotifier struct {
 	recheckAt       atomic.Int64 // unix nanoseconds timestamp
 }
 
-func newRateLimitedNotifier(upstream notify.Notifier, limits rateLimits, recheckInterval time.Duration, counter prometheus.Counter) *rateLimitedNotifier {
+// newRateLimitedNotifier wraps upstream in a rate-limited notifier.
+//
+// If limiter is non-nil, the provided *rate.Limiter is reused (and shared) by
+// the returned notifier. This is used by the Alertmanager to keep a single
+// token bucket per (tenant, integration-name) across all integration
+// *instances* in a tenant's config, and to preserve the bucket state across
+// ApplyConfig calls (a tenant must not be able to refill its burst allowance
+// by re-uploading a trivially-modified config).
+//
+// If limiter is nil, a fresh *rate.Limiter is created from the current
+// limits.
+func newRateLimitedNotifier(upstream notify.Notifier, limits rateLimits, recheckInterval time.Duration, counter prometheus.Counter, limiter ...*rate.Limiter) *rateLimitedNotifier {
+	var l *rate.Limiter
+	if len(limiter) > 0 && limiter[0] != nil {
+		l = limiter[0]
+	} else {
+		l = rate.NewLimiter(limits.RateLimit(), limits.Burst())
+	}
 	return &rateLimitedNotifier{
 		upstream:        upstream,
 		counter:         counter,
 		limits:          limits,
-		limiter:         rate.NewLimiter(limits.RateLimit(), limits.Burst()),
+		limiter:         l,
 		recheckInterval: recheckInterval,
 	}
 }
