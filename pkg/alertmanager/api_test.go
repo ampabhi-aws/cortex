@@ -690,7 +690,21 @@ receivers:
 	require.Equal(t, "application/yaml", resp.Header.Get("Content-Type"))
 	body, err := io.ReadAll(resp.Body)
 	require.NoError(t, err)
-	old, err := yaml.Marshal(testCases)
+
+	// The handler redacts secrets by re-marshalling the parsed Alertmanager
+	// config, so build the expected response the same way.
+	expected := map[string]*UserConfig{}
+	for u, cfg := range testCases {
+		parsed, err := config.Load(cfg.AlertmanagerConfig)
+		require.NoError(t, err)
+		redacted, err := yaml.Marshal(parsed)
+		require.NoError(t, err)
+		expected[u] = &UserConfig{
+			TemplateFiles:      map[string]string{},
+			AlertmanagerConfig: string(redacted),
+		}
+	}
+	old, err := yaml.Marshal(expected)
 	require.NoError(t, err)
 	require.YAMLEq(t, string(old), string(body))
 }

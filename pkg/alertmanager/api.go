@@ -283,10 +283,24 @@ func (am *MultitenantAlertmanager) ListAllConfigs(w http.ResponseWriter, r *http
 		} else if err != nil {
 			return errors.Wrapf(err, "failed to fetch alertmanager config for user %s", userID)
 		}
+
+		// Redact secrets before returning the config. The raw config stored for a
+		// tenant contains inline credentials (SMTP passwords, Slack/PagerDuty/OpsGenie
+		// API URLs and keys, bearer tokens, OAuth2 client secrets, etc.). Re-marshal
+		// via the Alertmanager config schema whose Secret/SecretURL types render as
+		// "<secret>" so this administrative listing does not leak tenant credentials.
+		redacted, rerr := redactAlertmanagerConfig(cfg.RawConfig)
+		if rerr != nil {
+			// If we cannot safely parse the config, do NOT fall back to the raw
+			// (unredacted) YAML — that is the exact leak this handler must avoid.
+			// Log and omit this tenant's config body; the entry is still listed.
+			level.Warn(logger).Log("msg", "failed to redact alertmanager config for user; omitting from response body", "user", userID, "err", rerr)
+			redacted = ""
+		}
 		data := map[string]*UserConfig{
 			userID: {
 				TemplateFiles:      alertspb.ParseTemplates(cfg),
-				AlertmanagerConfig: cfg.RawConfig,
+				AlertmanagerConfig: redacted,
 			},
 		}
 
@@ -302,6 +316,32 @@ func (am *MultitenantAlertmanager) ListAllConfigs(w http.ResponseWriter, r *http
 	}
 	close(iter)
 	<-done
+}
+
+// redactAlertmanagerConfig parses the given raw Alertmanager YAML configuration
+// and re-marshals it so that secret-bearing fields are rendered as "<secret>"
+// via the Prometheus Alertmanager config schema's Secret/SecretURL MarshalYAML
+// implementations. This is used to safely expose configurations through the
+// administrative /multitenant_alertmanager/configs endpoint without leaking
+// tenant credentials (SMTP passwords, Slack/PagerDuty/OpsGenie API URLs and
+// keys, bearer tokens, OAuth2 client secrets, etc.).
+//
+// An empty input returns an empty string. A parse failure is returned to the
+// caller so it can decide how to handle it; callers MUST NOT fall back to the
+// unredacted raw string on error.
+func redactAlertmanagerConfig(raw string) (string, error) {
+	if raw == "" {
+		return "", nil
+	}
+	amCfg, err := config.Load(raw)
+	if err != nil {
+		return "", errors.Wrap(err, "failed to parse alertmanager config for redaction")
+	}
+	out, err := yaml.Marshal(amCfg)
+	if err != nil {
+		return "", errors.Wrap(err, "failed to marshal redacted alertmanager config")
+	}
+	return string(out), nil
 }
 
 // validateAlertmanagerConfig recursively scans the input config looking for data types for which
