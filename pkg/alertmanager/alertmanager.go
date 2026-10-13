@@ -114,6 +114,16 @@ type Alertmanager struct {
 	configHashMetric prometheus.Gauge
 
 	rateLimitedNotifications *prometheus.CounterVec
+
+	// rateLimitersMtx guards rateLimiters.
+	rateLimitersMtx sync.Mutex
+	// rateLimiters holds a shared *rate.Limiter per integration name for this
+	// tenant. Limiters are created on demand and are *preserved across
+	// ApplyConfig calls*, so that a tenant cannot refill the token bucket by
+	// re-uploading a trivially-modified config, and so that multiple
+	// integration *instances* of the same integration-name share a single
+	// token bucket (the documented "per-user" rate limit).
+	rateLimiters map[string]*rate.Limiter
 }
 
 var (
@@ -168,6 +178,7 @@ func New(cfg *Config, reg *prometheus.Registry) (*Alertmanager, error) {
 			Help: "Number of rate-limited notifications per integration.",
 		}, []string{"integration"}), // "integration" is consistent with other alertmanager metrics.
 
+		rateLimiters: map[string]*rate.Limiter{},
 	}
 
 	am.registry = reg
@@ -360,7 +371,13 @@ func (am *Alertmanager) ApplyConfig(userID string, conf *config.Config, rawCfg s
 				integration: integrationName,
 			}
 
-			return newRateLimitedNotifier(notifier, rl, 10*time.Second, am.rateLimitedNotifications.WithLabelValues(integrationName))
+			// Reuse a single shared *rate.Limiter per (tenant, integration-name)
+			// across all integration *instances* and across ApplyConfig reloads,
+			// so the documented per-user rate limit cannot be multiplied by
+			// declaring K integrations, nor reset by re-uploading the config.
+			sharedLimiter := am.rateLimiterFor(integrationName, rl)
+
+			return newRateLimitedNotifier(notifier, rl, 10*time.Second, am.rateLimitedNotifications.WithLabelValues(integrationName), sharedLimiter)
 		}
 		return notifier
 	})
@@ -584,6 +601,26 @@ func (t *tenantRateLimits) RateLimit() rate.Limit {
 
 func (t *tenantRateLimits) Burst() int {
 	return t.limits.NotificationBurstSize(t.tenant, t.integration)
+}
+
+// rateLimiterFor returns the shared *rate.Limiter for this tenant and
+// integration-name, creating it on first use. The limiter is preserved for
+// the lifetime of the Alertmanager struct (not rebuilt by ApplyConfig), so
+// its token bucket cannot be refilled by a tenant re-uploading a modified
+// config. All integration instances of the same integration-name within
+// this tenant share the same bucket, so the configured per-user rate limit
+// is enforced regardless of how many receivers / integration entries the
+// tenant declares.
+func (am *Alertmanager) rateLimiterFor(integrationName string, rl rateLimits) *rate.Limiter {
+	am.rateLimitersMtx.Lock()
+	defer am.rateLimitersMtx.Unlock()
+
+	if l, ok := am.rateLimiters[integrationName]; ok {
+		return l
+	}
+	l := rate.NewLimiter(rl.RateLimit(), rl.Burst())
+	am.rateLimiters[integrationName] = l
+	return l
 }
 
 type dispatcherLimits struct {
