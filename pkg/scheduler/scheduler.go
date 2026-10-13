@@ -6,6 +6,7 @@ import (
 	"io"
 	"net/http"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/go-kit/log"
@@ -68,6 +69,18 @@ type Scheduler struct {
 type requestKey struct {
 	frontendAddr string
 	queryID      uint64
+}
+
+// nextConnID is a process-wide monotonic counter used to tag each
+// SchedulerForFrontend/FrontendLoop stream with a unique, non-forgeable
+// identifier. This identifier is used to bind the pending-request keyspace
+// (cancellations) to the specific connection that enqueued the request, so
+// that a peer connecting with another frontend's claimed address cannot
+// cancel or overwrite that frontend's in-flight queries.
+var nextConnID uint64
+
+func newConnID() uint64 {
+	return atomic.AddUint64(&nextConnID, 1)
 }
 
 type connectedFrontend struct {
@@ -147,10 +160,16 @@ type Limits interface {
 
 type schedulerRequest struct {
 	frontendAddress string
-	userID          string
-	queryID         uint64
-	request         *httpgrpc.HTTPRequest
-	statsEnabled    bool
+	// connID is the identifier of the FrontendLoop stream that enqueued this
+	// request. It is set by the scheduler itself (never taken from the wire)
+	// and is used to make sure CANCEL messages received on another stream
+	// cannot cancel this request, even if that other stream claims the same
+	// FrontendAddress.
+	connID       uint64
+	userID       string
+	queryID      uint64
+	request      *httpgrpc.HTTPRequest
+	statsEnabled bool
 
 	enqueueTime time.Time
 
@@ -169,6 +188,12 @@ func (s *Scheduler) FrontendLoop(frontend schedulerpb.SchedulerForFrontend_Front
 		return err
 	}
 	defer s.frontendDisconnected(frontendAddress)
+
+	// Tag this stream with a unique connection id. This id is used to bind the
+	// pending-request keyspace to this specific stream, so that CANCEL
+	// messages received on another stream (even one claiming the same
+	// FrontendAddress) cannot cancel queries this stream enqueued.
+	connID := newConnID()
 
 	// Response to INIT. If scheduler is not running, we skip for-loop, send SHUTTING_DOWN and exit this method.
 	if s.State() == services.Running {
@@ -195,9 +220,20 @@ func (s *Scheduler) FrontendLoop(frontend schedulerpb.SchedulerForFrontend_Front
 
 		var resp *schedulerpb.SchedulerToFrontend
 
+		// Defense in depth: a FrontendAddress supplied on subsequent
+		// messages must match the FrontendAddress declared on INIT. The
+		// scheduler always uses the INIT address internally, but we reject
+		// mismatching values rather than silently ignoring them, to make
+		// stream-level identity confusion explicit.
+		if msg.FrontendAddress != "" && msg.FrontendAddress != frontendAddress {
+			level.Warn(s.log).Log("msg", "frontend address in message does not match the one declared on INIT; closing stream",
+				"init_addr", frontendAddress, "msg_addr", msg.FrontendAddress)
+			return errors.New("frontend address mismatch")
+		}
+
 		switch msg.GetType() {
 		case schedulerpb.ENQUEUE:
-			err = s.enqueueRequest(frontendCtx, frontendAddress, msg)
+			err = s.enqueueRequest(frontendCtx, frontendAddress, connID, msg)
 			switch {
 			case err == nil:
 				resp = &schedulerpb.SchedulerToFrontend{Status: schedulerpb.OK}
@@ -208,7 +244,10 @@ func (s *Scheduler) FrontendLoop(frontend schedulerpb.SchedulerForFrontend_Front
 			}
 
 		case schedulerpb.CANCEL:
-			s.cancelRequestAndRemoveFromPending(frontendAddress, msg.QueryID)
+			// Only cancel requests that were enqueued on this same stream.
+			// This prevents a peer that claims another frontend's address
+			// from cancelling that frontend's in-flight queries.
+			s.cancelRequestFromConn(frontendAddress, msg.QueryID, connID)
 			resp = &schedulerpb.SchedulerToFrontend{Status: schedulerpb.OK}
 
 		default:
@@ -264,7 +303,7 @@ func (s *Scheduler) frontendDisconnected(frontendAddress string) {
 	}
 }
 
-func (s *Scheduler) enqueueRequest(frontendContext context.Context, frontendAddr string, msg *schedulerpb.FrontendToScheduler) error {
+func (s *Scheduler) enqueueRequest(frontendContext context.Context, frontendAddr string, connID uint64, msg *schedulerpb.FrontendToScheduler) error {
 	// Create new context for this request, to support cancellation.
 	ctx, cancel := context.WithCancel(frontendContext)
 	shouldCancel := true
@@ -286,6 +325,7 @@ func (s *Scheduler) enqueueRequest(frontendContext context.Context, frontendAddr
 
 	req := &schedulerRequest{
 		frontendAddress: frontendAddr,
+		connID:          connID,
 		userID:          msg.UserID,
 		queryID:         msg.QueryID,
 		request:         msg.HttpRequest,
@@ -316,7 +356,12 @@ func (s *Scheduler) enqueueRequest(frontendContext context.Context, frontendAddr
 	})
 }
 
-// This method doesn't do removal from the queue.
+// cancelRequestAndRemoveFromPending unconditionally cancels and removes the
+// request. This is only used by internal cleanup paths (querier dispatch,
+// shutdown) that already own the request. Callers that act on data received
+// from a FrontendLoop peer must use cancelRequestFromConn instead, which
+// restricts cancellation to the connection that originally enqueued the
+// request.
 func (s *Scheduler) cancelRequestAndRemoveFromPending(frontendAddr string, queryID uint64) {
 	s.pendingRequestsMu.Lock()
 	defer s.pendingRequestsMu.Unlock()
@@ -326,6 +371,24 @@ func (s *Scheduler) cancelRequestAndRemoveFromPending(frontendAddr string, query
 	if req != nil {
 		req.ctxCancel()
 	}
+	delete(s.pendingRequests, key)
+}
+
+// cancelRequestFromConn cancels a pending request only if it was enqueued on
+// the FrontendLoop stream identified by connID. If another stream (possibly
+// claiming the same frontend address) tries to cancel it, the request is
+// left untouched. This binds the pending-request keyspace to the specific
+// connection that owns each entry.
+func (s *Scheduler) cancelRequestFromConn(frontendAddr string, queryID uint64, connID uint64) {
+	s.pendingRequestsMu.Lock()
+	defer s.pendingRequestsMu.Unlock()
+
+	key := requestKey{frontendAddr: frontendAddr, queryID: queryID}
+	req := s.pendingRequests[key]
+	if req == nil || req.connID != connID {
+		return
+	}
+	req.ctxCancel()
 	delete(s.pendingRequests, key)
 }
 
