@@ -173,10 +173,25 @@ func (l *Limits) RegisterFlags(f *flag.FlagSet) {
 	f.IntVar(&l.StoreGatewayTenantShardSize, "store-gateway.tenant-shard-size", 0, "The default tenant's shard size when the shuffle-sharding strategy is used. Must be set when the store-gateway sharding is enabled with the shuffle-sharding strategy. When this setting is specified in the per-tenant overrides, a value of 0 disables shuffle sharding for the tenant.")
 
 	// Alertmanager.
-	f.Var(&l.AlertmanagerReceiversBlockCIDRNetworks, "alertmanager.receivers-firewall-block-cidr-networks", "Comma-separated list of network CIDRs to block in Alertmanager receiver integrations.")
-	f.BoolVar(&l.AlertmanagerReceiversBlockPrivateAddresses, "alertmanager.receivers-firewall-block-private-addresses", false, "True to block private and local addresses in Alertmanager receiver integrations. It blocks private addresses defined by  RFC 1918 (IPv4 addresses) and RFC 4193 (IPv6 addresses), as well as loopback, local unicast and local multicast addresses.")
+	// Pre-populate the receiver firewall CIDR block list with ranges that must never be reachable
+	// from tenant-controlled receiver integrations: IPv4 loopback (127.0.0.0/8), IPv6 loopback
+	// (::1/128), link-local (IPv4 169.254.0.0/16 and IPv6 fe80::/10), RFC 1918 private IPv4 space,
+	// RFC 6598 carrier-grade NAT (100.64.0.0/10), and RFC 4193 unique local IPv6 (fc00::/7). This
+	// makes the receiver firewall fail-closed by default so an operator who enables the
+	// tenant-facing Alertmanager config API must explicitly opt out of the protection (for
+	// example by setting -alertmanager.receivers-firewall-block-cidr-networks="" and
+	// -alertmanager.receivers-firewall-block-private-addresses=false in their config).
+	if l.AlertmanagerReceiversBlockCIDRNetworks == nil {
+		_ = l.AlertmanagerReceiversBlockCIDRNetworks.Set("127.0.0.0/8,::1/128,169.254.0.0/16,fe80::/10,10.0.0.0/8,172.16.0.0/12,192.168.0.0/16,100.64.0.0/10,fc00::/7")
+	}
+	f.Var(&l.AlertmanagerReceiversBlockCIDRNetworks, "alertmanager.receivers-firewall-block-cidr-networks", "Comma-separated list of network CIDRs to block in Alertmanager receiver integrations. Defaults to loopback, link-local, RFC 1918, RFC 6598 and RFC 4193 ranges so that tenant-supplied webhook URLs cannot reach the cluster's own internal services; set to an empty string to disable.")
+	f.BoolVar(&l.AlertmanagerReceiversBlockPrivateAddresses, "alertmanager.receivers-firewall-block-private-addresses", true, "True to block private and local addresses in Alertmanager receiver integrations. It blocks private addresses defined by  RFC 1918 (IPv4 addresses) and RFC 4193 (IPv6 addresses), as well as loopback, local unicast and local multicast addresses. Enabled by default so that the receiver firewall fails closed; set to false to allow tenants to send notifications to private networks.")
 
-	f.Float64Var(&l.NotificationRateLimit, "alertmanager.notification-rate-limit", 0, "Per-user rate limit for sending notifications from Alertmanager in notifications/sec. 0 = rate limit disabled. Negative value = no notifications are allowed.")
+	// Per-user rate limit on outgoing notifications. Defaults to a small positive value so a
+	// single tenant cannot drive unbounded outbound traffic from the Alertmanager pod; set
+	// explicitly to a higher value (or raise it via per-tenant overrides) when more throughput
+	// is required. 0 disables the rate limit; negative values block all notifications.
+	f.Float64Var(&l.NotificationRateLimit, "alertmanager.notification-rate-limit", 10, "Per-user rate limit for sending notifications from Alertmanager in notifications/sec. 0 = rate limit disabled. Negative value = no notifications are allowed.")
 
 	if l.NotificationRateLimitPerIntegration == nil {
 		l.NotificationRateLimitPerIntegration = NotificationRateLimitMap{}
