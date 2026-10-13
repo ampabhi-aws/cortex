@@ -37,7 +37,9 @@ const (
 	missingMetricName       = "missing_metric_name"
 	invalidMetricName       = "metric_name_invalid"
 	greaterThanMaxSampleAge = "greater_than_max_sample_age"
-	maxLabelNamesPerSeries  = "max_label_names_per_series"
+	// MaxLabelNamesPerSeries is one of the reasons for discarding samples:
+	// the series has more labels than the per-tenant limit allows.
+	MaxLabelNamesPerSeries  = "max_label_names_per_series"
 	tooFarInFuture          = "too_far_in_future"
 	invalidLabel            = "label_invalid"
 	labelNameTooLong        = "label_name_too_long"
@@ -190,8 +192,8 @@ func ValidateLabels(cfg LabelValidationConfig, userID string, ls []cortexpb.Labe
 
 	numLabelNames := len(ls)
 	if numLabelNames > cfg.MaxLabelNamesPerSeries(userID) {
-		DiscardedSamples.WithLabelValues(maxLabelNamesPerSeries, userID).Inc()
-		return newTooManyLabelsError(ls, cfg.MaxLabelNamesPerSeries(userID))
+		DiscardedSamples.WithLabelValues(MaxLabelNamesPerSeries, userID).Inc()
+		return NewTooManyLabelsError(ls, cfg.MaxLabelNamesPerSeries(userID))
 	}
 
 	maxLabelNameLength := cfg.MaxLabelNameLength(userID)

@@ -640,6 +640,21 @@ func (d *Distributor) Push(ctx context.Context, req *cortexpb.WriteRequest) (*co
 			latestSampleTimestampMs = util_math.Max64(latestSampleTimestampMs, ts.Samples[len(ts.Samples)-1].TimestampMs)
 		}
 
+		// Enforce the per-series label-count limit before any per-label processing
+		// (relabel/removeLabel/sort/hash). This bounds CPU/memory used on
+		// attacker-controlled label slices that would otherwise be sorted and
+		// hashed before validation. The same check is also performed later in
+		// validation.ValidateLabels; applying it here avoids superlinear work
+		// (notably sort.Slice in sortLabelsIfNeeded) over a huge label slice.
+		if maxLabelNames := d.limits.MaxLabelNamesPerSeries(userID); len(ts.Labels) > maxLabelNames {
+			d.labelsHistogram.Observe(float64(len(ts.Labels)))
+			validation.DiscardedSamples.WithLabelValues(validation.MaxLabelNamesPerSeries, userID).Add(float64(len(ts.Samples)))
+			if firstPartialErr == nil {
+				firstPartialErr = httpgrpc.Errorf(http.StatusBadRequest, validation.NewTooManyLabelsError(ts.Labels, maxLabelNames).Error())
+			}
+			continue
+		}
+
 		if mrc := d.limits.MetricRelabelConfigs(userID); len(mrc) > 0 {
 			l := relabel.Process(cortexpb.FromLabelAdaptersToLabels(ts.Labels), mrc...)
 			if len(l) == 0 {

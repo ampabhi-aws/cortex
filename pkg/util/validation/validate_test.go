@@ -114,7 +114,7 @@ func TestValidateLabels(t *testing.T) {
 		{
 			map[model.LabelName]model.LabelValue{model.MetricNameLabel: "foo", "bar": "baz", "blip": "blop"},
 			false,
-			newTooManyLabelsError([]cortexpb.LabelAdapter{
+			NewTooManyLabelsError([]cortexpb.LabelAdapter{
 				{Name: model.MetricNameLabel, Value: "foo"},
 				{Name: "bar", Value: "baz"},
 				{Name: "blip", Value: "blop"},

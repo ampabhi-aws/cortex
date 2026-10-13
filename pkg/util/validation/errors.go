@@ -120,7 +120,7 @@ type tooManyLabelsError struct {
 	limit  int
 }
 
-func newTooManyLabelsError(series []cortexpb.LabelAdapter, limit int) ValidationError {
+func NewTooManyLabelsError(series []cortexpb.LabelAdapter, limit int) ValidationError {
 	return &tooManyLabelsError{
 		series: series,
 		limit:  limit,
