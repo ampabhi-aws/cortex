@@ -9,6 +9,7 @@ import (
 	"github.com/go-kit/log"
 	"github.com/go-kit/log/level"
 	"github.com/weaveworks/common/httpgrpc"
+	"github.com/weaveworks/common/user"
 	"google.golang.org/grpc"
 
 	"github.com/cortexproject/cortex/pkg/frontend/v1/frontendv1pb"
@@ -46,6 +47,11 @@ type frontendProcessor struct {
 func (fp *frontendProcessor) notifyShutdown(ctx context.Context, conn *grpc.ClientConn, address string) {
 	client := frontendv1pb.NewFrontendClient(conn)
 
+	// Attach the querier's component identity so that the frontend's auth
+	// interceptor accepts the call and binds the shutdown notification to
+	// this querier.
+	ctx = user.InjectOrgID(ctx, fp.querierID)
+
 	req := &frontendv1pb.NotifyClientShutdownRequest{ClientID: fp.querierID}
 	if _, err := client.NotifyClientShutdown(ctx, req); err != nil {
 		// Since we're shutting down there's nothing we can do except logging it.
@@ -56,6 +62,12 @@ func (fp *frontendProcessor) notifyShutdown(ctx context.Context, conn *grpc.Clie
 // runOne loops, trying to establish a stream to the frontend to begin request processing.
 func (fp *frontendProcessor) processQueriesOnSingleStream(ctx context.Context, conn *grpc.ClientConn, address string) {
 	client := frontendv1pb.NewFrontendClient(conn)
+
+	// Attach the querier's component identity for the entire Process stream
+	// so that the frontend's auth interceptor accepts it and derives the
+	// querier identity from this value (bound to the transport-level peer
+	// when mTLS is configured).
+	ctx = user.InjectOrgID(ctx, fp.querierID)
 
 	backoff := backoff.New(ctx, processorBackoffConfig)
 	for backoff.Ongoing() {

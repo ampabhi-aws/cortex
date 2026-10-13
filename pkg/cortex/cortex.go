@@ -339,14 +339,20 @@ func New(cfg Config) (*Cortex, error) {
 	// sending it and this could cause transfers to fail on update.
 	cfg.API.HTTPAuthMiddleware = fakeauth.SetupAuthMiddleware(&cfg.Server, cfg.AuthEnabled,
 		// Also don't check auth for these gRPC methods, since single call is used for multiple users (or no user like health check).
+		//
+		// The querier<->frontend and querier<->scheduler streams are intentionally
+		// NOT in this list: they must present an authenticated component identity
+		// (via X-Scope-OrgID metadata, typically bound to transport-level mTLS
+		// client authentication) so that any party reaching the internal gRPC
+		// listener cannot anonymously register itself as a querier and thereby
+		// receive other tenants' queries or forge their query results. Operators
+		// should additionally configure -server.grpc-tls-client-auth and the
+		// matching -querier.frontend-client.tls-* / -querier.scheduler-client.tls-*
+		// client certificates to bind that identity to the TLS peer.
 		[]string{
 			"/grpc.health.v1.Health/Check",
 			"/cortex.Ingester/TransferChunks",
-			"/frontend.Frontend/Process",
-			"/frontend.Frontend/NotifyClientShutdown",
 			"/schedulerpb.SchedulerForFrontend/FrontendLoop",
-			"/schedulerpb.SchedulerForQuerier/QuerierLoop",
-			"/schedulerpb.SchedulerForQuerier/NotifyQuerierShutdown",
 		})
 
 	cortex := &Cortex{

@@ -12,6 +12,7 @@ import (
 	"github.com/pkg/errors"
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/weaveworks/common/httpgrpc"
+	"github.com/weaveworks/common/middleware"
 	"google.golang.org/grpc"
 
 	"github.com/cortexproject/cortex/pkg/util"
@@ -258,8 +259,17 @@ func (w *querierWorker) resetConcurrency() {
 }
 
 func (w *querierWorker) connect(ctx context.Context, address string) (*grpc.ClientConn, error) {
-	// Because we only use single long-running method, it doesn't make sense to inject user ID, send over tracing or add metrics.
-	opts, err := w.cfg.GRPCClientConfig.DialOption(nil, nil)
+	// The querier<->frontend and querier<->scheduler streams require an
+	// authenticated component identity on the server side (see
+	// pkg/cortex/cortex.go). Attach the user-header interceptors so that the
+	// querier identity injected into the outgoing context is forwarded to the
+	// server as X-Scope-OrgID metadata; the server derives the querier
+	// identity from this value (bound to the transport-level peer when mTLS
+	// is configured).
+	opts, err := w.cfg.GRPCClientConfig.DialOption(
+		[]grpc.UnaryClientInterceptor{middleware.ClientUserHeaderInterceptor},
+		[]grpc.StreamClientInterceptor{middleware.StreamClientUserHeaderInterceptor},
+	)
 	if err != nil {
 		return nil, err
 	}
