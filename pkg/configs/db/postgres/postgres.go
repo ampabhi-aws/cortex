@@ -172,11 +172,36 @@ func (d DB) SetConfig(ctx context.Context, userID string, cfg userconfig.Config)
 		return err
 	}
 
-	_, err = d.Insert("configs").
-		Columns("owner_id", "owner_type", "subsystem", "config").
-		Values(userID, entityType, subsystem, cfgBytes).
-		Exec()
-	return err
+	return d.Transaction(func(tx DB) error {
+		var newID int64
+		err := tx.Insert("configs").
+			Columns("owner_id", "owner_type", "subsystem", "config").
+			Values(userID, entityType, subsystem, cfgBytes).
+			Suffix("RETURNING id").
+			Scan(&newID)
+		if err != nil {
+			return err
+		}
+		// Prune superseded rows for this owner so one tenant cannot grow
+		// the configs table unboundedly by repeatedly POSTing new configs.
+		// Only rows with id < newID are removed; readers always use
+		// DISTINCT ON (owner_id) + ORDER BY id DESC, so retaining only the
+		// latest row per owner preserves current and polling semantics
+		// (GetConfigs/GetRulesConfigs filter by id > since and the latest
+		// row still has the highest id).
+		if newID > 0 {
+			_, err = tx.Delete("configs").
+				Where(squirrel.And{
+					squirrel.Eq{"owner_id": userID, "owner_type": entityType, "subsystem": subsystem},
+					squirrel.Lt{"id": newID},
+				}).
+				Exec()
+			if err != nil {
+				return err
+			}
+		}
+		return nil
+	})
 }
 
 // GetAllConfigs gets all of the userconfig.
@@ -303,17 +328,36 @@ func (d DB) GetRulesConfigs(ctx context.Context, since userconfig.ID) (map[strin
 
 // SetDeletedAtConfig sets a deletedAt for configuration
 // by adding a single new row with deleted_at set
-// the same as SetConfig is actually insert
+// the same as SetConfig is actually insert. Older superseded rows for the
+// same owner are pruned to keep the table bounded (see SetConfig).
 func (d DB) SetDeletedAtConfig(ctx context.Context, userID string, deletedAt pq.NullTime, cfg userconfig.Config) error {
 	cfgBytes, err := json.Marshal(cfg)
 	if err != nil {
 		return err
 	}
-	_, err = d.Insert("configs").
-		Columns("owner_id", "owner_type", "subsystem", "deleted_at", "config").
-		Values(userID, entityType, subsystem, deletedAt, cfgBytes).
-		Exec()
-	return err
+	return d.Transaction(func(tx DB) error {
+		var newID int64
+		err := tx.Insert("configs").
+			Columns("owner_id", "owner_type", "subsystem", "deleted_at", "config").
+			Values(userID, entityType, subsystem, deletedAt, cfgBytes).
+			Suffix("RETURNING id").
+			Scan(&newID)
+		if err != nil {
+			return err
+		}
+		if newID > 0 {
+			_, err = tx.Delete("configs").
+				Where(squirrel.And{
+					squirrel.Eq{"owner_id": userID, "owner_type": entityType, "subsystem": subsystem},
+					squirrel.Lt{"id": newID},
+				}).
+				Exec()
+			if err != nil {
+				return err
+			}
+		}
+		return nil
+	})
 }
 
 // DeactivateConfig deactivates a configuration.

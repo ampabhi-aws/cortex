@@ -32,6 +32,37 @@ var (
 	ErrWebhookNotificationsAreDisabled = errors.New("webhook notifications are disabled")
 )
 
+const (
+	errConfigurationTooBig = "configuration is too big, limit: %d bytes"
+	errTooManyTemplates    = "too many templates in the configuration: %d (limit: %d)"
+	errTemplateTooBig      = "template %s is too big: %d bytes (limit: %d bytes)"
+	errTooManyRuleGroups   = "too many rule groups in the configuration: %d (limit: %d)"
+	errTooManyRulesInGroup = "rule file %s contains too many rules: %d (limit: %d)"
+)
+
+// Limits exposes the per-tenant resource limits that setConfig enforces.
+// It is a strict subset of the global validation.Overrides so we don't take
+// a dependency on the full validation package from this leaf package.
+// A nil Limits means "no limits are enforced" (0 == unlimited) which matches
+// the behavior that existed before these limits were added.
+type Limits interface {
+	// AlertmanagerMaxConfigSize returns the maximum size (in bytes) of a full
+	// uploaded config body. 0 disables the limit.
+	AlertmanagerMaxConfigSize(userID string) int
+	// AlertmanagerMaxTemplatesCount returns the maximum number of template
+	// files that a tenant can store. 0 disables the limit.
+	AlertmanagerMaxTemplatesCount(userID string) int
+	// AlertmanagerMaxTemplateSize returns the maximum size (in bytes) of a
+	// single template file. 0 disables the limit.
+	AlertmanagerMaxTemplateSize(userID string) int
+	// RulerMaxRuleGroupsPerTenant returns the maximum number of rule groups
+	// (rule files, in legacy terms) a tenant may upload. 0 disables the limit.
+	RulerMaxRuleGroupsPerTenant(userID string) int
+	// RulerMaxRulesPerRuleGroup returns the maximum number of rules allowed
+	// in a single group/file. 0 disables the limit.
+	RulerMaxRulesPerRuleGroup(userID string) int
+}
+
 // Config configures Configs API
 type Config struct {
 	Notifications NotificationsConfig `yaml:"notifications"`
@@ -52,15 +83,25 @@ func (cfg *Config) RegisterFlags(f *flag.FlagSet) {
 // API implements the configs api.
 type API struct {
 	http.Handler
-	db  db.DB
-	cfg Config
+	db     db.DB
+	cfg    Config
+	limits Limits
 }
 
-// New creates a new API
+// New creates a new API. A nil Limits disables the per-tenant throttling
+// controls, preserving the pre-existing behavior; prefer NewWithLimits in
+// production so that unbounded uploads cannot exhaust shared ruler and
+// alertmanager replicas.
 func New(database db.DB, cfg Config) *API {
+	return NewWithLimits(database, cfg, nil)
+}
+
+// NewWithLimits creates a new API bound to the given per-tenant Limits.
+func NewWithLimits(database db.DB, cfg Config, limits Limits) *API {
 	a := &API{
-		db:  database,
-		cfg: cfg,
+		db:     database,
+		cfg:    cfg,
+		limits: limits,
 	}
 	r := mux.NewRouter()
 	a.RegisterRoutes(r)
@@ -154,12 +195,27 @@ func (a *API) setConfig(w http.ResponseWriter, r *http.Request) {
 	}
 	logger := util_log.WithContext(r.Context(), util_log.Logger)
 
+	// Bound the request body before decoding so a single tenant cannot
+	// exhaust memory on the shared configs/ruler/alertmanager replicas by
+	// POSTing a huge body. We reuse the Alertmanager per-tenant config size
+	// limit, since this endpoint uploads the same alertmanager/template/rule
+	// payloads. 0 (the default) preserves the previous unlimited behavior
+	// unless an operator opts in.
+	maxConfigSize := a.alertmanagerMaxConfigSize(userID)
+	if maxConfigSize > 0 {
+		r.Body = http.MaxBytesReader(w, r.Body, int64(maxConfigSize))
+	}
+
 	var cfg userconfig.Config
 	switch parseConfigFormat(r.Header.Get("Content-Type"), FormatJSON) {
 	case FormatJSON:
 		if err := json.NewDecoder(r.Body).Decode(&cfg); err != nil {
 			// XXX: Untested
 			level.Error(logger).Log("msg", "error decoding json body", "err", err)
+			if isRequestBodyTooLarge(err) {
+				http.Error(w, fmt.Sprintf(errConfigurationTooBig, maxConfigSize), http.StatusRequestEntityTooLarge)
+				return
+			}
 			http.Error(w, err.Error(), http.StatusBadRequest)
 			return
 		}
@@ -167,6 +223,10 @@ func (a *API) setConfig(w http.ResponseWriter, r *http.Request) {
 		if err := yaml.NewDecoder(r.Body).Decode(&cfg); err != nil {
 			// XXX: Untested
 			level.Error(logger).Log("msg", "error decoding yaml body", "err", err)
+			if isRequestBodyTooLarge(err) {
+				http.Error(w, fmt.Sprintf(errConfigurationTooBig, maxConfigSize), http.StatusRequestEntityTooLarge)
+				return
+			}
 			http.Error(w, err.Error(), http.StatusBadRequest)
 			return
 		}
@@ -192,6 +252,16 @@ func (a *API) setConfig(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, fmt.Sprintf("Invalid templates: %v", err), http.StatusBadRequest)
 		return
 	}
+	if err := a.validateTemplateLimits(cfg, userID); err != nil {
+		level.Warn(logger).Log("msg", "template limits exceeded", "err", err)
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
+	if err := a.validateRuleLimits(cfg, userID); err != nil {
+		level.Warn(logger).Log("msg", "rule limits exceeded", "err", err)
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
 	if err := a.db.SetConfig(r.Context(), userID, cfg); err != nil {
 		// XXX: Untested
 		level.Error(logger).Log("msg", "error storing config", "err", err)
@@ -203,9 +273,23 @@ func (a *API) setConfig(w http.ResponseWriter, r *http.Request) {
 
 func (a *API) validateAlertmanagerConfig(w http.ResponseWriter, r *http.Request) {
 	logger := util_log.WithContext(r.Context(), util_log.Logger)
+
+	// Bound the body on the standalone validate endpoint too. We don't
+	// require a tenant header here (callers may be probing config syntax),
+	// so we fall back to the "" tenant limit which still gives operators a
+	// single knob to configure.
+	userID, _, _ := tenant.ExtractTenantIDFromHTTPRequest(r)
+	if max := a.alertmanagerMaxConfigSize(userID); max > 0 {
+		r.Body = http.MaxBytesReader(w, r.Body, int64(max))
+	}
+
 	cfg, err := io.ReadAll(r.Body)
 	if err != nil {
 		level.Error(logger).Log("msg", "error reading request body", "err", err)
+		if isRequestBodyTooLarge(err) {
+			http.Error(w, err.Error(), http.StatusRequestEntityTooLarge)
+			return
+		}
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
 	}
@@ -255,6 +339,73 @@ func validateTemplateFiles(c userconfig.Config) error {
 	}
 
 	return nil
+}
+
+// alertmanagerMaxConfigSize returns the configured per-tenant max body size
+// in bytes, or 0 if no limits are wired in (preserving legacy behavior).
+func (a *API) alertmanagerMaxConfigSize(userID string) int {
+	if a.limits == nil {
+		return 0
+	}
+	return a.limits.AlertmanagerMaxConfigSize(userID)
+}
+
+// validateTemplateLimits enforces the per-tenant template count and per-file
+// size caps used by the modern Alertmanager API, so the legacy configs write
+// path cannot be used to bypass them.
+func (a *API) validateTemplateLimits(cfg userconfig.Config, userID string) error {
+	if a.limits == nil {
+		return nil
+	}
+	if maxCount := a.limits.AlertmanagerMaxTemplatesCount(userID); maxCount > 0 && len(cfg.TemplateFiles) > maxCount {
+		return fmt.Errorf(errTooManyTemplates, len(cfg.TemplateFiles), maxCount)
+	}
+	if maxSize := a.limits.AlertmanagerMaxTemplateSize(userID); maxSize > 0 {
+		for fn, content := range cfg.TemplateFiles {
+			if size := len(content); size > maxSize {
+				return fmt.Errorf(errTemplateTooBig, fn, size, maxSize)
+			}
+		}
+	}
+	return nil
+}
+
+// validateRuleLimits enforces the per-tenant ruler group and per-group rule
+// caps on the legacy configs write path. In the legacy configs model each
+// "rules file" maps 1:1 to a rule group once parsed, so we treat the file
+// count as the group count.
+func (a *API) validateRuleLimits(cfg userconfig.Config, userID string) error {
+	if a.limits == nil {
+		return nil
+	}
+	if maxGroups := a.limits.RulerMaxRuleGroupsPerTenant(userID); maxGroups > 0 && len(cfg.RulesConfig.Files) > maxGroups {
+		return fmt.Errorf(errTooManyRuleGroups, len(cfg.RulesConfig.Files), maxGroups)
+	}
+	if maxRules := a.limits.RulerMaxRulesPerRuleGroup(userID); maxRules > 0 {
+		parsed, err := cfg.RulesConfig.ParseFormatted()
+		if err != nil {
+			// If the rules fail to parse here we would already have been
+			// rejected by validateRulesFiles earlier; fall through quietly.
+			return nil
+		}
+		for fn, rg := range parsed {
+			for _, g := range rg.Groups {
+				if n := len(g.Rules); n > maxRules {
+					return fmt.Errorf(errTooManyRulesInGroup, fn, n, maxRules)
+				}
+			}
+		}
+	}
+	return nil
+}
+
+// isRequestBodyTooLarge reports whether err was produced by
+// http.MaxBytesReader rejecting an oversized body.
+func isRequestBodyTooLarge(err error) bool {
+	if err == nil {
+		return false
+	}
+	return strings.Contains(err.Error(), "http: request body too large")
 }
 
 // ConfigsView renders multiple configurations, mapping userID to userconfig.View.
