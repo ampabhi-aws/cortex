@@ -3,6 +3,7 @@ package tenantfederation
 import (
 	"context"
 	"fmt"
+	"net/http"
 	"sort"
 	"strings"
 
@@ -11,6 +12,7 @@ import (
 	"github.com/prometheus/prometheus/storage"
 	"github.com/prometheus/prometheus/tsdb/chunkenc"
 	tsdb_errors "github.com/prometheus/prometheus/tsdb/errors"
+	"github.com/weaveworks/common/httpgrpc"
 	"github.com/weaveworks/common/user"
 
 	"github.com/cortexproject/cortex/pkg/tenant"
@@ -37,14 +39,28 @@ const (
 // by the tenant ID and the previous value is exposed through a new label
 // prefixed with "original_". This behaviour is not implemented recursively.
 func NewQueryable(upstream storage.Queryable, byPassWithSingleQuerier bool) storage.Queryable {
-	return NewMergeQueryable(defaultTenantLabel, tenantQuerierCallback(upstream), byPassWithSingleQuerier)
+	return NewQueryableWithMaxTenants(upstream, byPassWithSingleQuerier, 0)
 }
 
-func tenantQuerierCallback(queryable storage.Queryable) MergeQuerierCallback {
+// NewQueryableWithMaxTenants behaves like NewQueryable but enforces a cap on
+// the number of tenant IDs that may appear in a single federated request.
+// When maxTenants is <= 0 no limit is enforced. When the limit is exceeded
+// the request is rejected with an HTTP 400 error before any per-tenant
+// Querier is constructed, preventing unbounded fan-out driven by the
+// X-Scope-OrgID header.
+func NewQueryableWithMaxTenants(upstream storage.Queryable, byPassWithSingleQuerier bool, maxTenants int) storage.Queryable {
+	return NewMergeQueryable(defaultTenantLabel, tenantQuerierCallback(upstream, maxTenants), byPassWithSingleQuerier)
+}
+
+func tenantQuerierCallback(queryable storage.Queryable, maxTenants int) MergeQuerierCallback {
 	return func(ctx context.Context, mint int64, maxt int64) ([]string, []storage.Querier, error) {
 		tenantIDs, err := tenant.TenantIDs(ctx)
 		if err != nil {
 			return nil, nil, err
+		}
+
+		if maxTenants > 0 && len(tenantIDs) > maxTenants {
+			return nil, nil, httpgrpc.Errorf(http.StatusBadRequest, "too many tenant IDs in request: got %d, maximum allowed is %d; configure -tenant-federation.max-tenants to change this limit", len(tenantIDs), maxTenants)
 		}
 
 		var queriers = make([]storage.Querier, len(tenantIDs))
@@ -63,6 +79,7 @@ func tenantQuerierCallback(queryable storage.Queryable) MergeQuerierCallback {
 		return tenantIDs, queriers, nil
 	}
 }
+
 
 // MergeQuerierCallback returns the underlying queriers and their IDs relevant
 // for the query.
