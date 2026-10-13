@@ -1,6 +1,7 @@
 package api
 
 import (
+	"crypto/subtle"
 	"database/sql"
 	"encoding/json"
 	"errors"
@@ -35,6 +36,17 @@ var (
 // Config configures Configs API
 type Config struct {
 	Notifications NotificationsConfig `yaml:"notifications"`
+
+	// InternalAuthToken, when non-empty, requires requests to the internal
+	// (undocumented) /private/api/prom/configs/* endpoints to present a
+	// matching bearer token via the Authorization header. These endpoints
+	// return every tenant's rules and Alertmanager configuration (including
+	// embedded receiver secrets) and are intended to be reached only by the
+	// in-cluster ruler / alertmanager configdb clients. The listener itself
+	// has no authentication; operators are still responsible for keeping
+	// `/private/*` off any tenant-facing ingress, but this token provides a
+	// defense-in-depth check that can be enforced in-process.
+	InternalAuthToken string `yaml:"internal_auth_token"`
 }
 
 // NotificationsConfig configures Alertmanager notifications method.
@@ -47,6 +59,7 @@ type NotificationsConfig struct {
 func (cfg *Config) RegisterFlags(f *flag.FlagSet) {
 	f.BoolVar(&cfg.Notifications.DisableEmail, "configs.notifications.disable-email", false, "Disable Email notifications for Alertmanager.")
 	f.BoolVar(&cfg.Notifications.DisableWebHook, "configs.notifications.disable-webhook", false, "Disable WebHook notifications for Alertmanager.")
+	f.StringVar(&cfg.InternalAuthToken, "configs.internal-auth-token", "", "Shared bearer token required to access the internal /private/api/prom/configs/* endpoints. When empty (default) no in-process check is enforced and the operator must restrict these paths at the gateway; when set, requests to the private endpoints must send `Authorization: Bearer <token>`.")
 }
 
 // API implements the configs api.
@@ -99,11 +112,38 @@ func (a *API) RegisterRoutes(r *mux.Router) {
 		{"validate_alertmanager_config", "POST", "/api/prom/configs/alertmanager/validate", a.validateAlertmanagerConfig},
 		{"deactivate_config", "DELETE", "/api/prom/configs/deactivate", a.deactivateConfig},
 		{"restore_config", "POST", "/api/prom/configs/restore", a.restoreConfig},
-		// Internal APIs.
-		{"private_get_rules", "GET", "/private/api/prom/configs/rules", a.getConfigs},
-		{"private_get_alertmanager_config", "GET", "/private/api/prom/configs/alertmanager", a.getConfigs},
+		// Internal APIs. These return every tenant's configuration and must
+		// never be exposed on a tenant-facing listener. When
+		// Config.InternalAuthToken is set, requests must present a matching
+		// bearer token in the Authorization header; otherwise they are
+		// rejected with 401. When the token is empty the endpoints remain
+		// callable (preserving backward compatibility with existing ruler /
+		// alertmanager configdb clients) and the operator is responsible for
+		// blocking `/private/*` at the ingress / reverse proxy.
+		{"private_get_rules", "GET", "/private/api/prom/configs/rules", a.requireInternalAuth(a.getConfigs)},
+		{"private_get_alertmanager_config", "GET", "/private/api/prom/configs/alertmanager", a.requireInternalAuth(a.getConfigs)},
 	} {
 		r.Handle(route.path, route.handler).Methods(route.method).Name(route.name)
+	}
+}
+
+// requireInternalAuth wraps handlers for the internal /private/* endpoints so
+// that, when Config.InternalAuthToken is non-empty, the caller must present a
+// matching `Authorization: Bearer <token>` header. Comparison is
+// constant-time. When the token is empty the wrapper is a no-op, preserving
+// behavior for operators that gateway-restrict these paths externally.
+func (a *API) requireInternalAuth(next http.HandlerFunc) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		expected := a.cfg.InternalAuthToken
+		if expected != "" {
+			const prefix = "Bearer "
+			got := r.Header.Get("Authorization")
+			if !strings.HasPrefix(got, prefix) || subtle.ConstantTimeCompare([]byte(got[len(prefix):]), []byte(expected)) != 1 {
+				http.Error(w, "unauthorized", http.StatusUnauthorized)
+				return
+			}
+		}
+		next(w, r)
 	}
 }
 
