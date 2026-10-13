@@ -9,6 +9,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/cortexproject/cortex/pkg/tenant"
 	"github.com/cortexproject/cortex/pkg/util"
 )
 
@@ -67,13 +68,34 @@ func (s userStatsByTimeseries) Less(i, j int) bool {
 		(s[i].NumSeries == s[j].NumSeries && s[i].UserID < s[j].UserID)
 }
 
-// AllUserStatsHandler shows stats for all users.
+// AllUserStatsHandler shows stats for the authenticated tenant.
+//
+// The handler historically returned the full per-tenant usage roster across
+// the cluster. That cross-tenant disclosure has been scoped to the caller's
+// own tenant by requiring the tenant header (enforced by the API router at
+// `auth=true`) and filtering the aggregated results on the way out.
 func (d *Distributor) AllUserStatsHandler(w http.ResponseWriter, r *http.Request) {
+	userID, err := tenant.TenantID(r.Context())
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusUnauthorized)
+		return
+	}
+
 	stats, err := d.AllUserStats(r.Context())
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
 	}
+
+	// Scope the response to the caller's tenant to avoid cross-tenant
+	// disclosure of tenant identifiers, series counts and ingestion rates.
+	filtered := stats[:0]
+	for _, s := range stats {
+		if s.UserID == userID {
+			filtered = append(filtered, s)
+		}
+	}
+	stats = filtered
 
 	sort.Sort(userStatsByTimeseries(stats))
 
