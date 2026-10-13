@@ -86,10 +86,11 @@ var (
 
 // Config is the root config for Cortex.
 type Config struct {
-	Target      flagext.StringSliceCSV `yaml:"target"`
-	AuthEnabled bool                   `yaml:"auth_enabled"`
-	PrintConfig bool                   `yaml:"-"`
-	HTTPPrefix  string                 `yaml:"http_prefix"`
+	Target           flagext.StringSliceCSV `yaml:"target"`
+	AuthEnabled      bool                   `yaml:"auth_enabled"`
+	AuthClusterToken string                 `yaml:"auth_cluster_token"`
+	PrintConfig      bool                   `yaml:"-"`
+	HTTPPrefix       string                 `yaml:"http_prefix"`
 
 	ExternalQueryable prom_storage.Queryable `yaml:"-"`
 	ExternalPusher    ruler.Pusher           `yaml:"-"`
@@ -137,6 +138,7 @@ func (c *Config) RegisterFlags(f *flag.FlagSet) {
 		"Use '-modules' command line flag to get a list of available modules, and to see which modules are included in 'all'.")
 
 	f.BoolVar(&c.AuthEnabled, "auth.enabled", true, "Set to false to disable auth.")
+	f.StringVar(&c.AuthClusterToken, "auth.cluster-token", "", "Shared bearer token required on cluster-internal gRPC loop methods (scheduler/frontend/querier) that are exempt from the per-request X-Scope-OrgID interceptor because a single stream multiplexes many tenants. When set, the server rejects RPCs on those methods that do not present a matching token in the \"x-cortex-cluster-authorization\" gRPC metadata header, and legitimate internal clients (frontend worker, frontend-v2) attach the token when dialing. When empty (default), no token is required and operators are expected to protect the gRPC listener externally (e.g. mTLS, network ACLs).")
 	f.BoolVar(&c.PrintConfig, "print.config", false, "Print the config and exit.")
 	f.StringVar(&c.HTTPPrefix, "http.prefix", "/api/prom", "HTTP path prefix for Cortex API.")
 
@@ -337,8 +339,13 @@ func New(cfg Config) (*Cortex, error) {
 
 	// Don't check auth header on TransferChunks, as we weren't originally
 	// sending it and this could cause transfers to fail on update.
+	// These gRPC methods multiplex many tenants on a single stream (or have no
+	// user at all, e.g. health check), so the per-request X-Scope-OrgID
+	// interceptor cannot be applied. When cfg.AuthClusterToken is non-empty,
+	// SetupAuthMiddleware enforces a shared cluster bearer token on these
+	// methods instead; otherwise the exemption is unconditional and the
+	// operator must protect this listener externally (mTLS / network ACLs).
 	cfg.API.HTTPAuthMiddleware = fakeauth.SetupAuthMiddleware(&cfg.Server, cfg.AuthEnabled,
-		// Also don't check auth for these gRPC methods, since single call is used for multiple users (or no user like health check).
 		[]string{
 			"/grpc.health.v1.Health/Check",
 			"/cortex.Ingester/TransferChunks",
@@ -347,7 +354,18 @@ func New(cfg Config) (*Cortex, error) {
 			"/schedulerpb.SchedulerForFrontend/FrontendLoop",
 			"/schedulerpb.SchedulerForQuerier/QuerierLoop",
 			"/schedulerpb.SchedulerForQuerier/NotifyQuerierShutdown",
-		})
+		},
+		cfg.AuthClusterToken,
+	)
+
+	// Propagate the cluster-internal token to legitimate loop-client components
+	// so they can authenticate to the frontend/scheduler cluster-internal gRPC
+	// surface. These components dial the exempt methods, so without this they
+	// would be rejected once the server-side check is enabled.
+	if cfg.AuthClusterToken != "" {
+		cfg.Worker.ClusterAuthToken = cfg.AuthClusterToken
+		cfg.Frontend.FrontendV2.ClusterAuthToken = cfg.AuthClusterToken
+	}
 
 	cortex := &Cortex{
 		Cfg: cfg,

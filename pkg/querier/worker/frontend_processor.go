@@ -15,6 +15,7 @@ import (
 	"github.com/cortexproject/cortex/pkg/querier/stats"
 	querier_stats "github.com/cortexproject/cortex/pkg/querier/stats"
 	"github.com/cortexproject/cortex/pkg/util/backoff"
+	"github.com/cortexproject/cortex/pkg/util/fakeauth"
 )
 
 var (
@@ -26,18 +27,20 @@ var (
 
 func newFrontendProcessor(cfg Config, handler RequestHandler, log log.Logger) processor {
 	return &frontendProcessor{
-		log:            log,
-		handler:        handler,
-		maxMessageSize: cfg.GRPCClientConfig.MaxSendMsgSize,
-		querierID:      cfg.QuerierID,
+		log:              log,
+		handler:          handler,
+		maxMessageSize:   cfg.GRPCClientConfig.MaxSendMsgSize,
+		querierID:        cfg.QuerierID,
+		clusterAuthToken: cfg.ClusterAuthToken,
 	}
 }
 
 // Handles incoming queries from frontend.
 type frontendProcessor struct {
-	handler        RequestHandler
-	maxMessageSize int
-	querierID      string
+	handler          RequestHandler
+	maxMessageSize   int
+	querierID        string
+	clusterAuthToken string
 
 	log log.Logger
 }
@@ -46,6 +49,7 @@ type frontendProcessor struct {
 func (fp *frontendProcessor) notifyShutdown(ctx context.Context, conn *grpc.ClientConn, address string) {
 	client := frontendv1pb.NewFrontendClient(conn)
 
+	ctx = fakeauth.WithClusterAuthToken(ctx, fp.clusterAuthToken)
 	req := &frontendv1pb.NotifyClientShutdownRequest{ClientID: fp.querierID}
 	if _, err := client.NotifyClientShutdown(ctx, req); err != nil {
 		// Since we're shutting down there's nothing we can do except logging it.
@@ -56,6 +60,7 @@ func (fp *frontendProcessor) notifyShutdown(ctx context.Context, conn *grpc.Clie
 // runOne loops, trying to establish a stream to the frontend to begin request processing.
 func (fp *frontendProcessor) processQueriesOnSingleStream(ctx context.Context, conn *grpc.ClientConn, address string) {
 	client := frontendv1pb.NewFrontendClient(conn)
+	ctx = fakeauth.WithClusterAuthToken(ctx, fp.clusterAuthToken)
 
 	backoff := backoff.New(ctx, processorBackoffConfig)
 	for backoff.Ongoing() {

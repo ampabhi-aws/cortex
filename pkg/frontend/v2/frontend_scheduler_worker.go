@@ -16,6 +16,7 @@ import (
 	"github.com/cortexproject/cortex/pkg/scheduler/schedulerpb"
 	"github.com/cortexproject/cortex/pkg/util"
 	"github.com/cortexproject/cortex/pkg/util/backoff"
+	"github.com/cortexproject/cortex/pkg/util/fakeauth"
 	"github.com/cortexproject/cortex/pkg/util/services"
 )
 
@@ -92,7 +93,7 @@ func (f *frontendSchedulerWorkers) AddressAdded(address string) {
 	}
 
 	// No worker for this address yet, start a new one.
-	w = newFrontendSchedulerWorker(conn, address, f.frontendAddress, f.requestsCh, f.cfg.WorkerConcurrency, f.log)
+	w = newFrontendSchedulerWorker(conn, address, f.frontendAddress, f.requestsCh, f.cfg.WorkerConcurrency, f.cfg.ClusterAuthToken, f.log)
 
 	f.mu.Lock()
 	defer f.mu.Unlock()
@@ -145,10 +146,11 @@ func (f *frontendSchedulerWorkers) connectToScheduler(ctx context.Context, addre
 type frontendSchedulerWorker struct {
 	log log.Logger
 
-	conn          *grpc.ClientConn
-	concurrency   int
-	schedulerAddr string
-	frontendAddr  string
+	conn             *grpc.ClientConn
+	concurrency      int
+	schedulerAddr    string
+	frontendAddr     string
+	clusterAuthToken string
 
 	// Context and cancellation used by individual goroutines.
 	ctx    context.Context
@@ -163,15 +165,16 @@ type frontendSchedulerWorker struct {
 	cancelCh chan uint64
 }
 
-func newFrontendSchedulerWorker(conn *grpc.ClientConn, schedulerAddr string, frontendAddr string, requestCh <-chan *frontendRequest, concurrency int, log log.Logger) *frontendSchedulerWorker {
+func newFrontendSchedulerWorker(conn *grpc.ClientConn, schedulerAddr string, frontendAddr string, requestCh <-chan *frontendRequest, concurrency int, clusterAuthToken string, log log.Logger) *frontendSchedulerWorker {
 	w := &frontendSchedulerWorker{
-		log:           log,
-		conn:          conn,
-		concurrency:   concurrency,
-		schedulerAddr: schedulerAddr,
-		frontendAddr:  frontendAddr,
-		requestCh:     requestCh,
-		cancelCh:      make(chan uint64),
+		log:              log,
+		conn:             conn,
+		concurrency:      concurrency,
+		schedulerAddr:    schedulerAddr,
+		frontendAddr:     frontendAddr,
+		clusterAuthToken: clusterAuthToken,
+		requestCh:        requestCh,
+		cancelCh:         make(chan uint64),
 	}
 	w.ctx, w.cancel = context.WithCancel(context.Background())
 
@@ -202,6 +205,11 @@ func (w *frontendSchedulerWorker) runOne(ctx context.Context, client schedulerpb
 		MinBackoff: 50 * time.Millisecond,
 		MaxBackoff: 1 * time.Second,
 	}
+
+	// Attach the cluster-internal auth token (if configured) so the scheduler
+	// accepts the FrontendLoop stream even when the server-side cluster-token
+	// check is enabled.
+	ctx = fakeauth.WithClusterAuthToken(ctx, w.clusterAuthToken)
 
 	backoff := backoff.New(ctx, backoffConfig)
 	for backoff.Ongoing() {

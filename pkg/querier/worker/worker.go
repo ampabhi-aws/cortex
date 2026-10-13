@@ -30,6 +30,14 @@ type Config struct {
 
 	QuerierID string `yaml:"id"`
 
+	// ClusterAuthToken, if set, is attached as outgoing gRPC metadata on all
+	// control-plane RPCs to the query-frontend (v1) and query-scheduler loop
+	// methods. It is populated from the top-level `-auth.cluster-token`
+	// option and must match the token the server was configured with. Not
+	// registered as a flag here to avoid a duplicate knob; see
+	// pkg/cortex/cortex.go.
+	ClusterAuthToken string `yaml:"-"`
+
 	GRPCClientConfig grpcclient.Config `yaml:"grpc_client_config"`
 }
 
