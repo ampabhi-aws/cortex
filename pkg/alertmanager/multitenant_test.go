@@ -491,6 +491,11 @@ receivers:
 				var limits validation.Limits
 				flagext.DefaultValues(&limits)
 				limits.AlertmanagerReceiversBlockPrivateAddresses = firewallEnabled
+				if !firewallEnabled {
+					// Clear the firewall CIDR default (loopback / private ranges) so this test can
+					// reach the loopback-bound httptest server when firewall is disabled.
+					limits.AlertmanagerReceiversBlockCIDRNetworks = nil
+				}
 
 				overrides, err := validation.NewOverrides(limits, nil)
 				require.NoError(t, err)
