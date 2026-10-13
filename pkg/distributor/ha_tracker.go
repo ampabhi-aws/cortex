@@ -396,15 +396,20 @@ func (c *haTracker) checkReplica(ctx context.Context, userID, cluster, replica s
 	}
 
 	err := c.checkKVStore(ctx, key, replica, now)
-	c.kvCASCalls.WithLabelValues(userID, cluster).Inc()
 	if err != nil {
 		// The callback within checkKVStore will return a replicasNotMatchError if the sample is being deduped,
 		// otherwise there may have been an actual error CAS'ing that we should log.
 		if !errors.Is(err, replicasNotMatchError{}) {
 			level.Error(c.logger).Log("msg", "rejecting sample", "err", err)
 		}
+		return err
 	}
-	return err
+	// Only record a CAS metric child for clusters that actually produced a KV
+	// write. Doing this on the failure path would let a tenant permanently grow
+	// the metric cardinality (and the exposed /metrics output) by sending
+	// requests with arbitrary cluster label values that never win election.
+	c.kvCASCalls.WithLabelValues(userID, cluster).Inc()
+	return nil
 }
 
 func (c *haTracker) checkKVStore(ctx context.Context, key, replica string, now time.Time) error {
@@ -467,6 +472,24 @@ func (e tooManyClustersError) Is(err error) bool {
 	_, ok1 := err.(tooManyClustersError)
 	_, ok2 := err.(*tooManyClustersError)
 	return ok1 || ok2
+}
+
+// validHAClusterLabel returns true if the given cluster label value is safe to
+// use as (part of) a Consul/etcd KV key and as a Prometheus metric label value.
+// It rejects empty values, any value containing a path separator ('/') and any
+// value that is or contains '..' path segments, which could otherwise end up in
+// the KV store's HTTP key path.
+func validHAClusterLabel(cluster string) bool {
+	if cluster == "" {
+		return false
+	}
+	if strings.ContainsAny(cluster, "/\\") {
+		return false
+	}
+	if cluster == "." || cluster == ".." {
+		return false
+	}
+	return true
 }
 
 func findHALabels(replicaLabel, clusterLabel string, labels []cortexpb.LabelAdapter) (string, string) {
