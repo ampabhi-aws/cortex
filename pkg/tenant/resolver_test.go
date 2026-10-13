@@ -82,10 +82,10 @@ func TestSingleResolver(t *testing.T) {
 	r := NewSingleResolver()
 	for _, tc := range append(commonResolverTestCases, []resolverTestCase{
 		{
-			name:        "multi-tenant",
-			headerValue: strptr("tenant-a|tenant-b"),
-			tenantID:    "tenant-a|tenant-b",
-			tenantIDs:   []string{"tenant-a|tenant-b"},
+			name:         "multi-tenant",
+			headerValue:  strptr("tenant-a|tenant-b"),
+			errTenantID:  errInvalidTenantID,
+			errTenantIDs: errInvalidTenantID,
 		},
 		{
 			name:         "containing-forward-slash",
