@@ -141,6 +141,14 @@ func (kvs *KVInitService) ServeHTTP(w http.ResponseWriter, req *http.Request) {
 		}
 
 		if len(req.Form[deleteMessagesParam]) > 0 && req.Form[deleteMessagesParam][0] == "true" {
+			// Deleting the sent/received message history mutates server state,
+			// so it must not be reachable via GET (which would make it
+			// cross-site-request forgeable from any page an operator visits).
+			if req.Method != http.MethodPost {
+				w.Header().Set("Allow", http.MethodPost)
+				http.Error(w, "deleteMessages requires POST", http.StatusMethodNotAllowed)
+				return
+			}
 			kv.deleteSentReceivedMessages()
 
 			// Redirect back.
@@ -216,12 +224,17 @@ func viewMessage(w http.ResponseWriter, kv *KV, msg message, format string) {
 }
 
 func viewKey(w http.ResponseWriter, store map[string]valueDesc, key string, format string) {
-	if store[key].value == nil {
+	// Only serve keys that the component actually owns, i.e. that are
+	// present in the local in-memory store. The map lookup is checked
+	// explicitly so that an unknown key cannot fall through to any later
+	// handling.
+	v, ok := store[key]
+	if !ok || v.value == nil {
 		http.Error(w, "value not found", http.StatusNotFound)
 		return
 	}
 
-	formatValue(w, store[key].value, format)
+	formatValue(w, v.value, format)
 }
 
 func formatValue(w http.ResponseWriter, val interface{}, format string) {
@@ -247,14 +260,15 @@ func formatValue(w http.ResponseWriter, val interface{}, format string) {
 }
 
 func downloadKey(w http.ResponseWriter, kv *KV, store map[string]valueDesc, key string) {
-	if store[key].value == nil {
+	// Only serve keys that the component actually owns, i.e. that are
+	// present in the local in-memory store.
+	val, ok := store[key]
+	if !ok || val.value == nil {
 		http.Error(w, "value not found", http.StatusNotFound)
 		return
 	}
 
-	val := store[key]
-
-	c := kv.GetCodec(store[key].codecID)
+	c := kv.GetCodec(val.codecID)
 	if c == nil {
 		http.Error(w, "codec not found", http.StatusNotFound)
 		return
@@ -360,7 +374,7 @@ const pageContent = `
 
 		<h2>Received Messages</h2>
 
-		<a href="?deleteMessages=true">Delete All Messages (received and sent)</a>
+		<form method="POST" action="?deleteMessages=true"><button type="submit">Delete All Messages (received and sent)</button></form>
 
 		<table width="100%" border="1">
 			<thead>
@@ -396,7 +410,7 @@ const pageContent = `
 
 		<h2>Sent Messages</h2>
 
-		<a href="?deleteMessages=true">Delete All Messages (received and sent)</a>
+		<form method="POST" action="?deleteMessages=true"><button type="submit">Delete All Messages (received and sent)</button></form>
 
 		<table width="100%" border="1">
 			<thead>
