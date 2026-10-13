@@ -18,6 +18,7 @@ import (
 	"github.com/cortexproject/cortex/pkg/alertmanager"
 	"github.com/cortexproject/cortex/pkg/alertmanager/alertmanagerpb"
 	"github.com/cortexproject/cortex/pkg/compactor"
+	configsAPI "github.com/cortexproject/cortex/pkg/configs/api"
 	"github.com/cortexproject/cortex/pkg/cortexpb"
 	"github.com/cortexproject/cortex/pkg/distributor"
 	"github.com/cortexproject/cortex/pkg/distributor/distributorpb"
@@ -322,6 +323,27 @@ func (a *API) RegisterRulerAPI(r *ruler.API) {
 	a.RegisterRoute(path.Join(a.cfg.LegacyHTTPPrefix, "/rules/{namespace}"), http.HandlerFunc(r.CreateRuleGroup), true, "POST")
 	a.RegisterRoute(path.Join(a.cfg.LegacyHTTPPrefix, "/rules/{namespace}/{groupName}"), http.HandlerFunc(r.DeleteRuleGroup), true, "DELETE")
 	a.RegisterRoute(path.Join(a.cfg.LegacyHTTPPrefix, "/rules/{namespace}"), http.HandlerFunc(r.DeleteNamespace), true, "DELETE")
+}
+
+// RegisterConfigAPI registers the legacy configs service HTTP routes on the
+// shared Cortex mux through RegisterRoute so that the configured
+// authentication middleware and other wrappers are applied, instead of
+// hijacking the raw router. Tenant-scoped routes are registered with
+// auth=true so they go through the AuthenticateUser middleware; the
+// cross-tenant /private/* routes are registered with auth=false (matching
+// /multitenant_alertmanager/configs) and are additionally guarded by the
+// administrative token check configured on the configs API itself.
+func (a *API) RegisterConfigAPI(c *configsAPI.API) {
+	for _, route := range c.Routes() {
+		// Skip the configs service's own "/" landing page: on the shared
+		// Cortex mux the index page registered by RegisterAPI already
+		// serves that path, and letting the configs module shadow it is
+		// one of the symptoms this registration path exists to fix.
+		if route.Path == "/" {
+			continue
+		}
+		a.RegisterRoute(route.Path, route.Handler, route.Auth, route.Method)
+	}
 }
 
 // RegisterRing registers the ring UI page associated with the distributor for writes.
