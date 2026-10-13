@@ -2,6 +2,7 @@ package tenant
 
 import (
 	"context"
+	"strings"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
@@ -54,11 +55,6 @@ var commonResolverTestCases = []resolverTestCase{
 		errTenantIDs: user.ErrNoOrgID,
 	},
 	{
-		name:        "empty",
-		headerValue: strptr(""),
-		tenantIDs:   []string{""},
-	},
-	{
 		name:        "single-tenant",
 		headerValue: strptr("tenant-a"),
 		tenantID:    "tenant-a",
@@ -82,10 +78,40 @@ func TestSingleResolver(t *testing.T) {
 	r := NewSingleResolver()
 	for _, tc := range append(commonResolverTestCases, []resolverTestCase{
 		{
-			name:        "multi-tenant",
-			headerValue: strptr("tenant-a|tenant-b"),
-			tenantID:    "tenant-a|tenant-b",
-			tenantIDs:   []string{"tenant-a|tenant-b"},
+			name:         "empty",
+			headerValue:  strptr(""),
+			errTenantID:  errEmptyTenantID,
+			errTenantIDs: errEmptyTenantID,
+		},
+		{
+			name:         "multi-tenant",
+			headerValue:  strptr("tenant-a|tenant-b"),
+			errTenantID:  errInvalidTenantID,
+			errTenantIDs: errInvalidTenantID,
+		},
+		{
+			name:         "containing-colon",
+			headerValue:  strptr("tenant:a"),
+			errTenantID:  errInvalidTenantID,
+			errTenantIDs: errInvalidTenantID,
+		},
+		{
+			name:         "containing-space",
+			headerValue:  strptr("tenant a"),
+			errTenantID:  errInvalidTenantID,
+			errTenantIDs: errInvalidTenantID,
+		},
+		{
+			name:         "containing-control-character",
+			headerValue:  strptr("tenant\x01a"),
+			errTenantID:  errInvalidTenantID,
+			errTenantIDs: errInvalidTenantID,
+		},
+		{
+			name:         "too-long",
+			headerValue:  strptr(strings.Repeat("a", tenantIDMaxLength+1)),
+			errTenantID:  errTenantIDTooLongSingle,
+			errTenantIDs: errTenantIDTooLongSingle,
 		},
 		{
 			name:         "containing-forward-slash",
@@ -107,6 +133,11 @@ func TestSingleResolver(t *testing.T) {
 func TestMultiResolver(t *testing.T) {
 	r := NewMultiResolver()
 	for _, tc := range append(commonResolverTestCases, []resolverTestCase{
+		{
+			name:        "empty",
+			headerValue: strptr(""),
+			tenantIDs:   []string{""},
+		},
 		{
 			name:        "multi-tenant",
 			headerValue: strptr("tenant-a|tenant-b"),

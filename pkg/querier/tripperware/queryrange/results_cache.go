@@ -141,9 +141,16 @@ type CacheSplitter interface {
 type constSplitter time.Duration
 
 // GenerateCacheKey generates a cache key based on the userID, Request and interval.
+//
+// The userID (which is the join of all tenant IDs for the request) is
+// length-prefixed so that the tenant component of the key is unambiguous even
+// when the single-tenant resolver's lenient character set allows separator
+// characters inside a tenant ID or when the attacker-controlled query string
+// itself contains ':'. Without the prefix two different (tenant, query) pairs
+// could serialize to the same key and share cached results across tenants.
 func (t constSplitter) GenerateCacheKey(userID string, r tripperware.Request) string {
 	currentInterval := r.GetStart() / int64(time.Duration(t)/time.Millisecond)
-	return fmt.Sprintf("%s:%s:%d:%d", userID, r.GetQuery(), r.GetStep(), currentInterval)
+	return fmt.Sprintf("%d:%s:%s:%d:%d", len(userID), userID, r.GetQuery(), r.GetStep(), currentInterval)
 }
 
 // ShouldCacheFn checks whether the current request should go to cache
