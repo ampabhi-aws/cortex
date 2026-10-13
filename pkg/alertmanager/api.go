@@ -24,6 +24,15 @@ import (
 	util_log "github.com/cortexproject/cortex/pkg/util/log"
 )
 
+// defaultMaxConfigSizeBytes is the hard upper bound applied to the
+// Alertmanager config API request body when the per-tenant
+// `-alertmanager.max-config-size-bytes` limit is not configured. It mirrors
+// the default used by the sibling Alertmanager request path
+// (`-alertmanager.max-recv-msg-size`, 16 MiB) and exists so that the handler
+// is never allowed to buffer an unbounded tenant-controlled body in heap
+// memory of the shared multitenant process.
+const defaultMaxConfigSizeBytes = 16 * 1024 * 1024
+
 const (
 	errMarshallingYAML       = "error marshalling YAML Alertmanager config"
 	errValidatingConfig      = "error validating Alertmanager config"
@@ -100,25 +109,37 @@ func (am *MultitenantAlertmanager) SetUserConfig(w http.ResponseWriter, r *http.
 		return
 	}
 
-	var input io.Reader
+	// Always install a hard body cap so that a tenant request cannot cause
+	// the shared Alertmanager process to buffer an unbounded body in heap.
+	// If the operator has configured a per-tenant limit, use it; otherwise
+	// fall back to a built-in default (mirroring the sibling distributor
+	// path at pkg/alertmanager/distributor.go which already wraps the body
+	// in http.MaxBytesReader).
 	maxConfigSize := am.limits.AlertmanagerMaxConfigSize(userID)
-	if maxConfigSize > 0 {
-		// LimitReader will return EOF after reading specified number of bytes. To check if
-		// we have read too many bytes, allow one extra byte.
-		input = io.LimitReader(r.Body, int64(maxConfigSize)+1)
-	} else {
-		input = r.Body
+	effectiveMax := maxConfigSize
+	if effectiveMax <= 0 {
+		effectiveMax = defaultMaxConfigSizeBytes
 	}
+	// Allow one extra byte so that reading exactly `effectiveMax` bytes
+	// does not trip the limit but reading `effectiveMax+1` bytes does,
+	// matching the previous io.LimitReader-based length check semantics.
+	input := http.MaxBytesReader(w, r.Body, int64(effectiveMax)+1)
 
 	payload, err := io.ReadAll(input)
 	if err != nil {
+		if util.IsRequestBodyTooLarge(err) {
+			msg := fmt.Sprintf(errConfigurationTooBig, effectiveMax)
+			level.Warn(logger).Log("msg", msg)
+			http.Error(w, msg, http.StatusBadRequest)
+			return
+		}
 		level.Error(logger).Log("msg", errReadingConfiguration, "err", err.Error())
 		http.Error(w, fmt.Sprintf("%s: %s", errReadingConfiguration, err.Error()), http.StatusBadRequest)
 		return
 	}
 
-	if maxConfigSize > 0 && len(payload) > maxConfigSize {
-		msg := fmt.Sprintf(errConfigurationTooBig, maxConfigSize)
+	if len(payload) > effectiveMax {
+		msg := fmt.Sprintf(errConfigurationTooBig, effectiveMax)
 		level.Warn(logger).Log("msg", msg)
 		http.Error(w, msg, http.StatusBadRequest)
 		return
