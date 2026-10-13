@@ -516,6 +516,12 @@ type TSDBState struct {
 	forceCompactTrigger chan requestWithUsersAndCallback
 	shipTrigger         chan requestWithUsersAndCallback
 
+	// asyncFlushPending is true while an asynchronous flushHandler goroutine
+	// is in flight. It bounds the number of concurrent async flushHandler
+	// goroutines to one so that repeated requests cannot pile up blocked
+	// goroutines on the unbuffered forceCompactTrigger channel.
+	asyncFlushPending atomic.Bool
+
 	// Timeout chosen for idle compactions.
 	compactionIdleTimeout time.Duration
 
@@ -834,7 +840,18 @@ func (i *Ingester) updateActiveSeries() {
 // ShutdownHandler triggers the following set of operations in order:
 //   - Change the state of ring to stop accepting writes.
 //   - Flush all the chunks.
-func (i *Ingester) ShutdownHandler(w http.ResponseWriter, _ *http.Request) {
+//
+// This is a destructive operator-plane endpoint: it unregisters this ingester
+// from the ring and stops the service. It is restricted to POST at the route
+// layer; this handler additionally rejects any non-POST request that reaches
+// it (defence-in-depth). A nil request is accepted so in-process callers
+// (such as tests and the lifecycler) can continue to invoke it directly.
+func (i *Ingester) ShutdownHandler(w http.ResponseWriter, r *http.Request) {
+	if r != nil && r.Method != http.MethodPost {
+		w.Header().Set("Allow", http.MethodPost)
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
 	originalFlush := i.lifecycler.FlushOnShutdown()
 	// We want to flush the chunks if transfer fails irrespective of original flag.
 	i.lifecycler.SetFlushOnShutdown(true)
@@ -2481,7 +2498,23 @@ const (
 )
 
 // Blocks version of Flush handler. It force-compacts blocks, and triggers shipping.
+//
+// This is a destructive operator-plane endpoint. It is registered as POST-only
+// at the route layer; the handler additionally rejects non-POST requests that
+// reach it directly (defence-in-depth against GET-based CSRF/prefetch).
+//
+// Asynchronous invocations (?wait != true) are bounded to a single in-flight
+// goroutine: because i.TSDBState.forceCompactTrigger is unbuffered and a
+// forced compaction serialises through compactBlocks, letting a new async
+// request launch a new goroutine while one is already pending only grows the
+// blocked-goroutine count. Repeated requests while one is pending receive
+// HTTP 429 instead of spawning additional goroutines.
 func (i *Ingester) flushHandler(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		w.Header().Set("Allow", http.MethodPost)
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
 	err := r.ParseForm()
 	if err != nil {
 		level.Warn(logutil.WithContext(r.Context(), i.logger)).Log("msg", "failed to parse HTTP request in flush handler", "err", err)
@@ -2549,7 +2582,18 @@ func (i *Ingester) flushHandler(w http.ResponseWriter, r *http.Request) {
 		// Run synchronously. This simplifies and speeds up tests.
 		run()
 	} else {
-		go run()
+		// Bound the number of concurrent asynchronous flushes to one. Each
+		// invocation blocks on an unbuffered channel send into
+		// forceCompactTrigger, so without this guard repeated requests would
+		// accumulate blocked goroutines in the ingester process.
+		if !i.TSDBState.asyncFlushPending.CompareAndSwap(false, true) {
+			http.Error(w, "flush already in progress", http.StatusTooManyRequests)
+			return
+		}
+		go func() {
+			defer i.TSDBState.asyncFlushPending.Store(false)
+			run()
+		}()
 	}
 
 	w.WriteHeader(http.StatusNoContent)
