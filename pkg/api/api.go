@@ -265,13 +265,18 @@ func (a *API) RegisterIngester(i Ingester, pushConfig distributor.Config) {
 
 	a.indexPage.AddLink(SectionDangerous, "/ingester/flush", "Trigger a Flush of data from Ingester to storage")
 	a.indexPage.AddLink(SectionDangerous, "/ingester/shutdown", "Trigger Ingester Shutdown (Dangerous)")
-	a.RegisterRoute("/ingester/flush", http.HandlerFunc(i.FlushHandler), false, "GET", "POST")
-	a.RegisterRoute("/ingester/shutdown", http.HandlerFunc(i.ShutdownHandler), false, "GET", "POST")
+	// These are destructive, state-changing operator-plane endpoints. They are
+	// restricted to POST only so that a GET navigation/prefetch/crawl cannot
+	// trigger an ingester termination or a cross-tenant forced compaction, and
+	// so that simple cross-origin browser-initiated requests cannot invoke them
+	// without a CORS preflight. See CWE-306 and CSRF guidance.
+	a.RegisterRoute("/ingester/flush", http.HandlerFunc(i.FlushHandler), false, "POST")
+	a.RegisterRoute("/ingester/shutdown", http.HandlerFunc(i.ShutdownHandler), false, "POST")
 	a.RegisterRoute("/ingester/push", push.Handler(pushConfig.MaxRecvMsgSize, a.sourceIPs, i.Push), true, "POST") // For testing and debugging.
 
 	// Legacy Routes
-	a.RegisterRoute("/flush", http.HandlerFunc(i.FlushHandler), false, "GET", "POST")
-	a.RegisterRoute("/shutdown", http.HandlerFunc(i.ShutdownHandler), false, "GET", "POST")
+	a.RegisterRoute("/flush", http.HandlerFunc(i.FlushHandler), false, "POST")
+	a.RegisterRoute("/shutdown", http.HandlerFunc(i.ShutdownHandler), false, "POST")
 	a.RegisterRoute("/push", push.Handler(pushConfig.MaxRecvMsgSize, a.sourceIPs, i.Push), true, "POST") // For testing and debugging.
 }
 
