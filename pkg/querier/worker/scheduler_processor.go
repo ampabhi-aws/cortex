@@ -76,6 +76,11 @@ type schedulerProcessor struct {
 func (sp *schedulerProcessor) notifyShutdown(ctx context.Context, conn *grpc.ClientConn, address string) {
 	client := schedulerpb.NewSchedulerForQuerierClient(conn)
 
+	// Attach the querier's component identity so that the scheduler's auth
+	// interceptor accepts the shutdown notification and binds it to this
+	// querier.
+	ctx = user.InjectOrgID(ctx, sp.querierID)
+
 	req := &schedulerpb.NotifyQuerierShutdownRequest{QuerierID: sp.querierID}
 	if _, err := client.NotifyQuerierShutdown(ctx, req); err != nil {
 		// Since we're shutting down there's nothing we can do except logging it.
@@ -85,6 +90,12 @@ func (sp *schedulerProcessor) notifyShutdown(ctx context.Context, conn *grpc.Cli
 
 func (sp *schedulerProcessor) processQueriesOnSingleStream(ctx context.Context, conn *grpc.ClientConn, address string) {
 	schedulerClient := schedulerpb.NewSchedulerForQuerierClient(conn)
+
+	// Attach the querier's component identity for the entire QuerierLoop
+	// stream so that the scheduler's auth interceptor accepts it and derives
+	// the querier identity from this value (bound to the transport-level
+	// peer when mTLS is configured).
+	ctx = user.InjectOrgID(ctx, sp.querierID)
 
 	backoff := backoff.New(ctx, processorBackoffConfig)
 	for backoff.Ongoing() {
