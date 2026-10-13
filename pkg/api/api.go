@@ -276,7 +276,18 @@ func (a *API) RegisterIngester(i Ingester, pushConfig distributor.Config) {
 }
 
 func (a *API) RegisterTenantDeletion(api *purger.TenantDeletionAPI) {
-	a.RegisterRoute("/purger/delete_tenant", http.HandlerFunc(api.DeleteTenant), true, "POST")
+	// The /purger/delete_tenant endpoint permanently destroys a tenant's
+	// stored blocks. It is only wired up when the operator has explicitly
+	// opted in via `-purger.enable-tenant-deletion-api`; even then it must
+	// be exposed on an operator-only listener because Cortex itself has no
+	// administrative credential model (every component only trusts the
+	// tenant selector header X-Scope-OrgID).
+	if api.Enabled() {
+		a.indexPage.AddLink(SectionDangerous, "/purger/delete_tenant", "Mark Tenant For Deletion (Dangerous - must not be exposed to tenants)")
+		a.indexPage.AddLink(SectionDangerous, "/purger/cancel_delete_tenant", "Cancel Tenant Deletion (Dangerous - must not be exposed to tenants)")
+		a.RegisterRoute("/purger/delete_tenant", http.HandlerFunc(api.DeleteTenant), true, "POST")
+		a.RegisterRoute("/purger/cancel_delete_tenant", http.HandlerFunc(api.CancelDeleteTenant), true, "POST")
+	}
 	a.RegisterRoute("/purger/delete_tenant_status", http.HandlerFunc(api.DeleteTenantStatus), true, "GET")
 }
 

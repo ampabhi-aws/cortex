@@ -60,6 +60,7 @@ For the sake of clarity, in this document we have grouped API endpoints by servi
 | [Set Alertmanager configuration](#set-alertmanager-configuration) | Alertmanager | `POST /api/v1/alerts` |
 | [Delete Alertmanager configuration](#delete-alertmanager-configuration) | Alertmanager | `DELETE /api/v1/alerts` |
 | [Tenant delete request](#tenant-delete-request) | Purger | `POST /purger/delete_tenant` |
+| [Cancel tenant delete request](#cancel-tenant-delete-request) | Purger | `POST /purger/cancel_delete_tenant` |
 | [Tenant delete status](#tenant-delete-status) | Purger | `GET /purger/delete_tenant_status` |
 | [Store-gateway ring status](#store-gateway-ring-status) | Store-gateway | `GET /store-gateway/ring` |
 | [Compactor ring status](#compactor-ring-status) | Compactor | `GET /compactor/ring` |
@@ -795,9 +796,27 @@ The Purger service provides APIs for requesting deletion of tenants.
 POST /purger/delete_tenant
 ```
 
-Request deletion of ALL tenant data. Only works with blocks storage. Experimental.
+**This is an administrative, internal, and irreversible endpoint. It must not be exposed to tenants via the public gateway.** When invoked, it writes a tenant deletion mark that causes the compactor's blocks cleaner to hard-delete the tenant's bucket index and every TSDB block under the tenant's object-storage prefix. Any party that can reach this endpoint with the tenant's `X-Scope-OrgID` header can therefore permanently destroy that tenant's entire long-term metric history.
 
-_Requires [authentication](#authentication)._
+For that reason the endpoint is disabled by default. Operators must opt in via `-purger.enable-tenant-deletion-api=true` (YAML: `purger.enable_tenant_deletion_api`) and must route `/purger/*` only on an operator-only listener (or otherwise require an administrative credential distinct from `X-Scope-OrgID`). When the flag is not set the endpoint responds with HTTP 404.
+
+Callers must also provide a confirmation parameter named `tenant_id` (as a form value or URL query parameter) whose value matches the `X-Scope-OrgID` header being used. Requests without a matching confirmation parameter are rejected with HTTP 400.
+
+Only works with blocks storage. Experimental.
+
+_Requires [authentication](#authentication). Must only be reachable on an operator-only listener._
+
+### Cancel Tenant Delete Request
+
+```
+POST /purger/cancel_delete_tenant
+```
+
+Removes an outstanding tenant deletion mark previously written by `POST /purger/delete_tenant`. This provides a window to abort a mistakenly-issued deletion request before the compactor's blocks cleaner begins hard-deleting blocks (the cleaner runs on a schedule controlled by `-compactor.cleanup-interval`). Once blocks have already been deleted, cancellation cannot restore them.
+
+This endpoint is subject to the same preconditions as `POST /purger/delete_tenant`: it is disabled unless `-purger.enable-tenant-deletion-api=true`, requires the `tenant_id` confirmation parameter to match the `X-Scope-OrgID` header, and must only be exposed on an operator-only listener.
+
+_Requires [authentication](#authentication). Must only be reachable on an operator-only listener._
 
 ### Tenant Delete Status
 
