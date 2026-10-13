@@ -312,6 +312,13 @@ func clusterWait(position func() int, timeout time.Duration) func() time.Duratio
 func (am *Alertmanager) ApplyConfig(userID string, conf *config.Config, rawCfg string) error {
 	templateFiles := make([]string, len(conf.Templates))
 	for i, t := range conf.Templates {
+		// Validate the template filename to make sure a config loaded from any
+		// store backend cannot reference a template path. This mirrors the
+		// fence applied by the HTTP alertmanager API path.
+		if err := validateTemplateFilename(t); err != nil {
+			return err
+		}
+
 		templateFilepath, err := safeTemplateFilepath(filepath.Join(am.cfg.TenantDataDir, templatesDir), t)
 		if err != nil {
 			return err
