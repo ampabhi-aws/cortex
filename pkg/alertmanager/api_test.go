@@ -15,6 +15,7 @@ import (
 	"github.com/prometheus/alertmanager/config"
 	"github.com/prometheus/client_golang/prometheus"
 	commoncfg "github.com/prometheus/common/config"
+	"github.com/prometheus/common/sigv4"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	"github.com/thanos-io/objstore"
@@ -419,6 +420,61 @@ alertmanager_config: |
 			err: errors.Wrap(errVictorOpsAPIKeyFileNotAllowed, "error validating Alertmanager config"),
 		},
 		{
+			name: "Should return error if SNS receiver omits sigv4 access_key/secret_key",
+			cfg: `
+alertmanager_config: |
+  receivers:
+    - name: default-receiver
+      sns_configs:
+        - api_url: https://attacker.example.com/
+          sigv4:
+            region: us-east-1
+          topic_arn: arn:aws:sns:us-east-1:111122223333:x
+
+  route:
+    receiver: 'default-receiver'
+`,
+			err: errors.Wrap(errSigV4CredentialsNotAllowed, "error validating Alertmanager config"),
+		},
+		{
+			name: "Should return error if SNS receiver sets sigv4 profile",
+			cfg: `
+alertmanager_config: |
+  receivers:
+    - name: default-receiver
+      sns_configs:
+        - sigv4:
+            region: us-east-1
+            access_key: a
+            secret_key: b
+            profile: default
+          topic_arn: arn:aws:sns:us-east-1:111122223333:x
+
+  route:
+    receiver: 'default-receiver'
+`,
+			err: errors.Wrap(errSigV4ProfileNotAllowed, "error validating Alertmanager config"),
+		},
+		{
+			name: "Should return error if SNS receiver sets sigv4 role_arn",
+			cfg: `
+alertmanager_config: |
+  receivers:
+    - name: default-receiver
+      sns_configs:
+        - sigv4:
+            region: us-east-1
+            access_key: a
+            secret_key: b
+            role_arn: arn:aws:iam::111122223333:role/x
+          topic_arn: arn:aws:sns:us-east-1:111122223333:x
+
+  route:
+    receiver: 'default-receiver'
+`,
+			err: errors.Wrap(errSigV4RoleARNNotAllowed, "error validating Alertmanager config"),
+		},
+		{
 			name: "should return error if template is wrong",
 			cfg: `
 alertmanager_config: |
@@ -784,6 +840,34 @@ func TestValidateAlertmanagerConfig(t *testing.T) {
 				}},
 			},
 			expected: errTLSFileNotAllowed,
+		},
+		"SNSConfig without sigv4 credentials falls back to server AWS credentials": {
+			input: config.SNSConfig{
+				APIUrl:   "https://attacker.example.com/",
+				TopicARN: "arn:aws:sns:us-east-1:111122223333:x",
+				Sigv4: sigv4.SigV4Config{
+					Region: "us-east-1",
+				},
+			},
+			expected: errSigV4CredentialsNotAllowed,
+		},
+		"SigV4Config with profile set is rejected": {
+			input: sigv4.SigV4Config{
+				Region:    "us-east-1",
+				AccessKey: "a",
+				SecretKey: "b",
+				Profile:   "default",
+			},
+			expected: errSigV4ProfileNotAllowed,
+		},
+		"SigV4Config with role_arn set is rejected": {
+			input: sigv4.SigV4Config{
+				Region:    "us-east-1",
+				AccessKey: "a",
+				SecretKey: "b",
+				RoleARN:   "arn:aws:iam::111122223333:role/x",
+			},
+			expected: errSigV4RoleARNNotAllowed,
 		},
 	}
 

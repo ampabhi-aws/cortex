@@ -15,6 +15,7 @@ import (
 	"github.com/prometheus/alertmanager/config"
 	"github.com/prometheus/alertmanager/template"
 	commoncfg "github.com/prometheus/common/config"
+	"github.com/prometheus/common/sigv4"
 	"gopkg.in/yaml.v2"
 
 	"github.com/cortexproject/cortex/pkg/alertmanager/alertspb"
@@ -45,6 +46,9 @@ var (
 	errTLSFileNotAllowed             = errors.New("setting TLS ca_file, cert_file and key_file is not allowed")
 	errSlackAPIURLFileNotAllowed     = errors.New("setting Slack api_url_file and global slack_api_url_file is not allowed")
 	errVictorOpsAPIKeyFileNotAllowed = errors.New("setting VictorOps api_key_file is not allowed")
+	errSigV4CredentialsNotAllowed    = errors.New("setting SNS sigv4 access_key and secret_key is required: falling back to the server's AWS credential chain is not allowed")
+	errSigV4ProfileNotAllowed        = errors.New("setting SNS sigv4 profile is not allowed: it would select a profile from the server's shared AWS config")
+	errSigV4RoleARNNotAllowed        = errors.New("setting SNS sigv4 role_arn is not allowed: it would assume the role using the server's AWS credentials")
 )
 
 // UserConfig is used to communicate a users alertmanager configs
@@ -350,6 +354,16 @@ func validateAlertmanagerConfig(cfg interface{}) error {
 		if err := validateVictorOpsConfig(v.Interface().(config.VictorOpsConfig)); err != nil {
 			return err
 		}
+
+	case reflect.TypeOf(config.SNSConfig{}):
+		if err := validateSNSConfig(v.Interface().(config.SNSConfig)); err != nil {
+			return err
+		}
+
+	case reflect.TypeOf(sigv4.SigV4Config{}):
+		if err := validateSigV4Config(v.Interface().(sigv4.SigV4Config)); err != nil {
+			return err
+		}
 	}
 
 	// If the input config is a struct, recursively iterate on all fields.
@@ -446,6 +460,38 @@ func validateSlackConfig(cfg config.SlackConfig) error {
 func validateVictorOpsConfig(cfg config.VictorOpsConfig) error {
 	if cfg.APIKeyFile != "" {
 		return errVictorOpsAPIKeyFileNotAllowed
+	}
+	return nil
+}
+
+// validateSNSConfig validates the SNS config and returns an error if it contains
+// settings not allowed by Cortex. Delegates sigv4 validation to validateSigV4Config,
+// but validateAlertmanagerConfig also reaches sigv4.SigV4Config directly through
+// recursion; keeping this explicit guards against the SNS case being hit before
+// the recursive descent (e.g. zero-value sigv4 blocks).
+func validateSNSConfig(cfg config.SNSConfig) error {
+	return validateSigV4Config(cfg.Sigv4)
+}
+
+// validateSigV4Config validates the sigv4 block attached to an SNS receiver and
+// returns an error if it would make the Cortex process sign requests with its
+// own AWS identity or read from the host's shared AWS configuration.
+//
+// Tenant configs must supply both access_key and secret_key explicitly; falling
+// back to the AWS default credential chain would let a tenant exfiltrate the
+// cluster principal's signed Authorization/X-Amz-Security-Token headers to a
+// tenant-chosen api_url, or publish as the cluster to arbitrary topics. The
+// profile and role_arn fields are rejected for the same reason: they resolve
+// against the server's local AWS config/credentials and server identity.
+func validateSigV4Config(cfg sigv4.SigV4Config) error {
+	if cfg.Profile != "" {
+		return errSigV4ProfileNotAllowed
+	}
+	if cfg.RoleARN != "" {
+		return errSigV4RoleARNNotAllowed
+	}
+	if cfg.AccessKey == "" || cfg.SecretKey == "" {
+		return errSigV4CredentialsNotAllowed
 	}
 	return nil
 }
