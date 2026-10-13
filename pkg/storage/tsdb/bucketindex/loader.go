@@ -29,6 +29,19 @@ type LoaderConfig struct {
 	UpdateOnStaleInterval time.Duration
 	UpdateOnErrorInterval time.Duration
 	IdleTimeout           time.Duration
+
+	// MaxCachedTenants caps the number of per-tenant bucket indexes kept in memory.
+	// When the cap is reached, the least-recently-requested entry is evicted before
+	// inserting a new one. 0 (the default) means unbounded.
+	MaxCachedTenants int
+
+	// NegativeCacheTTL, when greater than 0, overrides IdleTimeout for entries
+	// cached with ErrIndexNotFound. Negative entries are also excluded from the
+	// periodic refresh loop so that a stream of unknown tenant IDs can neither
+	// grow the cache unbounded nor amplify object-store GETs. 0 preserves the
+	// legacy behaviour (negatives are refreshed every UpdateOnStaleInterval and
+	// evicted after IdleTimeout).
+	NegativeCacheTTL time.Duration
 }
 
 // Loader is responsible to lazy load bucket indexes and, once loaded for the first time,
@@ -105,6 +118,11 @@ func (l *Loader) GetIndex(ctx context.Context, userID string) (*Index, error) {
 	}
 	l.indexesMx.RUnlock()
 
+	// If the cache is at its configured cap and this is a brand-new tenant, drop
+	// the least-recently-requested entry to make room. This prevents an attacker
+	// from pinning the cache full of bogus tenants permanently.
+	l.evictOldestIfOverCapacity()
+
 	startTime := time.Now()
 	l.loadAttempts.Inc()
 	idx, err := ReadIndex(ctx, l.bkt, userID, l.cfgProvider, l.logger)
@@ -138,9 +156,54 @@ func (l *Loader) cacheIndex(userID string, idx *Index, err error) {
 	l.indexesMx.Lock()
 	defer l.indexesMx.Unlock()
 
+	// Enforce the cap again while holding the write lock in case concurrent
+	// GetIndex callers filled the cache since evictOldestIfOverCapacity ran.
+	// Skip eviction when the entry already exists (we are refreshing it) so
+	// legitimate tenants are not evicted by their own refresh.
+	if l.cfg.MaxCachedTenants > 0 {
+		if _, exists := l.indexes[userID]; !exists {
+			l.evictOldestLocked()
+		}
+	}
+
 	// Not an issue if, due to concurrency, another index was already cached
 	// and we overwrite it: last will win.
 	l.indexes[userID] = newCachedIndex(idx, err)
+}
+
+// evictOldestIfOverCapacity drops the least-recently-requested entry when the
+// cache is at or above its configured cap. Does nothing when the cap is 0
+// (unbounded).
+func (l *Loader) evictOldestIfOverCapacity() {
+	if l.cfg.MaxCachedTenants <= 0 {
+		return
+	}
+	l.indexesMx.Lock()
+	defer l.indexesMx.Unlock()
+	l.evictOldestLocked()
+}
+
+// evictOldestLocked must be called with indexesMx held for writing.
+func (l *Loader) evictOldestLocked() {
+	if l.cfg.MaxCachedTenants <= 0 || len(l.indexes) < l.cfg.MaxCachedTenants {
+		return
+	}
+
+	var oldestUser string
+	var oldestRequested int64
+	first := true
+	for userID, entry := range l.indexes {
+		req := entry.requestedAt.Load()
+		if first || req < oldestRequested {
+			oldestUser = userID
+			oldestRequested = req
+			first = false
+		}
+	}
+	if oldestUser != "" {
+		delete(l.indexes, oldestUser)
+		level.Info(l.logger).Log("msg", "unloaded bucket index", "user", oldestUser, "reason", "max_cached_tenants")
+	}
 }
 
 // checkCachedIndexes checks all cached indexes and, for each of them, does two things:
@@ -174,7 +237,17 @@ func (l *Loader) checkCachedIndexesToUpdateAndDelete() (toUpdate, toDelete []str
 		// Given ErrIndexNotFound is a legit case and assuming UpdateOnErrorInterval is lower than
 		// UpdateOnStaleInterval, we don't consider ErrIndexNotFound as an error with regards to the
 		// refresh interval and so it will updated once stale.
-		isError := entry.err != nil && !errors.Is(entry.err, ErrIndexNotFound)
+		isNotFound := entry.err != nil && errors.Is(entry.err, ErrIndexNotFound)
+		isError := entry.err != nil && !isNotFound
+
+		// Honour a short, non-refreshing TTL for negative (ErrIndexNotFound) entries when
+		// configured, so unknown tenant IDs cannot pin cache slots or feed the refresh loop.
+		if isNotFound && l.cfg.NegativeCacheTTL > 0 {
+			if now.Sub(entry.getUpdatedAt()) >= l.cfg.NegativeCacheTTL {
+				toDelete = append(toDelete, userID)
+			}
+			continue
+		}
 
 		switch {
 		case now.Sub(entry.getRequestedAt()) >= l.cfg.IdleTimeout:

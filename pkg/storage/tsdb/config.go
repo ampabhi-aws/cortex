@@ -307,6 +307,8 @@ type BucketIndexConfig struct {
 	UpdateOnErrorInterval time.Duration `yaml:"update_on_error_interval"`
 	IdleTimeout           time.Duration `yaml:"idle_timeout"`
 	MaxStalePeriod        time.Duration `yaml:"max_stale_period"`
+	MaxCachedTenants      int           `yaml:"max_cached_tenants"`
+	NegativeCacheTTL      time.Duration `yaml:"negative_cache_ttl"`
 }
 
 func (cfg *BucketIndexConfig) RegisterFlagsWithPrefix(f *flag.FlagSet, prefix string) {
@@ -314,4 +316,6 @@ func (cfg *BucketIndexConfig) RegisterFlagsWithPrefix(f *flag.FlagSet, prefix st
 	f.DurationVar(&cfg.UpdateOnErrorInterval, prefix+"update-on-error-interval", time.Minute, "How frequently a bucket index, which previously failed to load, should be tried to load again. This option is used only by querier.")
 	f.DurationVar(&cfg.IdleTimeout, prefix+"idle-timeout", time.Hour, "How long a unused bucket index should be cached. Once this timeout expires, the unused bucket index is removed from the in-memory cache. This option is used only by querier.")
 	f.DurationVar(&cfg.MaxStalePeriod, prefix+"max-stale-period", time.Hour, "The maximum allowed age of a bucket index (last updated) before queries start failing because the bucket index is too old. The bucket index is periodically updated by the compactor, while this check is enforced in the querier (at query time).")
+	f.IntVar(&cfg.MaxCachedTenants, prefix+"max-cached-tenants", 0, "Maximum number of per-tenant bucket indexes kept in the querier's in-memory cache. When reached, the least-recently-requested entry is evicted before caching a new one. 0 disables the cap (default). Setting a positive value protects against unbounded growth caused by requests carrying arbitrary X-Scope-OrgID values.")
+	f.DurationVar(&cfg.NegativeCacheTTL, prefix+"negative-cache-ttl", 0, "If greater than 0, overrides idle-timeout for cache entries that hold a bucket-index-not-found result and excludes those entries from the periodic refresh loop. Shortens how long unknown tenant IDs persist in memory and prevents them from amplifying object-store GETs. 0 keeps the legacy behaviour (idle-timeout, refreshed every sync-interval).")
 }

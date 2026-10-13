@@ -580,3 +580,75 @@ func prepareLoaderConfig() LoaderConfig {
 		IdleTimeout:           time.Hour,
 	}
 }
+
+func TestLoader_GetIndex_ShouldCapCachedTenants(t *testing.T) {
+	ctx := context.Background()
+	reg := prometheus.NewPedanticRegistry()
+	bkt, _ := cortex_testutil.PrepareFilesystemBucket(t)
+
+	cfg := LoaderConfig{
+		CheckInterval:         time.Hour,
+		UpdateOnStaleInterval: time.Hour,
+		UpdateOnErrorInterval: time.Hour,
+		IdleTimeout:           time.Hour,
+		MaxCachedTenants:      2,
+	}
+
+	loader := NewLoader(cfg, bkt, nil, log.NewNopLogger(), reg)
+	require.NoError(t, services.StartAndAwaitRunning(ctx, loader))
+	t.Cleanup(func() {
+		require.NoError(t, services.StopAndAwaitTerminated(ctx, loader))
+	})
+
+	// Request indexes for three distinct (non-existent) tenants. The cache cap is 2,
+	// so after the third request only two entries must remain.
+	for _, user := range []string{"user-a", "user-b", "user-c"} {
+		_, err := loader.GetIndex(ctx, user)
+		require.Equal(t, ErrIndexNotFound, err)
+	}
+
+	loader.indexesMx.RLock()
+	defer loader.indexesMx.RUnlock()
+	assert.LessOrEqual(t, len(loader.indexes), 2)
+	// The most recently requested tenant must still be cached.
+	assert.NotNil(t, loader.indexes["user-c"])
+	// The oldest (user-a) must have been evicted.
+	assert.Nil(t, loader.indexes["user-a"])
+}
+
+func TestLoader_NegativeCacheTTL_ShouldSkipRefreshAndExpireQuickly(t *testing.T) {
+	ctx := context.Background()
+	reg := prometheus.NewPedanticRegistry()
+	bkt, _ := cortex_testutil.PrepareFilesystemBucket(t)
+
+	cfg := LoaderConfig{
+		CheckInterval:         time.Second,
+		UpdateOnStaleInterval: time.Second,
+		UpdateOnErrorInterval: time.Second,
+		IdleTimeout:           time.Hour,
+		NegativeCacheTTL:      time.Second,
+	}
+
+	loader := NewLoader(cfg, bkt, nil, log.NewNopLogger(), reg)
+	require.NoError(t, services.StartAndAwaitRunning(ctx, loader))
+	t.Cleanup(func() {
+		require.NoError(t, services.StopAndAwaitTerminated(ctx, loader))
+	})
+
+	// First request creates a negative cache entry.
+	_, err := loader.GetIndex(ctx, "unknown-tenant")
+	require.Equal(t, ErrIndexNotFound, err)
+
+	initialAttempts := testutil.ToFloat64(loader.loadAttempts)
+
+	// The background loop must evict the entry rather than refresh it.
+	test.Poll(t, 5*time.Second, true, func() interface{} {
+		loader.indexesMx.RLock()
+		defer loader.indexesMx.RUnlock()
+		_, exists := loader.indexes["unknown-tenant"]
+		return !exists
+	})
+
+	// No background refresh must have been issued for the negative entry.
+	assert.Equal(t, initialAttempts, testutil.ToFloat64(loader.loadAttempts))
+}
