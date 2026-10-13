@@ -413,6 +413,19 @@ func WithUserAgent(ua string) HTTPClientOption {
 	}
 }
 
+// DialContextFuncFromOptions applies the given HTTPClientOption values to a
+// temporary options struct and returns the configured DialContextFunc, if any.
+// It allows callers that do not themselves build an *http.Transport to still
+// honor the WithDialContextFunc option (e.g. the SMTP email notifier that
+// must consult the per-tenant firewall dialer).
+func DialContextFuncFromOptions(optFuncs []HTTPClientOption) DialContextFunc {
+	opts := defaultHTTPClientOptions
+	for _, f := range optFuncs {
+		f(&opts)
+	}
+	return opts.dialContextFunc
+}
+
 // NewClient returns a http.Client using the specified http.RoundTripper.
 func newClient(rt http.RoundTripper) *http.Client {
 	return &http.Client{Transport: rt}
@@ -680,6 +693,10 @@ func (rt *oauth2RoundTripper) RoundTrip(req *http.Request) (*http.Response, erro
 		}
 
 		tlsTransport := func(tlsConfig *tls.Config) (http.RoundTripper, error) {
+			var dialContext func(ctx context.Context, network, addr string) (net.Conn, error)
+			if rt.opts != nil && rt.opts.dialContextFunc != nil {
+				dialContext = (func(context.Context, string, string) (net.Conn, error))(rt.opts.dialContextFunc)
+			}
 			return &http.Transport{
 				TLSClientConfig:       tlsConfig,
 				Proxy:                 http.ProxyURL(rt.config.ProxyURL.URL),
@@ -689,6 +706,7 @@ func (rt *oauth2RoundTripper) RoundTrip(req *http.Request) (*http.Response, erro
 				IdleConnTimeout:       10 * time.Second,
 				TLSHandshakeTimeout:   10 * time.Second,
 				ExpectContinueTimeout: 1 * time.Second,
+				DialContext:           dialContext,
 			}, nil
 		}
 
