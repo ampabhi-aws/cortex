@@ -378,7 +378,6 @@ func (c *haTracker) checkReplica(ctx context.Context, userID, cluster, replica s
 
 	c.electedLock.RLock()
 	entry, ok := c.elected[key]
-	clusters := len(c.clusters[userID])
 	c.electedLock.RUnlock()
 
 	if ok && now.Sub(timestamp.Time(entry.ReceivedAt)) < c.cfg.UpdateTimeout+c.updateTimeoutJitter {
@@ -388,11 +387,40 @@ func (c *haTracker) checkReplica(ctx context.Context, userID, cluster, replica s
 		return nil
 	}
 
+	// For a cluster we have not yet seen locally, re-check the per-tenant
+	// limit while holding the write lock and reserve a slot before issuing
+	// the KV write. The in-process cache `c.clusters` is populated only
+	// asynchronously by the KV watch callback, so without this reservation
+	// a burst of concurrent (or sub-second sequential) requests for distinct
+	// clusters all observe the same stale count and all slip past the limit
+	// check. Reserving under the write lock makes the check atomic with
+	// respect to other checkReplica calls on this distributor and bounds the
+	// per-process KV-key growth (the per-cluster-wide bound still relies on
+	// the KV layer, see the fix note below).
+	reservedSlot := false
 	if !ok {
-		// If we don't know about this cluster yet and we have reached the limit for number of clusters, we error out now.
-		if limit := c.limits.MaxHAClusters(userID); limit > 0 && clusters+1 > limit {
-			return tooManyClustersError{limit: limit}
+		c.electedLock.Lock()
+		// Re-check for the elected entry under the write lock in case the
+		// watch callback populated it while we were waiting on the lock.
+		if _, elected := c.elected[key]; !elected {
+			// Only enforce / reserve when a limit is actually configured.
+			if limit := c.limits.MaxHAClusters(userID); limit > 0 {
+				// Count the slot we are about to add, unless an in-flight
+				// reservation (or a watch-populated entry) already covers it.
+				if _, alreadyKnown := c.clusters[userID][cluster]; !alreadyKnown {
+					if len(c.clusters[userID])+1 > limit {
+						c.electedLock.Unlock()
+						return tooManyClustersError{limit: limit}
+					}
+					if c.clusters[userID] == nil {
+						c.clusters[userID] = map[string]struct{}{}
+					}
+					c.clusters[userID][cluster] = struct{}{}
+					reservedSlot = true
+				}
+			}
 		}
+		c.electedLock.Unlock()
 	}
 
 	err := c.checkKVStore(ctx, key, replica, now)
@@ -402,6 +430,24 @@ func (c *haTracker) checkReplica(ctx context.Context, userID, cluster, replica s
 		// otherwise there may have been an actual error CAS'ing that we should log.
 		if !errors.Is(err, replicasNotMatchError{}) {
 			level.Error(c.logger).Log("msg", "rejecting sample", "err", err)
+		}
+
+		if reservedSlot {
+			// Roll back our provisional reservation so a failed KV write does
+			// not permanently consume a slot. Keep the reservation if the
+			// watch callback has since turned it into a real elected entry
+			// (another distributor may have written the key, or ours
+			// succeeded and the watch raced ahead of this error path).
+			c.electedLock.Lock()
+			if _, elected := c.elected[key]; !elected {
+				if userClusters := c.clusters[userID]; userClusters != nil {
+					delete(userClusters, cluster)
+					if len(userClusters) == 0 {
+						delete(c.clusters, userID)
+					}
+				}
+			}
+			c.electedLock.Unlock()
 		}
 	}
 	return err
