@@ -590,7 +590,7 @@ func (t *Cortex) initConfig() (serv services.Service, err error) {
 		return
 	}
 
-	t.ConfigAPI = configAPI.New(t.ConfigDB, t.Cfg.Configs.API)
+	t.ConfigAPI = configAPI.NewWithLimits(t.ConfigDB, t.Cfg.Configs.API, t.Overrides)
 	t.ConfigAPI.RegisterRoutes(t.Server.HTTP)
 	return services.NewIdleService(nil, func(_ error) error {
 		t.ConfigDB.Close()
@@ -748,7 +748,7 @@ func (t *Cortex) setupModuleManager() error {
 		QueryScheduler:           {API, Overrides},
 		Ruler:                    {DistributorService, Overrides, DeleteRequestsStore, StoreQueryable, RulerStorage},
 		RulerStorage:             {Overrides},
-		Configs:                  {API},
+		Configs:                  {API, Overrides},
 		AlertManager:             {API, MemberlistKV, Overrides},
 		Compactor:                {API, MemberlistKV, Overrides},
 		StoreGateway:             {API, Overrides, MemberlistKV},
