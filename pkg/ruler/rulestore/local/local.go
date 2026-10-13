@@ -5,6 +5,7 @@ import (
 	"flag"
 	"os"
 	"path/filepath"
+	"strings"
 
 	"github.com/pkg/errors"
 	promRules "github.com/prometheus/prometheus/rules"
@@ -168,11 +169,19 @@ func (l *Client) loadAllRulesGroupsForUser(ctx context.Context, userID string) (
 }
 
 func (l *Client) loadAllRulesGroupsForUserAndNamespace(_ context.Context, userID string, namespace string) (rulespb.RuleGroupList, error) {
-	filename := filepath.Join(l.cfg.Directory, userID, namespace)
+	filename, err := safeJoinInsideDir(l.cfg.Directory, userID, namespace)
+	if err != nil {
+		return nil, err
+	}
 
 	rulegroups, allErrors := l.loader.Load(filename)
 	if len(allErrors) > 0 {
-		return nil, errors.Wrapf(allErrors[0], "error parsing %s", filename)
+		// Do not expose the resolved absolute filename or the raw parser error
+		// (which can embed file contents) to the caller. The absolute path is
+		// still useful for operators, so include it in the wrapped error that
+		// is logged server-side via the API layer, but surface only a generic
+		// message to end-users of the local store.
+		return nil, errors.Wrapf(allErrors[0], "error parsing rule group for user %q namespace %q", userID, namespace)
 	}
 
 	var list rulespb.RuleGroupList
@@ -183,4 +192,67 @@ func (l *Client) loadAllRulesGroupsForUserAndNamespace(_ context.Context, userID
 	}
 
 	return list, nil
+}
+
+// safeJoinInsideDir builds <dir>/<userID>/<namespace> and verifies that the
+// resulting path (after symlink resolution if the path exists) is contained
+// within <dir>/<userID>. This mirrors the alertmanager's safeTemplateFilepath
+// hardening and prevents attacker-controlled namespace values that contain
+// '..' or path separators from escaping the per-tenant directory.
+func safeJoinInsideDir(dir, userID, namespace string) (string, error) {
+	userDir, err := filepath.Abs(filepath.Join(dir, userID))
+	if err != nil {
+		return "", errors.Wrap(err, "unable to resolve user directory")
+	}
+
+	full, err := filepath.Abs(filepath.Join(userDir, namespace))
+	if err != nil {
+		return "", errors.Wrap(err, "unable to resolve rule group path")
+	}
+
+	// Lexical check: after filepath.Clean (performed by filepath.Abs/Join),
+	// the final path must still be inside the per-tenant directory. This is
+	// the primary defense against '../' traversal in attacker-supplied
+	// namespaces, independent of what exists on disk.
+	if !isWithinDir(full, userDir) {
+		return "", errors.Errorf("invalid namespace %q: resolved path escapes the per-tenant directory", namespace)
+	}
+
+	// Symlink-resolution check: if both the per-tenant directory and the
+	// target path exist, make sure the target's physical location is still
+	// inside the physical per-tenant directory. We resolve both ends with
+	// EvalSymlinks so a symlinked tenant directory (which is a legitimate
+	// deployment pattern) does not false-positive. We ignore "not exists"
+	// so that a missing namespace file still reaches the loader and
+	// produces a predictable error.
+	resolvedUserDir, err := filepath.EvalSymlinks(userDir)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return full, nil
+		}
+		return "", errors.Wrap(err, "unable to resolve user directory")
+	}
+	resolvedFull, err := filepath.EvalSymlinks(full)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return full, nil
+		}
+		return "", errors.Wrap(err, "unable to resolve rule group path")
+	}
+	if !isWithinDir(resolvedFull, resolvedUserDir) {
+		return "", errors.Errorf("invalid namespace %q: resolved path escapes the per-tenant directory", namespace)
+	}
+
+	return full, nil
+}
+
+// isWithinDir reports whether path is equal to parent or located within it.
+// Both arguments must be cleaned absolute paths.
+func isWithinDir(path, parent string) bool {
+	parent = filepath.Clean(parent)
+	path = filepath.Clean(path)
+	if path == parent {
+		return true
+	}
+	return strings.HasPrefix(path, parent+string(os.PathSeparator))
 }

@@ -288,7 +288,36 @@ var (
 	ErrNoRuleGroups = errors.New("no rule groups found")
 	// ErrBadRuleGroup is returned when the provided rule group can not be unmarshalled
 	ErrBadRuleGroup = errors.New("unable to decoded rule group")
+	// ErrInvalidNamespace signals that the provided namespace is not a safe
+	// single path element (contains separators, '..', or is empty/'.').
+	ErrInvalidNamespace = errors.New("invalid namespace: must be a single path element and must not contain '/', '\\\\', or '..'")
+	// ErrInvalidGroupName signals that the provided group name is not a safe
+	// single path element (contains separators, '..', or is empty/'.').
+	ErrInvalidGroupName = errors.New("invalid group name: must be a single path element and must not contain '/', '\\\\', or '..'")
+	// ErrListRules is a generic error returned to the caller when listing rule
+	// groups fails. The underlying error (which may contain filesystem paths or
+	// parser output) is logged server-side only.
+	ErrListRules = errors.New("unable to list rule groups")
 )
+
+// validatePathComponent ensures the user-controlled path segment is a single
+// safe path element. It rejects empty strings, '.', '..', values containing
+// '/' or '\\', or values that are rooted. This mirrors the hardening applied
+// to tenant IDs in pkg/tenant and prevents the segment from being used to
+// escape the per-tenant directory in the local rule store.
+func validatePathComponent(value string) bool {
+	if value == "" || value == "." || value == ".." {
+		return false
+	}
+	if strings.ContainsAny(value, "/\\") {
+		return false
+	}
+	// Reject any form of relative-path traversal or a null byte.
+	if strings.Contains(value, "\x00") {
+		return false
+	}
+	return true
+}
 
 func marshalAndSend(output interface{}, w http.ResponseWriter, logger log.Logger) {
 	d, err := yaml.Marshal(&output)
@@ -336,6 +365,10 @@ func parseNamespace(params map[string]string) (string, error) {
 		return "", err
 	}
 
+	if !validatePathComponent(namespace) {
+		return "", ErrInvalidNamespace
+	}
+
 	return namespace, nil
 }
 
@@ -350,6 +383,10 @@ func parseGroupName(params map[string]string) (string, error) {
 	groupName, err := url.PathUnescape(groupName)
 	if err != nil {
 		return "", err
+	}
+
+	if !validatePathComponent(groupName) {
+		return "", ErrInvalidGroupName
 	}
 
 	return groupName, nil
@@ -395,7 +432,11 @@ func (a *API) ListRules(w http.ResponseWriter, req *http.Request) {
 	level.Debug(logger).Log("msg", "retrieving rule groups with namespace", "userID", userID, "namespace", namespace)
 	rgs, err := a.store.ListRuleGroupsForUserAndNamespace(req.Context(), userID, namespace)
 	if err != nil {
-		http.Error(w, err.Error(), http.StatusBadRequest)
+		// Do not leak the underlying error (which may include absolute
+		// filesystem paths or parser output for the local store) to the
+		// HTTP client. Log it server-side only.
+		level.Warn(logger).Log("msg", "unable to list rule groups", "userID", userID, "namespace", namespace, "err", err)
+		http.Error(w, ErrListRules.Error(), http.StatusBadRequest)
 		return
 	}
 
