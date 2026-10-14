@@ -83,9 +83,10 @@ func TestMarkBlocksVisited(t *testing.T) {
 			dummyCounter := prometheus.NewCounter(prometheus.CounterOpts{})
 			bkt, _ := cortex_testutil.PrepareFilesystemBucket(t)
 			logger := log.NewNopLogger()
-			markBlocksVisited(ctx, bkt, logger, tcase.blocks, tcase.visitMarker, dummyCounter)
+			instrBkt := objstore.WithNoopInstr(bkt)
+			require.True(t, markBlocksVisited(ctx, bkt, instrBkt, logger, tcase.blocks, tcase.visitMarker, 5*time.Minute, dummyCounter, dummyCounter))
 			for _, meta := range tcase.blocks {
-				res, err := ReadBlockVisitMarker(ctx, objstore.WithNoopInstr(bkt), logger, meta.ULID.String(), dummyCounter)
+				res, err := ReadBlockVisitMarker(ctx, instrBkt, logger, meta.ULID.String(), dummyCounter)
 				require.NoError(t, err)
 				require.Equal(t, tcase.visitMarker, *res)
 			}

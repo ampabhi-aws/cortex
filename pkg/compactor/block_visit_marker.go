@@ -75,6 +75,13 @@ func ReadBlockVisitMarker(ctx context.Context, bkt objstore.InstrumentedBucketRe
 	return &blockVisitMarker, nil
 }
 
+// ErrorBlockVisitMarkerOwnedByOther is returned by the conditional update helpers
+// when the on-bucket visit marker is currently owned by a different compactor and
+// has not yet expired (its visit time is within -compactor.block-visit-marker-timeout).
+// Callers must treat this as "another compactor already owns this block/group" and
+// must NOT proceed to compact the affected blocks.
+var ErrorBlockVisitMarkerOwnedByOther = errors.New("block visit marker owned by another live compactor")
+
 func UpdateBlockVisitMarker(ctx context.Context, bkt objstore.Bucket, blockID string, reader io.Reader, blockVisitMarkerWriteFailed prometheus.Counter) error {
 	blockVisitMarkerFilePath := path.Join(blockID, BlockVisitMarkerFile)
 	if err := bkt.Upload(ctx, blockVisitMarkerFilePath, reader); err != nil {
@@ -84,30 +91,82 @@ func UpdateBlockVisitMarker(ctx context.Context, bkt objstore.Bucket, blockID st
 	return nil
 }
 
+// tryClaimBlockVisitMarker performs a read-before-write "claim" of a block visit
+// marker. It refuses to overwrite a marker that is currently owned by a
+// different compactor and whose visit time is still within blockVisitMarkerTimeout.
+// It is not fully atomic with respect to concurrent writers (object storage
+// here does not expose a conditional PUT), but it closes the common
+// read-then-blind-write TOCTOU window by re-checking ownership on every write
+// (initial claim and heartbeat refresh), so a losing compactor stops instead
+// of silently overwriting the winner's claim.
+func tryClaimBlockVisitMarker(
+	ctx context.Context,
+	bkt objstore.Bucket,
+	instrBkt objstore.InstrumentedBucketReader,
+	logger log.Logger,
+	blockID string,
+	marker BlockVisitMarker,
+	blockVisitMarkerTimeout time.Duration,
+	reader io.Reader,
+	blockVisitMarkerReadFailed prometheus.Counter,
+	blockVisitMarkerWriteFailed prometheus.Counter,
+) error {
+	existing, err := ReadBlockVisitMarker(ctx, instrBkt, logger, blockID, blockVisitMarkerReadFailed)
+	if err != nil && !errors.Is(err, ErrorBlockVisitMarkerNotFound) {
+		// Unmarshal/version/transient errors: fall through and attempt to
+		// (re)claim. If storage is permanently broken the Upload below will
+		// surface the same class of error to the caller.
+		level.Warn(logger).Log("msg", "unable to read existing block visit marker before claim, attempting to claim anyway", "blockID", blockID, "err", err)
+	} else if err == nil && existing != nil {
+		if existing.CompactorID != marker.CompactorID && existing.isVisited(blockVisitMarkerTimeout) {
+			return errors.Wrapf(ErrorBlockVisitMarkerOwnedByOther, "block %s is currently owned by compactor %s", blockID, existing.CompactorID)
+		}
+	}
+	return UpdateBlockVisitMarker(ctx, bkt, blockID, reader, blockVisitMarkerWriteFailed)
+}
+
+// markBlocksVisited attempts to claim/refresh the visit marker on every block
+// in blocks on behalf of marker.CompactorID. It returns true only if every
+// block was successfully claimed by us; it returns false if any block was
+// already owned by a different live compactor or if any upload failed. Callers
+// that take out an initial claim (e.g. ShuffleShardingGrouper) MUST check this
+// return value and skip the group when it is false — otherwise two compactors
+// in the same tenant sub-ring can both believe they own the group and both
+// compact the same source blocks.
 func markBlocksVisited(
 	ctx context.Context,
 	bkt objstore.Bucket,
+	instrBkt objstore.InstrumentedBucketReader,
 	logger log.Logger,
 	blocks []*metadata.Meta,
 	marker BlockVisitMarker,
+	blockVisitMarkerTimeout time.Duration,
+	blockVisitMarkerReadFailed prometheus.Counter,
 	blockVisitMarkerWriteFailed prometheus.Counter,
-) {
+) bool {
 	visitMarkerFileContent, err := json.Marshal(marker)
 	if err != nil {
 		blockVisitMarkerWriteFailed.Inc()
-		return
+		return false
 	}
 	reader := bytes.NewReader(visitMarkerFileContent)
+	ok := true
 	for _, block := range blocks {
 		blockID := block.ULID.String()
-		if err := UpdateBlockVisitMarker(ctx, bkt, blockID, reader, blockVisitMarkerWriteFailed); err != nil {
-			level.Error(logger).Log("msg", "unable to upsert visit marker file content for block", "blockID", blockID, "err", err)
+		if err := tryClaimBlockVisitMarker(ctx, bkt, instrBkt, logger, blockID, marker, blockVisitMarkerTimeout, reader, blockVisitMarkerReadFailed, blockVisitMarkerWriteFailed); err != nil {
+			if errors.Is(err, ErrorBlockVisitMarkerOwnedByOther) {
+				level.Info(logger).Log("msg", "refusing to overwrite visit marker owned by another live compactor", "blockID", blockID, "err", err)
+			} else {
+				level.Error(logger).Log("msg", "unable to upsert visit marker file content for block", "blockID", blockID, "err", err)
+			}
+			ok = false
 		}
 		reader.Reset(visitMarkerFileContent)
 	}
+	return ok
 }
 
-func markBlocksVisitedHeartBeat(ctx context.Context, bkt objstore.Bucket, logger log.Logger, blocks []*metadata.Meta, compactorID string, blockVisitMarkerFileUpdateInterval time.Duration, blockVisitMarkerWriteFailed prometheus.Counter) {
+func markBlocksVisitedHeartBeat(ctx context.Context, bkt objstore.Bucket, instrBkt objstore.InstrumentedBucketReader, logger log.Logger, blocks []*metadata.Meta, compactorID string, blockVisitMarkerFileUpdateInterval time.Duration, blockVisitMarkerTimeout time.Duration, blockVisitMarkerReadFailed prometheus.Counter, blockVisitMarkerWriteFailed prometheus.Counter) {
 	var blockIds []string
 	for _, block := range blocks {
 		blockIds = append(blockIds, block.ULID.String())
@@ -124,7 +183,14 @@ heartBeat:
 			CompactorID: compactorID,
 			Version:     VisitMarkerVersion1,
 		}
-		markBlocksVisited(ctx, bkt, logger, blocks, blockVisitMarker, blockVisitMarkerWriteFailed)
+		if !markBlocksVisited(ctx, bkt, instrBkt, logger, blocks, blockVisitMarker, blockVisitMarkerTimeout, blockVisitMarkerReadFailed, blockVisitMarkerWriteFailed) {
+			// Another compactor has taken ownership of at least one block in
+			// this group (or the write failed). Stop refreshing so we do not
+			// trample the current owner's claim; the losing compaction will
+			// be aborted by ShuffleShardingPlanner.Plan's ownership re-check.
+			level.Warn(logger).Log("msg", fmt.Sprintf("stopping heart beat because visit marker ownership was lost for one or more blocks: %s", blocksInfo))
+			break heartBeat
+		}
 
 		select {
 		case <-ctx.Done():
