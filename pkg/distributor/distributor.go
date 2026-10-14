@@ -709,6 +709,12 @@ func (d *Distributor) Push(ctx context.Context, req *cortexpb.WriteRequest) (*co
 		validatedExemplars += len(ts.Exemplars)
 	}
 
+	// Charge at least one token per forwarded timeseries so that label-only
+	// series (no samples and no exemplars) cannot bypass the per-tenant
+	// ingestion rate limit and the per-instance ingestion-rate guard, which
+	// would otherwise see totalN == 0 and allow unlimited write-path work.
+	validatedSeriesCount := len(validatedTimeseries)
+
 	for _, m := range req.Metadata {
 		err := validation.ValidateMetadata(d.limits, userID, m)
 
@@ -736,6 +742,12 @@ func (d *Distributor) Push(ctx context.Context, req *cortexpb.WriteRequest) (*co
 	}
 
 	totalN := validatedSamples + validatedExemplars + len(validatedMetadata)
+	if totalN < validatedSeriesCount {
+		// Ensure every forwarded timeseries is charged at least one token,
+		// so a request made entirely of sample-free, exemplar-free series
+		// cannot bypass the rate limiter with totalN == 0.
+		totalN = validatedSeriesCount
+	}
 	if !d.ingestionRateLimiter.AllowN(now, userID, totalN) {
 		// Ensure the request slice is reused if the request is rate limited.
 		cortexpb.ReuseSlice(req.Timeseries)
