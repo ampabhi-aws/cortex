@@ -2,9 +2,11 @@ package v2
 
 import (
 	"context"
+	cryptorand "crypto/rand"
+	"encoding/binary"
 	"flag"
 	"fmt"
-	"math/rand"
+	mathrand "math/rand"
 	"net/http"
 	"sync"
 	"time"
@@ -82,6 +84,11 @@ type frontendRequest struct {
 
 	enqueue  chan enqueueResult
 	response chan *frontendv2pb.QueryResultRequest
+
+	// responseDelivered guards req.response so that at most one QueryResult call per queryID is
+	// accepted. Combined with per-query ID unpredictability, this ensures a late or forged peer
+	// cannot overwrite a result that has already been delivered by the legitimate querier.
+	responseDelivered atomic.Bool
 }
 
 type enqueueStatus int
@@ -116,10 +123,22 @@ func NewFrontend(cfg Config, log log.Logger, reg prometheus.Registerer) (*Fronte
 		schedulerWorkers: schedulerWorkers,
 		requests:         newRequestsInProgress(),
 	}
-	// Randomize to avoid getting responses from queries sent before restart, which could lead to mixing results
-	// between different queries. Note that frontend verifies the user, so it cannot leak results between tenants.
-	// This isn't perfect, but better than nothing.
-	f.lastQueryID.Store(rand.Uint64())
+	// Randomize the per-query ID counter start value with a cryptographically secure random number
+	// so that in-flight query IDs are not predictable from process start time (previously the counter
+	// was seeded from math/rand, whose seed was derived from time.Now().UnixNano() in cmd/cortex/main.go
+	// and could be narrowed by observing process_start_time_seconds on /metrics). Query IDs are used
+	// as a correlation value between the frontend, scheduler and querier and must not be guessable by
+	// an unauthenticated caller of /frontend.FrontendForQuerier/QueryResult. Note that this is a
+	// defense-in-depth measure; strong peer authentication for the internal gRPC plane (e.g. mTLS via
+	// server.grpc-tls-client-auth=RequireAndVerifyClientCert) remains the recommended control.
+	var seedBuf [8]byte
+	if _, err := cryptorand.Read(seedBuf[:]); err != nil {
+		// Fall back to math/rand only if the OS CSPRNG is unavailable; this preserves startup even
+		// in degraded environments but should essentially never happen in practice.
+		f.lastQueryID.Store(mathrand.Uint64())
+	} else {
+		f.lastQueryID.Store(binary.BigEndian.Uint64(seedBuf[:]))
+	}
 
 	promauto.With(reg).NewGaugeFunc(prometheus.GaugeOpts{
 		Name: "cortex_query_frontend_queries_in_progress",
@@ -253,11 +272,19 @@ func (f *Frontend) QueryResult(ctx context.Context, qrReq *frontendv2pb.QueryRes
 	// To avoid leaking query results between users, we verify the user here.
 	// To avoid mixing results from different queries, we randomize queryID counter on start.
 	if req != nil && req.userID == userID {
-		select {
-		case req.response <- qrReq:
-			// Should always be possible, unless QueryResult is called multiple times with the same queryID.
-		default:
-			level.Warn(f.log).Log("msg", "failed to write query result to the response channel", "queryID", qrReq.QueryID, "user", userID)
+		// Accept each query ID exactly once: only the first caller that wins the compare-and-swap
+		// gets to deliver the result. Subsequent calls (which could be a late/replayed response
+		// from a different peer, or an attacker racing the legitimate querier) are rejected before
+		// they can overwrite or poison the in-flight response channel.
+		if req.responseDelivered.CAS(false, true) {
+			select {
+			case req.response <- qrReq:
+				// Delivered.
+			default:
+				level.Warn(f.log).Log("msg", "failed to write query result to the response channel", "queryID", qrReq.QueryID, "user", userID)
+			}
+		} else {
+			level.Warn(f.log).Log("msg", "ignoring duplicate query result", "queryID", qrReq.QueryID, "user", userID)
 		}
 	}
 
