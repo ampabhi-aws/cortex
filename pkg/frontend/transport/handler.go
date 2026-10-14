@@ -232,9 +232,21 @@ func (f *Handler) parseRequestQueryString(r *http.Request, bodyBuf bytes.Buffer)
 	return r.Form
 }
 
+// maxQueryStringLogSize caps the size of any single logged query/form
+// parameter so that an attacker cannot cause the frontend to spend
+// multi-megabyte I/O per request writing its own payload back out.
+const maxQueryStringLogSize = 10 * 1024
+
+func truncateForLog(s string) string {
+	if len(s) <= maxQueryStringLogSize {
+		return s
+	}
+	return s[:maxQueryStringLogSize] + fmt.Sprintf("...<truncated: original %d bytes>", len(s))
+}
+
 func formatQueryString(queryString url.Values) (fields []interface{}) {
 	for k, v := range queryString {
-		fields = append(fields, fmt.Sprintf("param_%s", k), strings.Join(v, ","))
+		fields = append(fields, fmt.Sprintf("param_%s", k), truncateForLog(strings.Join(v, ",")))
 	}
 	return fields
 }
