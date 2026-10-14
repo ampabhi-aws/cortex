@@ -20,7 +20,7 @@ import (
 	"github.com/thanos-io/thanos/pkg/block/metadata"
 
 	"github.com/cortexproject/cortex/pkg/ring"
-	"github.com/cortexproject/cortex/pkg/storage/bucket"
+	cortex_testutil "github.com/cortexproject/cortex/pkg/storage/tsdb/testutil"
 	"github.com/cortexproject/cortex/pkg/util/validation"
 )
 
@@ -345,7 +345,7 @@ func TestShuffleShardingGrouper_Groups(t *testing.T) {
 				Help: "Number of block visit marker file failed to be written.",
 			})
 
-			bkt := &bucket.ClientMock{}
+			bkt, _ := cortex_testutil.PrepareFilesystemBucket(t)
 			blockVisitMarkerTimeout := 5 * time.Minute
 			for _, visitedBlock := range testData.visitedBlocks {
 				visitMarkerFile := path.Join(visitedBlock.id.String(), BlockVisitMarkerFile)
@@ -359,10 +359,8 @@ func TestShuffleShardingGrouper_Groups(t *testing.T) {
 					Version:     VisitMarkerVersion1,
 				}
 				visitMarkerFileContent, _ := json.Marshal(blockVisitMarker)
-				bkt.MockGet(visitMarkerFile, string(visitMarkerFileContent), nil)
+				require.NoError(t, bkt.Upload(context.Background(), visitMarkerFile, bytes.NewReader(visitMarkerFileContent)))
 			}
-			bkt.MockUpload(mock.Anything, nil)
-			bkt.MockGet(mock.Anything, "", nil)
 
 			ctx, cancel := context.WithCancel(context.Background())
 			defer cancel()

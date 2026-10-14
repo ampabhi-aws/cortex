@@ -84,6 +84,10 @@ func UpdateBlockVisitMarker(ctx context.Context, bkt objstore.Bucket, blockID st
 	return nil
 }
 
+// markBlocksVisited writes the given visit marker for every provided block.
+// It returns a non-nil error if marshalling fails or if any individual upload
+// fails, so callers that rely on the marker as a mutual-exclusion signal can
+// abort the group when they cannot be sure every block was marked.
 func markBlocksVisited(
 	ctx context.Context,
 	bkt objstore.Bucket,
@@ -91,20 +95,25 @@ func markBlocksVisited(
 	blocks []*metadata.Meta,
 	marker BlockVisitMarker,
 	blockVisitMarkerWriteFailed prometheus.Counter,
-) {
+) error {
 	visitMarkerFileContent, err := json.Marshal(marker)
 	if err != nil {
 		blockVisitMarkerWriteFailed.Inc()
-		return
+		return errors.Wrap(err, "marshal block visit marker")
 	}
 	reader := bytes.NewReader(visitMarkerFileContent)
+	var firstErr error
 	for _, block := range blocks {
 		blockID := block.ULID.String()
 		if err := UpdateBlockVisitMarker(ctx, bkt, blockID, reader, blockVisitMarkerWriteFailed); err != nil {
 			level.Error(logger).Log("msg", "unable to upsert visit marker file content for block", "blockID", blockID, "err", err)
+			if firstErr == nil {
+				firstErr = errors.Wrapf(err, "upload block visit marker for block %s", blockID)
+			}
 		}
 		reader.Reset(visitMarkerFileContent)
 	}
+	return firstErr
 }
 
 func markBlocksVisitedHeartBeat(ctx context.Context, bkt objstore.Bucket, logger log.Logger, blocks []*metadata.Meta, compactorID string, blockVisitMarkerFileUpdateInterval time.Duration, blockVisitMarkerWriteFailed prometheus.Counter) {
@@ -124,7 +133,9 @@ heartBeat:
 			CompactorID: compactorID,
 			Version:     VisitMarkerVersion1,
 		}
-		markBlocksVisited(ctx, bkt, logger, blocks, blockVisitMarker, blockVisitMarkerWriteFailed)
+		if err := markBlocksVisited(ctx, bkt, logger, blocks, blockVisitMarker, blockVisitMarkerWriteFailed); err != nil {
+			level.Warn(logger).Log("msg", "failed to refresh block visit marker heart beat", "blocks", blocksInfo, "err", err)
+		}
 
 		select {
 		case <-ctx.Done():
