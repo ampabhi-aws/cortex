@@ -42,7 +42,13 @@ func TestRemoteReadHandler(t *testing.T) {
 
 	requestBody, err := proto.Marshal(&client.ReadRequest{
 		Queries: []*client.QueryRequest{
-			{StartTimestampMs: 0, EndTimestampMs: 10},
+			{
+				StartTimestampMs: 0,
+				EndTimestampMs:   10,
+				Matchers: []*client.LabelMatcher{
+					{Type: client.EQUAL, Name: "__name__", Value: "foo"},
+				},
+			},
 		},
 	})
 	require.NoError(t, err)

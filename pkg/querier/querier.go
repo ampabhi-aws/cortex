@@ -221,7 +221,20 @@ func NewQueryable(distributor QueryableWithFilter, stores []QueryableWithFilter,
 			return nil, err
 		}
 
-		ctx = limiter.AddQueryLimiterToContext(ctx, limiter.NewQueryLimiter(limits.MaxFetchedSeriesPerQuery(userID), limits.MaxFetchedChunkBytesPerQuery(userID), limits.MaxChunksPerQuery(userID), limits.MaxFetchedDataBytesPerQuery(userID)))
+		// If a request-scoped shared limiter provider is installed on the context
+		// (e.g. by the remote-read HTTP handler, which performs N sub-queries per
+		// request), reuse the same QueryLimiter for every sub-query so that
+		// MaxFetchedSeriesPerQuery / MaxFetchedChunkBytesPerQuery /
+		// MaxChunksPerQuery / MaxFetchedDataBytesPerQuery apply to the whole
+		// request instead of being multiplied by the number of sub-queries.
+		ql := func() *limiter.QueryLimiter {
+			return limiter.NewQueryLimiter(limits.MaxFetchedSeriesPerQuery(userID), limits.MaxFetchedChunkBytesPerQuery(userID), limits.MaxChunksPerQuery(userID), limits.MaxFetchedDataBytesPerQuery(userID))
+		}
+		if p := limiter.SharedQueryLimiterProviderFromContext(ctx); p != nil {
+			ctx = limiter.AddQueryLimiterToContext(ctx, p.Get(ql))
+		} else {
+			ctx = limiter.AddQueryLimiterToContext(ctx, ql())
+		}
 
 		mint, maxt, err = validateQueryTimeRange(ctx, userID, mint, maxt, limits, cfg.MaxQueryIntoFuture)
 		if err == errEmptyTimeRange {

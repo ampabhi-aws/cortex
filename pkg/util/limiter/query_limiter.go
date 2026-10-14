@@ -13,9 +13,11 @@ import (
 )
 
 type queryLimiterCtxKey struct{}
+type sharedQueryLimiterProviderCtxKey struct{}
 
 var (
 	ctxKey                    = &queryLimiterCtxKey{}
+	sharedProviderKey         = &sharedQueryLimiterProviderCtxKey{}
 	ErrMaxSeriesHit           = "the query hit the max number of series limit (limit: %d series)"
 	ErrMaxChunkBytesHit       = "the query hit the aggregated chunks size limit (limit: %d bytes)"
 	ErrMaxDataBytesHit        = "the query hit the aggregated data size limit (limit: %d bytes)"
@@ -52,6 +54,41 @@ func NewQueryLimiter(maxSeriesPerQuery, maxChunkBytesPerQuery, maxChunksPerQuery
 
 func AddQueryLimiterToContext(ctx context.Context, limiter *QueryLimiter) context.Context {
 	return context.WithValue(ctx, ctxKey, limiter)
+}
+
+// SharedQueryLimiterProvider lazily constructs and caches a single QueryLimiter
+// that is shared across every sub-query made under one logical request. It lets
+// a request-scoped caller (e.g. the remote-read HTTP handler, which performs N
+// independent sub-queries) enforce the per-query series/chunk/byte limits over
+// the whole request instead of allowing each sub-query to allocate its own
+// (unshared) budget.
+type SharedQueryLimiterProvider struct {
+	once sync.Once
+	ql   *QueryLimiter
+}
+
+// Get returns the shared QueryLimiter, constructing it exactly once via factory.
+func (p *SharedQueryLimiterProvider) Get(factory func() *QueryLimiter) *QueryLimiter {
+	p.once.Do(func() {
+		p.ql = factory()
+	})
+	return p.ql
+}
+
+// AddSharedQueryLimiterProviderToContext installs a fresh
+// SharedQueryLimiterProvider on the context. Downstream code that would
+// normally build a fresh per-query limiter should instead ask the provider for
+// one via Get so that every sub-query under the same request shares the limits.
+func AddSharedQueryLimiterProviderToContext(ctx context.Context) context.Context {
+	return context.WithValue(ctx, sharedProviderKey, &SharedQueryLimiterProvider{})
+}
+
+// SharedQueryLimiterProviderFromContext returns the shared provider installed
+// on the context, or nil if none was installed. Callers that get nil must fall
+// back to allocating a per-query limiter as before.
+func SharedQueryLimiterProviderFromContext(ctx context.Context) *SharedQueryLimiterProvider {
+	p, _ := ctx.Value(sharedProviderKey).(*SharedQueryLimiterProvider)
+	return p
 }
 
 // QueryLimiterFromContextWithFallback returns a QueryLimiter from the current context.
