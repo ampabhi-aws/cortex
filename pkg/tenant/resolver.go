@@ -83,6 +83,14 @@ func (t *SingleResolver) TenantID(ctx context.Context) (string, error) {
 		return "", err
 	}
 
+	// A tenant ID must not be empty because the ingester (and other components)
+	// use it directly as a filesystem/object-store path segment. An empty tenant
+	// ID collapses `filepath.Join(dir, "")` to `dir`, which would make the
+	// tenant TSDB share the global TSDB root with all other tenants.
+	if id == "" {
+		return "", user.ErrNoOrgID
+	}
+
 	if containsUnsafePathSegments(id) {
 		return "", errInvalidTenantID
 	}
@@ -127,6 +135,14 @@ func (t *MultiResolver) TenantIDs(ctx context.Context) ([]string, error) {
 	orgID, err := user.ExtractOrgID(ctx)
 	if err != nil {
 		return nil, err
+	}
+
+	// Reject a present-but-empty org ID outright. `strings.Split("", sep)`
+	// returns `[""]`, and ValidTenantID() now rejects an empty string, but we
+	// check here explicitly so the resolver returns the canonical
+	// user.ErrNoOrgID rather than a character-validation error.
+	if orgID == "" {
+		return nil, user.ErrNoOrgID
 	}
 
 	orgIDs := strings.Split(orgID, tenantIDsLabelSeparator)
