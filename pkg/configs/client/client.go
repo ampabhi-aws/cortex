@@ -32,12 +32,18 @@ type Config struct {
 	ConfigsAPIURL flagext.URLValue     `yaml:"configs_api_url"`
 	ClientTimeout time.Duration        `yaml:"client_timeout"` // HTTP timeout duration for requests made to the Weave Cloud configs service.
 	TLS           tls_cfg.ClientConfig `yaml:",inline"`
+
+	// TenantID, if set, is sent as the X-Scope-OrgID header on requests to the
+	// configs service's privileged all-tenant endpoints. It must match an entry
+	// in the configs service's -configs.admin-allowed-tenants list.
+	TenantID string `yaml:"tenant_id"`
 }
 
 // RegisterFlagsWithPrefix adds the flags required to config this to the given FlagSet
 func (cfg *Config) RegisterFlagsWithPrefix(prefix string, f *flag.FlagSet) {
 	f.Var(&cfg.ConfigsAPIURL, prefix+"configs.url", "URL of configs API server.")
 	f.DurationVar(&cfg.ClientTimeout, prefix+"configs.client-timeout", 5*time.Second, "Timeout for requests to Weave Cloud configs service.")
+	f.StringVar(&cfg.TenantID, prefix+"configs.tenant-id", "", "Tenant ID sent as X-Scope-OrgID when fetching all-tenant configs from the configs service's /private/* endpoints. Must match an entry in the configs service's -configs.admin-allowed-tenants list.")
 	cfg.TLS.RegisterFlagsWithPrefix(prefix+"configs", f)
 }
 
@@ -66,8 +72,9 @@ func New(cfg Config) (*ConfigDBClient, error) {
 	}
 
 	client := &ConfigDBClient{
-		URL:     cfg.ConfigsAPIURL.URL,
-		Timeout: cfg.ClientTimeout,
+		URL:      cfg.ConfigsAPIURL.URL,
+		Timeout:  cfg.ClientTimeout,
+		TenantID: cfg.TenantID,
 	}
 
 	tlsConfig, err := cfg.TLS.GetTLSConfig()
@@ -86,6 +93,7 @@ type ConfigDBClient struct {
 	URL       *url.URL
 	Timeout   time.Duration
 	TLSConfig *tls.Config
+	TenantID  string
 }
 
 // GetRules implements Client
@@ -98,7 +106,7 @@ func (c ConfigDBClient) GetRules(ctx context.Context, since userconfig.ID) (map[
 	var response *ConfigsResponse
 	err := instrument.CollectedRequest(ctx, "GetRules", configsRequestDuration, instrument.ErrorCode, func(ctx context.Context) error {
 		var err error
-		response, err = doRequest(endpoint, c.Timeout, c.TLSConfig, since)
+		response, err = doRequest(endpoint, c.Timeout, c.TLSConfig, c.TenantID, since)
 		return err
 	})
 	if err != nil {
@@ -124,13 +132,13 @@ func (c ConfigDBClient) GetAlerts(ctx context.Context, since userconfig.ID) (*Co
 	var response *ConfigsResponse
 	err := instrument.CollectedRequest(ctx, "GetAlerts", configsRequestDuration, instrument.ErrorCode, func(ctx context.Context) error {
 		var err error
-		response, err = doRequest(endpoint, c.Timeout, c.TLSConfig, since)
+		response, err = doRequest(endpoint, c.Timeout, c.TLSConfig, c.TenantID, since)
 		return err
 	})
 	return response, err
 }
 
-func doRequest(endpoint string, timeout time.Duration, tlsConfig *tls.Config, since userconfig.ID) (*ConfigsResponse, error) {
+func doRequest(endpoint string, timeout time.Duration, tlsConfig *tls.Config, tenantID string, since userconfig.ID) (*ConfigsResponse, error) {
 	req, err := http.NewRequest("GET", endpoint, nil)
 	if err != nil {
 		return nil, err
@@ -142,6 +150,9 @@ func doRequest(endpoint string, timeout time.Duration, tlsConfig *tls.Config, si
 	}
 
 	req.Header.Set("User-Agent", fmt.Sprintf("Cortex/%s", version.Version))
+	if tenantID != "" {
+		req.Header.Set("X-Scope-OrgID", tenantID)
+	}
 
 	resp, err := client.Do(req)
 	if err != nil {

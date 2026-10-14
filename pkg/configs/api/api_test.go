@@ -9,6 +9,7 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/cortexproject/cortex/pkg/configs/db/dbtest"
 	"github.com/cortexproject/cortex/pkg/configs/userconfig"
 
 	"github.com/stretchr/testify/assert"
@@ -149,7 +150,7 @@ func Test_GetAllConfigs_Empty(t *testing.T) {
 	defer cleanup(t)
 
 	for _, c := range allClients {
-		w := request(t, "GET", c.PrivateEndpoint, nil)
+		w := requestAsUser(t, adminUserID, "GET", c.PrivateEndpoint, "", nil)
 		assert.Equal(t, http.StatusOK, w.Code)
 		var found ConfigsView
 		err := json.Unmarshal(w.Body.Bytes(), &found)
@@ -168,7 +169,7 @@ func Test_GetAllConfigs(t *testing.T) {
 
 	for _, c := range allClients {
 		view := c.post(t, userID, config)
-		w := request(t, "GET", c.PrivateEndpoint, nil)
+		w := requestAsUser(t, adminUserID, "GET", c.PrivateEndpoint, "", nil)
 		assert.Equal(t, http.StatusOK, w.Code)
 		var found ConfigsView
 		err := json.Unmarshal(w.Body.Bytes(), &found)
@@ -191,7 +192,7 @@ func Test_GetAllConfigs_Newest(t *testing.T) {
 		c.post(t, userID, makeConfig())
 		lastCreated := c.post(t, userID, makeConfig())
 
-		w := request(t, "GET", c.PrivateEndpoint, nil)
+		w := requestAsUser(t, adminUserID, "GET", c.PrivateEndpoint, "", nil)
 		assert.Equal(t, http.StatusOK, w.Code)
 		var found ConfigsView
 		err := json.Unmarshal(w.Body.Bytes(), &found)
@@ -212,7 +213,7 @@ func Test_GetConfigs_IncludesNewerConfigsAndExcludesOlder(t *testing.T) {
 		userID3 := makeUserID()
 		config3 := c.post(t, userID3, makeConfig())
 
-		w := request(t, "GET", fmt.Sprintf("%s?since=%d", c.PrivateEndpoint, config2.ID), nil)
+		w := requestAsUser(t, adminUserID, "GET", fmt.Sprintf("%s?since=%d", c.PrivateEndpoint, config2.ID), "", nil)
 		assert.Equal(t, http.StatusOK, w.Code)
 		var found ConfigsView
 		err := json.Unmarshal(w.Body.Bytes(), &found)
@@ -220,6 +221,47 @@ func Test_GetConfigs_IncludesNewerConfigsAndExcludesOlder(t *testing.T) {
 		assert.Equal(t, ConfigsView{Configs: map[string]userconfig.View{
 			userID3: config3,
 		}}, found)
+	}
+}
+
+// GetAllConfigs returns 401 to anonymous callers.
+func Test_GetAllConfigs_Anonymous(t *testing.T) {
+	setup(t)
+	defer cleanup(t)
+
+	for _, c := range allClients {
+		w := request(t, "GET", c.PrivateEndpoint, nil)
+		assert.Equal(t, http.StatusUnauthorized, w.Code)
+	}
+}
+
+// GetAllConfigs returns 403 to authenticated callers who are not admins.
+func Test_GetAllConfigs_NonAdminForbidden(t *testing.T) {
+	setup(t)
+	defer cleanup(t)
+
+	for _, c := range allClients {
+		w := requestAsUser(t, makeUserID(), "GET", c.PrivateEndpoint, "", nil)
+		assert.Equal(t, http.StatusForbidden, w.Code)
+	}
+}
+
+// GetAllConfigs returns 403 to every caller when no admin tenants are configured.
+func Test_GetAllConfigs_DisabledByDefault(t *testing.T) {
+	database = dbtest.Setup(t)
+	defer cleanup(t)
+	savedApp := app
+	app = New(database, Config{Notifications: NotificationsConfig{DisableEmail: true}})
+	defer func() { app = savedApp }()
+	counter = 0
+
+	for _, c := range allClients {
+		// Even the previously-admin tenant is rejected now.
+		w := requestAsUser(t, adminUserID, "GET", c.PrivateEndpoint, "", nil)
+		assert.Equal(t, http.StatusForbidden, w.Code)
+		// So is an anonymous caller.
+		w = request(t, "GET", c.PrivateEndpoint, nil)
+		assert.Equal(t, http.StatusUnauthorized, w.Code)
 	}
 }
 
