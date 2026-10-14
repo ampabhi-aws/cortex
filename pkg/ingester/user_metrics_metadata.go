@@ -88,6 +88,7 @@ func (mm *userMetricsMetadata) toClientMetadata() []*cortexpb.MetricMetadata {
 	r := make([]*cortexpb.MetricMetadata, 0, len(mm.metricToMetadata))
 	for _, set := range mm.metricToMetadata {
 		for m := range set {
+			m := m // new variable per iteration; avoid aliasing the range variable
 			r = append(r, &m)
 		}
 	}
