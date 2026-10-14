@@ -53,6 +53,13 @@ const (
 	// ringAutoForgetUnhealthyPeriods is how many consecutive timeout periods an unhealthy instance
 	// in the ring will be automatically removed.
 	ringAutoForgetUnhealthyPeriods = 5
+
+	// perTenantStopTimeout bounds the time MultitenantAlertmanager.stopping
+	// will wait for all per-tenant alertmanagers to shut down. A wedged
+	// per-tenant alertmanager (for example, one whose silences mutex is
+	// held by a stuck state broadcast) must not be able to block shutdown
+	// of the whole instance indefinitely.
+	perTenantStopTimeout = 30 * time.Second
 )
 
 var (
@@ -702,11 +709,21 @@ func (am *MultitenantAlertmanager) waitInitialStateSync(ctx context.Context) err
 
 // stopping runs when MultitenantAlertmanager transitions to Stopping state.
 func (am *MultitenantAlertmanager) stopping(_ error) error {
+	// Snapshot the per-tenant alertmanagers under the lock, then release it
+	// before calling StopAndWait on each. StopAndWait can block on a wedged
+	// per-tenant alertmanager (for example, one with its silences/nflog
+	// mutex held by a stuck state broadcast), and holding alertmanagersMtx
+	// across that call would also wedge serveRequest, UpdateState and
+	// ReadState for every other tenant on this instance.
 	am.alertmanagersMtx.Lock()
-	for _, am := range am.alertmanagers {
-		am.StopAndWait()
+	ams := make([]*Alertmanager, 0, len(am.alertmanagers))
+	for _, userAM := range am.alertmanagers {
+		ams = append(ams, userAM)
 	}
 	am.alertmanagersMtx.Unlock()
+
+	stopPerTenantAlertmanagers(ams, am.logger)
+
 	if am.peer != nil { // Tests don't setup any peer.
 		err := am.peer.Leave(am.cfg.Cluster.PeerTimeout)
 		if err != nil {
@@ -719,6 +736,38 @@ func (am *MultitenantAlertmanager) stopping(_ error) error {
 		_ = services.StopManagerAndAwaitStopped(context.Background(), am.subservices)
 	}
 	return nil
+}
+
+// stopPerTenantAlertmanagers invokes StopAndWait on each per-tenant
+// alertmanager in parallel with a bounded timeout, so that a wedged tenant
+// cannot block shutdown of the whole instance. A warning is logged for any
+// alertmanager that does not stop in time; the goroutine is leaked but the
+// process is free to exit.
+func stopPerTenantAlertmanagers(ams []*Alertmanager, logger log.Logger) {
+	if len(ams) == 0 {
+		return
+	}
+	var wg sync.WaitGroup
+	wg.Add(len(ams))
+	for _, userAM := range ams {
+		userAM := userAM
+		go func() {
+			defer wg.Done()
+			userAM.StopAndWait()
+		}()
+	}
+
+	done := make(chan struct{})
+	go func() {
+		wg.Wait()
+		close(done)
+	}()
+
+	select {
+	case <-done:
+	case <-time.After(perTenantStopTimeout):
+		level.Warn(logger).Log("msg", "timed out waiting for per-tenant alertmanagers to stop; proceeding with shutdown", "timeout", perTenantStopTimeout.String())
+	}
 }
 
 // loadAlertmanagerConfigs Loads (and filters) the alertmanagers configuration from object storage, taking into consideration the sharding strategy. Returns:
@@ -1073,7 +1122,15 @@ func (am *MultitenantAlertmanager) ReplicateStateForUser(ctx context.Context, us
 			return err
 		}
 
-		resp, err := c.UpdateState(user.InjectOrgID(ctx, userID), part)
+		// Bound the per-peer UpdateState RPC with the configured client
+		// RemoteTimeout. Without this, a slow or wedged peer blocks the
+		// serial replication consumer indefinitely, which in turn blocks
+		// the per-tenant silences/nflog mutex via a full broadcast queue
+		// and can deadlock two replicas in a circular wait.
+		callCtx, cancel := context.WithTimeout(ctx, am.cfg.AlertmanagerClient.RemoteTimeout)
+		defer cancel()
+
+		resp, err := c.UpdateState(user.InjectOrgID(callCtx, userID), part)
 		if err != nil {
 			return err
 		}
@@ -1120,7 +1177,13 @@ func (am *MultitenantAlertmanager) ReadFullStateForUser(ctx context.Context, use
 			return nil
 		}
 
-		resp, err := c.ReadState(user.InjectOrgID(ctx, userID), &alertmanagerpb.ReadStateRequest{})
+		// Bound the per-peer ReadState RPC with the configured client
+		// RemoteTimeout, matching the behaviour of the distributor and
+		// preventing a slow peer from blocking initial-state settling.
+		callCtx, cancel := context.WithTimeout(ctx, am.cfg.AlertmanagerClient.RemoteTimeout)
+		defer cancel()
+
+		resp, err := c.ReadState(user.InjectOrgID(callCtx, userID), &alertmanagerpb.ReadStateRequest{})
 		if err != nil {
 			level.Error(am.logger).Log("msg", "rpc reading state from replica failed", "addr", addr, "user", userID, "err", err)
 			return nil

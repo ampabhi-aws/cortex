@@ -24,6 +24,15 @@ const (
 	defaultSettleReadTimeout = 15 * time.Second
 	defaultStoreReadTimeout  = 15 * time.Second
 
+	// Buffer for pending state broadcasts. A small buffer absorbs normal
+	// bursts (one in-flight replication plus a couple of queued updates)
+	// while keeping memory bounded; anything beyond that is dropped so a
+	// slow or wedged peer cannot block callers that hold the silences or
+	// notification-log mutex. Dropped messages are safe because the full
+	// state is re-synced from peers/storage on next startup and the
+	// per-tenant alertmanager also persists state periodically.
+	defaultBroadcastQueueLen = 16
+
 	// Initial sync outcome label values.
 	syncFromReplica  = "from-replica"
 	syncFromStorage  = "from-storage"
@@ -53,6 +62,7 @@ type state struct {
 	partialStateMergesFailed *prometheus.CounterVec
 	stateReplicationTotal    *prometheus.CounterVec
 	stateReplicationFailed   *prometheus.CounterVec
+	stateReplicationDropped  *prometheus.CounterVec
 	fetchReplicaStateTotal   prometheus.Counter
 	fetchReplicaStateFailed  prometheus.Counter
 	initialSyncTotal         prometheus.Counter
@@ -72,7 +82,10 @@ func newReplicatedStates(userID string, rf int, re Replicator, st alertstore.Ale
 		replicator:        re,
 		store:             st,
 		states:            make(map[string]cluster.State, 2), // we use two, one for the notifications and one for silences.
-		msgc:              make(chan *clusterpb.Part),
+		// Buffered channel so broadcast() does not block callers that hold
+		// the silences/nflog mutex when the replication consumer is busy
+		// waiting on a slow or wedged peer.
+		msgc:              make(chan *clusterpb.Part, defaultBroadcastQueueLen),
 		reg:               r,
 		settleReadTimeout: defaultSettleReadTimeout,
 		storeReadTimeout:  defaultStoreReadTimeout,
@@ -91,6 +104,10 @@ func newReplicatedStates(userID string, rf int, re Replicator, st alertstore.Ale
 		stateReplicationFailed: promauto.With(r).NewCounterVec(prometheus.CounterOpts{
 			Name: "alertmanager_state_replication_failed_total",
 			Help: "Number of times we have failed to replicate a state to other alertmanagers.",
+		}, []string{"key"}),
+		stateReplicationDropped: promauto.With(r).NewCounterVec(prometheus.CounterOpts{
+			Name: "alertmanager_state_replication_dropped_total",
+			Help: "Number of times we have dropped a state broadcast because the replication queue was full. The next successful replication or state resync restores consistency.",
 		}, []string{"key"}),
 		fetchReplicaStateTotal: promauto.With(r).NewCounter(prometheus.CounterOpts{
 			Name: "alertmanager_state_fetch_replica_state_total",
@@ -135,6 +152,7 @@ func (s *state) AddState(key string, cs cluster.State, _ prometheus.Registerer) 
 	s.partialStateMergesFailed.WithLabelValues(key)
 	s.stateReplicationTotal.WithLabelValues(key)
 	s.stateReplicationFailed.WithLabelValues(key)
+	s.stateReplicationDropped.WithLabelValues(key)
 
 	return &stateChannel{
 		s:   s,
@@ -298,8 +316,25 @@ func (s *state) running(ctx context.Context) error {
 
 func (s *state) broadcast(key string, b []byte) {
 	// We should ignore the Merges into the initial state during settling.
-	if s.Ready() {
-		s.msgc <- &clusterpb.Part{Key: key, Data: b}
+	if !s.Ready() {
+		return
+	}
+	// Non-blocking send: callers of broadcast (silence.Set/Merge and
+	// nflog.Log/Merge in the vendored alertmanager code) hold a write
+	// lock on the underlying state while invoking this function. A
+	// blocking send on an unbuffered channel can therefore stall every
+	// silence/notification read and write for the tenant whenever the
+	// single serial consumer in running() is waiting on a slow or
+	// mutually-blocked peer's UpdateState RPC. If the queue is full we
+	// drop this message and record it; silence and nflog state is
+	// re-synced from peers/storage on startup and periodically
+	// persisted, so dropping an in-flight update degrades convergence
+	// without risking a per-tenant or cross-replica deadlock.
+	select {
+	case s.msgc <- &clusterpb.Part{Key: key, Data: b}:
+	default:
+		s.stateReplicationDropped.WithLabelValues(key).Inc()
+		level.Warn(s.logger).Log("msg", "dropping state broadcast because the replication queue is full", "user", s.userID, "key", key)
 	}
 }
 
