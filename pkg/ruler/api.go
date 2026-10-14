@@ -279,6 +279,10 @@ func (a *API) PrometheusAlerts(w http.ResponseWriter, req *http.Request) {
 	}
 }
 
+// maxNamePathLength bounds the length of a namespace or group path variable
+// after percent-decoding, to prevent abusive inputs.
+const maxNamePathLength = 255
+
 var (
 	// ErrNoNamespace signals that no namespace was specified in the request
 	ErrNoNamespace = errors.New("a namespace must be provided in the request")
@@ -288,7 +292,28 @@ var (
 	ErrNoRuleGroups = errors.New("no rule groups found")
 	// ErrBadRuleGroup is returned when the provided rule group can not be unmarshalled
 	ErrBadRuleGroup = errors.New("unable to decoded rule group")
+	// ErrInvalidNamespace is returned when the namespace path variable contains
+	// characters that could allow path traversal or is otherwise unsafe to use
+	// as a filesystem path segment.
+	ErrInvalidNamespace = errors.New("invalid namespace: must not be empty, '.', '..', or contain '/', '\\' or NUL")
+	// ErrInvalidGroupName is returned when the group name path variable is unsafe.
+	ErrInvalidGroupName = errors.New("invalid group name: must not be empty, '.', '..', or contain '/', '\\' or NUL")
 )
+
+// isUnsafePathSegment reports whether the provided value is empty, a relative
+// directory reference ("." or ".."), contains a path separator or NUL byte, or
+// exceeds the maximum allowed length. The checks mirror
+// tenant.containsUnsafePathSegments and are enforced on untrusted URL path
+// variables that reach the filesystem.
+func isUnsafePathSegment(s string) bool {
+	if s == "" || s == "." || s == ".." {
+		return true
+	}
+	if len(s) > maxNamePathLength {
+		return true
+	}
+	return strings.ContainsAny(s, "\\/\x00")
+}
 
 func marshalAndSend(output interface{}, w http.ResponseWriter, logger log.Logger) {
 	d, err := yaml.Marshal(&output)
@@ -324,7 +349,16 @@ func respondAccepted(w http.ResponseWriter, logger log.Logger) {
 }
 
 // parseNamespace parses the namespace from the provided set of params, in this
-// api these params are derived from the url path
+// api these params are derived from the url path.
+//
+// The namespace is percent-decoded and then validated: it must be non-empty,
+// must not be a relative directory reference ("." or ".."), must not contain
+// path separators ("/" or "\\") or NUL bytes, and must not exceed the maximum
+// allowed length. This is required because downstream rule stores (notably the
+// local filesystem rule store) join the value into a filesystem path and
+// reading an un-validated value enables path traversal and cross-tenant rule
+// disclosure. An invalid value is reported as ErrInvalidNamespace to avoid
+// echoing attacker-controlled content back to the caller.
 func parseNamespace(params map[string]string) (string, error) {
 	namespace, exists := params["namespace"]
 	if !exists {
@@ -333,14 +367,20 @@ func parseNamespace(params map[string]string) (string, error) {
 
 	namespace, err := url.PathUnescape(namespace)
 	if err != nil {
-		return "", err
+		return "", ErrInvalidNamespace
+	}
+
+	if isUnsafePathSegment(namespace) {
+		return "", ErrInvalidNamespace
 	}
 
 	return namespace, nil
 }
 
 // parseGroupName parses the group name from the provided set of params, in this
-// api these params are derived from the url path
+// api these params are derived from the url path. The same validation applied
+// to the namespace is applied here for the same reason: the value flows into
+// filesystem paths used by rule stores.
 func parseGroupName(params map[string]string) (string, error) {
 	groupName, exists := params["groupName"]
 	if !exists {
@@ -349,7 +389,11 @@ func parseGroupName(params map[string]string) (string, error) {
 
 	groupName, err := url.PathUnescape(groupName)
 	if err != nil {
-		return "", err
+		return "", ErrInvalidGroupName
+	}
+
+	if isUnsafePathSegment(groupName) {
+		return "", ErrInvalidGroupName
 	}
 
 	return groupName, nil
@@ -395,7 +439,8 @@ func (a *API) ListRules(w http.ResponseWriter, req *http.Request) {
 	level.Debug(logger).Log("msg", "retrieving rule groups with namespace", "userID", userID, "namespace", namespace)
 	rgs, err := a.store.ListRuleGroupsForUserAndNamespace(req.Context(), userID, namespace)
 	if err != nil {
-		http.Error(w, err.Error(), http.StatusBadRequest)
+		level.Error(logger).Log("msg", "unable to list rule groups", "err", err.Error(), "user", userID)
+		http.Error(w, "unable to list rule groups", http.StatusBadRequest)
 		return
 	}
 
