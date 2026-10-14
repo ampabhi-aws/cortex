@@ -16,6 +16,7 @@ var (
 	errMaxMetadataPerMetricLimitExceeded = errors.New("per-metric metadata limit exceeded")
 	errMaxSeriesPerUserLimitExceeded     = errors.New("per-user series limit exceeded")
 	errMaxMetadataPerUserLimitExceeded   = errors.New("per-user metric metadata limit exceeded")
+	errMaxSeriesHit                      = errors.New("the query hit the max number of series limit")
 )
 
 // RingCount is the interface exposed by a ring implementation which allows
@@ -98,6 +99,22 @@ func (l *Limiter) AssertMaxMetricsWithMetadataPerUser(userID string, metrics int
 // MaxSeriesPerQuery returns the maximum number of series a query is allowed to hit.
 func (l *Limiter) MaxSeriesPerQuery(userID string) int {
 	return l.limits.MaxSeriesPerQuery(userID)
+}
+
+// AssertMaxSeriesPerQuery checks whether the given number of series exceeds the
+// configured per-tenant per-query series limit (-ingester.max-series-per-query).
+// A limit of 0 disables the check. Returns errMaxSeriesHit when the limit is
+// reached. This is used to bound the memory a single ingester metadata/query
+// RPC can allocate while materializing a response.
+func (l *Limiter) AssertMaxSeriesPerQuery(userID string, series int) error {
+	actualLimit := l.limits.MaxSeriesPerQuery(userID)
+	if actualLimit <= 0 {
+		return nil
+	}
+	if series < actualLimit {
+		return nil
+	}
+	return errMaxSeriesHit
 }
 
 // FormatError returns the input error enriched with the actual limits for the given user.

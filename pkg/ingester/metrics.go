@@ -64,8 +64,9 @@ type ingesterMetrics struct {
 	maxSeriesGauge          prometheus.GaugeFunc
 	maxIngestionRate        prometheus.GaugeFunc
 	ingestionRate           prometheus.GaugeFunc
-	maxInflightPushRequests prometheus.GaugeFunc
-	inflightRequests        prometheus.GaugeFunc
+	maxInflightPushRequests  prometheus.GaugeFunc
+	maxInflightQueryRequests prometheus.GaugeFunc
+	inflightRequests         prometheus.GaugeFunc
 }
 
 func newIngesterMetrics(r prometheus.Registerer, createMetricsConflictingWithTSDB bool, activeSeriesEnabled bool, instanceLimitsFn func() *InstanceLimits, ingestionRate *util_math.EwmaRate, inflightRequests *atomic.Int64) *ingesterMetrics {
@@ -263,6 +264,17 @@ func newIngesterMetrics(r prometheus.Registerer, createMetricsConflictingWithTSD
 		}, func() float64 {
 			if g := instanceLimitsFn(); g != nil {
 				return float64(g.MaxInflightPushRequests)
+			}
+			return 0
+		}),
+
+		maxInflightQueryRequests: promauto.With(r).NewGaugeFunc(prometheus.GaugeOpts{
+			Name:        instanceLimits,
+			Help:        instanceLimitsHelp,
+			ConstLabels: map[string]string{limitLabel: "max_inflight_query_requests"},
+		}, func() float64 {
+			if g := instanceLimitsFn(); g != nil {
+				return float64(g.MaxInflightQueryRequests)
 			}
 			return 0
 		}),
