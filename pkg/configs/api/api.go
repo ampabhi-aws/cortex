@@ -81,29 +81,56 @@ func (a *API) admin(w http.ResponseWriter, r *http.Request) {
 `)
 }
 
-// RegisterRoutes registers the configs API HTTP routes with the provided Router.
-func (a *API) RegisterRoutes(r *mux.Router) {
-	for _, route := range []struct {
-		name, method, path string
-		handler            http.HandlerFunc
-	}{
-		{"root", "GET", "/", a.admin},
+// Route describes a single configs API HTTP route and whether it should be
+// wrapped by the Cortex-wide auth middleware when registered through
+// pkg/api.API.RegisterRoute. Per-tenant routes are marked Auth=true so the
+// shared AuthMiddleware runs and the handler-level
+// tenant.ExtractTenantIDFromHTTPRequest check continues to act as
+// defence-in-depth. The two /private/* operator routes are marked Auth=false
+// to preserve the documented all-tenant contract consumed by
+// pkg/configs/client (used by the ruler/alertmanager pollers which send no
+// X-Scope-OrgID header); they must be kept off any end-user-reachable listener
+// by the operator, matching the pattern of /multitenant_alertmanager/configs
+// and /ruler/rule_groups.
+type Route struct {
+	Name, Method, Path string
+	Handler            http.HandlerFunc
+	Auth               bool
+}
+
+// Routes returns the full list of HTTP routes exposed by the configs API,
+// together with the per-route auth flag that pkg/api should honour.
+func (a *API) Routes() []Route {
+	return []Route{
+		{Name: "root", Method: "GET", Path: "/", Handler: a.admin, Auth: false},
 		// Dedicated APIs for updating rules config. In the future, these *must*
 		// be used.
-		{"get_rules", "GET", "/api/prom/configs/rules", a.getConfig},
-		{"set_rules", "POST", "/api/prom/configs/rules", a.setConfig},
-		{"get_templates", "GET", "/api/prom/configs/templates", a.getConfig},
-		{"set_templates", "POST", "/api/prom/configs/templates", a.setConfig},
-		{"get_alertmanager_config", "GET", "/api/prom/configs/alertmanager", a.getConfig},
-		{"set_alertmanager_config", "POST", "/api/prom/configs/alertmanager", a.setConfig},
-		{"validate_alertmanager_config", "POST", "/api/prom/configs/alertmanager/validate", a.validateAlertmanagerConfig},
-		{"deactivate_config", "DELETE", "/api/prom/configs/deactivate", a.deactivateConfig},
-		{"restore_config", "POST", "/api/prom/configs/restore", a.restoreConfig},
-		// Internal APIs.
-		{"private_get_rules", "GET", "/private/api/prom/configs/rules", a.getConfigs},
-		{"private_get_alertmanager_config", "GET", "/private/api/prom/configs/alertmanager", a.getConfigs},
-	} {
-		r.Handle(route.path, route.handler).Methods(route.method).Name(route.name)
+		{Name: "get_rules", Method: "GET", Path: "/api/prom/configs/rules", Handler: a.getConfig, Auth: true},
+		{Name: "set_rules", Method: "POST", Path: "/api/prom/configs/rules", Handler: a.setConfig, Auth: true},
+		{Name: "get_templates", Method: "GET", Path: "/api/prom/configs/templates", Handler: a.getConfig, Auth: true},
+		{Name: "set_templates", Method: "POST", Path: "/api/prom/configs/templates", Handler: a.setConfig, Auth: true},
+		{Name: "get_alertmanager_config", Method: "GET", Path: "/api/prom/configs/alertmanager", Handler: a.getConfig, Auth: true},
+		{Name: "set_alertmanager_config", Method: "POST", Path: "/api/prom/configs/alertmanager", Handler: a.setConfig, Auth: true},
+		{Name: "validate_alertmanager_config", Method: "POST", Path: "/api/prom/configs/alertmanager/validate", Handler: a.validateAlertmanagerConfig, Auth: true},
+		{Name: "deactivate_config", Method: "DELETE", Path: "/api/prom/configs/deactivate", Handler: a.deactivateConfig, Auth: true},
+		{Name: "restore_config", Method: "POST", Path: "/api/prom/configs/restore", Handler: a.restoreConfig, Auth: true},
+		// Internal APIs. Auth=false matches the pattern of other all-tenant
+		// operator endpoints (e.g. /multitenant_alertmanager/configs,
+		// /ruler/rule_groups, /distributor/all_user_stats) and the contract
+		// polled by pkg/configs/client, which sends no X-Scope-OrgID header.
+		// Operators must keep /private/* off end-user-reachable listeners.
+		{Name: "private_get_rules", Method: "GET", Path: "/private/api/prom/configs/rules", Handler: a.getConfigs, Auth: false},
+		{Name: "private_get_alertmanager_config", Method: "GET", Path: "/private/api/prom/configs/alertmanager", Handler: a.getConfigs, Auth: false},
+	}
+}
+
+// RegisterRoutes registers the configs API HTTP routes with the provided Router.
+// This path does not apply the Cortex auth middleware; callers that want
+// uniform middleware should instead register the routes via
+// pkg/api.API.RegisterConfigAPI using a.Routes().
+func (a *API) RegisterRoutes(r *mux.Router) {
+	for _, route := range a.Routes() {
+		r.Handle(route.Path, route.Handler).Methods(route.Method).Name(route.Name)
 	}
 }
 

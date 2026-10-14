@@ -18,6 +18,7 @@ import (
 	"github.com/cortexproject/cortex/pkg/alertmanager"
 	"github.com/cortexproject/cortex/pkg/alertmanager/alertmanagerpb"
 	"github.com/cortexproject/cortex/pkg/compactor"
+	configAPI "github.com/cortexproject/cortex/pkg/configs/api"
 	"github.com/cortexproject/cortex/pkg/cortexpb"
 	"github.com/cortexproject/cortex/pkg/distributor"
 	"github.com/cortexproject/cortex/pkg/distributor/distributorpb"
@@ -278,6 +279,18 @@ func (a *API) RegisterIngester(i Ingester, pushConfig distributor.Config) {
 func (a *API) RegisterTenantDeletion(api *purger.TenantDeletionAPI) {
 	a.RegisterRoute("/purger/delete_tenant", http.HandlerFunc(api.DeleteTenant), true, "POST")
 	a.RegisterRoute("/purger/delete_tenant_status", http.HandlerFunc(api.DeleteTenantStatus), true, "GET")
+}
+
+// RegisterConfigAPI registers the deprecated configs module routes, wrapping
+// each per-tenant route with the shared AuthMiddleware instead of attaching
+// them straight to the raw server mux. The two /private/* operator routes keep
+// their documented all-tenant contract (auth=false) matching the pattern of
+// /multitenant_alertmanager/configs and /ruler/rule_groups; operators must
+// keep /private/* off any end-user-reachable listener.
+func (a *API) RegisterConfigAPI(c *configAPI.API) {
+	for _, route := range c.Routes() {
+		a.RegisterRoute(route.Path, route.Handler, route.Auth, route.Method)
+	}
 }
 
 // RegisterRuler registers routes associated with the Ruler service.
