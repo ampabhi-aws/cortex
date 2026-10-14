@@ -63,15 +63,18 @@ type SingleResolver struct {
 }
 
 // containsUnsafePathSegments will return true if the string is a directory
-// reference like `.` and `..` or if any path separator character like `/` and
-// `\` can be found.
+// reference like `.` and `..`, if any path separator character like `/` and
+// `\` can be found, or if any glob/shell metacharacter is present. Glob
+// metacharacters are rejected because the tenant id is used as a filesystem
+// path component and may reach callers (e.g. the Alertmanager template
+// loader) that expand paths with filepath.Glob.
 func containsUnsafePathSegments(id string) bool {
 	// handle the relative reference to current and parent path.
 	if id == "." || id == ".." {
 		return true
 	}
 
-	return strings.ContainsAny(id, "\\/")
+	return strings.ContainsAny(id, "\\/") || strings.ContainsAny(id, "*?[]")
 }
 
 var errInvalidTenantID = errors.New("invalid tenant ID")
