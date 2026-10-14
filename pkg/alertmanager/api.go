@@ -45,6 +45,8 @@ var (
 	errTLSFileNotAllowed             = errors.New("setting TLS ca_file, cert_file and key_file is not allowed")
 	errSlackAPIURLFileNotAllowed     = errors.New("setting Slack api_url_file and global slack_api_url_file is not allowed")
 	errVictorOpsAPIKeyFileNotAllowed = errors.New("setting VictorOps api_key_file is not allowed")
+	errOpsGenieAPIKeyFileNotAllowed  = errors.New("setting OpsGenie api_key_file and global opsgenie_api_key_file is not allowed")
+	errSNSSigV4CredentialsRequired   = errors.New("when SNS sigv4 is used, both access_key and secret_key must be set explicitly; use of the AWS default credentials chain, sigv4.profile or sigv4.role_arn is not allowed")
 )
 
 // UserConfig is used to communicate a users alertmanager configs
@@ -350,6 +352,16 @@ func validateAlertmanagerConfig(cfg interface{}) error {
 		if err := validateVictorOpsConfig(v.Interface().(config.VictorOpsConfig)); err != nil {
 			return err
 		}
+
+	case reflect.TypeOf(config.OpsGenieConfig{}):
+		if err := validateOpsGenieConfig(v.Interface().(config.OpsGenieConfig)); err != nil {
+			return err
+		}
+
+	case reflect.TypeOf(config.SNSConfig{}):
+		if err := validateSNSConfig(v.Interface().(config.SNSConfig)); err != nil {
+			return err
+		}
 	}
 
 	// If the input config is a struct, recursively iterate on all fields.
@@ -428,6 +440,38 @@ func validateReceiverTLSConfig(cfg commoncfg.TLSConfig) error {
 func validateGlobalConfig(cfg config.GlobalConfig) error {
 	if cfg.SlackAPIURLFile != "" {
 		return errSlackAPIURLFileNotAllowed
+	}
+	if cfg.OpsGenieAPIKeyFile != "" {
+		return errOpsGenieAPIKeyFileNotAllowed
+	}
+	return nil
+}
+
+// validateOpsGenieConfig validates the OpsGenie config and returns an error if it contains
+// settings not allowed by Cortex. In particular, api_key_file would let a tenant point the
+// notifier at any file readable by the Alertmanager process and exfiltrate its contents in
+// the Authorization header of a tenant-controlled api_url.
+func validateOpsGenieConfig(cfg config.OpsGenieConfig) error {
+	if cfg.APIKeyFile != "" {
+		return errOpsGenieAPIKeyFileNotAllowed
+	}
+	return nil
+}
+
+// validateSNSConfig validates the SNS config and returns an error if it would cause the
+// Alertmanager process to authenticate to AWS as the operator on behalf of a tenant.
+// SNS always signs requests with the AWS SDK; if the tenant does not supply explicit
+// static credentials via sigv4.access_key + sigv4.secret_key, the SDK falls back to the
+// AWS default credential chain (instance profile, IRSA, AWS_* env vars, shared config)
+// which belongs to the operator. Similarly, sigv4.profile and sigv4.role_arn resolve
+// against the operator's AWS environment and must not be tenant-controlled.
+func validateSNSConfig(cfg config.SNSConfig) error {
+	sig := cfg.Sigv4
+	if sig.Profile != "" || sig.RoleARN != "" {
+		return errSNSSigV4CredentialsRequired
+	}
+	if sig.AccessKey == "" || sig.SecretKey == "" {
+		return errSNSSigV4CredentialsRequired
 	}
 	return nil
 }
