@@ -19,6 +19,10 @@ func TestValidTenantIDs(t *testing.T) {
 			name: "ABCDEFGHIJKLMNOPQRSTUVWXYZ-abcdefghijklmnopqrstuvwxyz_0987654321!.*'()",
 		},
 		{
+			name: "",
+			err:  strptr("empty tenant ID is not allowed"),
+		},
+		{
 			name: "invalid|",
 			err:  strptr("tenant ID 'invalid|' contains unsupported character '|'"),
 		},

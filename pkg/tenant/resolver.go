@@ -53,8 +53,9 @@ type Resolver interface {
 }
 
 // NewSingleResolver creates a tenant resolver, which restricts all requests to
-// be using a single tenant only. This allows a wider set of characters to be
-// used within the tenant ID and should not impose a breaking change.
+// be using a single tenant only. The tenant ID is checked against the shared
+// tenant ID character allow-list and 150 character length limit, and may not
+// be the empty string.
 func NewSingleResolver() *SingleResolver {
 	return &SingleResolver{}
 }
@@ -83,8 +84,23 @@ func (t *SingleResolver) TenantID(ctx context.Context) (string, error) {
 		return "", err
 	}
 
+	// Reject an empty tenant ID: upstream user.ExtractFromGRPCRequest accepts a
+	// present-but-empty x-scope-orgid metadata value (unlike the HTTP variant),
+	// and an empty tenant ID would collapse a per-tenant TSDB onto the shared
+	// data directory in the ingester.
+	if id == "" {
+		return "", user.ErrNoOrgID
+	}
+
 	if containsUnsafePathSegments(id) {
 		return "", errInvalidTenantID
+	}
+
+	// Apply the shared tenant ID character allow-list and 150 character length
+	// limit so a single-tenant setup gets the same validation as a multi-tenant
+	// one.
+	if err := ValidTenantID(id); err != nil {
+		return "", err
 	}
 
 	return id, nil
