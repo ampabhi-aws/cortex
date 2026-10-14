@@ -1515,15 +1515,16 @@ func TestDistributor_Push_LabelNameValidation(t *testing.T) {
 			errExpected: true,
 			errMessage:  `sample invalid label: "999.illegal" metric "foo{999.illegal=\"baz\"}"`,
 		},
-		"label name validation can be skipped via config": {
+		"label name validation is skipped via config": {
 			inputLabels:                inputLabels,
 			skipLabelNameValidationCfg: true,
 			errExpected:                false,
 		},
-		"label name validation can be skipped via WriteRequest parameter": {
+		"label name validation is NOT skipped via WriteRequest parameter (treated as trusted-internal)": {
 			inputLabels:                inputLabels,
 			skipLabelNameValidationReq: true,
-			errExpected:                false,
+			errExpected:                true,
+			errMessage:                 `sample invalid label: "999.illegal" metric "foo{999.illegal=\"baz\"}"`,
 		},
 	}
 

@@ -554,6 +554,16 @@ func (d *Distributor) Push(ctx context.Context, req *cortexpb.WriteRequest) (*co
 		return nil, err
 	}
 
+	// SkipLabelNameValidation is a trusted-internal field: only the operator may
+	// enable it via d.cfg.SkipLabelNameValidation. The HTTP ingestion handler
+	// (pkg/util/push.Handler) already clears the per-request flag before
+	// invoking Push, but Distributor.Push is also registered as a gRPC service
+	// (see API.RegisterDistributor) where the only control is a tenant-id
+	// metadata header. Clear the request-supplied flag here so that no ingress
+	// path (HTTP or gRPC) can be used by a tenant to bypass label-name syntax
+	// validation.
+	req.SkipLabelNameValidation = false
+
 	// We will report *this* request in the error too.
 	inflight := d.inflightPushRequests.Inc()
 	defer d.inflightPushRequests.Dec()
