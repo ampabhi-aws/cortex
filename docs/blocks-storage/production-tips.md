@@ -109,3 +109,15 @@ Despite hardening the system is out of the scope of Cortex, Cortex provides a ba
 - `-alertmanager.receivers-firewall-block-private-addresses`
 
 _These settings can also be overridden on a per-tenant basis via overrides specified in the [runtime config](../configuration/arguments.md#runtime-configuration-file)._
+
+> **Note (security):** In earlier releases the receivers firewall was wired
+> into the HTTP-based notifier integrations but not into the `email_configs`
+> integration, because the upstream email notifier does not accept a
+> `commoncfg.HTTPClientOption`. As a result a tenant could set
+> `global.smtp_smarthost` (or `receivers[].email_configs[].smarthost`) to an
+> internal host:port and bypass the firewall. The firewall is now also applied
+> to the email notifier: the configured smarthost is re-resolved and checked
+> against the same block policy on every notification attempt. Operators who
+> previously relied on the firewall for internal-network isolation should
+> re-review stored tenant Alertmanager configs for email receivers that
+> targeted internal addresses.
