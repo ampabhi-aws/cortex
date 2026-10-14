@@ -75,9 +75,14 @@ func (m *mapper) MapRules(user string, ruleConfigs map[string][]rulefmt.RuleGrou
 
 	// user rule files will be stored as `/<path>/<userid>/<encoded filename>`
 	path := filepath.Join(m.Path, user)
-	err := m.FS.MkdirAll(path, 0777)
+	err := m.FS.MkdirAll(path, 0700)
 	if err != nil {
 		return false, nil, err
+	}
+	// Tighten permissions on any pre-existing directory that may have been
+	// created by an older version with world-accessible mode bits.
+	if err := m.FS.Chmod(path, 0700); err != nil {
+		level.Warn(m.logger).Log("msg", "unable to tighten permissions on user rule directory", "path", path, "err", err)
 	}
 
 	// write all rule configs to disk
@@ -152,9 +157,15 @@ func (m *mapper) writeRuleGroupsIfNewer(groups []rulefmt.RuleGroup, filename str
 	}
 
 	level.Info(m.logger).Log("msg", "updating rule file", "file", filename)
-	err = afero.WriteFile(m.FS, filename, d, 0777)
+	err = afero.WriteFile(m.FS, filename, d, 0600)
 	if err != nil {
 		return false, err
+	}
+	// Tighten permissions on any pre-existing file that may have been written
+	// by an older version with world-accessible mode bits, and in case the
+	// process umask did not already mask them off on creation.
+	if err := m.FS.Chmod(filename, 0600); err != nil {
+		level.Warn(m.logger).Log("msg", "unable to tighten permissions on rule file", "file", filename, "err", err)
 	}
 
 	return true, nil
