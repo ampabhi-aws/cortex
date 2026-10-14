@@ -24,6 +24,7 @@ import (
 	"github.com/cortexproject/cortex/pkg/configs/userconfig"
 	"github.com/cortexproject/cortex/pkg/tenant"
 	"github.com/cortexproject/cortex/pkg/util"
+	"github.com/cortexproject/cortex/pkg/util/flagext"
 	util_log "github.com/cortexproject/cortex/pkg/util/log"
 )
 
@@ -35,6 +36,14 @@ var (
 // Config configures Configs API
 type Config struct {
 	Notifications NotificationsConfig `yaml:"notifications"`
+
+	// AdminAllowedTenants is the set of tenant IDs that are permitted to call
+	// the privileged all-tenant endpoints (/private/api/prom/configs/{rules,alertmanager}).
+	// If empty, those endpoints are disabled and return 403 to every caller. This
+	// is secure by default: previously the routes returned all tenants' configs
+	// (including Alertmanager YAML with inline notification credentials) to any
+	// unauthenticated caller that could reach the HTTP listener.
+	AdminAllowedTenants flagext.StringSliceCSV `yaml:"admin_allowed_tenants"`
 }
 
 // NotificationsConfig configures Alertmanager notifications method.
@@ -47,13 +56,15 @@ type NotificationsConfig struct {
 func (cfg *Config) RegisterFlags(f *flag.FlagSet) {
 	f.BoolVar(&cfg.Notifications.DisableEmail, "configs.notifications.disable-email", false, "Disable Email notifications for Alertmanager.")
 	f.BoolVar(&cfg.Notifications.DisableWebHook, "configs.notifications.disable-webhook", false, "Disable WebHook notifications for Alertmanager.")
+	f.Var(&cfg.AdminAllowedTenants, "configs.admin-allowed-tenants", "Comma separated list of tenant IDs allowed to call the privileged all-tenant endpoints under /private/api/prom/configs/. If empty, those endpoints are disabled and return 403.")
 }
 
 // API implements the configs api.
 type API struct {
 	http.Handler
-	db  db.DB
-	cfg Config
+	db                 db.DB
+	cfg                Config
+	adminAllowedTenant map[string]struct{}
 }
 
 // New creates a new API
@@ -62,10 +73,27 @@ func New(database db.DB, cfg Config) *API {
 		db:  database,
 		cfg: cfg,
 	}
+	if len(cfg.AdminAllowedTenants) > 0 {
+		a.adminAllowedTenant = make(map[string]struct{}, len(cfg.AdminAllowedTenants))
+		for _, t := range cfg.AdminAllowedTenants {
+			a.adminAllowedTenant[t] = struct{}{}
+		}
+	}
 	r := mux.NewRouter()
 	a.RegisterRoutes(r)
 	a.Handler = r
 	return a
+}
+
+// isAdmin reports whether userID is permitted to call the privileged
+// all-tenant endpoints. If no admin tenants are configured the routes are
+// disabled for every caller.
+func (a *API) isAdmin(userID string) bool {
+	if len(a.adminAllowedTenant) == 0 {
+		return false
+	}
+	_, ok := a.adminAllowedTenant[userID]
+	return ok
 }
 
 func (a *API) admin(w http.ResponseWriter, r *http.Request) {
@@ -264,9 +292,25 @@ type ConfigsView struct {
 }
 
 func (a *API) getConfigs(w http.ResponseWriter, r *http.Request) {
+	logger := util_log.WithContext(r.Context(), util_log.Logger)
+
+	// These /private endpoints return every tenant's configuration (including
+	// Alertmanager YAML with embedded notification credentials). Require an
+	// authenticated tenant and an explicit admin allow-list match before
+	// serving. By default (no allow-list configured) the routes are disabled.
+	userID, _, err := tenant.ExtractTenantIDFromHTTPRequest(r)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusUnauthorized)
+		return
+	}
+	if !a.isAdmin(userID) {
+		level.Warn(logger).Log("msg", "rejected unauthorized access to all-tenant configs endpoint", "userID", userID, "path", r.URL.Path)
+		http.Error(w, "forbidden", http.StatusForbidden)
+		return
+	}
+
 	var cfgs map[string]userconfig.View
 	var cfgErr error
-	logger := util_log.WithContext(r.Context(), util_log.Logger)
 	rawSince := r.FormValue("since")
 	if rawSince == "" {
 		cfgs, cfgErr = a.db.GetAllConfigs(r.Context())

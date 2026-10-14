@@ -24,6 +24,10 @@ var (
 	counter  int
 )
 
+const (
+	adminUserID = "__admin__"
+)
+
 // setup sets up the environment for the tests.
 func setup(t *testing.T) {
 	database = dbtest.Setup(t)
@@ -31,6 +35,7 @@ func setup(t *testing.T) {
 		Notifications: NotificationsConfig{
 			DisableEmail: true,
 		},
+		AdminAllowedTenants: []string{adminUserID},
 	})
 	counter = 0
 }
@@ -42,6 +47,7 @@ func setupWithEmailEnabled(t *testing.T) {
 		Notifications: NotificationsConfig{
 			DisableEmail: false,
 		},
+		AdminAllowedTenants: []string{adminUserID},
 	})
 	counter = 0
 }
