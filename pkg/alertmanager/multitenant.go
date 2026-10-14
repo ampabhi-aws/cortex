@@ -874,6 +874,34 @@ func (am *MultitenantAlertmanager) setConfig(cfg alertspb.AlertConfigDesc) error
 		}
 	}
 
+	// Validate the loaded config the same way the HTTP configuration API does,
+	// so that configs sourced from the alert store (e.g. the deprecated
+	// configdb backend) and the operator-provided fallback config cannot
+	// bypass the server-side policy that forbids tenant-specified file paths
+	// such as bearer_token_file, password_file, credentials_file, ca_file,
+	// api_url_file, etc. Without this, an authenticated tenant writing through
+	// an unvalidated path could coerce the Alertmanager into reading arbitrary
+	// server-local files and exfiltrating them via notification HTTP headers.
+	if userAmConfig != nil {
+		if err := validateAlertmanagerConfig(userAmConfig); err != nil {
+			return fmt.Errorf("invalid Cortex configuration for %v: %v", cfg.User, err)
+		}
+
+		// Validate templates referenced in the alertmanager config.
+		for _, name := range userAmConfig.Templates {
+			if err := validateTemplateFilename(name); err != nil {
+				return fmt.Errorf("invalid Cortex configuration for %v: %v", cfg.User, err)
+			}
+		}
+	}
+
+	// Validate template filenames provided alongside the config.
+	for _, tmpl := range cfg.Templates {
+		if err := validateTemplateFilename(tmpl.Filename); err != nil {
+			return fmt.Errorf("invalid Cortex configuration for %v: %v", cfg.User, err)
+		}
+	}
+
 	// We can have an empty configuration here if:
 	// 1) the user had a previous alertmanager
 	// 2) then, submitted a non-working configuration (and we kept running the prev working config)
