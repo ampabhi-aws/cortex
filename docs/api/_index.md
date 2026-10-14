@@ -795,7 +795,12 @@ The Purger service provides APIs for requesting deletion of tenants.
 POST /purger/delete_tenant
 ```
 
-Request deletion of ALL tenant data. Only works with blocks storage. Experimental.
+Requests deletion of a tenant's data in **blocks storage only**. Experimental.
+
+This endpoint writes a tenant deletion mark into the blocks bucket; the compactor's blocks cleaner subsequently removes the tenant's blocks. It does **not** touch the ruler store or the alertmanager store, so the tenant's rule groups and alertmanager configuration (which may embed notification credentials such as Slack/webhook URLs and SMTP passwords) are **not** deleted by this endpoint. To fully erase a tenant's data, operators must additionally call:
+
+- `POST /ruler/delete_tenant_config` — to delete the tenant's rule groups.
+- `POST /multitenant_alertmanager/delete_tenant_config` — to delete the tenant's alertmanager configuration.
 
 _Requires [authentication](#authentication)._
 
@@ -805,7 +810,16 @@ _Requires [authentication](#authentication)._
 GET /purger/delete_tenant_status
 ```
 
-Returns status of tenant deletion. Output format to be defined. Experimental.
+Returns the status of blocks-storage tenant deletion. Experimental.
+
+The response is a JSON object with the following fields:
+
+- `tenant_id` — the tenant the status is reported for.
+- `blocks_deleted` — `true` when no blocks remain under the tenant's prefix in the blocks bucket. **Only reflects blocks storage.**
+- `deletion_requested` — `true` when a tenant-deletion mark currently exists in the blocks bucket (i.e. `POST /purger/delete_tenant` has been called for the tenant and the mark has not been cleaned up yet). A `blocks_deleted: true` response with `deletion_requested: false` therefore means "no blocks exist for this tenant", not "a deletion request has completed".
+- `stores_not_covered` — enumerates per-tenant object stores whose deletion state is **not** reflected by this response (currently: the ruler store and the alertmanager store), along with the dedicated endpoint operators must call to delete the tenant's data from each.
+
+Operators must not treat this endpoint as reporting full tenant erasure.
 
 _Requires [authentication](#authentication)._
 
