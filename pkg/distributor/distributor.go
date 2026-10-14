@@ -547,6 +547,28 @@ func (d *Distributor) validateSeries(ts cortexpb.PreallocTimeseries, userID stri
 		nil
 }
 
+// StartPushRequest is a non-counting admission check that HTTP push handlers
+// can run before reading or allocating anything for the request body. It
+// consults the current inflight counter and ingestion rate against the
+// per-instance limits; actual accounting still happens in Push. Returning a
+// non-nil error means the request should be rejected without decoding the
+// body. This closes the memory-amplification DoS where an attacker-set
+// Content-Length drives util.ParseProtoReader into a large pre-allocation
+// before Push's limit checks run (CWE-770).
+func (d *Distributor) StartPushRequest(_ context.Context) error {
+	if d.cfg.InstanceLimits.MaxInflightPushRequests > 0 {
+		if inflight := d.inflightPushRequests.Load(); inflight >= int64(d.cfg.InstanceLimits.MaxInflightPushRequests) {
+			return errTooManyInflightPushRequests
+		}
+	}
+	if d.cfg.InstanceLimits.MaxIngestionRate > 0 {
+		if rate := d.ingestionRate.Rate(); rate >= d.cfg.InstanceLimits.MaxIngestionRate {
+			return errMaxSamplesPushRateLimitReached
+		}
+	}
+	return nil
+}
+
 // Push implements client.IngesterServer
 func (d *Distributor) Push(ctx context.Context, req *cortexpb.WriteRequest) (*cortexpb.WriteResponse, error) {
 	userID, err := tenant.TenantID(ctx)

@@ -193,6 +193,16 @@ func decompressRequest(reader io.Reader, expectedSize, maxSize int, compression 
 	return
 }
 
+// maxDecompressGrowHint caps the pre-allocation hint derived from the
+// unverified client-supplied Content-Length header. Without this cap a
+// malicious client can send only request headers and reserve up to
+// maxRecvMsgSize of distributor heap per request (CWE-770: allocation of
+// resources without limits or throttling). The buffer still grows
+// amortised as real bytes arrive, so legitimate requests see no
+// behavioural change beyond a few extra allocations for bodies larger
+// than the hint.
+const maxDecompressGrowHint = 1 << 20 // 1 MiB
+
 func decompressFromReader(reader io.Reader, expectedSize, maxSize int, compression CompressionType, sp opentracing.Span) ([]byte, error) {
 	var (
 		buf  bytes.Buffer
@@ -200,7 +210,14 @@ func decompressFromReader(reader io.Reader, expectedSize, maxSize int, compressi
 		err  error
 	)
 	if expectedSize > 0 {
-		buf.Grow(expectedSize + bytes.MinRead) // extra space guarantees no reallocation
+		// Clamp the hint derived from the client's Content-Length header
+		// so that memory is committed in proportion to data actually
+		// received rather than to the attacker-controlled header value.
+		hint := expectedSize
+		if hint > maxDecompressGrowHint {
+			hint = maxDecompressGrowHint
+		}
+		buf.Grow(hint + bytes.MinRead)
 	}
 	// Read from LimitReader with limit max+1. So if the underlying
 	// reader is over limit, the result will be bigger than max.

@@ -16,8 +16,31 @@ import (
 // Func defines the type of the push. It is similar to http.HandlerFunc.
 type Func func(context.Context, *cortexpb.WriteRequest) (*cortexpb.WriteResponse, error)
 
+// AdmissionController, when non-nil, is consulted by Handler before any body
+// bytes are read or buffers are allocated. If it returns a non-nil error, the
+// request is rejected immediately with the supplied HTTP status code and no
+// decoding/allocation is performed. This exists so that instance-level limits
+// (for example a distributor's MaxInflightPushRequests) can gate requests
+// before the body-sized pre-allocation inside util.ParseProtoReader, closing
+// the memory-amplification DoS where ~headers reserve maxRecvMsgSize of heap
+// per connection (CWE-770).
+type AdmissionController func(ctx context.Context, r *http.Request) (status int, err error)
+
 // Handler is a http.Handler which accepts WriteRequests.
 func Handler(maxRecvMsgSize int, sourceIPs *middleware.SourceIPExtractor, push Func) http.Handler {
+	return handler(maxRecvMsgSize, sourceIPs, nil, push)
+}
+
+// HandlerWithAdmission is like Handler but consults the supplied
+// AdmissionController before reading or allocating anything for the request
+// body. Prefer this variant from callers that have access to a per-instance
+// inflight/rate limiter so that over-limit requests are rejected without
+// committing heap for the body.
+func HandlerWithAdmission(maxRecvMsgSize int, sourceIPs *middleware.SourceIPExtractor, admit AdmissionController, push Func) http.Handler {
+	return handler(maxRecvMsgSize, sourceIPs, admit, push)
+}
+
+func handler(maxRecvMsgSize int, sourceIPs *middleware.SourceIPExtractor, admit AdmissionController, push Func) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		ctx := r.Context()
 		logger := log.WithContext(ctx, log.Logger)
@@ -26,6 +49,15 @@ func Handler(maxRecvMsgSize int, sourceIPs *middleware.SourceIPExtractor, push F
 			if source != "" {
 				ctx = util.AddSourceIPsToOutgoingContext(ctx, source)
 				logger = log.WithSourceIPs(source, logger)
+			}
+		}
+		// Admission control runs before ParseProtoReader so that
+		// over-limit requests cannot pre-allocate the body buffer.
+		if admit != nil {
+			if status, err := admit(ctx, r); err != nil {
+				level.Error(logger).Log("err", err.Error())
+				http.Error(w, err.Error(), status)
+				return
 			}
 		}
 		var req cortexpb.PreallocWriteRequest
