@@ -241,9 +241,40 @@ func validateUserConfig(logger log.Logger, cfg alertspb.AlertConfigDesc, limits 
 		}
 	}
 
+	// Escape glob metacharacters in the per-tenant temp directory before
+	// building glob patterns. userTempDir is derived from os.MkdirTemp with a
+	// cfg.User suffix, so a tenant ID containing a glob metacharacter would
+	// otherwise let the pattern expand onto other tenants' concurrent
+	// validate-config-* temp directories. We also validate every post-glob
+	// match stays inside userTempDir as defence in depth.
+	userTempDirAbs, err := filepath.Abs(userTempDir)
+	if err != nil {
+		return err
+	}
+	globBaseDir := escapeGlobBaseDir(userTempDir)
+
 	templateFiles := make([]string, len(amCfg.Templates))
 	for i, t := range amCfg.Templates {
-		templateFiles[i] = filepath.Join(userTempDir, t)
+		if _, err := safeTemplateFilepath(userTempDir, t); err != nil {
+			return err
+		}
+		templateFiles[i] = filepath.Join(globBaseDir, t)
+	}
+
+	for _, pattern := range templateFiles {
+		matches, err := filepath.Glob(pattern)
+		if err != nil {
+			return err
+		}
+		for _, m := range matches {
+			absMatch, err := filepath.Abs(m)
+			if err != nil {
+				return err
+			}
+			if !isPathWithinDir(absMatch, userTempDirAbs) {
+				return fmt.Errorf("template glob %q matched a file outside of the per-tenant templates directory: %q", pattern, m)
+			}
+		}
 	}
 
 	_, err = template.FromGlobs(templateFiles...)

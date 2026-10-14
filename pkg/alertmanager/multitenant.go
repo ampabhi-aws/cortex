@@ -1307,6 +1307,33 @@ func validateTemplateFilename(filename string) error {
 	return nil
 }
 
+// escapeGlobBaseDir backslash-escapes every filepath.Glob metacharacter
+// (`*`, `?`, `[`, `]`, and the escape character `\` itself) in dir so that
+// the returned string, when used as the fixed prefix of a glob pattern (as in
+// `escapeGlobBaseDir(dir) + "/" + templateName`), matches dir literally. The
+// per-tenant data directory is derived from a tenant-supplied identifier, and
+// template loading passes the resulting path through filepath.Glob; without
+// this escaping an identifier containing a glob metacharacter would turn its
+// own path segment into a wildcard and expand onto sibling tenants'
+// directories.
+//
+// On Windows, filepath.Glob does not treat `\` as an escape and
+// backslash-escaping metacharacters would still be unsafe. We mitigate this
+// at the source by rejecting any tenant ID containing glob metacharacters in
+// pkg/tenant/resolver.go, so this helper is purely defence in depth.
+func escapeGlobBaseDir(dir string) string {
+	var b strings.Builder
+	b.Grow(len(dir))
+	for _, r := range dir {
+		switch r {
+		case '*', '?', '[', ']', '\\':
+			b.WriteByte('\\')
+		}
+		b.WriteRune(r)
+	}
+	return b.String()
+}
+
 // safeTemplateFilepath builds and return the template filepath within the provided dir.
 // This function also performs a security check to make sure the provided templateName
 // doesn't contain a relative path escaping the provided dir.
@@ -1324,13 +1351,46 @@ func safeTemplateFilepath(dir, templateName string) (string, error) {
 	}
 
 	// Ensure the actual path of the template is within the expected directory.
-	// This check is a counter-measure to make sure the tenant is not trying to
-	// escape its own directory on disk.
-	if !strings.HasPrefix(actualPath, containerDir) {
+	// A purely lexical strings.HasPrefix is unsafe: both because of partial
+	// prefix matches (e.g. /data/tenant vs /data/tenant-evil) and because it
+	// does not constrain post-expansion paths when the pattern contains glob
+	// metacharacters. Use filepath.Rel which both normalises the result and
+	// lets us assert a clean relative sub-path with no ".." components.
+	if !isPathWithinDir(actualPath, containerDir) {
 		return "", fmt.Errorf("invalid template name %q: the template filepath is escaping the per-tenant local directory", templateName)
 	}
 
 	return actualPath, nil
+}
+
+// isPathWithinDir returns true if path (which must already be absolute and
+// cleaned, as returned by filepath.Abs) is equal to or a descendant of dir
+// (also already absolute). The check is performed with filepath.Rel and
+// explicitly rejects ".." relative segments, and additionally verifies that
+// path either equals dir or sits immediately below it on a separator boundary
+// — this prevents partial-prefix matches like "/data/tenant" being accepted
+// as inside "/data/ten".
+func isPathWithinDir(path, dir string) bool {
+	if path == dir {
+		return true
+	}
+	rel, err := filepath.Rel(dir, path)
+	if err != nil {
+		return false
+	}
+	if rel == "." {
+		return true
+	}
+	// Reject any path that walks outside of dir.
+	if rel == ".." || strings.HasPrefix(rel, ".."+string(filepath.Separator)) {
+		return false
+	}
+	// filepath.Rel never returns an absolute path when the inputs are both
+	// absolute and share a volume, but guard against platform corner cases.
+	if filepath.IsAbs(rel) {
+		return false
+	}
+	return true
 }
 
 // storeTemplateFile stores template file at the given templateFilepath.

@@ -63,15 +63,27 @@ type SingleResolver struct {
 }
 
 // containsUnsafePathSegments will return true if the string is a directory
-// reference like `.` and `..` or if any path separator character like `/` and
-// `\` can be found.
+// reference like `.` and `..`, if any path separator character like `/` and
+// `\` can be found, or if the string contains any filepath glob metacharacter
+// (`*`, `?`, `[`, `]`). Glob metacharacters are rejected because tenant IDs
+// are joined into on-disk paths that are later expanded with filepath.Glob
+// (see Alertmanager template handling), where an unescaped wildcard in the
+// tenant-ID path segment would let one tenant read other tenants' files.
 func containsUnsafePathSegments(id string) bool {
 	// handle the relative reference to current and parent path.
 	if id == "." || id == ".." {
 		return true
 	}
 
-	return strings.ContainsAny(id, "\\/")
+	return strings.ContainsAny(id, "\\/") || containsGlobMetacharacters(id)
+}
+
+// containsGlobMetacharacters returns true if the string contains any character
+// treated as a metacharacter by Go's filepath.Match / filepath.Glob
+// (`*`, `?`, `[`, `]`). The glob escape character `\` is already rejected by
+// containsUnsafePathSegments as a path separator on Windows.
+func containsGlobMetacharacters(id string) bool {
+	return strings.ContainsAny(id, "*?[]")
 }
 
 var errInvalidTenantID = errors.New("invalid tenant ID")
@@ -134,6 +146,13 @@ func (t *MultiResolver) TenantIDs(ctx context.Context) ([]string, error) {
 		if err := ValidTenantID(orgID); err != nil {
 			return nil, err
 		}
+		// containsUnsafePathSegments rejects '.' / '..', path separators, and
+		// also filepath.Glob metacharacters (`*`, `?`, `[`, `]`). The glob
+		// metacharacter check matters here even though ValidTenantID rejects
+		// '?', '[' and ']' at the character-set level: ValidTenantID still
+		// explicitly allows '*', which is unsafe when the ID is joined into
+		// an on-disk path that is later expanded with filepath.Glob (see
+		// Alertmanager template loading).
 		if containsUnsafePathSegments(orgID) {
 			return nil, errInvalidTenantID
 		}
