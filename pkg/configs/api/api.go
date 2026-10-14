@@ -10,6 +10,7 @@ import (
 	"io"
 	"mime"
 	"net/http"
+	"path/filepath"
 	"strconv"
 	"strings"
 
@@ -249,9 +250,28 @@ func validateRulesFiles(c userconfig.Config) error {
 
 func validateTemplateFiles(c userconfig.Config) error {
 	for fn, content := range c.TemplateFiles {
+		if err := validateTemplateFilename(fn); err != nil {
+			return err
+		}
 		if _, err := template.New(fn).Funcs(template.FuncMap(amtemplate.DefaultFuncs)).Parse(content); err != nil {
 			return err
 		}
+	}
+
+	return nil
+}
+
+// validateTemplateFilename ensures the template filename does not contain any
+// path components. This mirrors the check performed by the Alertmanager HTTP
+// API and prevents the legacy configs service from persisting template names
+// whose keys would resolve outside the per-tenant templates directory.
+func validateTemplateFilename(filename string) error {
+	if filepath.Base(filename) != filename {
+		return fmt.Errorf("invalid template name %q: the template name cannot contain any path", filename)
+	}
+
+	if filepath.Dir(filepath.Clean(filename)) != "." {
+		return fmt.Errorf("invalid template name %q: the template name cannot contain any path", filename)
 	}
 
 	return nil
