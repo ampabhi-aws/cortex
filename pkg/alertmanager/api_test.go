@@ -419,6 +419,85 @@ alertmanager_config: |
 			err: errors.Wrap(errVictorOpsAPIKeyFileNotAllowed, "error validating Alertmanager config"),
 		},
 		{
+			name: "Should return error if OpsGenie api_key_file is set",
+			cfg: `
+alertmanager_config: |
+  receivers:
+    - name: default-receiver
+      opsgenie_configs:
+        - api_key_file: /secrets
+
+  route:
+    receiver: 'default-receiver'
+`,
+			err: errors.Wrap(errOpsGenieAPIKeyFileNotAllowed, "error validating Alertmanager config"),
+		},
+		{
+			name: "Should return error if global opsgenie_api_key_file is set",
+			cfg: `
+alertmanager_config: |
+  global:
+    opsgenie_api_key_file: /secrets
+
+  receivers:
+    - name: default-receiver
+
+  route:
+    receiver: 'default-receiver'
+`,
+			err: errors.Wrap(errOpsGenieAPIKeyFileNotAllowed, "error validating Alertmanager config"),
+		},
+		{
+			name: "Should return error if SNS sigv4 role_arn is set",
+			cfg: `
+alertmanager_config: |
+  receivers:
+    - name: default-receiver
+      sns_configs:
+        - sigv4:
+            region: us-east-1
+            role_arn: arn:aws:iam::123456789012:role/op
+          topic_arn: arn:aws:sns:us-east-1:123456789012:topic
+
+  route:
+    receiver: 'default-receiver'
+`,
+			err: errors.Wrap(errSNSSigV4CredentialsRequired, "error validating Alertmanager config"),
+		},
+		{
+			name: "Should return error if SNS sigv4 profile is set",
+			cfg: `
+alertmanager_config: |
+  receivers:
+    - name: default-receiver
+      sns_configs:
+        - sigv4:
+            region: us-east-1
+            profile: op
+          topic_arn: arn:aws:sns:us-east-1:123456789012:topic
+
+  route:
+    receiver: 'default-receiver'
+`,
+			err: errors.Wrap(errSNSSigV4CredentialsRequired, "error validating Alertmanager config"),
+		},
+		{
+			name: "Should return error if SNS sigv4 is used without explicit access_key/secret_key",
+			cfg: `
+alertmanager_config: |
+  receivers:
+    - name: default-receiver
+      sns_configs:
+        - sigv4:
+            region: us-east-1
+          topic_arn: arn:aws:sns:us-east-1:123456789012:topic
+
+  route:
+    receiver: 'default-receiver'
+`,
+			err: errors.Wrap(errSNSSigV4CredentialsRequired, "error validating Alertmanager config"),
+		},
+		{
 			name: "should return error if template is wrong",
 			cfg: `
 alertmanager_config: |
