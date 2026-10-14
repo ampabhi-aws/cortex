@@ -62,7 +62,7 @@ type Config struct {
 	Region           string         `yaml:"region"`
 	BucketName       string         `yaml:"bucket_name"`
 	SecretAccessKey  flagext.Secret `yaml:"secret_access_key"`
-	AccessKeyID      string         `yaml:"access_key_id"`
+	AccessKeyID      flagext.Secret `yaml:"access_key_id"`
 	Insecure         bool           `yaml:"insecure"`
 	SignatureVersion string         `yaml:"signature_version"`
 	BucketLookupType string         `yaml:"bucket_lookup_type"`
@@ -78,11 +78,11 @@ func (cfg *Config) RegisterFlags(f *flag.FlagSet) {
 
 // RegisterFlagsWithPrefix registers the flags for s3 storage with the provided prefix
 func (cfg *Config) RegisterFlagsWithPrefix(prefix string, f *flag.FlagSet) {
-	f.StringVar(&cfg.AccessKeyID, prefix+"s3.access-key-id", "", "S3 access key ID")
-	f.Var(&cfg.SecretAccessKey, prefix+"s3.secret-access-key", "S3 secret access key")
 	f.StringVar(&cfg.BucketName, prefix+"s3.bucket-name", "", "S3 bucket name")
 	f.StringVar(&cfg.Region, prefix+"s3.region", "", "S3 region. If unset, the client will issue a S3 GetBucketLocation API call to autodetect it.")
 	f.StringVar(&cfg.Endpoint, prefix+"s3.endpoint", "", "The S3 bucket endpoint. It could be an AWS S3 endpoint listed at https://docs.aws.amazon.com/general/latest/gr/s3.html or the address of an S3-compatible service in hostname:port format.")
+	f.Var(&cfg.AccessKeyID, prefix+"s3.access-key-id", "S3 access key ID")
+	f.Var(&cfg.SecretAccessKey, prefix+"s3.secret-access-key", "S3 secret access key")
 	f.BoolVar(&cfg.Insecure, prefix+"s3.insecure", false, "If enabled, use http:// for the S3 endpoint instead of https://. This could be useful in local dev/test environments while using an S3-compatible backend storage, like Minio.")
 	f.StringVar(&cfg.SignatureVersion, prefix+"s3.signature-version", SignatureVersionV4, fmt.Sprintf("The signature version to use for authenticating against S3. Supported values are: %s.", strings.Join(supportedSignatureVersions, ", ")))
 	f.StringVar(&cfg.BucketLookupType, prefix+"s3.bucket-lookup-type", BucketAutoLookup, fmt.Sprintf("The s3 bucket lookup style. Supported values are: %s.", strings.Join(supportedBucketLookupTypes, ", ")))

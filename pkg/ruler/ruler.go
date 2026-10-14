@@ -125,6 +125,39 @@ type Config struct {
 	DisableRuleGroupLabel bool `yaml:"disable_rule_group_label"`
 }
 
+// MarshalYAML implements yaml.Marshaler and masks any password embedded in
+// AlertmanagerURL before the ruler config is serialized (for example on the
+// /config HTTP endpoint). The field itself remains a plain string so legacy
+// comma-separated values keep working at runtime.
+func (cfg Config) MarshalYAML() (interface{}, error) {
+	type plain Config
+	safe := plain(cfg)
+	safe.AlertmanagerURL = maskURLPasswords(safe.AlertmanagerURL)
+	return safe, nil
+}
+
+// maskURLPasswords replaces the password portion of each URL in a
+// comma-separated list with "********". Non-URL fragments or URLs without a
+// userinfo password are returned unchanged.
+func maskURLPasswords(raw string) string {
+	if raw == "" {
+		return raw
+	}
+	parts := strings.Split(raw, ",")
+	for i, p := range parts {
+		u, err := url.Parse(p)
+		if err != nil || u.User == nil {
+			continue
+		}
+		if _, set := u.User.Password(); !set {
+			continue
+		}
+		u.User = url.UserPassword(u.User.Username(), "********")
+		parts[i] = u.String()
+	}
+	return strings.Join(parts, ",")
+}
+
 // Validate config and returns error on failure
 func (cfg *Config) Validate(limits validation.Limits, log log.Logger) error {
 	if !util.StringsContain(supportedShardingStrategies, cfg.ShardingStrategy) {

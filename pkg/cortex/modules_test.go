@@ -104,6 +104,58 @@ func TestAPIConfig(t *testing.T) {
 	}
 }
 
+// TestAPIConfig_MasksCredentials is a regression test for the plaintext
+// credential disclosure through the /config endpoint. It configures a set of
+// non-default credential-bearing fields (Swift/etcd password, ruler basic auth
+// and Alertmanager URL, configs database DSN, S3 access key id) and asserts
+// that none of the configured credential values appear in the marshalled
+// response of /config, /config?mode=diff or /config?mode=defaults.
+func TestAPIConfig_MasksCredentials(t *testing.T) {
+	const (
+		swiftSecret   = "swift-super-secret-password"
+		etcdSecret    = "etcd-ring-password"
+		basicSecret   = "alertmanager-basic-auth-password"
+		amURLSecret   = "am-url-embedded-password"
+		dbURISecret   = "configs-db-password"
+		s3AccessKeyID = "AKIAEXAMPLEACCESSKEY"
+		s3SecretKey   = "super-secret-s3-key"
+	)
+
+	cfg := newDefaultConfig()
+	cfg.BlocksStorage.Bucket.Swift.Password.Value = swiftSecret
+	cfg.BlocksStorage.Bucket.S3.AccessKeyID.Value = s3AccessKeyID
+	cfg.BlocksStorage.Bucket.S3.SecretAccessKey.Value = s3SecretKey
+	cfg.Ingester.LifecyclerConfig.RingConfig.KVStore.Etcd.Password.Value = etcdSecret
+	cfg.Ruler.AlertmanagerURL = "http://amuser:" + amURLSecret + "@alertmanager/"
+	cfg.Ruler.Notifier.BasicAuth.Username = "amuser"
+	cfg.Ruler.Notifier.BasicAuth.Password.Value = basicSecret
+	cfg.Configs.DB.URI = "postgres://dbuser:" + dbURISecret + "@db/configs"
+
+	cortex := &Cortex{
+		Cfg:    *cfg,
+		Server: &server.Server{},
+	}
+	cortex.Server.HTTP = mux.NewRouter()
+
+	_, err := cortex.initAPI()
+	require.NoError(t, err)
+
+	secrets := []string{swiftSecret, etcdSecret, basicSecret, amURLSecret, dbURISecret, s3AccessKeyID, s3SecretKey}
+
+	for _, path := range []string{"/config", "/config?mode=diff", "/config?mode=defaults"} {
+		t.Run(path, func(t *testing.T) {
+			req := httptest.NewRequest("GET", path, nil)
+			resp := httptest.NewRecorder()
+			cortex.Server.HTTP.ServeHTTP(resp, req)
+			assert.Equal(t, 200, resp.Code)
+			body := resp.Body.String()
+			for _, s := range secrets {
+				assert.NotContainsf(t, body, s, "/config response leaked credential %q at path %q", s, path)
+			}
+		})
+	}
+}
+
 func TestCortex_InitRulerStorage(t *testing.T) {
 	tests := map[string]struct {
 		config       *Config

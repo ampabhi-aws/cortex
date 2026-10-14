@@ -74,7 +74,7 @@ http:
 				Region:           "test-region",
 				BucketName:       "test-bucket-name",
 				SecretAccessKey:  flagext.Secret{Value: "test-secret-access-key"},
-				AccessKeyID:      "test-access-key-id",
+				AccessKeyID:      flagext.Secret{Value: "test-access-key-id"},
 				Insecure:         true,
 				SignatureVersion: "test-signature-version",
 				BucketLookupType: BucketVirtualHostLookup,
