@@ -52,6 +52,15 @@ type DB interface {
 	GetAllConfigs(ctx context.Context) (map[string]userconfig.View, error)
 	GetConfigs(ctx context.Context, since userconfig.ID) (map[string]userconfig.View, error)
 
+	// GetConfigsForUser returns the configs for the given userID that have
+	// changed since the provided config ID. It is the tenant-scoped
+	// equivalent of GetAllConfigs / GetConfigs: the underlying query must
+	// filter rows by owner_id so that no caller can retrieve configs
+	// belonging to another tenant. The result map is keyed by userID (and
+	// will contain at most one entry) to preserve the response shape of
+	// the configs HTTP API.
+	GetConfigsForUser(ctx context.Context, userID string, since userconfig.ID) (map[string]userconfig.View, error)
+
 	DeactivateConfig(ctx context.Context, userID string) error
 	RestoreConfig(ctx context.Context, userID string) error
 

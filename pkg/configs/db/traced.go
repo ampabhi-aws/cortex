@@ -39,6 +39,11 @@ func (t traced) GetConfigs(ctx context.Context, since userconfig.ID) (cfgs map[s
 	return t.d.GetConfigs(ctx, since)
 }
 
+func (t traced) GetConfigsForUser(ctx context.Context, userID string, since userconfig.ID) (cfgs map[string]userconfig.View, err error) {
+	defer func() { t.trace("GetConfigsForUser", userID, since, cfgs, err) }()
+	return t.d.GetConfigsForUser(ctx, userID, since)
+}
+
 func (t traced) DeactivateConfig(ctx context.Context, userID string) (err error) {
 	defer func() { t.trace("DeactivateConfig", userID, err) }()
 	return t.d.DeactivateConfig(ctx, userID)

@@ -1,6 +1,7 @@
 package client
 
 import (
+	"context"
 	"net/http"
 	"net/http/httptest"
 	"testing"
@@ -9,6 +10,7 @@ import (
 	"github.com/cortexproject/cortex/pkg/configs/userconfig"
 
 	"github.com/stretchr/testify/require"
+	"github.com/weaveworks/common/user"
 
 	"github.com/stretchr/testify/assert"
 )
@@ -30,12 +32,19 @@ var response = `{
 
 func TestDoRequest(t *testing.T) {
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		// The client must forward the tenant ID so the server can scope
+		// the query. Fail fast if the header is missing.
+		if _, _, err := user.ExtractOrgIDFromHTTPRequest(r); err != nil {
+			http.Error(w, err.Error(), http.StatusUnauthorized)
+			return
+		}
 		_, err := w.Write([]byte(response))
 		require.NoError(t, err)
 	}))
 	defer server.Close()
 
-	resp, err := doRequest(server.URL, 1*time.Second, nil, 0)
+	ctx := user.InjectOrgID(context.Background(), "user-1")
+	resp, err := doRequest(ctx, server.URL, 1*time.Second, nil, 0)
 	assert.Nil(t, err)
 
 	expected := ConfigsResponse{Configs: map[string]userconfig.View{

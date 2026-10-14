@@ -192,6 +192,19 @@ func (d DB) GetConfigs(ctx context.Context, since userconfig.ID) (map[string]use
 	})
 }
 
+// GetConfigsForUser gets the latest config for the given userID that has
+// changed since the provided config ID. The returned map contains at most
+// one entry (keyed by userID). The underlying SQL filter includes an
+// owner_id predicate so no row belonging to a different tenant can be
+// returned.
+func (d DB) GetConfigsForUser(ctx context.Context, userID string, since userconfig.ID) (map[string]userconfig.View, error) {
+	return d.findConfigs(squirrel.And{
+		allConfigs,
+		squirrel.Eq{"owner_id": userID},
+		squirrel.Gt{"id": since},
+	})
+}
+
 // GetRulesConfig gets the latest alertmanager config for a user.
 func (d DB) GetRulesConfig(ctx context.Context, userID string) (userconfig.VersionedRulesConfig, error) {
 	current, err := d.GetConfig(ctx, userID)
