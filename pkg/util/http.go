@@ -103,10 +103,17 @@ func RenderHTTPResponse(w http.ResponseWriter, v interface{}, t *template.Templa
 		return
 	}
 
-	err := t.Execute(w, v)
-	if err != nil {
+	// Issue a per-session CSRF token and substitute it for the template
+	// placeholder before writing the rendered page to the client. The
+	// token is pinned to the browser via an HttpOnly cookie; handlers
+	// that mutate state must additionally require it via CSRFValidate.
+	token := CSRFToken(w, r)
+	var buf bytes.Buffer
+	if err := t.Execute(&buf, v); err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
 	}
+	_, _ = w.Write(CSRFSubstitute(buf.Bytes(), token))
 }
 
 // StreamWriteYAMLResponseCommon stream writes data as http response

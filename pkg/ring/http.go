@@ -1,6 +1,7 @@
 package ring
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"fmt"
@@ -12,6 +13,8 @@ import (
 	"time"
 
 	"github.com/go-kit/log/level"
+
+	"github.com/cortexproject/cortex/pkg/util"
 )
 
 const pageContent = `
@@ -123,6 +126,17 @@ type httpResponse struct {
 
 func (r *Ring) ServeHTTP(w http.ResponseWriter, req *http.Request) {
 	if req.Method == http.MethodPost {
+		// Reject cross-site state-changing requests, and require the
+		// per-session CSRF token the GET page handed out via a cookie
+		// and a hidden form field.
+		if !util.CSRFCheckOrigin(req) {
+			http.Error(w, "cross-site request rejected", http.StatusForbidden)
+			return
+		}
+		if !util.CSRFValidate(req) {
+			http.Error(w, "invalid or missing CSRF token", http.StatusForbidden)
+			return
+		}
 		ingesterID := req.FormValue("forget")
 		if err := r.forget(req.Context(), ingesterID); err != nil {
 			level.Error(r.logger).Log("msg", "error forgetting instance", "err", err)
@@ -197,9 +211,19 @@ func renderHTTPResponse(w http.ResponseWriter, v httpResponse, t *template.Templ
 		return
 	}
 
-	err := t.Execute(w, v)
-	if err != nil {
+	// Issue a per-session CSRF token and substitute it for the template
+	// placeholder before writing to the client. The token is pinned to
+	// the browser via an HttpOnly cookie and the matching POST handler
+	// requires both the cookie and the form field.
+	token := util.CSRFToken(w, r)
+	var buf bytes.Buffer
+	if err := t.Execute(&buf, v); err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	if _, err := w.Write(util.CSRFSubstitute(buf.Bytes(), token)); err != nil {
+		// We cannot change status after Write; just log at the caller.
+		return
 	}
 }
 
