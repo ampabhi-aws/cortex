@@ -419,6 +419,34 @@ alertmanager_config: |
 			err: errors.Wrap(errVictorOpsAPIKeyFileNotAllowed, "error validating Alertmanager config"),
 		},
 		{
+			name: "Should return error if OpsGenie api_key_file is set on a receiver",
+			cfg: `
+alertmanager_config: |
+  receivers:
+    - name: default-receiver
+      opsgenie_configs:
+        - api_key_file: /secrets
+
+  route:
+    receiver: 'default-receiver'
+`,
+			err: errors.Wrap(errOpsGenieAPIKeyFileNotAllowed, "error validating Alertmanager config"),
+		},
+		{
+			name: "Should return error if global opsgenie_api_key_file is set",
+			cfg: `
+alertmanager_config: |
+  global:
+    opsgenie_api_key_file: /secrets
+  receivers:
+    - name: default-receiver
+
+  route:
+    receiver: 'default-receiver'
+`,
+			err: errors.Wrap(errOpsGenieAPIKeyFileNotAllowed, "error validating Alertmanager config"),
+		},
+		{
 			name: "should return error if template is wrong",
 			cfg: `
 alertmanager_config: |
@@ -784,6 +812,29 @@ func TestValidateAlertmanagerConfig(t *testing.T) {
 				}},
 			},
 			expected: errTLSFileNotAllowed,
+		},
+		"OpsGenieConfig with api_key_file": {
+			input: config.OpsGenieConfig{
+				APIKeyFile: "/secrets/opsgenie",
+			},
+			expected: errOpsGenieAPIKeyFileNotAllowed,
+		},
+		"GlobalConfig with opsgenie_api_key_file": {
+			input: config.GlobalConfig{
+				OpsGenieAPIKeyFile: "/secrets/opsgenie",
+			},
+			expected: errOpsGenieAPIKeyFileNotAllowed,
+		},
+		"OpsGenie receiver via config.Config (end-to-end nesting)": {
+			input: config.Config{
+				Receivers: []*config.Receiver{{
+					Name: "og",
+					OpsGenieConfigs: []*config.OpsGenieConfig{{
+						APIKeyFile: "/var/run/secrets/kubernetes.io/serviceaccount/token",
+					}},
+				}},
+			},
+			expected: errOpsGenieAPIKeyFileNotAllowed,
 		},
 	}
 
