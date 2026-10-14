@@ -449,3 +449,25 @@ func validateVictorOpsConfig(cfg config.VictorOpsConfig) error {
 	}
 	return nil
 }
+
+// ValidateAlertmanagerReceiverFiles runs the reflective scan used on the v1
+// alertmanager API write path and returns an error if the given parsed
+// Alertmanager configuration contains disallowed references to local files
+// (password_file, bearer_token_file, credentials_file, OAuth2 client_secret_file,
+// TLS ca_file/cert_file/key_file, Slack api_url_file, VictorOps api_key_file).
+//
+// This function is exported so other tenant-facing writers of Alertmanager
+// configurations (for example the legacy /api/prom/configs/alertmanager
+// endpoint) can enforce the same restrictions and avoid storing configs that
+// the Alertmanager would otherwise accept at apply time and use to exfiltrate
+// process-readable files to tenant-controlled receivers.
+func ValidateAlertmanagerReceiverFiles(cfg *config.Config) error {
+	return validateAlertmanagerConfig(cfg)
+}
+
+// ValidateTemplateFilename re-exports validateTemplateFilename so other
+// tenant-facing writers of Alertmanager configurations can enforce the same
+// restrictions on template filenames.
+func ValidateTemplateFilename(filename string) error {
+	return validateTemplateFilename(filename)
+}

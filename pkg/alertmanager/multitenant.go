@@ -814,6 +814,17 @@ func (am *MultitenantAlertmanager) setConfig(cfg alertspb.AlertConfigDesc) error
 	var userTemplateDir = filepath.Join(am.getTenantDirectory(cfg.User), templatesDir)
 	var pathsToRemove = make(map[string]struct{})
 
+	// Re-validate the stored configuration before applying it. The write-time
+	// validation in pkg/alertmanager/api.go only runs on the v1 API path; any
+	// configuration reaching the alertstore via another writer (e.g. the
+	// legacy configs service with -alertmanager-storage.backend=configdb or
+	// records that pre-date the write-time checks) would otherwise be applied
+	// verbatim. Enforce the file-field, template filename, and per-tenant
+	// template count/size restrictions at the point of use as well.
+	if err := validateStoredAlertmanagerConfig(cfg, am.limits); err != nil {
+		return fmt.Errorf("invalid Alertmanager configuration for %v: %v", cfg.User, err)
+	}
+
 	// List existing files to keep track the ones to be removed
 	if oldTemplateFiles, err := os.ReadDir(userTemplateDir); err == nil {
 		for _, file := range oldTemplateFiles {
@@ -1302,6 +1313,64 @@ func validateTemplateFilename(filename string) error {
 	// Further enforce no path in the template name.
 	if filepath.Dir(filepath.Clean(filename)) != "." {
 		return fmt.Errorf("invalid template name %q: the template name cannot contain any path", filename)
+	}
+
+	return nil
+}
+
+// validateStoredAlertmanagerConfig re-applies the restrictions enforced by
+// pkg/alertmanager/api.go on the write path to any configuration that is
+// about to be loaded from the alertstore. It mirrors the subset of
+// validateUserConfig that gates whether the Alertmanager will accept a
+// configuration (file-field restrictions on receivers, template filename
+// validation, and per-tenant template count/size limits) without performing
+// the on-disk template render done at write time.
+func validateStoredAlertmanagerConfig(cfg alertspb.AlertConfigDesc, limits Limits) error {
+	// Empty configurations are handled by setConfig (they fall back to the
+	// operator-provided fallback config, which is trusted). Nothing further
+	// to validate here.
+	if cfg.RawConfig == "" {
+		return nil
+	}
+
+	amCfg, err := amconfig.Load(cfg.RawConfig)
+	if err != nil {
+		// Parsing errors are reported by the caller which has more context
+		// (hasExisting handling); don't short-circuit here.
+		return nil
+	}
+
+	// Reflective scan for forbidden file-based secret references (same
+	// gate as pkg/alertmanager/api.go:validateAlertmanagerConfig).
+	if err := validateAlertmanagerConfig(amCfg); err != nil {
+		return err
+	}
+
+	// Validate templates referenced in the alertmanager config.
+	for _, name := range amCfg.Templates {
+		if err := validateTemplateFilename(name); err != nil {
+			return err
+		}
+	}
+
+	// Enforce per-tenant template count/size limits.
+	if l := limits.AlertmanagerMaxTemplatesCount(cfg.User); l > 0 && len(cfg.Templates) > l {
+		return fmt.Errorf(errTooManyTemplates, len(cfg.Templates), l)
+	}
+
+	if maxSize := limits.AlertmanagerMaxTemplateSize(cfg.User); maxSize > 0 {
+		for _, tmpl := range cfg.Templates {
+			if size := len(tmpl.GetBody()); size > maxSize {
+				return fmt.Errorf(errTemplateTooBig, tmpl.GetFilename(), size, maxSize)
+			}
+		}
+	}
+
+	// Validate the stored template filenames themselves.
+	for _, tmpl := range cfg.Templates {
+		if err := validateTemplateFilename(tmpl.Filename); err != nil {
+			return err
+		}
 	}
 
 	return nil
