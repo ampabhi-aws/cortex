@@ -302,6 +302,10 @@ func (t *TCPTransport) handleConnection(conn net.Conn) {
 		if !bytes.Equal(receivedDigest, expectedDigest[:]) {
 			t.receivedPacketsErrors.Inc()
 			level.Warn(t.logger).Log("msg", "packet digest mismatch", "expected", fmt.Sprintf("%x", expectedDigest), "received", fmt.Sprintf("%x", receivedDigest), "data_length", len(buf), "remote", conn.RemoteAddr())
+			// Drop the packet instead of forwarding a corrupted/truncated payload
+			// to memberlist: the digest is the only packet-completeness check for
+			// this transport, so a mismatch means the frame cannot be trusted.
+			return
 		}
 
 		t.debugLog().Log("msg", "Received packet", "addr", addr(addrBuf), "size", len(buf), "hash", fmt.Sprintf("%x", receivedDigest))
