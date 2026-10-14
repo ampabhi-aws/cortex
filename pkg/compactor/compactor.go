@@ -904,6 +904,9 @@ const compactorMetaPrefix = "compactor-meta-"
 // but we prefix it with "compactor-meta-" in order to guarantee no clashing with
 // the directory used by the Thanos Syncer, whatever is the user ID.
 func (c *Compactor) metaSyncDirForUser(userID string) string {
+	if userID == "" {
+		return ""
+	}
 	return filepath.Join(c.compactorCfg.DataDir, compactorMetaPrefix+userID)
 }
 
