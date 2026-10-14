@@ -872,6 +872,18 @@ func (am *MultitenantAlertmanager) setConfig(cfg alertspb.AlertConfigDesc) error
 			// working configuration.
 			return fmt.Errorf("invalid Cortex configuration for %v: %v", cfg.User, err)
 		}
+
+		// Re-run the deny-list / fail-closed validation against the stored config.
+		// setConfig() can be called with a previously stored config that was accepted
+		// by an older binary (before new *_file checks existed) — we must not start a
+		// user Alertmanager whose config contains disallowed file references, or the
+		// opsgenie/slack/victorops/webhook notifier would read and exfiltrate an
+		// arbitrary file on the Alertmanager host when it fires.
+		if err == nil && userAmConfig != nil {
+			if verr := validateAlertmanagerConfig(userAmConfig); verr != nil {
+				return fmt.Errorf("invalid Cortex configuration for %v: %v", cfg.User, verr)
+			}
+		}
 	}
 
 	// We can have an empty configuration here if:
