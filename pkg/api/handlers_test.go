@@ -189,3 +189,95 @@ func TestConfigOverrideHandler(t *testing.T) {
 	assert.NoError(t, err)
 	assert.Equal(t, []byte("config"), body)
 }
+
+// configWithSecretsMock exercises the GET /config credential redaction. It
+// embeds plain-string credential fields (modeled after swift.password,
+// etcd.password, basic_auth_password, access_key_id, configs.database.uri)
+// to ensure DefaultConfigHandler masks them before serving the response.
+type configWithSecretsMock struct {
+	TopPassword   string                 `yaml:"password"`
+	TopKeyID      string                 `yaml:"access_key_id"`
+	Database      configWithSecretsDBMock `yaml:"database"`
+	Alertmanager  configWithSecretsAMMock `yaml:"alertmanager_client"`
+	HarmlessField string                 `yaml:"harmless_field"`
+}
+
+type configWithSecretsDBMock struct {
+	URI string `yaml:"uri"`
+}
+
+type configWithSecretsAMMock struct {
+	BasicAuthPassword string `yaml:"basic_auth_password"`
+	BasicAuthUsername string `yaml:"basic_auth_username"`
+}
+
+func TestConfigHandlerRedactsSensitiveFields(t *testing.T) {
+	cfg := &configWithSecretsMock{
+		TopPassword:   "super-secret",
+		TopKeyID:      "AKIAEXAMPLE",
+		HarmlessField: "keep-me",
+	}
+	cfg.Database.URI = "postgres://user:hunter2@host/db"
+	cfg.Alertmanager.BasicAuthPassword = "notify-pass"
+	cfg.Alertmanager.BasicAuthUsername = "notify-user"
+
+	req := httptest.NewRequest("GET", "http://test.com/config", nil)
+	w := httptest.NewRecorder()
+
+	DefaultConfigHandler(cfg, cfg)(w, req)
+
+	resp := w.Result()
+	assert.Equal(t, 200, resp.StatusCode)
+
+	body, err := io.ReadAll(resp.Body)
+	assert.NoError(t, err)
+
+	bodyStr := string(body)
+
+	// Sensitive values must be redacted.
+	assert.NotContains(t, bodyStr, "super-secret")
+	assert.NotContains(t, bodyStr, "AKIAEXAMPLE")
+	assert.NotContains(t, bodyStr, "hunter2")
+	assert.NotContains(t, bodyStr, "notify-pass")
+	assert.Contains(t, bodyStr, "********")
+
+	// Non-sensitive values must survive unchanged.
+	assert.Contains(t, bodyStr, "keep-me")
+	assert.Contains(t, bodyStr, "notify-user")
+}
+
+func TestConfigHandlerRedactsSensitiveFieldsDefaultsMode(t *testing.T) {
+	defaultCfg := &configWithSecretsMock{
+		TopPassword: "baked-in-default",
+	}
+
+	req := httptest.NewRequest("GET", "http://test.com/config?mode=defaults", nil)
+	w := httptest.NewRecorder()
+
+	DefaultConfigHandler(&configWithSecretsMock{}, defaultCfg)(w, req)
+
+	resp := w.Result()
+	assert.Equal(t, 200, resp.StatusCode)
+
+	body, err := io.ReadAll(resp.Body)
+	assert.NoError(t, err)
+	assert.NotContains(t, string(body), "baked-in-default")
+	assert.Contains(t, string(body), "********")
+}
+
+func TestConfigHandlerRedactsSensitiveFieldsDiffMode(t *testing.T) {
+	defaultCfg := &configWithSecretsMock{}
+	actualCfg := &configWithSecretsMock{TopPassword: "operator-set"}
+
+	req := httptest.NewRequest("GET", "http://test.com/config?mode=diff", nil)
+	w := httptest.NewRecorder()
+
+	DefaultConfigHandler(actualCfg, defaultCfg)(w, req)
+
+	resp := w.Result()
+	assert.Equal(t, 200, resp.StatusCode)
+
+	body, err := io.ReadAll(resp.Body)
+	assert.NoError(t, err)
+	assert.NotContains(t, string(body), "operator-set")
+}

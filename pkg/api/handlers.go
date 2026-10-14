@@ -21,6 +21,7 @@ import (
 	v1 "github.com/prometheus/prometheus/web/api/v1"
 	"github.com/weaveworks/common/instrument"
 	"github.com/weaveworks/common/middleware"
+	yaml "gopkg.in/yaml.v2"
 
 	"github.com/cortexproject/cortex/pkg/purger"
 	"github.com/cortexproject/cortex/pkg/querier"
@@ -117,6 +118,105 @@ func (cfg *Config) configHandler(actualCfg interface{}, defaultCfg interface{}) 
 	return DefaultConfigHandler(actualCfg, defaultCfg)
 }
 
+// configSensitiveYAMLKeys lists YAML field names whose values must be
+// redacted before the config is served over HTTP. The underlying Go types
+// for these fields are plain strings (not flagext.Secret) so the type-driven
+// masking in pkg/util/flagext.Secret does not cover them; without this
+// allowlist they would be returned verbatim by GET /config, leaking
+// credentials (Swift/etcd/basic-auth passwords, S3 access key id, configs
+// database DSN which commonly embeds a password).
+var configSensitiveYAMLKeys = map[string]struct{}{
+	"password":            {}, // swift.password, etcd.password, and any other plain-string password field.
+	"basic_auth_password": {}, // ruler alertmanager_client basic auth (pkg/util.BasicAuth, inlined into NotifierConfig).
+	"access_key_id":       {}, // S3 access key id (its secret counterpart is already flagext.Secret).
+	"uri":                 {}, // configs.database.uri — DSN that may embed an inline password.
+}
+
+// redactSensitiveConfig walks a yaml-decoded value and replaces any value
+// whose yaml key is in configSensitiveYAMLKeys with a mask, when the value
+// is a non-empty scalar. Empty scalars are preserved so the output still
+// reflects whether the field was configured. The function mutates maps
+// in place and returns the (possibly rewritten) value for use with slices.
+func redactSensitiveConfig(v interface{}) interface{} {
+	switch node := v.(type) {
+	case yaml.MapSlice:
+		for i, item := range node {
+			if ks, ok := item.Key.(string); ok {
+				if _, sensitive := configSensitiveYAMLKeys[ks]; sensitive {
+					if s, isStr := item.Value.(string); isStr {
+						if s == "" {
+							node[i].Value = ""
+						} else {
+							node[i].Value = "********"
+						}
+						continue
+					}
+				}
+			}
+			node[i].Value = redactSensitiveConfig(item.Value)
+		}
+		return node
+	case map[interface{}]interface{}:
+		for k, val := range node {
+			if ks, ok := k.(string); ok {
+				if _, sensitive := configSensitiveYAMLKeys[ks]; sensitive {
+					if s, isStr := val.(string); isStr {
+						if s == "" {
+							node[k] = ""
+						} else {
+							node[k] = "********"
+						}
+						continue
+					}
+				}
+			}
+			node[k] = redactSensitiveConfig(val)
+		}
+		return node
+	case map[string]interface{}:
+		for k, val := range node {
+			if _, sensitive := configSensitiveYAMLKeys[k]; sensitive {
+				if s, isStr := val.(string); isStr {
+					if s == "" {
+						node[k] = ""
+					} else {
+						node[k] = "********"
+					}
+					continue
+				}
+			}
+			node[k] = redactSensitiveConfig(val)
+		}
+		return node
+	case []interface{}:
+		for i, val := range node {
+			node[i] = redactSensitiveConfig(val)
+		}
+		return node
+	default:
+		return v
+	}
+}
+
+// sanitizeConfigForResponse marshals cfg to YAML, redacts sensitive fields
+// identified by yaml key, and returns a value suitable for re-marshaling as
+// the HTTP response. A yaml.MapSlice is used as the intermediate
+// representation so that the field order emitted by the Go config structs
+// is preserved in the response. This complements the type-driven masking
+// performed by flagext.Secret (pkg/util/flagext/secret.go) for the
+// credential fields that are still plain strings in the config structs.
+func sanitizeConfigForResponse(cfg interface{}) (interface{}, error) {
+	yamlBytes, err := yaml.Marshal(cfg)
+	if err != nil {
+		return nil, err
+	}
+	var obj yaml.MapSlice
+	if err := yaml.Unmarshal(yamlBytes, &obj); err != nil {
+		return nil, err
+	}
+	return redactSensitiveConfig(obj), nil
+}
+
 func DefaultConfigHandler(actualCfg interface{}, defaultCfg interface{}) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		var output interface{}
@@ -127,12 +227,14 @@ func DefaultConfigHandler(actualCfg interface{}, defaultCfg interface{}) http.Ha
 				http.Error(w, err.Error(), http.StatusInternalServerError)
 				return
 			}
+			redactSensitiveConfig(defaultCfgObj)
 
 			actualCfgObj, err := util.YAMLMarshalUnmarshal(actualCfg)
 			if err != nil {
 				http.Error(w, err.Error(), http.StatusInternalServerError)
 				return
 			}
+			redactSensitiveConfig(actualCfgObj)
 
 			diff, err := util.DiffConfig(defaultCfgObj, actualCfgObj)
 			if err != nil {
@@ -142,9 +244,19 @@ func DefaultConfigHandler(actualCfg interface{}, defaultCfg interface{}) http.Ha
 			output = diff
 
 		case "defaults":
-			output = defaultCfg
+			sanitized, err := sanitizeConfigForResponse(defaultCfg)
+			if err != nil {
+				http.Error(w, err.Error(), http.StatusInternalServerError)
+				return
+			}
+			output = sanitized
 		default:
-			output = actualCfg
+			sanitized, err := sanitizeConfigForResponse(actualCfg)
+			if err != nil {
+				http.Error(w, err.Error(), http.StatusInternalServerError)
+				return
+			}
+			output = sanitized
 		}
 
 		util.WriteYAMLResponse(w, output)
