@@ -157,6 +157,15 @@ type KVConfig struct {
 	// How much space to use to keep received and sent messages in memory (for troubleshooting).
 	MessageHistoryBufferBytes int `yaml:"message_history_buffer_bytes"`
 
+	// EnableReceivedMessagesDeletion, when true, allows the memberlist status
+	// page to accept the `?deleteMessages=true` action, which wipes the
+	// in-memory gossip message history (sent and received). This is a
+	// debugging-only, destructive action and is disabled by default; the
+	// Cortex HTTP listener does not authenticate callers, so operators must
+	// also ensure the endpoint is reachable only through a trusted
+	// authenticating reverse proxy before enabling it.
+	EnableReceivedMessagesDeletion bool `yaml:"enable_received_messages_deletion"`
+
 	TCPTransport TCPTransportConfig `yaml:",inline"`
 
 	// Where to put custom metrics. Metrics are not registered, if this is nil.
@@ -190,6 +199,7 @@ func (cfg *KVConfig) RegisterFlagsWithPrefix(f *flag.FlagSet, prefix string) {
 	f.DurationVar(&cfg.GossipToTheDeadTime, prefix+"memberlist.gossip-to-dead-nodes-time", mlDefaults.GossipToTheDeadTime, "How long to keep gossiping to dead nodes, to give them chance to refute their death.")
 	f.DurationVar(&cfg.DeadNodeReclaimTime, prefix+"memberlist.dead-node-reclaim-time", mlDefaults.DeadNodeReclaimTime, "How soon can dead node's name be reclaimed with new address. 0 to disable.")
 	f.IntVar(&cfg.MessageHistoryBufferBytes, prefix+"memberlist.message-history-buffer-bytes", 0, "How much space to use for keeping received and sent messages in memory for troubleshooting (two buffers). 0 to disable.")
+	f.BoolVar(&cfg.EnableReceivedMessagesDeletion, prefix+"memberlist.enable-received-messages-deletion", false, "Allow operators to clear the in-memory gossip message history via GET /memberlist?deleteMessages=true. Disabled by default because the memberlist page is not credential-authenticated by Cortex and the action destroys debugging evidence; only enable this behind a trusted authenticating reverse proxy.")
 	f.BoolVar(&cfg.EnableCompression, prefix+"memberlist.compression-enabled", mlDefaults.EnableCompression, "Enable message compression. This can be used to reduce bandwidth usage at the cost of slightly more CPU utilization.")
 	f.StringVar(&cfg.AdvertiseAddr, prefix+"memberlist.advertise-addr", mlDefaults.AdvertiseAddr, "Gossip address to advertise to other members in the cluster. Used for NAT traversal.")
 	f.IntVar(&cfg.AdvertisePort, prefix+"memberlist.advertise-port", mlDefaults.AdvertisePort, "Gossip port to advertise to other members in the cluster. Used for NAT traversal.")

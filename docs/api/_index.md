@@ -282,6 +282,8 @@ GET /ring
 
 Displays a web page with the ingesters hash ring status, including the state, healthy and last heartbeat time of each ingester.
 
+The same route also accepts `POST /ingester/ring` (and `POST /ring`) with a `forget=<instance-id>` form value, which removes the specified instance from the shared ring KV. This is a destructive operator-only capability and is **disabled by default**: a POST will return `403 Forbidden` unless Cortex is started with `-ring.enable-forget-api=true`. Because Cortex itself does not authenticate HTTP callers (authentication is delegated to an external reverse proxy), operators must additionally ensure this endpoint is only reachable through a trusted authenticating proxy before enabling the flag. The same gating applies to `POST` on `/distributor/ring`, `/ruler/ring`, `/ruler_ring`, `/compactor/ring`, `/store-gateway/ring`, and `/multitenant_alertmanager/ring`.
+
 
 ## Querier / Query-frontend
 

@@ -125,6 +125,13 @@ type Config struct {
 	ZoneAwarenessEnabled bool                   `yaml:"zone_awareness_enabled"`
 	ExcludedZones        flagext.StringSliceCSV `yaml:"excluded_zones"`
 
+	// EnableForgetAPI, when true, allows the ring HTTP page to accept POST
+	// requests that remove ("forget") an instance from the ring. This is a
+	// destructive operator-only action, so it is disabled by default. Even
+	// when enabled, the request must still be gated by an external
+	// authenticating reverse proxy (see docs/guides/authentication-and-authorisation.md).
+	EnableForgetAPI bool `yaml:"enable_forget_api"`
+
 	// Whether the shuffle-sharding subring cache is disabled. This option is set
 	// internally and never exposed to the user.
 	SubringCacheDisabled bool `yaml:"-"`
@@ -143,6 +150,7 @@ func (cfg *Config) RegisterFlagsWithPrefix(prefix string, f *flag.FlagSet) {
 	f.IntVar(&cfg.ReplicationFactor, prefix+"distributor.replication-factor", 3, "The number of ingesters to write to and read from.")
 	f.BoolVar(&cfg.ZoneAwarenessEnabled, prefix+"distributor.zone-awareness-enabled", false, "True to enable the zone-awareness and replicate ingested samples across different availability zones.")
 	f.Var(&cfg.ExcludedZones, prefix+"distributor.excluded-zones", "Comma-separated list of zones to exclude from the ring. Instances in excluded zones will be filtered out from the ring.")
+	f.BoolVar(&cfg.EnableForgetAPI, prefix+"ring.enable-forget-api", false, "Allow operators to remove instances from the ring via POST on the ring status page. Disabled by default because it is a destructive operation and the ring endpoints are not credential-authenticated by Cortex; only enable this behind a trusted authenticating reverse proxy.")
 }
 
 type instanceInfo struct {
