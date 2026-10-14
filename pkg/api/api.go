@@ -234,7 +234,18 @@ func (a *API) RegisterRuntimeConfig(runtimeConfigHandler http.HandlerFunc) {
 func (a *API) RegisterDistributor(d *distributor.Distributor, pushConfig distributor.Config) {
 	distributorpb.RegisterDistributorServer(a.server.GRPC, d)
 
-	a.RegisterRoute("/api/v1/push", push.Handler(pushConfig.MaxRecvMsgSize, a.sourceIPs, a.cfg.wrapDistributorPush(d)), true, "POST")
+	// Admit requests against the distributor's per-instance inflight/rate
+	// limits before util.ParseProtoReader reads or allocates the body. This
+	// prevents a client from reserving up to -distributor.max-recv-msg-size
+	// of heap per connection by sending only request headers (CWE-770).
+	distributorAdmit := func(ctx context.Context, r *http.Request) (int, error) {
+		if err := d.StartPushRequest(ctx); err != nil {
+			return http.StatusTooManyRequests, err
+		}
+		return 0, nil
+	}
+
+	a.RegisterRoute("/api/v1/push", push.HandlerWithAdmission(pushConfig.MaxRecvMsgSize, a.sourceIPs, distributorAdmit, a.cfg.wrapDistributorPush(d)), true, "POST")
 
 	a.indexPage.AddLink(SectionAdminEndpoints, "/distributor/ring", "Distributor Ring Status")
 	a.indexPage.AddLink(SectionAdminEndpoints, "/distributor/all_user_stats", "Usage Statistics")
@@ -245,7 +256,7 @@ func (a *API) RegisterDistributor(d *distributor.Distributor, pushConfig distrib
 	a.RegisterRoute("/distributor/ha_tracker", d.HATracker, false, "GET")
 
 	// Legacy Routes
-	a.RegisterRoute(path.Join(a.cfg.LegacyHTTPPrefix, "/push"), push.Handler(pushConfig.MaxRecvMsgSize, a.sourceIPs, a.cfg.wrapDistributorPush(d)), true, "POST")
+	a.RegisterRoute(path.Join(a.cfg.LegacyHTTPPrefix, "/push"), push.HandlerWithAdmission(pushConfig.MaxRecvMsgSize, a.sourceIPs, distributorAdmit, a.cfg.wrapDistributorPush(d)), true, "POST")
 	a.RegisterRoute("/all_user_stats", http.HandlerFunc(d.AllUserStatsHandler), false, "GET")
 	a.RegisterRoute("/ha-tracker", d.HATracker, false, "GET")
 }
