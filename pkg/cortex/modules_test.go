@@ -4,6 +4,7 @@ import (
 	"context"
 	"net/http/httptest"
 	"os"
+	"strings"
 	"testing"
 
 	"github.com/gorilla/mux"
@@ -13,10 +14,16 @@ import (
 	"github.com/weaveworks/common/server"
 
 	"github.com/cortexproject/cortex/pkg/cortexpb"
+	"github.com/cortexproject/cortex/pkg/util/flagext"
 )
 
 func changeTargetConfig(c *Config) {
 	c.Target = []string{"all", "ruler"}
+}
+
+func setRulerAlertmanagerBasicAuthPassword(c *Config) {
+	c.Ruler.Notifier.BasicAuth.Username = "ruler"
+	c.Ruler.Notifier.BasicAuth.Password = flagext.Secret{Value: "supersecretpassword"}
 }
 
 func TestAPIConfig(t *testing.T) {
@@ -76,6 +83,29 @@ func TestAPIConfig(t *testing.T) {
 			expectedStatusCode: 200,
 			expectedBody: func(t *testing.T, body string) {
 				assert.Equal(t, "target: all,ruler\n", body)
+			},
+		},
+		{
+			// Regression test: the ruler Alertmanager basic-auth password must be
+			// masked in the /config output; it must not leak the plaintext credential
+			// to any caller that can reach the Cortex HTTP port.
+			name:               "ruler alertmanager basic_auth_password is masked in /config",
+			path:               "/config",
+			actualCfg:          setRulerAlertmanagerBasicAuthPassword,
+			expectedStatusCode: 200,
+			expectedBody: func(t *testing.T, body string) {
+				assert.NotContains(t, body, "supersecretpassword", "plaintext password must not appear in /config output")
+				assert.Contains(t, body, "basic_auth_password: '********'", "basic_auth_password must be rendered as the masked literal")
+			},
+		},
+		{
+			name:               "ruler alertmanager basic_auth_password is masked in /config?mode=diff",
+			path:               "/config?mode=diff",
+			actualCfg:          setRulerAlertmanagerBasicAuthPassword,
+			expectedStatusCode: 200,
+			expectedBody: func(t *testing.T, body string) {
+				assert.NotContains(t, body, "supersecretpassword", "plaintext password must not appear in /config?mode=diff output")
+				assert.True(t, strings.Contains(body, "basic_auth_password: '********'") || strings.Contains(body, "basic_auth_password: \"********\""), "basic_auth_password must be rendered as the masked literal in diff mode, got: %s", body)
 			},
 		},
 	} {
