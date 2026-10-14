@@ -9,6 +9,7 @@ import (
 
 	"github.com/cortexproject/cortex/pkg/ingester"
 	"github.com/cortexproject/cortex/pkg/ring/kv"
+	"github.com/cortexproject/cortex/pkg/tenant"
 	"github.com/cortexproject/cortex/pkg/util"
 	"github.com/cortexproject/cortex/pkg/util/runtimeconfig"
 	"github.com/cortexproject/cortex/pkg/util/validation"
@@ -126,6 +127,30 @@ func runtimeConfigHandler(runtimeCfgManager *runtimeconfig.Manager, defaultLimit
 			return
 		}
 
+		// Resolve the tenant from the request so that we only expose the
+		// caller's own overrides rather than the full tenant roster. The route
+		// is registered with auth=true, so the auth middleware has already
+		// required an X-Scope-OrgID header; if it is somehow missing or
+		// unresolvable here, refuse the request rather than fall back to the
+		// unfiltered map.
+		tenantID, err := tenant.TenantID(r.Context())
+		if err != nil {
+			http.Error(w, err.Error(), http.StatusUnauthorized)
+			return
+		}
+
+		// Build a tenant-scoped view of the runtime config: everything except
+		// TenantLimits is shared process-level state (ring KV multi config,
+		// ingester instance limits, feature flags) that already matches what
+		// the tenant observes via the data-path APIs, but TenantLimits must be
+		// filtered to the caller's own tenant so that a tenant cannot
+		// enumerate other tenants' IDs or overrides.
+		scoped := *cfg
+		scoped.TenantLimits = map[string]*validation.Limits{}
+		if tl, ok := cfg.TenantLimits[tenantID]; ok {
+			scoped.TenantLimits[tenantID] = tl
+		}
+
 		var output interface{}
 		switch r.URL.Query().Get("mode") {
 		case "diff":
@@ -133,13 +158,13 @@ func runtimeConfigHandler(runtimeCfgManager *runtimeconfig.Manager, defaultLimit
 			// we set defaultLimits for every tenant that exists in runtime config.
 			defaultCfg := runtimeConfigValues{}
 			defaultCfg.TenantLimits = map[string]*validation.Limits{}
-			for k, v := range cfg.TenantLimits {
+			for k, v := range scoped.TenantLimits {
 				if v != nil {
 					defaultCfg.TenantLimits[k] = &defaultLimits
 				}
 			}
 
-			cfgYaml, err := util.YAMLMarshalUnmarshal(cfg)
+			cfgYaml, err := util.YAMLMarshalUnmarshal(&scoped)
 			if err != nil {
 				http.Error(w, err.Error(), http.StatusInternalServerError)
 				return
@@ -158,7 +183,7 @@ func runtimeConfigHandler(runtimeCfgManager *runtimeconfig.Manager, defaultLimit
 			}
 
 		default:
-			output = cfg
+			output = &scoped
 		}
 		util.WriteYAMLResponse(w, output)
 	}

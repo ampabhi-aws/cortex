@@ -217,7 +217,11 @@ func (a *API) RegisterAPI(httpPathPrefix string, actualCfg interface{}, defaultC
 	a.indexPage.AddLink(SectionAdminEndpoints, "/config", "Current Config (including the default values)")
 	a.indexPage.AddLink(SectionAdminEndpoints, "/config?mode=diff", "Current Config (show only values that differ from the defaults)")
 
-	a.RegisterRoute("/config", a.cfg.configHandler(actualCfg, defaultCfg), false, "GET")
+	// /config exposes the whole process configuration (object-storage endpoints,
+	// bucket names, KV endpoints, internal addresses, feature flags, ...), so it
+	// is gated behind the auth middleware so an operator-fronting reverse proxy
+	// / authenticating layer can enforce a credential before it is served.
+	a.RegisterRoute("/config", a.cfg.configHandler(actualCfg, defaultCfg), true, "GET")
 	a.RegisterRoute("/", indexHandler(httpPathPrefix, a.indexPage), false, "GET")
 	a.RegisterRoute("/debug/fgprof", fgprof.Handler(), false, "GET")
 }
@@ -227,7 +231,12 @@ func (a *API) RegisterRuntimeConfig(runtimeConfigHandler http.HandlerFunc) {
 	a.indexPage.AddLink(SectionAdminEndpoints, "/runtime_config", "Current Runtime Config (incl. Overrides)")
 	a.indexPage.AddLink(SectionAdminEndpoints, "/runtime_config?mode=diff", "Current Runtime Config (show only values that differ from the defaults)")
 
-	a.RegisterRoute("/runtime_config", runtimeConfigHandler, false, "GET")
+	// /runtime_config exposes the per-tenant overrides map (tenant roster and
+	// each tenant's limit overrides). It is gated behind the auth middleware so
+	// that it requires a tenant identity (and so a fronting authenticating
+	// proxy can enforce a credential) before it is served, and the handler
+	// itself filters the overrides to just the caller's tenant.
+	a.RegisterRoute("/runtime_config", runtimeConfigHandler, true, "GET")
 }
 
 // RegisterDistributor registers the endpoints associated with the distributor.

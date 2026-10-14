@@ -91,6 +91,11 @@ func TestAPIConfig(t *testing.T) {
 			require.NoError(t, err)
 
 			req := httptest.NewRequest("GET", tc.path, nil)
+			// /config is served only to authenticated callers (the auth
+			// middleware requires an X-Scope-OrgID header); supply one here so
+			// that the test exercises the configured handler rather than being
+			// rejected by the middleware.
+			req.Header.Set("X-Scope-OrgID", "test")
 			resp := httptest.NewRecorder()
 
 			cortex.Server.HTTP.ServeHTTP(resp, req)
