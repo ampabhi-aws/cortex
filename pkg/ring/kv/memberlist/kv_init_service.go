@@ -141,6 +141,11 @@ func (kvs *KVInitService) ServeHTTP(w http.ResponseWriter, req *http.Request) {
 		}
 
 		if len(req.Form[deleteMessagesParam]) > 0 && req.Form[deleteMessagesParam][0] == "true" {
+			if !kvs.cfg.EnableReceivedMessagesDeletion {
+				http.Error(w, "memberlist message deletion is disabled; enable it with -memberlist.enable-received-messages-deletion after placing this endpoint behind an authenticating reverse proxy", http.StatusForbidden)
+				return
+			}
+
 			kv.deleteSentReceivedMessages()
 
 			// Redirect back.

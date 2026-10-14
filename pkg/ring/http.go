@@ -6,12 +6,14 @@ import (
 	"fmt"
 	"html/template"
 	"math"
+	"net"
 	"net/http"
 	"sort"
 	"strings"
 	"time"
 
 	"github.com/go-kit/log/level"
+	"github.com/weaveworks/common/user"
 )
 
 const pageContent = `
@@ -123,9 +125,42 @@ type httpResponse struct {
 
 func (r *Ring) ServeHTTP(w http.ResponseWriter, req *http.Request) {
 	if req.Method == http.MethodPost {
+		// The POST handler on the ring status page implements the "forget"
+		// action, which unconditionally removes an instance from the shared
+		// ring KV. This is a destructive operator-only capability, so it is
+		// gated behind an explicit opt-in flag that is off by default. The
+		// Cortex HTTP listener does not perform credential authentication of
+		// its own (authentication is delegated to an external reverse proxy),
+		// so operators must additionally ensure this endpoint is only
+		// reachable through that proxy before enabling the flag.
+		if !r.cfg.EnableForgetAPI {
+			level.Warn(r.logger).Log(
+				"msg", "rejected ring forget request: forget API is disabled",
+				"path", req.URL.Path,
+				"source_ip", clientIP(req),
+				"principal", requestPrincipal(req),
+			)
+			http.Error(w, "ring forget API is disabled; enable it with -ring.enable-forget-api after placing this endpoint behind an authenticating reverse proxy", http.StatusForbidden)
+			return
+		}
+
 		ingesterID := req.FormValue("forget")
+		logger := level.Info(r.logger)
+		logger.Log(
+			"msg", "ring forget requested",
+			"path", req.URL.Path,
+			"instance", ingesterID,
+			"source_ip", clientIP(req),
+			"principal", requestPrincipal(req),
+		)
 		if err := r.forget(req.Context(), ingesterID); err != nil {
-			level.Error(r.logger).Log("msg", "error forgetting instance", "err", err)
+			level.Error(r.logger).Log(
+				"msg", "error forgetting instance",
+				"instance", ingesterID,
+				"source_ip", clientIP(req),
+				"principal", requestPrincipal(req),
+				"err", err,
+			)
 		}
 
 		// Implement PRG pattern to prevent double-POST and work with CSRF middleware.
@@ -217,4 +252,33 @@ func writeJSONResponse(w http.ResponseWriter, v httpResponse) {
 	// Write will trigger sending Status code, so we cannot send a different status code afterwards.
 	// Also this isn't internal error, but error communicating with client.
 	_, _ = w.Write(data)
+}
+
+// clientIP returns the best-effort source IP of the HTTP request, preferring
+// X-Forwarded-For / X-Real-IP when a reverse proxy is in use. It is used only
+// for audit logging of destructive operator actions.
+func clientIP(req *http.Request) string {
+	if xff := req.Header.Get("X-Forwarded-For"); xff != "" {
+		if idx := strings.Index(xff, ","); idx >= 0 {
+			return strings.TrimSpace(xff[:idx])
+		}
+		return strings.TrimSpace(xff)
+	}
+	if xri := req.Header.Get("X-Real-IP"); xri != "" {
+		return strings.TrimSpace(xri)
+	}
+	if host, _, err := net.SplitHostPort(req.RemoteAddr); err == nil {
+		return host
+	}
+	return req.RemoteAddr
+}
+
+// requestPrincipal returns the tenant / principal associated with the request,
+// based on the X-Scope-OrgID header that Cortex treats as the authenticated
+// identity. Returns "anonymous" when no identity is present.
+func requestPrincipal(req *http.Request) string {
+	if id, _, err := user.ExtractOrgIDFromHTTPRequest(req); err == nil && id != "" {
+		return id
+	}
+	return "anonymous"
 }
