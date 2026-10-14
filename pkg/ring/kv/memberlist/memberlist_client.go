@@ -28,6 +28,19 @@ import (
 const (
 	maxCasRetries              = 10          // max retries in CAS operation
 	noChangeDetectedRetrySleep = time.Second // how long to sleep after no change was detected in CAS
+
+	// defaultMaxGossipKeyLength is the maximum length of a KV key that is
+	// accepted from a gossip-received message. It is intentionally generous
+	// (ring keys are short in practice) while still bounding how much heap a
+	// malicious peer can plant per message.
+	defaultMaxGossipKeyLength = 512
+
+	// defaultMaxKVStoreKeys is a safety cap on the number of distinct keys
+	// kept in the KV store map. Legitimate deployments use only a handful
+	// of ring keys per gossiping component, so this leaves ample headroom
+	// while bounding the heap and metric cardinality that a gossip peer
+	// (potentially an attacker) can drive by sending unknown keys.
+	defaultMaxKVStoreKeys = 1024
 )
 
 // Client implements kv.Client interface, by using memberlist.KV
@@ -157,6 +170,16 @@ type KVConfig struct {
 	// How much space to use to keep received and sent messages in memory (for troubleshooting).
 	MessageHistoryBufferBytes int `yaml:"message_history_buffer_bytes"`
 
+	// Maximum length (in bytes) of a KV key accepted from a gossip message.
+	// Keys exceeding this length are dropped and counted as invalid. 0 uses
+	// the default (defaultMaxGossipKeyLength).
+	MaxGossipKeyLength int `yaml:"max_gossip_key_length"`
+
+	// Maximum number of distinct keys kept in the KV store. Gossip messages
+	// introducing a new key beyond this cap are dropped and counted as
+	// invalid. 0 uses the default (defaultMaxKVStoreKeys).
+	MaxKVStoreKeys int `yaml:"max_kv_store_keys"`
+
 	TCPTransport TCPTransportConfig `yaml:",inline"`
 
 	// Where to put custom metrics. Metrics are not registered, if this is nil.
@@ -190,6 +213,8 @@ func (cfg *KVConfig) RegisterFlagsWithPrefix(f *flag.FlagSet, prefix string) {
 	f.DurationVar(&cfg.GossipToTheDeadTime, prefix+"memberlist.gossip-to-dead-nodes-time", mlDefaults.GossipToTheDeadTime, "How long to keep gossiping to dead nodes, to give them chance to refute their death.")
 	f.DurationVar(&cfg.DeadNodeReclaimTime, prefix+"memberlist.dead-node-reclaim-time", mlDefaults.DeadNodeReclaimTime, "How soon can dead node's name be reclaimed with new address. 0 to disable.")
 	f.IntVar(&cfg.MessageHistoryBufferBytes, prefix+"memberlist.message-history-buffer-bytes", 0, "How much space to use for keeping received and sent messages in memory for troubleshooting (two buffers). 0 to disable.")
+	f.IntVar(&cfg.MaxGossipKeyLength, prefix+"memberlist.max-gossip-key-length", defaultMaxGossipKeyLength, "Maximum length (in bytes) of a KV key accepted from a gossip message. Keys longer than this are dropped and counted as invalid received messages. Must be large enough to fit every ring key configured for this component.")
+	f.IntVar(&cfg.MaxKVStoreKeys, prefix+"memberlist.max-kv-store-keys", defaultMaxKVStoreKeys, "Maximum number of distinct keys kept in the memberlist KV store. Gossip messages introducing a new key beyond this cap are dropped and counted as invalid received messages. Must be greater than or equal to the number of ring keys configured for this component.")
 	f.BoolVar(&cfg.EnableCompression, prefix+"memberlist.compression-enabled", mlDefaults.EnableCompression, "Enable message compression. This can be used to reduce bandwidth usage at the cost of slightly more CPU utilization.")
 	f.StringVar(&cfg.AdvertiseAddr, prefix+"memberlist.advertise-addr", mlDefaults.AdvertiseAddr, "Gossip address to advertise to other members in the cluster. Used for NAT traversal.")
 	f.IntVar(&cfg.AdvertisePort, prefix+"memberlist.advertise-port", mlDefaults.AdvertisePort, "Gossip port to advertise to other members in the cluster. Used for NAT traversal.")
@@ -242,6 +267,13 @@ type KV struct {
 	watchersMu     sync.Mutex
 	watchers       map[string][]chan string
 	prefixWatchers map[string][]chan string
+
+	// Allowlist of KV keys and key prefixes that this process actually uses
+	// (populated as callers register them through CAS/WatchKey/WatchPrefix/List).
+	// Protected by watchersMu because it is updated on the same code paths as
+	// watchers/prefixWatchers.
+	allowedKeys     map[string]struct{}
+	allowedPrefixes map[string]struct{}
 
 	// Buffers with sent and received messages. Used for troubleshooting only.
 	// New messages are appended, old messages (based on configured size limit) removed from the front.
@@ -344,12 +376,14 @@ func NewKV(cfg KVConfig, logger log.Logger, dnsProvider DNSProvider, registerer 
 		registerer: registerer,
 		provider:   dnsProvider,
 
-		store:          make(map[string]valueDesc),
-		codecs:         make(map[string]codec.Codec),
-		watchers:       make(map[string][]chan string),
-		prefixWatchers: make(map[string][]chan string),
-		shutdown:       make(chan struct{}),
-		maxCasRetries:  maxCasRetries,
+		store:           make(map[string]valueDesc),
+		codecs:          make(map[string]codec.Codec),
+		watchers:        make(map[string][]chan string),
+		prefixWatchers:  make(map[string][]chan string),
+		allowedKeys:     make(map[string]struct{}),
+		allowedPrefixes: make(map[string]struct{}),
+		shutdown:        make(chan struct{}),
+		maxCasRetries:   maxCasRetries,
 	}
 
 	mlkv.createAndRegisterMetrics()
@@ -640,6 +674,8 @@ func (m *KV) stopping(_ error) error {
 // List returns all known keys under a given prefix.
 // No communication with other nodes in the cluster is done here.
 func (m *KV) List(prefix string) []string {
+	m.registerAllowedPrefix(prefix)
+
 	m.storeMu.Lock()
 	defer m.storeMu.Unlock()
 
@@ -655,6 +691,7 @@ func (m *KV) List(prefix string) []string {
 // Get returns current value associated with given key.
 // No communication with other nodes in the cluster is done here.
 func (m *KV) Get(key string, codec codec.Codec) (interface{}, error) {
+	m.registerAllowedKey(key)
 	val, _, err := m.get(key, codec)
 	return val, err
 }
@@ -685,6 +722,7 @@ func (m *KV) WatchKey(ctx context.Context, key string, codec codec.Codec, f func
 	// register watcher
 	m.watchersMu.Lock()
 	m.watchers[key] = append(m.watchers[key], w)
+	m.allowedKeys[key] = struct{}{}
 	m.watchersMu.Unlock()
 
 	defer func() {
@@ -732,6 +770,7 @@ func (m *KV) WatchPrefix(ctx context.Context, prefix string, codec codec.Codec, 
 	// register watcher
 	m.watchersMu.Lock()
 	m.prefixWatchers[prefix] = append(m.prefixWatchers[prefix], w)
+	m.allowedPrefixes[prefix] = struct{}{}
 	m.watchersMu.Unlock()
 
 	defer func() {
@@ -815,6 +854,104 @@ func (m *KV) notifyWatchers(key string) {
 	}
 }
 
+// registerAllowedKey records key as a KV key this process actively uses, so that
+// future gossip messages for it will be accepted. Safe to call multiple times.
+func (m *KV) registerAllowedKey(key string) {
+	if key == "" {
+		return
+	}
+	m.watchersMu.Lock()
+	defer m.watchersMu.Unlock()
+	m.allowedKeys[key] = struct{}{}
+}
+
+// registerAllowedPrefix records prefix as a KV key prefix this process actively
+// uses, so that future gossip messages for keys that start with prefix will be
+// accepted. Safe to call multiple times.
+func (m *KV) registerAllowedPrefix(prefix string) {
+	m.watchersMu.Lock()
+	defer m.watchersMu.Unlock()
+	m.allowedPrefixes[prefix] = struct{}{}
+}
+
+// maxGossipKeyLength returns the configured maximum length for a KV key that
+// may be accepted from a gossip message, falling back to the default when
+// the config value is non-positive.
+func (m *KV) maxGossipKeyLength() int {
+	if m.cfg.MaxGossipKeyLength > 0 {
+		return m.cfg.MaxGossipKeyLength
+	}
+	return defaultMaxGossipKeyLength
+}
+
+// maxKVStoreKeys returns the configured maximum number of distinct keys that
+// may live in m.store, falling back to the default when the config value is
+// non-positive.
+func (m *KV) maxKVStoreKeys() int {
+	if m.cfg.MaxKVStoreKeys > 0 {
+		return m.cfg.MaxKVStoreKeys
+	}
+	return defaultMaxKVStoreKeys
+}
+
+// isAllowedKey reports whether a gossip-supplied key is one this process has
+// explicitly registered through CAS/WatchKey/WatchPrefix/List/Get, or one
+// already present in the KV store because it was accepted earlier through a
+// legitimate path. storeHasKey must indicate whether the key is already a
+// first-class entry in m.store (callers hold storeMu or copy that bit of
+// state in advance). The hot path takes watchersMu, which is cheap.
+func (m *KV) isAllowedKey(key string, storeHasKey bool) bool {
+	if storeHasKey {
+		return true
+	}
+	m.watchersMu.Lock()
+	defer m.watchersMu.Unlock()
+	if _, ok := m.allowedKeys[key]; ok {
+		return true
+	}
+	if _, ok := m.watchers[key]; ok {
+		return true
+	}
+	for prefix := range m.allowedPrefixes {
+		if strings.HasPrefix(key, prefix) {
+			return true
+		}
+	}
+	for prefix := range m.prefixWatchers {
+		if strings.HasPrefix(key, prefix) {
+			return true
+		}
+	}
+	return false
+}
+
+// validateGossipKey enforces the length and allowlist checks for a key
+// received via gossip. It returns nil when the key may be processed further,
+// or an error describing why the key was rejected. Rejections should be
+// logged by the caller and reflected in numberOfInvalidReceivedMessages.
+func (m *KV) validateGossipKey(key string) error {
+	if key == "" {
+		return fmt.Errorf("empty key")
+	}
+	if maxLen := m.maxGossipKeyLength(); len(key) > maxLen {
+		return fmt.Errorf("key length %d exceeds max %d", len(key), maxLen)
+	}
+
+	m.storeMu.Lock()
+	_, inStore := m.store[key]
+	storeSize := len(m.store)
+	m.storeMu.Unlock()
+
+	if !m.isAllowedKey(key, inStore) {
+		return fmt.Errorf("key is not registered on this process")
+	}
+	// If this would introduce a new key, enforce the KV store size cap.
+	if !inStore && storeSize >= m.maxKVStoreKeys() {
+		return fmt.Errorf("KV store key cap %d reached", m.maxKVStoreKeys())
+	}
+	return nil
+}
+
 // CAS implements Compare-And-Set/Swap operation.
 //
 // CAS expects that value returned by 'f' function implements Mergeable interface. If it doesn't, CAS fails immediately.
@@ -826,6 +963,10 @@ func (m *KV) notifyWatchers(key string) {
 // After too many failed retries, this method returns error.
 func (m *KV) CAS(ctx context.Context, key string, codec codec.Codec, f func(in interface{}) (out interface{}, retry bool, err error)) error {
 	var lastError error
+
+	// CAS is called from Cortex modules with the ring key(s) they own, so
+	// use it as a signal to allowlist that key for incoming gossip.
+	m.registerAllowedKey(key)
 
 outer:
 	for retries := m.maxCasRetries; retries > 0; retries-- {
@@ -974,6 +1115,12 @@ func (m *KV) NotifyMsg(msg []byte) {
 
 	if len(kvPair.Key) == 0 {
 		level.Warn(m.logger).Log("msg", "received an invalid KV Pair (empty key)")
+		m.numberOfInvalidReceivedMessages.Inc()
+		return
+	}
+
+	if err := m.validateGossipKey(kvPair.Key); err != nil {
+		level.Warn(m.logger).Log("msg", "dropping gossip message with disallowed KV key", "key", kvPair.Key, "err", err)
 		m.numberOfInvalidReceivedMessages.Inc()
 		return
 	}
@@ -1151,8 +1298,15 @@ func (m *KV) MergeRemoteState(data []byte, join bool) {
 
 		data = data[kvPairLength:]
 
+		if validErr := m.validateGossipKey(kvPair.Key); validErr != nil {
+			level.Warn(m.logger).Log("msg", "dropping remote state entry with disallowed KV key", "key", kvPair.Key, "err", validErr)
+			m.numberOfInvalidReceivedMessages.Inc()
+			continue
+		}
+
 		codec := m.GetCodec(kvPair.GetCodec())
 		if codec == nil {
+			m.numberOfInvalidReceivedMessages.Inc()
 			level.Error(m.logger).Log("msg", "failed to parse remote state: unknown codec for key", "codec", kvPair.GetCodec(), "key", kvPair.GetKey())
 			continue
 		}
