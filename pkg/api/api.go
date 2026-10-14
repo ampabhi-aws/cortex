@@ -188,7 +188,8 @@ func (a *API) RegisterAlertmanager(am *alertmanager.MultitenantAlertmanager, tar
 	// Ensure this route is registered before the prefixed AM route
 	a.RegisterRoute("/multitenant_alertmanager/status", am.GetStatusHandler(), false, "GET")
 	a.RegisterRoute("/multitenant_alertmanager/configs", http.HandlerFunc(am.ListAllConfigs), false, "GET")
-	a.RegisterRoute("/multitenant_alertmanager/ring", http.HandlerFunc(am.RingHandler), false, "GET", "POST")
+	a.RegisterRoute("/multitenant_alertmanager/ring", http.HandlerFunc(am.RingHandler), false, "GET")
+	a.RegisterRoute("/multitenant_alertmanager/ring", http.HandlerFunc(am.RingHandler), true, "POST")
 	a.RegisterRoute("/multitenant_alertmanager/delete_tenant_config", http.HandlerFunc(am.DeleteUserConfig), true, "POST")
 
 	// UI components lead to a large number of routes to support, utilize a path prefix instead
@@ -240,7 +241,8 @@ func (a *API) RegisterDistributor(d *distributor.Distributor, pushConfig distrib
 	a.indexPage.AddLink(SectionAdminEndpoints, "/distributor/all_user_stats", "Usage Statistics")
 	a.indexPage.AddLink(SectionAdminEndpoints, "/distributor/ha_tracker", "HA Tracking Status")
 
-	a.RegisterRoute("/distributor/ring", d, false, "GET", "POST")
+	a.RegisterRoute("/distributor/ring", d, false, "GET")
+	a.RegisterRoute("/distributor/ring", d, true, "POST")
 	a.RegisterRoute("/distributor/all_user_stats", http.HandlerFunc(d.AllUserStatsHandler), false, "GET")
 	a.RegisterRoute("/distributor/ha_tracker", d.HATracker, false, "GET")
 
@@ -283,13 +285,15 @@ func (a *API) RegisterTenantDeletion(api *purger.TenantDeletionAPI) {
 // RegisterRuler registers routes associated with the Ruler service.
 func (a *API) RegisterRuler(r *ruler.Ruler) {
 	a.indexPage.AddLink(SectionAdminEndpoints, "/ruler/ring", "Ruler Ring Status")
-	a.RegisterRoute("/ruler/ring", r, false, "GET", "POST")
+	a.RegisterRoute("/ruler/ring", r, false, "GET")
+	a.RegisterRoute("/ruler/ring", r, true, "POST")
 
 	// Administrative API, uses authentication to inform which user's configuration to delete.
 	a.RegisterRoute("/ruler/delete_tenant_config", http.HandlerFunc(r.DeleteTenantConfiguration), true, "POST")
 
 	// Legacy Ring Route
-	a.RegisterRoute("/ruler_ring", r, false, "GET", "POST")
+	a.RegisterRoute("/ruler_ring", r, false, "GET")
+	a.RegisterRoute("/ruler_ring", r, true, "POST")
 
 	// List all user rule groups
 	a.RegisterRoute("/ruler/rule_groups", http.HandlerFunc(r.ListAllRules), false, "GET")
@@ -327,10 +331,14 @@ func (a *API) RegisterRulerAPI(r *ruler.API) {
 // RegisterRing registers the ring UI page associated with the distributor for writes.
 func (a *API) RegisterRing(r *ring.Ring) {
 	a.indexPage.AddLink(SectionAdminEndpoints, "/ingester/ring", "Ingester Ring Status")
-	a.RegisterRoute("/ingester/ring", r, false, "GET", "POST")
+	// Reads are public (same as the rest of the admin pages); mutations go through
+	// the auth middleware so unauthenticated callers cannot forget instances.
+	a.RegisterRoute("/ingester/ring", r, false, "GET")
+	a.RegisterRoute("/ingester/ring", r, true, "POST")
 
 	// Legacy Route
-	a.RegisterRoute("/ring", r, false, "GET", "POST")
+	a.RegisterRoute("/ring", r, false, "GET")
+	a.RegisterRoute("/ring", r, true, "POST")
 }
 
 // RegisterStoreGateway registers the ring UI page associated with the store-gateway.
@@ -338,13 +346,15 @@ func (a *API) RegisterStoreGateway(s *storegateway.StoreGateway) {
 	storegatewaypb.RegisterStoreGatewayServer(a.server.GRPC, s)
 
 	a.indexPage.AddLink(SectionAdminEndpoints, "/store-gateway/ring", "Store Gateway Ring")
-	a.RegisterRoute("/store-gateway/ring", http.HandlerFunc(s.RingHandler), false, "GET", "POST")
+	a.RegisterRoute("/store-gateway/ring", http.HandlerFunc(s.RingHandler), false, "GET")
+	a.RegisterRoute("/store-gateway/ring", http.HandlerFunc(s.RingHandler), true, "POST")
 }
 
 // RegisterCompactor registers the ring UI page associated with the compactor.
 func (a *API) RegisterCompactor(c *compactor.Compactor) {
 	a.indexPage.AddLink(SectionAdminEndpoints, "/compactor/ring", "Compactor Ring Status")
-	a.RegisterRoute("/compactor/ring", http.HandlerFunc(c.RingHandler), false, "GET", "POST")
+	a.RegisterRoute("/compactor/ring", http.HandlerFunc(c.RingHandler), false, "GET")
+	a.RegisterRoute("/compactor/ring", http.HandlerFunc(c.RingHandler), true, "POST")
 }
 
 type Distributor interface {
