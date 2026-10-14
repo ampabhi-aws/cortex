@@ -9,6 +9,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/cortexproject/cortex/pkg/tenant"
 	"github.com/cortexproject/cortex/pkg/util"
 )
 
@@ -67,12 +68,33 @@ func (s userStatsByTimeseries) Less(i, j int) bool {
 		(s[i].NumSeries == s[j].NumSeries && s[i].UserID < s[j].UserID)
 }
 
-// AllUserStatsHandler shows stats for all users.
+// AllUserStatsHandler shows stats scoped to the authenticated tenant.
+//
+// This endpoint is registered with auth=true, so the tenant is derived from the
+// request context (populated from the X-Scope-OrgID header by the auth
+// middleware). The response is filtered to only the authenticated tenant to
+// avoid leaking the full tenant roster (and each tenant's series counts and
+// ingestion rates) to any caller that can reach the HTTP port.
 func (d *Distributor) AllUserStatsHandler(w http.ResponseWriter, r *http.Request) {
-	stats, err := d.AllUserStats(r.Context())
+	userID, err := tenant.TenantID(r.Context())
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusUnauthorized)
+		return
+	}
+
+	allStats, err := d.AllUserStats(r.Context())
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
+	}
+
+	// Scope the response to only the authenticated tenant.
+	stats := make([]UserIDStats, 0, 1)
+	for _, s := range allStats {
+		if s.UserID == userID {
+			stats = append(stats, s)
+			break
+		}
 	}
 
 	sort.Sort(userStatsByTimeseries(stats))
