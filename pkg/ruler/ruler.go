@@ -863,12 +863,24 @@ func (r *Ruler) DeleteTenantConfiguration(w http.ResponseWriter, req *http.Reque
 func (r *Ruler) ListAllRules(w http.ResponseWriter, req *http.Request) {
 	logger := util_log.WithContext(req.Context(), r.logger)
 
-	userIDs, err := r.store.ListAllUsers(req.Context())
+	// Require an authenticated tenant and scope the response to that tenant's
+	// rule groups only. Previously this handler enumerated every tenant via
+	// store.ListAllUsers and streamed all of their rule groups without any
+	// tenant or role check, which allowed any caller that could reach the
+	// listener to read every tenant's PromQL rules, labels and annotations
+	// (CWE-1212 / CWE-653). Scoping to the caller's tenant preserves the
+	// response shape (map keyed by tenant ID) while removing the cross-tenant
+	// read.
+	userID, err := tenant.TenantID(req.Context())
 	if err != nil {
-		level.Error(logger).Log("msg", errListAllUser, "err", err)
-		http.Error(w, fmt.Sprintf("%s: %s", errListAllUser, err.Error()), http.StatusInternalServerError)
+		// When Cortex is running, it uses Auth Middleware for checking
+		// X-Scope-OrgID and injecting tenant into context. Auth Middleware
+		// sends http.StatusUnauthorized if X-Scope-OrgID is missing, so we do
+		// too here, for consistency.
+		http.Error(w, err.Error(), http.StatusUnauthorized)
 		return
 	}
+	userIDs := []string{userID}
 
 	done := make(chan struct{})
 	iter := make(chan interface{})
