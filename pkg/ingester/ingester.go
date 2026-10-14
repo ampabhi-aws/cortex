@@ -1556,21 +1556,33 @@ func (i *Ingester) UserStats(ctx context.Context, req *client.UserStatsRequest) 
 	return createUserStats(db), nil
 }
 
-// AllUserStats returns ingestion statistics for all users known to this ingester.
-func (i *Ingester) AllUserStats(_ context.Context, _ *client.UserStatsRequest) (*client.UsersStatsResponse, error) {
+// AllUserStats returns ingestion statistics for the caller's tenant only.
+//
+// Although the method is named "AllUserStats" and the response envelope
+// (UsersStatsResponse) can carry one entry per tenant, this handler is
+// exposed on the same tenant-facing gRPC service as Push/Query/UserStats
+// and is reachable by any caller that can present an X-Scope-OrgID
+// header. Returning every tenant's ID, live series count and ingestion
+// rate here is an unauthorized cross-tenant information disclosure
+// (CWE-497). To prevent that, this method now behaves as an alias of
+// UserStats: it resolves the caller's tenant from the request context
+// and returns at most a single entry scoped to that tenant. An
+// operator-only variant that iterates i.TSDBState.dbs must be exposed
+// on a separate, authenticated admin transport.
+func (i *Ingester) AllUserStats(ctx context.Context, _ *client.UserStatsRequest) (*client.UsersStatsResponse, error) {
 	if err := i.checkRunning(); err != nil {
 		return nil, err
 	}
 
-	i.stoppedMtx.RLock()
-	defer i.stoppedMtx.RUnlock()
-
-	users := i.TSDBState.dbs
+	userID, err := tenant.TenantID(ctx)
+	if err != nil {
+		return nil, err
+	}
 
 	response := &client.UsersStatsResponse{
-		Stats: make([]*client.UserIDStatsResponse, 0, len(users)),
+		Stats: make([]*client.UserIDStatsResponse, 0, 1),
 	}
-	for userID, db := range users {
+	if db := i.getTSDB(userID); db != nil {
 		response.Stats = append(response.Stats, &client.UserIDStatsResponse{
 			UserId: userID,
 			Data:   createUserStats(db),
