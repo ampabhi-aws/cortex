@@ -86,6 +86,14 @@ api:
   # CLI flag: -api.http-request-headers-to-log
   [http_request_headers_to_log: <list of string> | default = []]
 
+  # Register the ingester's HTTP debug push routes (/ingester/push and the
+  # legacy /push). These routes bypass distributor-side validation and the
+  # per-tenant ingestion rate limit, so they are disabled by default and
+  # should only be enabled for operator testing on a listener that is not
+  # reachable by tenant traffic.
+  # CLI flag: -api.ingester-push-enabled
+  [ingester_push_enabled: <boolean> | default = false]
+
 # The server_config configures the HTTP and gRPC server of the launched
 # service(s).
 [server: <server_config>]
