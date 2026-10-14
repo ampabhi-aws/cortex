@@ -1,6 +1,8 @@
 package querier
 
 import (
+	"context"
+	"fmt"
 	"net/http"
 
 	"github.com/go-kit/log"
@@ -10,11 +12,25 @@ import (
 	"github.com/cortexproject/cortex/pkg/cortexpb"
 	"github.com/cortexproject/cortex/pkg/ingester/client"
 	"github.com/cortexproject/cortex/pkg/util"
+	"github.com/cortexproject/cortex/pkg/util/concurrency"
 	util_log "github.com/cortexproject/cortex/pkg/util/log"
 )
 
 // Queries are a set of matchers with time ranges - should not get into megabytes
 const maxRemoteReadQuerySize = 1024 * 1024
+
+// maxRemoteReadQueries bounds the number of sub-queries that a single remote
+// read request may contain. Prometheus-compatible clients always send exactly
+// one query per request, so this is comfortably sized while still preventing
+// an attacker from stuffing a (byte-size-bounded) request body with hundreds
+// of thousands of empty QueryRequest elements and amplifying it into a
+// goroutine / distributed-query storm.
+const maxRemoteReadQueries = 100
+
+// maxRemoteReadConcurrency bounds the number of sub-queries from a single
+// remote read request that are executed concurrently, replacing the
+// previous unbounded `go func` per element pattern.
+const maxRemoteReadConcurrency = 10
 
 // RemoteReadHandler handles Prometheus remote read requests.
 func RemoteReadHandler(q storage.Queryable, logger log.Logger) http.Handler {
@@ -28,44 +44,57 @@ func RemoteReadHandler(q storage.Queryable, logger log.Logger) http.Handler {
 			return
 		}
 
-		// Fetch samples for all queries in parallel.
+		// Reject requests that contain more sub-queries than we are willing to
+		// serve from a single HTTP request. The protobuf ReadRequest schema has
+		// no element-count limit on repeated QueryRequest entries and each entry
+		// can be as small as 2 bytes on the wire, so without this check an
+		// attacker can amplify a small (snappy-compressed) body into hundreds
+		// of thousands of concurrent distributed queries.
+		if len(req.Queries) > maxRemoteReadQueries {
+			err := fmt.Errorf("remote read request contains %d queries, but the maximum allowed per request is %d", len(req.Queries), maxRemoteReadQueries)
+			level.Error(logger).Log("msg", "rejecting remote read request", "err", err.Error())
+			http.Error(w, err.Error(), http.StatusBadRequest)
+			return
+		}
+
+		// Fetch samples for all queries in parallel, bounding concurrency so a
+		// single request cannot spawn an unbounded number of goroutines or
+		// in-flight gRPC streams to ingesters / store-gateways.
 		resp := client.ReadResponse{
 			Results: make([]*client.QueryResponse, len(req.Queries)),
 		}
-		errors := make(chan error)
-		for i, qr := range req.Queries {
-			go func(i int, qr *client.QueryRequest) {
-				from, to, matchers, err := client.FromQueryRequest(qr)
-				if err != nil {
-					errors <- err
-					return
-				}
-
-				querier, err := q.Querier(ctx, int64(from), int64(to))
-				if err != nil {
-					errors <- err
-					return
-				}
-
-				params := &storage.SelectHints{
-					Start: int64(from),
-					End:   int64(to),
-				}
-				seriesSet := querier.Select(false, params, matchers...)
-				resp.Results[i], err = seriesSetToQueryResponse(seriesSet)
-				errors <- err
-			}(i, qr)
+		jobs := make([]interface{}, len(req.Queries))
+		for i := range req.Queries {
+			jobs[i] = i
 		}
+		err := concurrency.ForEach(ctx, jobs, maxRemoteReadConcurrency, func(ctx context.Context, job interface{}) error {
+			i := job.(int)
+			qr := req.Queries[i]
 
-		var lastErr error
-		for range req.Queries {
-			err := <-errors
+			from, to, matchers, err := client.FromQueryRequest(qr)
 			if err != nil {
-				lastErr = err
+				return err
 			}
-		}
-		if lastErr != nil {
-			http.Error(w, lastErr.Error(), http.StatusBadRequest)
+
+			querier, err := q.Querier(ctx, int64(from), int64(to))
+			if err != nil {
+				return err
+			}
+
+			params := &storage.SelectHints{
+				Start: int64(from),
+				End:   int64(to),
+			}
+			seriesSet := querier.Select(false, params, matchers...)
+			result, err := seriesSetToQueryResponse(seriesSet)
+			if err != nil {
+				return err
+			}
+			resp.Results[i] = result
+			return nil
+		})
+		if err != nil {
+			http.Error(w, err.Error(), http.StatusBadRequest)
 			return
 		}
 		w.Header().Add("Content-Type", "application/x-protobuf")
