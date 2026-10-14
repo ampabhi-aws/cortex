@@ -872,6 +872,15 @@ func (am *MultitenantAlertmanager) setConfig(cfg alertspb.AlertConfigDesc) error
 			// working configuration.
 			return fmt.Errorf("invalid Cortex configuration for %v: %v", cfg.User, err)
 		}
+		// Re-apply the Cortex-specific *_file denylist against the stored
+		// tenant-supplied config. The API path validates on submit, but
+		// configs persisted before a denylist was tightened must not be
+		// silently accepted on reload.
+		if userAmConfig != nil {
+			if err := validateAlertmanagerConfig(userAmConfig); err != nil {
+				return fmt.Errorf("invalid Cortex configuration for %v: %v", cfg.User, err)
+			}
+		}
 	}
 
 	// We can have an empty configuration here if:

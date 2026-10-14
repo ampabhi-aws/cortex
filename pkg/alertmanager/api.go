@@ -8,6 +8,7 @@ import (
 	"os"
 	"path/filepath"
 	"reflect"
+	"strings"
 
 	"github.com/go-kit/log"
 	"github.com/go-kit/log/level"
@@ -45,6 +46,7 @@ var (
 	errTLSFileNotAllowed             = errors.New("setting TLS ca_file, cert_file and key_file is not allowed")
 	errSlackAPIURLFileNotAllowed     = errors.New("setting Slack api_url_file and global slack_api_url_file is not allowed")
 	errVictorOpsAPIKeyFileNotAllowed = errors.New("setting VictorOps api_key_file is not allowed")
+	errOpsGenieAPIKeyFileNotAllowed  = errors.New("setting OpsGenie api_key_file and global opsgenie_api_key_file is not allowed")
 )
 
 // UserConfig is used to communicate a users alertmanager configs
@@ -350,6 +352,33 @@ func validateAlertmanagerConfig(cfg interface{}) error {
 		if err := validateVictorOpsConfig(v.Interface().(config.VictorOpsConfig)); err != nil {
 			return err
 		}
+
+	case reflect.TypeOf(config.OpsGenieConfig{}):
+		if err := validateOpsGenieConfig(v.Interface().(config.OpsGenieConfig)); err != nil {
+			return err
+		}
+	}
+
+	// Defense in depth: regardless of the explicit per-type checks above,
+	// reject any non-empty struct field whose YAML tag ends in `_file`. This
+	// fails closed if the upstream Alertmanager config ever adds a new
+	// `*_file` setting that we have not explicitly allow-listed, which was
+	// the root cause of the OpsGenie api_key_file bypass of the original
+	// hard-coded denylist.
+	if t.Kind() == reflect.Struct {
+		for i := 0; i < t.NumField(); i++ {
+			field := t.Field(i)
+			if !isFileYAMLField(field) {
+				continue
+			}
+			fieldValue := v.FieldByIndex(field.Index)
+			if !fieldValue.CanInterface() {
+				continue
+			}
+			if isNonEmptyFileFieldValue(fieldValue) {
+				return fmt.Errorf("setting %s is not allowed", yamlFieldName(field))
+			}
+		}
 	}
 
 	// If the input config is a struct, recursively iterate on all fields.
@@ -429,7 +458,61 @@ func validateGlobalConfig(cfg config.GlobalConfig) error {
 	if cfg.SlackAPIURLFile != "" {
 		return errSlackAPIURLFileNotAllowed
 	}
+	if cfg.OpsGenieAPIKeyFile != "" {
+		return errOpsGenieAPIKeyFileNotAllowed
+	}
 	return nil
+}
+
+// validateOpsGenieConfig validates the OpsGenie config and returns an error if
+// it contains settings not allowed by Cortex.
+func validateOpsGenieConfig(cfg config.OpsGenieConfig) error {
+	if cfg.APIKeyFile != "" {
+		return errOpsGenieAPIKeyFileNotAllowed
+	}
+	return nil
+}
+
+// isFileYAMLField reports whether the given struct field has a YAML tag whose
+// name ends in `_file`. Fields without a YAML tag or with a `-` tag are
+// ignored.
+func isFileYAMLField(field reflect.StructField) bool {
+	tag, ok := field.Tag.Lookup("yaml")
+	if !ok {
+		return false
+	}
+	name := strings.SplitN(tag, ",", 2)[0]
+	if name == "" || name == "-" {
+		return false
+	}
+	return strings.HasSuffix(name, "_file")
+}
+
+// yamlFieldName returns the YAML field name declared in the struct field tag.
+func yamlFieldName(field reflect.StructField) string {
+	tag, _ := field.Tag.Lookup("yaml")
+	return strings.SplitN(tag, ",", 2)[0]
+}
+
+// isNonEmptyFileFieldValue reports whether a struct field intended to hold a
+// filesystem path is set to something other than the zero value. It
+// understands the common representations used by the vendored Alertmanager and
+// prometheus/common config types (plain string and Secret-like named string
+// types).
+func isNonEmptyFileFieldValue(v reflect.Value) bool {
+	switch v.Kind() {
+	case reflect.String:
+		return v.Len() > 0
+	case reflect.Ptr, reflect.Interface:
+		if v.IsNil() {
+			return false
+		}
+		return isNonEmptyFileFieldValue(v.Elem())
+	default:
+		// Fail closed: if the field type is not understood but is
+		// nonetheless set to a non-zero value, reject it.
+		return v.IsValid() && !v.IsZero()
+	}
 }
 
 // validateSlackConfig validates the Slack config and returns an error if it contains
