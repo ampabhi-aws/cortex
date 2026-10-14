@@ -9,6 +9,7 @@ import (
 
 	"github.com/cortexproject/cortex/pkg/ingester"
 	"github.com/cortexproject/cortex/pkg/ring/kv"
+	"github.com/cortexproject/cortex/pkg/tenant"
 	"github.com/cortexproject/cortex/pkg/util"
 	"github.com/cortexproject/cortex/pkg/util/runtimeconfig"
 	"github.com/cortexproject/cortex/pkg/util/validation"
@@ -126,6 +127,22 @@ func runtimeConfigHandler(runtimeCfgManager *runtimeconfig.Manager, defaultLimit
 			return
 		}
 
+		// Resolve the caller's tenant ID from the request context (populated by the
+		// AuthenticateUser middleware from the X-Scope-OrgID header). If no tenant
+		// is present we refuse the request rather than disclose cross-tenant data.
+		userID, err := tenant.TenantID(r.Context())
+		if err != nil {
+			http.Error(w, err.Error(), http.StatusUnauthorized)
+			return
+		}
+
+		// Build a tenant-scoped view of the runtime config: everything except the
+		// per-tenant `overrides` map is global state; the overrides map is filtered
+		// to only the authenticated tenant so a caller cannot enumerate other
+		// tenants or read their per-tenant limit overrides.
+		scopedCfg := *cfg
+		scopedCfg.TenantLimits = filterTenantLimits(cfg.TenantLimits, userID)
+
 		var output interface{}
 		switch r.URL.Query().Get("mode") {
 		case "diff":
@@ -133,13 +150,13 @@ func runtimeConfigHandler(runtimeCfgManager *runtimeconfig.Manager, defaultLimit
 			// we set defaultLimits for every tenant that exists in runtime config.
 			defaultCfg := runtimeConfigValues{}
 			defaultCfg.TenantLimits = map[string]*validation.Limits{}
-			for k, v := range cfg.TenantLimits {
+			for k, v := range scopedCfg.TenantLimits {
 				if v != nil {
 					defaultCfg.TenantLimits[k] = &defaultLimits
 				}
 			}
 
-			cfgYaml, err := util.YAMLMarshalUnmarshal(cfg)
+			cfgYaml, err := util.YAMLMarshalUnmarshal(&scopedCfg)
 			if err != nil {
 				http.Error(w, err.Error(), http.StatusInternalServerError)
 				return
@@ -158,8 +175,19 @@ func runtimeConfigHandler(runtimeCfgManager *runtimeconfig.Manager, defaultLimit
 			}
 
 		default:
-			output = cfg
+			output = &scopedCfg
 		}
 		util.WriteYAMLResponse(w, output)
 	}
+}
+
+// filterTenantLimits returns a new map containing only the limits for the given
+// userID (if present in the source map). The returned map is never nil so that
+// YAML serialisation keeps the `overrides:` key stable in the response shape.
+func filterTenantLimits(all map[string]*validation.Limits, userID string) map[string]*validation.Limits {
+	scoped := map[string]*validation.Limits{}
+	if limits, ok := all[userID]; ok && limits != nil {
+		scoped[userID] = limits
+	}
+	return scoped
 }

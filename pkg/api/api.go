@@ -227,7 +227,11 @@ func (a *API) RegisterRuntimeConfig(runtimeConfigHandler http.HandlerFunc) {
 	a.indexPage.AddLink(SectionAdminEndpoints, "/runtime_config", "Current Runtime Config (incl. Overrides)")
 	a.indexPage.AddLink(SectionAdminEndpoints, "/runtime_config?mode=diff", "Current Runtime Config (show only values that differ from the defaults)")
 
-	a.RegisterRoute("/runtime_config", runtimeConfigHandler, false, "GET")
+	// Auth is required so the AuthenticateUser middleware extracts the X-Scope-OrgID
+	// header into the request context. runtimeConfigHandler then filters the per-tenant
+	// `overrides` map down to that tenant only, so a caller cannot enumerate other
+	// tenants or read their per-tenant limit overrides.
+	a.RegisterRoute("/runtime_config", runtimeConfigHandler, true, "GET")
 }
 
 // RegisterDistributor registers the endpoints associated with the distributor.
