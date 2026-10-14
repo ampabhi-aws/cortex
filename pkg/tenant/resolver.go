@@ -83,6 +83,14 @@ func (t *SingleResolver) TenantID(ctx context.Context) (string, error) {
 		return "", err
 	}
 
+	// Enforce the documented charset/length rule on every resolution path (not
+	// just MultiResolver) so that downstream components -- in particular the
+	// query results cache key builder, which uses ':' as a delimiter -- cannot
+	// receive ambiguous tenant IDs. See docs/guides/limitations.md.
+	if err := ValidTenantID(id); err != nil {
+		return "", err
+	}
+
 	if containsUnsafePathSegments(id) {
 		return "", errInvalidTenantID
 	}
@@ -131,6 +139,10 @@ func (t *MultiResolver) TenantIDs(ctx context.Context) ([]string, error) {
 
 	orgIDs := strings.Split(orgID, tenantIDsLabelSeparator)
 	for _, orgID := range orgIDs {
+		// ValidTenantID enforces the documented charset (alnum + ! - _ . * ' ( ))
+		// which already excludes the federation separator '|'; this guarantees
+		// that no individual tenant ID can forge an extra federated tenant via
+		// the separator.
 		if err := ValidTenantID(orgID); err != nil {
 			return nil, err
 		}
