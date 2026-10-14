@@ -681,7 +681,20 @@ receivers:
 
 	router := mux.NewRouter()
 	router.Path("/multitenant_alertmanager/configs").Methods(http.MethodGet).HandlerFunc(am.ListAllConfigs)
+
+	// Without an org id in the context the endpoint must refuse the request
+	// instead of dumping every tenant's config.
+	{
+		req := httptest.NewRequest("GET", "https://localhost:8080/multitenant_alertmanager/configs", nil)
+		w := httptest.NewRecorder()
+		router.ServeHTTP(w, req)
+		resp := w.Result()
+		require.Equal(t, http.StatusUnauthorized, resp.StatusCode)
+	}
+
+	// With a tenant in the context the endpoint returns only that tenant's config.
 	req := httptest.NewRequest("GET", "https://localhost:8080/multitenant_alertmanager/configs", nil)
+	req = req.WithContext(user.InjectOrgID(context.Background(), "user1"))
 	w := httptest.NewRecorder()
 	router.ServeHTTP(w, req)
 
@@ -690,9 +703,9 @@ receivers:
 	require.Equal(t, "application/yaml", resp.Header.Get("Content-Type"))
 	body, err := io.ReadAll(resp.Body)
 	require.NoError(t, err)
-	old, err := yaml.Marshal(testCases)
+	expected, err := yaml.Marshal(map[string]*UserConfig{"user1": testCases["user1"]})
 	require.NoError(t, err)
-	require.YAMLEq(t, string(old), string(body))
+	require.YAMLEq(t, string(expected), string(body))
 }
 
 func TestValidateAlertmanagerConfig(t *testing.T) {

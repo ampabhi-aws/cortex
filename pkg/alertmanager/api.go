@@ -1,7 +1,6 @@
 package alertmanager
 
 import (
-	"context"
 	"fmt"
 	"io"
 	"net/http"
@@ -20,7 +19,6 @@ import (
 	"github.com/cortexproject/cortex/pkg/alertmanager/alertspb"
 	"github.com/cortexproject/cortex/pkg/tenant"
 	"github.com/cortexproject/cortex/pkg/util"
-	"github.com/cortexproject/cortex/pkg/util/concurrency"
 	util_log "github.com/cortexproject/cortex/pkg/util/log"
 )
 
@@ -31,12 +29,9 @@ const (
 	errStoringConfiguration  = "unable to store the Alertmanager config"
 	errDeletingConfiguration = "unable to delete the Alertmanager config"
 	errNoOrgID               = "unable to determine the OrgID"
-	errListAllUser           = "unable to list the Alertmanager users"
 	errConfigurationTooBig   = "Alertmanager configuration is too big, limit: %d bytes"
 	errTooManyTemplates      = "too many templates in the configuration: %d (limit: %d)"
 	errTemplateTooBig        = "template %s is too big: %d bytes (limit: %d bytes)"
-
-	fetchConcurrency = 16
 )
 
 var (
@@ -261,10 +256,17 @@ func validateUserConfig(logger log.Logger, cfg alertspb.AlertConfigDesc, limits 
 
 func (am *MultitenantAlertmanager) ListAllConfigs(w http.ResponseWriter, r *http.Request) {
 	logger := util_log.WithContext(r.Context(), am.logger)
-	userIDs, err := am.store.ListAllUsers(r.Context())
+
+	// Require an authenticated tenant and scope the response to that tenant
+	// only. This endpoint was historically a cross-tenant admin dump, which
+	// leaked every tenant's Alertmanager configuration (including notifier
+	// secrets) to any caller that could reach the HTTP port. Operators that
+	// need a true cross-tenant dump must call this endpoint per tenant via
+	// their trusted gateway.
+	userID, err := tenant.TenantID(r.Context())
 	if err != nil {
-		level.Error(logger).Log("msg", "failed to list users of alertmanager", "err", err)
-		http.Error(w, fmt.Sprintf("%s: %s", errListAllUser, err.Error()), http.StatusInternalServerError)
+		level.Error(logger).Log("msg", errNoOrgID, "err", err.Error())
+		http.Error(w, fmt.Sprintf("%s: %s", errNoOrgID, err.Error()), http.StatusUnauthorized)
 		return
 	}
 
@@ -276,13 +278,10 @@ func (am *MultitenantAlertmanager) ListAllConfigs(w http.ResponseWriter, r *http
 		close(done)
 	}()
 
-	err = concurrency.ForEachUser(r.Context(), userIDs, fetchConcurrency, func(ctx context.Context, userID string) error {
-		cfg, err := am.store.GetAlertConfig(ctx, userID)
-		if errors.Is(err, alertspb.ErrNotFound) {
-			return nil
-		} else if err != nil {
-			return errors.Wrapf(err, "failed to fetch alertmanager config for user %s", userID)
-		}
+	cfg, err := am.store.GetAlertConfig(r.Context(), userID)
+	if err != nil && !errors.Is(err, alertspb.ErrNotFound) {
+		level.Error(logger).Log("msg", "failed to fetch alertmanager config", "err", err, "user", userID)
+	} else if err == nil {
 		data := map[string]*UserConfig{
 			userID: {
 				TemplateFiles:      alertspb.ParseTemplates(cfg),
@@ -294,12 +293,8 @@ func (am *MultitenantAlertmanager) ListAllConfigs(w http.ResponseWriter, r *http
 		case iter <- data:
 		case <-done: // stop early, if sending response has already finished
 		}
-
-		return nil
-	})
-	if err != nil {
-		level.Error(logger).Log("msg", "failed to list all alertmanager configs", "err", err)
 	}
+
 	close(iter)
 	<-done
 }
