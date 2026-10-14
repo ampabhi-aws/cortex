@@ -74,20 +74,29 @@ func (s shardBy) Do(ctx context.Context, r Request) (Response, error) {
 }
 
 func (s shardBy) shardQuery(l log.Logger, numShards int, r Request, analysis querysharding.QueryAnalysis) []Request {
-	reqs := make([]Request, numShards)
+	shardInfos := make([]*storepb.ShardInfo, numShards)
 	for i := 0; i < numShards; i++ {
-		q, err := cquerysharding.InjectShardingInfo(r.GetQuery(), &storepb.ShardInfo{
+		shardInfos[i] = &storepb.ShardInfo{
 			TotalShards: int64(numShards),
 			ShardIndex:  int64(i),
 			By:          analysis.ShardBy(),
 			Labels:      analysis.ShardingLabels(),
-		})
-		reqs[i] = r.WithQuery(q)
-
-		if err != nil {
-			level.Warn(l).Log("msg", "error sharding query", "q", r.GetQuery(), "err", err)
-			return []Request{r}
 		}
+	}
+
+	// Parse / print the PromQL exactly once per request (instead of once per shard).
+	// Expr.String() is quadratic in AST nesting depth, so sharing the parse
+	// bounds the frontend-side work to a single O(n^2) printing cycle per shard
+	// instead of per-shard-per-parse.
+	queries, err := cquerysharding.InjectShardingInfoBatch(r.GetQuery(), shardInfos)
+	if err != nil {
+		level.Warn(l).Log("msg", "error sharding query", "q", r.GetQuery(), "err", err)
+		return []Request{r}
+	}
+
+	reqs := make([]Request, numShards)
+	for i, q := range queries {
+		reqs[i] = r.WithQuery(q)
 	}
 
 	return reqs

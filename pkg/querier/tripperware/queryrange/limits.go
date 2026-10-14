@@ -68,6 +68,16 @@ func (l limitsMiddleware) Do(ctx context.Context, r tripperware.Request) (trippe
 		}
 	}
 
+	// Enforce the max query length (bytes) on the raw PromQL text.
+	// This bounds the amount of work the frontend performs when it later re-parses
+	// and re-serialises the query (for example in the @ modifier evaluation and
+	// vertical sharding paths).
+	if maxQueryBytes := validation.SmallestPositiveNonZeroIntPerTenant(tenantIDs, l.MaxQueryBytesSize); maxQueryBytes > 0 {
+		if n := len(r.GetQuery()); n > maxQueryBytes {
+			return nil, httpgrpc.Errorf(http.StatusBadRequest, validation.ErrQueryBytesTooLong, n, maxQueryBytes)
+		}
+	}
+
 	// Enforce the max query length.
 	if maxQueryLength := validation.SmallestPositiveNonZeroDurationPerTenant(tenantIDs, l.MaxQueryLength); maxQueryLength > 0 {
 		queryLen := timestamp.Time(r.GetEnd()).Sub(timestamp.Time(r.GetStart()))

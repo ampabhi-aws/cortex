@@ -92,6 +92,14 @@ func splitQuery(r tripperware.Request, interval time.Duration) ([]tripperware.Re
 	return reqs, nil
 }
 
+// maxQueryExprDepth caps the maximum PromQL AST nesting depth accepted by the
+// query-frontend. The vendored Prometheus parser is recursive, and the
+// re-serialisation path used below is quadratic in nesting depth, so an
+// extremely deeply-nested expression can allocate hundreds of GB and / or
+// drive the goroutine stack past Go's 1 GB cap. A few hundred levels is well
+// beyond what any realistic PromQL query uses in practice.
+const maxQueryExprDepth = 500
+
 // evaluateAtModifierFunction parse the query and evaluates the `start()` and `end()` at modifier functions into actual constant timestamps.
 // For example given the start of the query is 10.00, `http_requests_total[1h] @ start()` query will be replaced with `http_requests_total[1h] @ 10.00`
 // If the modifier is already a constant, it will be returned as is.
@@ -100,19 +108,52 @@ func evaluateAtModifierFunction(query string, start, end int64) (string, error) 
 	if err != nil {
 		return "", httpgrpc.Errorf(http.StatusBadRequest, "%s", err)
 	}
+	if err := checkASTDepth(expr, maxQueryExprDepth); err != nil {
+		return "", err
+	}
+	hasAtModifier := false
 	parser.Inspect(expr, func(n parser.Node, _ []parser.Node) error {
 		if selector, ok := n.(*parser.VectorSelector); ok {
 			switch selector.StartOrEnd {
 			case parser.START:
 				selector.Timestamp = &start
+				hasAtModifier = true
 			case parser.END:
 				selector.Timestamp = &end
+				hasAtModifier = true
 			}
 			selector.StartOrEnd = 0
 		}
 		return nil
 	})
-	return expr.String(), err
+	// Avoid the quadratic re-serialisation when the AST has no `start()`/`end()`
+	// at-modifier to rewrite - the original query text is already correct.
+	if !hasAtModifier {
+		return query, nil
+	}
+	return expr.String(), nil
+}
+
+// checkASTDepth walks the parsed expression and returns a bad-request error if
+// its nesting depth exceeds maxDepth. The walk itself is bounded by maxDepth,
+// so it does not itself risk a stack overflow.
+func checkASTDepth(expr parser.Expr, maxDepth int) error {
+	var check func(parser.Node, int) error
+	check = func(n parser.Node, d int) error {
+		if n == nil {
+			return nil
+		}
+		if d > maxDepth {
+			return httpgrpc.Errorf(http.StatusBadRequest, "query expression is too deeply nested (max depth %d)", maxDepth)
+		}
+		for _, c := range parser.Children(n) {
+			if err := check(c, d+1); err != nil {
+				return err
+			}
+		}
+		return nil
+	}
+	return check(expr, 1)
 }
 
 // Round up to the step before the next interval boundary.
