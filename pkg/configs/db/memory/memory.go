@@ -4,6 +4,7 @@ import (
 	"context"
 	"database/sql"
 	"fmt"
+	"sync"
 	"time"
 
 	"github.com/cortexproject/cortex/pkg/configs/userconfig"
@@ -11,6 +12,7 @@ import (
 
 // DB is an in-memory database for testing, and local development
 type DB struct {
+	mtx  sync.RWMutex
 	cfgs map[string]userconfig.View
 	id   uint
 }
@@ -25,6 +27,8 @@ func New(_, _ string) (*DB, error) {
 
 // GetConfig gets the user's configuration.
 func (d *DB) GetConfig(ctx context.Context, userID string) (userconfig.View, error) {
+	d.mtx.RLock()
+	defer d.mtx.RUnlock()
 	c, ok := d.cfgs[userID]
 	if !ok {
 		return userconfig.View{}, sql.ErrNoRows
@@ -32,8 +36,8 @@ func (d *DB) GetConfig(ctx context.Context, userID string) (userconfig.View, err
 	return c, nil
 }
 
-// SetConfig sets configuration for a user.
-func (d *DB) SetConfig(ctx context.Context, userID string, cfg userconfig.Config) error {
+// setConfigLocked sets configuration for a user. Caller must hold d.mtx for writing.
+func (d *DB) setConfigLocked(userID string, cfg userconfig.Config) error {
 	if !cfg.RulesConfig.FormatVersion.IsValid() {
 		return fmt.Errorf("invalid rule format version %v", cfg.RulesConfig.FormatVersion)
 	}
@@ -42,13 +46,28 @@ func (d *DB) SetConfig(ctx context.Context, userID string, cfg userconfig.Config
 	return nil
 }
 
+// SetConfig sets configuration for a user.
+func (d *DB) SetConfig(ctx context.Context, userID string, cfg userconfig.Config) error {
+	d.mtx.Lock()
+	defer d.mtx.Unlock()
+	return d.setConfigLocked(userID, cfg)
+}
+
 // GetAllConfigs gets all of the userconfig.
 func (d *DB) GetAllConfigs(ctx context.Context) (map[string]userconfig.View, error) {
-	return d.cfgs, nil
+	d.mtx.RLock()
+	defer d.mtx.RUnlock()
+	cfgs := make(map[string]userconfig.View, len(d.cfgs))
+	for user, c := range d.cfgs {
+		cfgs[user] = c
+	}
+	return cfgs, nil
 }
 
 // GetConfigs gets all of the configs that have changed recently.
 func (d *DB) GetConfigs(ctx context.Context, since userconfig.ID) (map[string]userconfig.View, error) {
+	d.mtx.RLock()
+	defer d.mtx.RUnlock()
 	cfgs := map[string]userconfig.View{}
 	for user, c := range d.cfgs {
 		if c.ID > since {
@@ -62,9 +81,11 @@ func (d *DB) GetConfigs(ctx context.Context, since userconfig.ID) (map[string]us
 // by adding a single new row with deleted_at set
 // the same as SetConfig is actually insert
 func (d *DB) SetDeletedAtConfig(ctx context.Context, userID string, deletedAt time.Time) error {
-	cv, err := d.GetConfig(ctx, userID)
-	if err != nil {
-		return err
+	d.mtx.Lock()
+	defer d.mtx.Unlock()
+	cv, ok := d.cfgs[userID]
+	if !ok {
+		return sql.ErrNoRows
 	}
 	cv.DeletedAt = deletedAt
 	cv.ID = userconfig.ID(d.id)
@@ -90,6 +111,8 @@ func (d *DB) Close() error {
 
 // GetRulesConfig gets the rules config for a user.
 func (d *DB) GetRulesConfig(ctx context.Context, userID string) (userconfig.VersionedRulesConfig, error) {
+	d.mtx.RLock()
+	defer d.mtx.RUnlock()
 	c, ok := d.cfgs[userID]
 	if !ok {
 		return userconfig.VersionedRulesConfig{}, sql.ErrNoRows
@@ -103,14 +126,16 @@ func (d *DB) GetRulesConfig(ctx context.Context, userID string) (userconfig.Vers
 
 // SetRulesConfig sets the rules config for a user.
 func (d *DB) SetRulesConfig(ctx context.Context, userID string, oldConfig, newConfig userconfig.RulesConfig) (bool, error) {
+	d.mtx.Lock()
+	defer d.mtx.Unlock()
 	c, ok := d.cfgs[userID]
 	if !ok {
-		return true, d.SetConfig(ctx, userID, userconfig.Config{RulesConfig: newConfig})
+		return true, d.setConfigLocked(userID, userconfig.Config{RulesConfig: newConfig})
 	}
 	if !oldConfig.Equal(c.Config.RulesConfig) {
 		return false, nil
 	}
-	return true, d.SetConfig(ctx, userID, userconfig.Config{
+	return true, d.setConfigLocked(userID, userconfig.Config{
 		AlertmanagerConfig: c.Config.AlertmanagerConfig,
 		RulesConfig:        newConfig,
 	})
@@ -118,6 +143,8 @@ func (d *DB) SetRulesConfig(ctx context.Context, userID string, oldConfig, newCo
 
 // GetAllRulesConfigs gets the rules configs for all users that have them.
 func (d *DB) GetAllRulesConfigs(ctx context.Context) (map[string]userconfig.VersionedRulesConfig, error) {
+	d.mtx.RLock()
+	defer d.mtx.RUnlock()
 	cfgs := map[string]userconfig.VersionedRulesConfig{}
 	for user, c := range d.cfgs {
 		cfg := c.GetVersionedRulesConfig()
@@ -131,6 +158,8 @@ func (d *DB) GetAllRulesConfigs(ctx context.Context) (map[string]userconfig.Vers
 // GetRulesConfigs gets the rules configs that have changed
 // since the given config version.
 func (d *DB) GetRulesConfigs(ctx context.Context, since userconfig.ID) (map[string]userconfig.VersionedRulesConfig, error) {
+	d.mtx.RLock()
+	defer d.mtx.RUnlock()
 	cfgs := map[string]userconfig.VersionedRulesConfig{}
 	for user, c := range d.cfgs {
 		if c.ID <= since {
