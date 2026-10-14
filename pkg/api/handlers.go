@@ -147,7 +147,17 @@ func DefaultConfigHandler(actualCfg interface{}, defaultCfg interface{}) http.Ha
 			output = actualCfg
 		}
 
-		util.WriteYAMLResponse(w, output)
+		// Belt-and-braces: in addition to the per-field flagext.Secret /
+		// MarshalYAML masking on the config types, re-walk the YAML tree and
+		// redact any value whose key still looks like a credential. This
+		// makes the handler safe-by-default against future config fields that
+		// forget to use flagext.Secret.
+		redacted, err := util.RedactYAMLConfig(output)
+		if err != nil {
+			http.Error(w, err.Error(), http.StatusInternalServerError)
+			return
+		}
+		util.WriteYAMLResponse(w, redacted)
 	}
 }
 

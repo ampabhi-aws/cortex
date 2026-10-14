@@ -125,6 +125,16 @@ type Config struct {
 	DisableRuleGroupLabel bool `yaml:"disable_rule_group_label"`
 }
 
+// MarshalYAML implements yaml.Marshaler. It redacts any credentials embedded
+// in AlertmanagerURL (userinfo component) before marshalling so that /config
+// and /runtime_config never leak the Alertmanager password.
+func (cfg Config) MarshalYAML() (interface{}, error) {
+	type plain Config
+	redacted := plain(cfg)
+	redacted.AlertmanagerURL = util.RedactURLCredentials(cfg.AlertmanagerURL)
+	return redacted, nil
+}
+
 // Validate config and returns error on failure
 func (cfg *Config) Validate(limits validation.Limits, log log.Logger) error {
 	if !util.StringsContain(supportedShardingStrategies, cfg.ShardingStrategy) {
