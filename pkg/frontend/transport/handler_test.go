@@ -33,13 +33,31 @@ func TestWriteError(t *testing.T) {
 		{http.StatusGatewayTimeout, context.DeadlineExceeded},
 		{StatusClientClosedRequest, context.Canceled},
 		{http.StatusBadRequest, httpgrpc.Errorf(http.StatusBadRequest, "")},
+		// Wrapped context errors must be mapped by errors.Is, not identity.
+		{http.StatusGatewayTimeout, errors.Wrap(context.DeadlineExceeded, "downstream")},
+		{StatusClientClosedRequest, errors.Wrap(context.Canceled, "downstream")},
 	} {
 		t.Run(test.err.Error(), func(t *testing.T) {
 			w := httptest.NewRecorder()
-			writeError(w, test.err)
+			writeError(context.Background(), log.NewNopLogger(), w, test.err)
 			require.Equal(t, test.status, w.Result().StatusCode)
 		})
 	}
+}
+
+// TestWriteError_DoesNotLeakInternalErrorText verifies that a non-httpgrpc
+// error whose text contains sensitive internal detail (e.g. the downstream
+// URL and dialed host/IP returned via *url.Error) is NOT written to the
+// client. The response body must be a generic "internal server error".
+func TestWriteError_DoesNotLeakInternalErrorText(t *testing.T) {
+	sensitive := "http://prometheus-querier.internal.svc:9090/prometheus/api/v1/query: dial tcp 10.42.3.7:9090: connect: connection refused"
+	w := httptest.NewRecorder()
+	writeError(context.Background(), log.NewNopLogger(), w, errors.New(sensitive))
+	require.Equal(t, http.StatusInternalServerError, w.Result().StatusCode)
+	body, _ := io.ReadAll(w.Result().Body)
+	require.NotContains(t, string(body), "prometheus-querier.internal.svc")
+	require.NotContains(t, string(body), "10.42.3.7")
+	require.Contains(t, string(body), "internal server error")
 }
 
 func TestHandler_ServeHTTP(t *testing.T) {
