@@ -2,6 +2,7 @@ package cortex
 
 import (
 	"errors"
+	"fmt"
 	"io"
 	"net/http"
 
@@ -9,6 +10,7 @@ import (
 
 	"github.com/cortexproject/cortex/pkg/ingester"
 	"github.com/cortexproject/cortex/pkg/ring/kv"
+	"github.com/cortexproject/cortex/pkg/tenant"
 	"github.com/cortexproject/cortex/pkg/util"
 	"github.com/cortexproject/cortex/pkg/util/runtimeconfig"
 	"github.com/cortexproject/cortex/pkg/util/validation"
@@ -118,6 +120,21 @@ func ingesterInstanceLimits(manager *runtimeconfig.Manager) func() *ingester.Ins
 	}
 }
 
+// scopeRuntimeConfigToTenant returns a shallow copy of cfg whose TenantLimits
+// map contains only the entry (if any) for userID. All other top-level fields
+// (Multi, IngesterChunkStreaming, IngesterLimits) are preserved: they are not
+// keyed by tenant. This prevents an authenticated tenant from enumerating
+// other tenant ids or reading other tenants' per-tenant override configuration
+// via GET /runtime_config.
+func scopeRuntimeConfigToTenant(cfg *runtimeConfigValues, userID string) *runtimeConfigValues {
+	scoped := *cfg
+	scoped.TenantLimits = map[string]*validation.Limits{}
+	if limits, ok := cfg.TenantLimits[userID]; ok && limits != nil {
+		scoped.TenantLimits[userID] = limits
+	}
+	return &scoped
+}
+
 func runtimeConfigHandler(runtimeCfgManager *runtimeconfig.Manager, defaultLimits validation.Limits) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		cfg, ok := runtimeCfgManager.GetConfig().(*runtimeConfigValues)
@@ -126,20 +143,32 @@ func runtimeConfigHandler(runtimeCfgManager *runtimeconfig.Manager, defaultLimit
 			return
 		}
 
+		// The route is registered with auth=true, so the tenant id must be
+		// present in the request context. Scope the view of TenantLimits to
+		// just that tenant so the handler cannot enumerate other tenant ids
+		// or disclose other tenants' per-tenant override configuration.
+		userID, err := tenant.TenantID(r.Context())
+		if err != nil {
+			http.Error(w, fmt.Sprintf("no org id: %s", err.Error()), http.StatusUnauthorized)
+			return
+		}
+		scopedCfg := scopeRuntimeConfigToTenant(cfg, userID)
+
 		var output interface{}
 		switch r.URL.Query().Get("mode") {
 		case "diff":
 			// Default runtime config is just empty struct, but to make diff work,
-			// we set defaultLimits for every tenant that exists in runtime config.
+			// we set defaultLimits for every tenant that exists in the (already
+			// tenant-scoped) runtime config view.
 			defaultCfg := runtimeConfigValues{}
 			defaultCfg.TenantLimits = map[string]*validation.Limits{}
-			for k, v := range cfg.TenantLimits {
+			for k, v := range scopedCfg.TenantLimits {
 				if v != nil {
 					defaultCfg.TenantLimits[k] = &defaultLimits
 				}
 			}
 
-			cfgYaml, err := util.YAMLMarshalUnmarshal(cfg)
+			cfgYaml, err := util.YAMLMarshalUnmarshal(scopedCfg)
 			if err != nil {
 				http.Error(w, err.Error(), http.StatusInternalServerError)
 				return
@@ -158,7 +187,7 @@ func runtimeConfigHandler(runtimeCfgManager *runtimeconfig.Manager, defaultLimit
 			}
 
 		default:
-			output = cfg
+			output = scopedCfg
 		}
 		util.WriteYAMLResponse(w, output)
 	}
