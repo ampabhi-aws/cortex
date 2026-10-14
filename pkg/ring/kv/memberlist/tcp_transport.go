@@ -88,7 +88,8 @@ type TCPTransport struct {
 	connCh       chan net.Conn
 	wg           sync.WaitGroup
 	tcpListeners []net.Listener
-	tlsConfig    *tls.Config
+	tlsConfig    *tls.Config // used by outgoing (dial) connections
+	serverTLSCfg *tls.Config // used by the gossip listener; requires and verifies client certificates when a CA is configured
 
 	shutdown atomic.Int32
 
@@ -131,6 +132,18 @@ func NewTCPTransport(config TCPTransportConfig, logger log.Logger) (*TCPTranspor
 		if err != nil {
 			return nil, errors.Wrap(err, "unable to create TLS config")
 		}
+
+		// For the server-side listener we must NOT reuse the client TLS
+		// config: that would leave ClientAuth at tls.NoClientCert and
+		// ClientCAs nil, so any host that can reach the gossip port could
+		// complete a memberlist push/pull exchange and read/overwrite the
+		// ring KV store. Build a dedicated server config that loads the
+		// server certificate and, when a CA path is configured, requires
+		// and verifies a client certificate signed by that CA.
+		t.serverTLSCfg, err = config.TLS.GetServerTLSConfig()
+		if err != nil {
+			return nil, errors.Wrap(err, "unable to create server TLS config for memberlist listener")
+		}
 	}
 
 	t.registerMetrics(config.MetricsRegisterer)
@@ -151,7 +164,7 @@ func NewTCPTransport(config TCPTransportConfig, logger log.Logger) (*TCPTranspor
 
 		var tcpLn net.Listener
 		if config.TLSEnabled {
-			tcpLn, err = tls.Listen("tcp", tcpAddr.String(), t.tlsConfig)
+			tcpLn, err = tls.Listen("tcp", tcpAddr.String(), t.serverTLSCfg)
 			if err != nil {
 				return nil, errors.Wrapf(err, "failed to start TLS TCP listener on %q port %d", addr, port)
 			}

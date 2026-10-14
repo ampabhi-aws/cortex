@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"crypto/rand"
+	"encoding/base64"
 	"encoding/binary"
 	"errors"
 	"flag"
@@ -157,6 +158,15 @@ type KVConfig struct {
 	// How much space to use to keep received and sent messages in memory (for troubleshooting).
 	MessageHistoryBufferBytes int `yaml:"message_history_buffer_bytes"`
 
+	// EncryptionKey is the pre-shared key used by memberlist to
+	// authenticate (and encrypt) gossip messages. When set it must be
+	// 16, 24 or 32 bytes long (base64-encoded on the command line) and
+	// identical on every node in the cluster. Setting this makes the
+	// gossip transport reject messages from peers that do not hold the
+	// same key. It is independent of the TLS listener and can be used
+	// in addition to, or instead of, -memberlist.tls-enabled.
+	EncryptionKey flagext.Secret `yaml:"encryption_key"`
+
 	TCPTransport TCPTransportConfig `yaml:",inline"`
 
 	// Where to put custom metrics. Metrics are not registered, if this is nil.
@@ -193,6 +203,7 @@ func (cfg *KVConfig) RegisterFlagsWithPrefix(f *flag.FlagSet, prefix string) {
 	f.BoolVar(&cfg.EnableCompression, prefix+"memberlist.compression-enabled", mlDefaults.EnableCompression, "Enable message compression. This can be used to reduce bandwidth usage at the cost of slightly more CPU utilization.")
 	f.StringVar(&cfg.AdvertiseAddr, prefix+"memberlist.advertise-addr", mlDefaults.AdvertiseAddr, "Gossip address to advertise to other members in the cluster. Used for NAT traversal.")
 	f.IntVar(&cfg.AdvertisePort, prefix+"memberlist.advertise-port", mlDefaults.AdvertisePort, "Gossip port to advertise to other members in the cluster. Used for NAT traversal.")
+	f.Var(&cfg.EncryptionKey, prefix+"memberlist.encryption-key", "Pre-shared base64-encoded key used by memberlist to authenticate and encrypt gossip messages. The decoded key must be 16, 24 or 32 bytes long (AES-128, AES-192 or AES-256) and must be identical on every node in the cluster. When set, peers that do not hold the same key are rejected before any ring KV state is exchanged.")
 
 	cfg.TCPTransport.RegisterFlagsWithPrefix(f, prefix)
 }
@@ -397,6 +408,30 @@ func (m *KV) buildMemberlistConfig() (*memberlist.Config, error) {
 
 	mlCfg.LogOutput = newMemberlistLoggerAdapter(m.logger, false)
 	mlCfg.Transport = tr
+
+	// If an encryption key is configured, enable memberlist's built-in
+	// keyring: this authenticates (HMAC) and encrypts every gossip
+	// message, so peers that do not hold the same key are dropped
+	// before any ring KV state is exchanged. The decoded key must be
+	// 16, 24 or 32 bytes long (AES-128/192/256). The input is
+	// base64-encoded to let operators safely pass binary bytes on the
+	// command line / in YAML without worrying about control chars.
+	if m.cfg.EncryptionKey.Value != "" {
+		key, err := base64.StdEncoding.DecodeString(m.cfg.EncryptionKey.Value)
+		if err != nil {
+			return nil, fmt.Errorf("invalid memberlist encryption key: must be base64-encoded: %v", err)
+		}
+		switch len(key) {
+		case 16, 24, 32:
+		default:
+			return nil, fmt.Errorf("invalid memberlist encryption key length %d: must decode to 16, 24 or 32 bytes", len(key))
+		}
+		mlCfg.SecretKey = key
+		// Reject incoming gossip messages that are not encrypted / do
+		// not carry a valid HMAC under one of the keys in the keyring.
+		mlCfg.GossipVerifyIncoming = true
+		mlCfg.GossipVerifyOutgoing = true
+	}
 
 	// Memberlist uses UDPBufferSize to figure out how many messages it can put into single "packet".
 	// As we don't use UDP for sending packets, we can use higher value here.
