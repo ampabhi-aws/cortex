@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"crypto/rand"
+	"encoding/base64"
 	"encoding/binary"
 	"errors"
 	"flag"
@@ -157,6 +158,13 @@ type KVConfig struct {
 	// How much space to use to keep received and sent messages in memory (for troubleshooting).
 	MessageHistoryBufferBytes int `yaml:"message_history_buffer_bytes"`
 
+	// GossipSecretKey, if set, enables symmetric encryption + authentication of
+	// the memberlist gossip channel. Peers that do not share the same key cannot
+	// inject (or decrypt) gossip messages. The decoded key must be 16, 24, or 32
+	// bytes long (AES-128/192/256). It may be provided either as a raw string of
+	// one of those lengths or as a base64-encoded string of such a value.
+	GossipSecretKey flagext.Secret `yaml:"gossip_secret_key"`
+
 	TCPTransport TCPTransportConfig `yaml:",inline"`
 
 	// Where to put custom metrics. Metrics are not registered, if this is nil.
@@ -193,6 +201,7 @@ func (cfg *KVConfig) RegisterFlagsWithPrefix(f *flag.FlagSet, prefix string) {
 	f.BoolVar(&cfg.EnableCompression, prefix+"memberlist.compression-enabled", mlDefaults.EnableCompression, "Enable message compression. This can be used to reduce bandwidth usage at the cost of slightly more CPU utilization.")
 	f.StringVar(&cfg.AdvertiseAddr, prefix+"memberlist.advertise-addr", mlDefaults.AdvertiseAddr, "Gossip address to advertise to other members in the cluster. Used for NAT traversal.")
 	f.IntVar(&cfg.AdvertisePort, prefix+"memberlist.advertise-port", mlDefaults.AdvertisePort, "Gossip port to advertise to other members in the cluster. Used for NAT traversal.")
+	f.Var(&cfg.GossipSecretKey, prefix+"memberlist.gossip-secret-key", "Shared secret used to encrypt and authenticate the memberlist gossip channel. If set, must decode to 16, 24, or 32 bytes (AES-128/192/256). Accepts a raw value of one of those lengths, or a base64-encoded value of such a length. When empty, gossip is not encrypted or authenticated and any host that can reach the gossip port can inject ring state; setting this is strongly recommended whenever the memberlist KV backend is in use.")
 
 	cfg.TCPTransport.RegisterFlagsWithPrefix(f, prefix)
 }
@@ -366,6 +375,31 @@ func defaultMemberlistConfig() *memberlist.Config {
 	return memberlist.DefaultLANConfig()
 }
 
+// decodeGossipSecretKey returns the raw bytes of a memberlist gossip secret
+// key. The input is accepted either as a raw string whose length is one of the
+// AES key sizes (16/24/32 bytes), or as a base64-encoded string that decodes
+// to such a length. Any other length is rejected rather than silently
+// disabling encryption, so that misconfiguration is a hard failure.
+func decodeGossipSecretKey(s string) ([]byte, error) {
+	if s == "" {
+		return nil, errors.New("empty gossip secret key")
+	}
+	validLen := func(n int) bool { return n == 16 || n == 24 || n == 32 }
+
+	// Prefer base64 if it decodes cleanly to an AES key size. We try standard
+	// first, then raw/URL variants, to accept common tooling output.
+	for _, enc := range []*base64.Encoding{base64.StdEncoding, base64.RawStdEncoding, base64.URLEncoding, base64.RawURLEncoding} {
+		if decoded, err := enc.DecodeString(s); err == nil && validLen(len(decoded)) {
+			return decoded, nil
+		}
+	}
+
+	if b := []byte(s); validLen(len(b)) {
+		return b, nil
+	}
+	return nil, fmt.Errorf("gossip secret key must decode to 16, 24, or 32 bytes (AES-128/192/256); got %d bytes", len(s))
+}
+
 func (m *KV) buildMemberlistConfig() (*memberlist.Config, error) {
 	tr, err := NewTCPTransport(m.cfg.TCPTransport, m.logger)
 	if err != nil {
@@ -397,6 +431,23 @@ func (m *KV) buildMemberlistConfig() (*memberlist.Config, error) {
 
 	mlCfg.LogOutput = newMemberlistLoggerAdapter(m.logger, false)
 	mlCfg.Transport = tr
+
+	// If a gossip secret key is configured, enable symmetric encryption and
+	// authentication of the gossip channel. memberlist uses this key for AES-GCM
+	// on every packet and push/pull stream, so unauthenticated peers can no
+	// longer inject ring state (CWE-306). We also force both
+	// GossipVerifyIncoming/Outgoing so that unencrypted traffic is rejected in
+	// both directions; this matches memberlist.DefaultLANConfig but is set
+	// explicitly here to be defensive against changes in the vendored defaults.
+	if key := m.cfg.GossipSecretKey.Value; key != "" {
+		decoded, err := decodeGossipSecretKey(key)
+		if err != nil {
+			return nil, fmt.Errorf("invalid memberlist.gossip-secret-key: %w", err)
+		}
+		mlCfg.SecretKey = decoded
+		mlCfg.GossipVerifyIncoming = true
+		mlCfg.GossipVerifyOutgoing = true
+	}
 
 	// Memberlist uses UDPBufferSize to figure out how many messages it can put into single "packet".
 	// As we don't use UDP for sending packets, we can use higher value here.
