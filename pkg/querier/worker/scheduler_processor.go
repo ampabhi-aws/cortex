@@ -2,6 +2,7 @@ package worker
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"net/http"
 	"time"
@@ -157,7 +158,17 @@ func (sp *schedulerProcessor) runRequest(ctx context.Context, logger log.Logger,
 		stats, ctx = querier_stats.ContextWithEmptyStats(ctx)
 	}
 
-	response, err := sp.handler.Handle(ctx, request)
+	var response *httpgrpc.HTTPResponse
+	var err error
+	// Defensive: the scheduler should never forward a nil HTTP request, but
+	// since the ENQUEUE stream is auth-exempt we also guard here so that the
+	// vendored httpgrpc.Server.Handle (which dereferences request fields
+	// unconditionally) can never be reached with a nil pointer.
+	if request == nil {
+		err = errors.New("nil HTTP request received from scheduler")
+	} else {
+		response, err = sp.handler.Handle(ctx, request)
+	}
 	if err != nil {
 		var ok bool
 		response, ok = httpgrpc.HTTPResponseFromError(err)

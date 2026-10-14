@@ -275,6 +275,14 @@ func (f *Frontend) Process(server frontendv1pb.Frontend_ProcessServer) error {
 
 		// Happy path: merge the stats and propagate the response.
 		case resp := <-resps:
+			// Guard against malformed replies from an unauthenticated peer that
+			// omit the HttpResponse submessage. Treat the dispatch as failed
+			// rather than dereferencing a nil pointer.
+			if resp == nil || resp.HttpResponse == nil {
+				err := errors.New("malformed response from querier: missing HttpResponse")
+				req.err <- err
+				return err
+			}
 			if stats.ShouldTrackHTTPGRPCResponse(resp.HttpResponse) {
 				stats := stats.FromContext(req.originalCtx)
 				stats.Merge(resp.Stats) // Safe if stats is nil.

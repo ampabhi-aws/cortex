@@ -265,6 +265,13 @@ func (s *Scheduler) frontendDisconnected(frontendAddress string) {
 }
 
 func (s *Scheduler) enqueueRequest(frontendContext context.Context, frontendAddr string, msg *schedulerpb.FrontendToScheduler) error {
+	// Reject malformed messages that omit the embedded HTTP request. Without
+	// this guard a nil HttpRequest would propagate to the querier (and, under a
+	// real tracer, panic the scheduler itself in GetParentSpanForRequest).
+	if msg.HttpRequest == nil {
+		return errors.New("invalid enqueue request: missing HttpRequest")
+	}
+
 	// Create new context for this request, to support cancellation.
 	ctx, cancel := context.WithCancel(frontendContext)
 	shouldCancel := true
