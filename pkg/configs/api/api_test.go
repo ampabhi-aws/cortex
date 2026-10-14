@@ -4,11 +4,13 @@ import (
 	"encoding/json"
 	"fmt"
 	"net/http"
+	"net/http/httptest"
 	"os"
 	"path"
 	"strings"
 	"testing"
 
+	"github.com/cortexproject/cortex/pkg/configs/db/dbtest"
 	"github.com/cortexproject/cortex/pkg/configs/userconfig"
 
 	"github.com/stretchr/testify/assert"
@@ -395,4 +397,49 @@ func Test_SetConfig_ValidateTemplateFiles(t *testing.T) {
 
 	err := validateTemplateFiles(cfg)
 	assert.Equal(t, nil, err)
+}
+
+// Test_PrivateAPI_RequiresAuthToken ensures the /private/* endpoints reject
+// requests that do not carry the configured operator bearer token.
+func Test_PrivateAPI_RequiresAuthToken(t *testing.T) {
+	setup(t)
+	defer cleanup(t)
+
+	for _, c := range allClients {
+		// Request without an Authorization header. Build it directly so
+		// the test helper does not auto-attach the token.
+		w := httptest.NewRecorder()
+		r, err := http.NewRequest("GET", c.PrivateEndpoint, nil)
+		require.NoError(t, err)
+		app.ServeHTTP(w, r)
+		assert.Equal(t, http.StatusUnauthorized, w.Code, "unauthenticated request to %s should be rejected", c.PrivateEndpoint)
+
+		// Request with a bogus token.
+		w = httptest.NewRecorder()
+		r, err = http.NewRequest("GET", c.PrivateEndpoint, nil)
+		require.NoError(t, err)
+		r.Header.Set("Authorization", "Bearer not-the-right-token")
+		app.ServeHTTP(w, r)
+		assert.Equal(t, http.StatusUnauthorized, w.Code, "bogus token to %s should be rejected", c.PrivateEndpoint)
+	}
+}
+
+// Test_PrivateAPI_DisabledWhenTokenUnset ensures the /private/* endpoints
+// return 403 Forbidden when no operator token is configured, so the
+// cross-tenant dump is not reachable by default on the tenant-facing listener.
+func Test_PrivateAPI_DisabledWhenTokenUnset(t *testing.T) {
+	database = dbtest.Setup(t)
+	defer dbtest.Cleanup(t, database)
+	noAuthApp := New(database, Config{})
+
+	for _, c := range allClients {
+		w := httptest.NewRecorder()
+		r, err := http.NewRequest("GET", c.PrivateEndpoint, nil)
+		require.NoError(t, err)
+		// Even a bearer header must not unlock the endpoint when the
+		// server has no token configured.
+		r.Header.Set("Authorization", "Bearer anything")
+		noAuthApp.ServeHTTP(w, r)
+		assert.Equal(t, http.StatusForbidden, w.Code, "with no server token configured %s must be disabled", c.PrivateEndpoint)
+	}
 }
