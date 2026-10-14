@@ -52,17 +52,124 @@ func (api *TenantDeletionAPI) DeleteTenant(w http.ResponseWriter, r *http.Reques
 		return
 	}
 
-	err = cortex_tsdb.WriteTenantDeletionMark(r.Context(), api.bucketClient, userID, api.cfgProvider, cortex_tsdb.NewTenantDeletionMark(time.Now()))
+	// Require the destructive operation to name its target tenant explicitly
+	// and to carry a confirmation parameter, so that neither an empty POST
+	// (which only carries X-Scope-OrgID) nor a stray/misrouted request can
+	// trigger irreversible deletion.
+	if err := r.ParseForm(); err != nil {
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
+	targetTenant := r.Form.Get("tenant")
+	if targetTenant == "" {
+		http.Error(w, "missing required 'tenant' parameter", http.StatusBadRequest)
+		return
+	}
+	if err := tenant.ValidTenantID(targetTenant); err != nil {
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
+	// The caller must explicitly name the tenant their credentials grant
+	// access to; the API does not implicitly derive the target from the
+	// auth header. Operators that firewall this endpoint and set the
+	// X-Scope-OrgID header on behalf of their admin can delete any tenant
+	// by naming it here.
+	if targetTenant != userID {
+		http.Error(w, "'tenant' parameter does not match authenticated tenant", http.StatusForbidden)
+		return
+	}
+	if r.Form.Get("confirm") != "true" {
+		http.Error(w, "missing or invalid 'confirm' parameter; set confirm=true to proceed", http.StatusBadRequest)
+		return
+	}
+
+	source := requestSource(r)
+	level.Warn(api.logger).Log(
+		"msg", "tenant deletion requested",
+		"user", targetTenant,
+		"caller", userID,
+		"source_ip", source,
+		"user_agent", r.UserAgent(),
+	)
+
+	err = cortex_tsdb.WriteTenantDeletionMark(r.Context(), api.bucketClient, targetTenant, api.cfgProvider, cortex_tsdb.NewTenantDeletionMark(time.Now()))
 	if err != nil {
-		level.Error(api.logger).Log("msg", "failed to write tenant deletion mark", "user", userID, "err", err)
+		level.Error(api.logger).Log("msg", "failed to write tenant deletion mark", "user", targetTenant, "err", err)
 
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
 	}
 
-	level.Info(api.logger).Log("msg", "tenant deletion mark in blocks storage created", "user", userID)
+	level.Info(api.logger).Log(
+		"msg", "tenant deletion mark in blocks storage created",
+		"user", targetTenant,
+		"caller", userID,
+		"source_ip", source,
+	)
 
 	w.WriteHeader(http.StatusOK)
+}
+
+// UndeleteTenant removes a tenant deletion mark from blocks storage. If this
+// is called before the compactor runs its cleanup pass, the tenant's blocks
+// are not deleted and the deletion is effectively undone.
+func (api *TenantDeletionAPI) UndeleteTenant(w http.ResponseWriter, r *http.Request) {
+	ctx := r.Context()
+	userID, err := tenant.TenantID(ctx)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusUnauthorized)
+		return
+	}
+
+	if err := r.ParseForm(); err != nil {
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
+	targetTenant := r.Form.Get("tenant")
+	if targetTenant == "" {
+		http.Error(w, "missing required 'tenant' parameter", http.StatusBadRequest)
+		return
+	}
+	if err := tenant.ValidTenantID(targetTenant); err != nil {
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
+	if targetTenant != userID {
+		http.Error(w, "'tenant' parameter does not match authenticated tenant", http.StatusForbidden)
+		return
+	}
+
+	source := requestSource(r)
+	level.Warn(api.logger).Log(
+		"msg", "tenant deletion rescind requested",
+		"user", targetTenant,
+		"caller", userID,
+		"source_ip", source,
+		"user_agent", r.UserAgent(),
+	)
+
+	if err := cortex_tsdb.DeleteTenantDeletionMark(r.Context(), api.bucketClient, targetTenant, api.cfgProvider); err != nil {
+		level.Error(api.logger).Log("msg", "failed to remove tenant deletion mark", "user", targetTenant, "err", err)
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+
+	level.Info(api.logger).Log(
+		"msg", "tenant deletion mark removed from blocks storage",
+		"user", targetTenant,
+		"caller", userID,
+		"source_ip", source,
+	)
+
+	w.WriteHeader(http.StatusOK)
+}
+
+// requestSource returns a best-effort source identifier for audit logging.
+func requestSource(r *http.Request) string {
+	if v := r.Header.Get("X-Forwarded-For"); v != "" {
+		return v
+	}
+	return r.RemoteAddr
 }
 
 type DeleteTenantStatusResponse struct {

@@ -275,8 +275,17 @@ func (a *API) RegisterIngester(i Ingester, pushConfig distributor.Config) {
 	a.RegisterRoute("/push", push.Handler(pushConfig.MaxRecvMsgSize, a.sourceIPs, i.Push), true, "POST") // For testing and debugging.
 }
 
-func (a *API) RegisterTenantDeletion(api *purger.TenantDeletionAPI) {
+func (a *API) RegisterTenantDeletion(api *purger.TenantDeletionAPI, enabled bool) {
+	if !enabled {
+		// Admin tenant deletion routes are destructive and irreversible once
+		// the compactor acts, so they are only registered when the operator
+		// explicitly opts in via -purger.enable-tenant-deletion-api.
+		return
+	}
+	a.indexPage.AddLink(SectionDangerous, "/purger/delete_tenant", "Request tenant data deletion (Dangerous)")
+	a.indexPage.AddLink(SectionDangerous, "/purger/undelete_tenant", "Rescind pending tenant data deletion")
 	a.RegisterRoute("/purger/delete_tenant", http.HandlerFunc(api.DeleteTenant), true, "POST")
+	a.RegisterRoute("/purger/undelete_tenant", http.HandlerFunc(api.UndeleteTenant), true, "POST")
 	a.RegisterRoute("/purger/delete_tenant_status", http.HandlerFunc(api.DeleteTenantStatus), true, "GET")
 }
 

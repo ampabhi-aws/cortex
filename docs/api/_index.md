@@ -792,10 +792,31 @@ The Purger service provides APIs for requesting deletion of tenants.
 ### Tenant Delete Request
 
 ```
-POST /purger/delete_tenant
+POST /purger/delete_tenant?tenant=<tenant>&confirm=true
 ```
 
 Request deletion of ALL tenant data. Only works with blocks storage. Experimental.
+
+This route is destructive and irreversible once the compactor has run its
+cleanup pass, so it is only registered when the operator opts in via
+`-purger.enable-tenant-deletion-api` (default off). The caller must name
+the target tenant explicitly via the `tenant` form/query parameter (it
+must equal the authenticated tenant from the `X-Scope-OrgID` header),
+and must pass `confirm=true`. The caller identity and source IP are
+recorded in the server log.
+
+_Requires [authentication](#authentication)._
+
+### Tenant Undelete Request
+
+```
+POST /purger/undelete_tenant?tenant=<tenant>
+```
+
+Rescind a pending tenant deletion by removing the tenant deletion mark
+from blocks storage. Effective only before the compactor's cleanup pass
+has run; after that, deletion of blocks from object storage is
+irreversible. Experimental.
 
 _Requires [authentication](#authentication)._
 

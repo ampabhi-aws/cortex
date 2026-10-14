@@ -678,7 +678,7 @@ func (t *Cortex) initTenantDeletionAPI() (services.Service, error) {
 		return nil, err
 	}
 
-	t.API.RegisterTenantDeletion(tenantDeletionAPI)
+	t.API.RegisterTenantDeletion(tenantDeletionAPI, t.Cfg.Purger.EnableTenantDeletionAPI)
 	return nil, nil
 }
 
