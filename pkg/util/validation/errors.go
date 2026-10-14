@@ -128,9 +128,14 @@ func newTooManyLabelsError(series []cortexpb.LabelAdapter, limit int) Validation
 }
 
 func (e *tooManyLabelsError) Error() string {
+	// Render only a bounded prefix of the attacker-controlled label set to avoid
+	// turning a large but otherwise valid-looking push request into a multi-GiB
+	// allocation and a ~100 MiB log line. ValidateLabels returns this error
+	// before any per-label length check has run, so e.series is unbounded in
+	// both label count and per-label size: we must not materialise it in full.
 	return fmt.Sprintf(
-		"series has too many labels (actual: %d, limit: %d) series: '%s'",
-		len(e.series), e.limit, cortexpb.FromLabelAdaptersToMetric(e.series).String())
+		"series has too many labels (actual: %d, limit: %d) series: %.200q",
+		len(e.series), e.limit, formatLabelSetBounded(e.series, 200))
 }
 
 type noMetricNameError struct{}
@@ -193,7 +198,10 @@ type exemplarValidationError struct {
 }
 
 func (e *exemplarValidationError) Error() string {
-	return fmt.Sprintf(e.message, e.timestamp, cortexpb.FromLabelAdaptersToLabels(e.seriesLabels).String(), cortexpb.FromLabelAdaptersToLabels(e.exemplarLabels).String())
+	// Bound the rendered label sets: ValidateExemplar is reached with the
+	// series' full unvalidated label set, which may contain millions of labels.
+	// Without truncation this error would produce multi-GiB output.
+	return fmt.Sprintf(e.message, e.timestamp, formatLabelSetBounded(e.seriesLabels, 200), formatLabelSetBounded(e.exemplarLabels, 200))
 }
 
 func newExemplarEmtpyLabelsError(seriesLabels []cortexpb.LabelAdapter, exemplarLabels []cortexpb.LabelAdapter, timestamp int64) ValidationError {
@@ -249,4 +257,65 @@ func formatLabelSet(ls []cortexpb.LabelAdapter) string {
 	}
 
 	return fmt.Sprintf("%s{%s}", metricName, strings.Join(labelStrings, ", "))
+}
+
+// formatLabelSetBounded is a defensive variant of formatLabelSet used on error
+// paths where the label set is attacker-controlled and may be arbitrarily
+// large (e.g. tooManyLabelsError, exemplarValidationError reached before any
+// per-label length check has run). It stops rendering once the accumulated
+// output would exceed maxBytes, appending an ellipsis and the remaining label
+// count instead. This keeps error formatting O(min(N, maxBytes)) in both time
+// and allocation, so a push request with millions of labels cannot drive
+// multi-GiB allocation or ~100 MiB log lines through a single Error() call.
+func formatLabelSetBounded(ls []cortexpb.LabelAdapter, maxBytes int) string {
+	if maxBytes <= 0 {
+		maxBytes = 200
+	}
+
+	metricName, hasMetricName := "", false
+	var sb strings.Builder
+	// Pre-size a little above maxBytes to accommodate the closing brace and the
+	// truncation suffix without re-allocating.
+	sb.Grow(maxBytes + 32)
+
+	writtenLabels := 0
+	totalLabels := 0
+	truncated := false
+
+	for _, l := range ls {
+		if l.Name == model.MetricNameLabel && !hasMetricName && l.Value != "" {
+			metricName = l.Value
+			hasMetricName = true
+			continue
+		}
+		totalLabels++
+		if truncated {
+			continue
+		}
+		if sb.Len() >= maxBytes {
+			truncated = true
+			continue
+		}
+		if writtenLabels == 0 {
+			sb.WriteString(metricName)
+			sb.WriteByte('{')
+		} else {
+			sb.WriteString(", ")
+		}
+		fmt.Fprintf(&sb, "%s=%q", l.Name, l.Value)
+		writtenLabels++
+	}
+
+	if writtenLabels == 0 {
+		if hasMetricName {
+			return metricName
+		}
+		return "{}"
+	}
+
+	if truncated {
+		fmt.Fprintf(&sb, ", ...and %d more", totalLabels-writtenLabels)
+	}
+	sb.WriteByte('}')
+	return sb.String()
 }
