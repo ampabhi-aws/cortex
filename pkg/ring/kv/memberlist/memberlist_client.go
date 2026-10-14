@@ -159,6 +159,23 @@ type KVConfig struct {
 
 	TCPTransport TCPTransportConfig `yaml:",inline"`
 
+	// Explicit allow-list of key prefixes that may be accepted from gossiped
+	// (remote) traffic. If empty, any key with a registered watcher/prefix-watcher,
+	// or any key already present in the local store, is accepted. Setting this
+	// restricts incoming NotifyMsg/MergeRemoteState pairs to the configured
+	// prefixes (CAS and other local writes are unaffected).
+	AcceptedKeyPrefixes flagext.StringSlice `yaml:"accepted_key_prefixes"`
+
+	// Maximum number of distinct keys allowed in the local KV store. When this
+	// cap is reached, remote inputs trying to introduce new keys are dropped
+	// (existing keys continue to merge). 0 disables the cap.
+	MaxStoreKeys int `yaml:"max_store_keys"`
+
+	// Maximum serialized size (bytes) produced by LocalState in a single push/pull
+	// round. Encoded entries beyond this limit are dropped and a counter is bumped.
+	// 0 disables the cap.
+	MaxLocalStateBytes int `yaml:"max_local_state_bytes"`
+
 	// Where to put custom metrics. Metrics are not registered, if this is nil.
 	MetricsRegisterer prometheus.Registerer `yaml:"-"`
 	MetricsNamespace  string                `yaml:"-"`
@@ -193,6 +210,9 @@ func (cfg *KVConfig) RegisterFlagsWithPrefix(f *flag.FlagSet, prefix string) {
 	f.BoolVar(&cfg.EnableCompression, prefix+"memberlist.compression-enabled", mlDefaults.EnableCompression, "Enable message compression. This can be used to reduce bandwidth usage at the cost of slightly more CPU utilization.")
 	f.StringVar(&cfg.AdvertiseAddr, prefix+"memberlist.advertise-addr", mlDefaults.AdvertiseAddr, "Gossip address to advertise to other members in the cluster. Used for NAT traversal.")
 	f.IntVar(&cfg.AdvertisePort, prefix+"memberlist.advertise-port", mlDefaults.AdvertisePort, "Gossip port to advertise to other members in the cluster. Used for NAT traversal.")
+	f.Var(&cfg.AcceptedKeyPrefixes, prefix+"memberlist.accepted-key-prefix", "Only accept gossiped KV pairs whose key starts with one of these prefixes (can be specified multiple times). When empty (the default), the allow-list is disabled and remote keys are accepted regardless of their name; the MaxStoreKeys cap still applies.")
+	f.IntVar(&cfg.MaxStoreKeys, prefix+"memberlist.max-store-keys", 0, "Maximum number of distinct keys allowed in the memberlist KV store. 0 to disable. When reached, newly-introduced keys from remote peers are dropped.")
+	f.IntVar(&cfg.MaxLocalStateBytes, prefix+"memberlist.max-local-state-bytes", 0, "Maximum serialized size (bytes) produced by LocalState per push/pull round. 0 to disable.")
 
 	cfg.TCPTransport.RegisterFlagsWithPrefix(f, prefix)
 }
@@ -259,6 +279,7 @@ type KV struct {
 	numberOfReceivedMessages            prometheus.Counter
 	totalSizeOfReceivedMessages         prometheus.Counter
 	numberOfInvalidReceivedMessages     prometheus.Counter
+	numberOfRejectedReceivedKeys        *prometheus.CounterVec
 	numberOfPulls                       prometheus.Counter
 	numberOfPushes                      prometheus.Counter
 	totalSizeOfPulls                    prometheus.Counter
@@ -508,6 +529,73 @@ func (m *KV) rejoinMemberlist(ctx context.Context) {
 // GetCodec returns codec for given ID or nil.
 func (m *KV) GetCodec(codecID string) codec.Codec {
 	return m.codecs[codecID]
+}
+
+// isRemoteKeyAcceptable decides whether a key received via gossip (NotifyMsg)
+// or push/pull (MergeRemoteState) may be merged into the local store.
+//
+// The check is opt-in: it only rejects keys when the operator has explicitly
+// configured AcceptedKeyPrefixes. Doing it this way avoids rejecting legitimate
+// state during cluster bootstrap, when watchers may not have registered yet.
+// Keys already present in the local store are always accepted.
+//
+// Precedence (first match wins):
+//  1. Empty key is always rejected.
+//  2. If AcceptedKeyPrefixes is empty, accept (permissive default).
+//  3. If the key already exists in the local store, accept.
+//  4. If any configured AcceptedKeyPrefixes matches (prefix match), accept.
+//  5. If any registered WatchKey channel targets this exact key, or any
+//     registered WatchPrefix target is a prefix of the key, accept.
+//  6. Otherwise reject (reason is used for metric labelling and logging).
+//
+// The decision for case (3) is made under storeMu, and (5) under watchersMu;
+// callers must not already hold either lock.
+func (m *KV) isRemoteKeyAcceptable(key string) (bool, string) {
+	if key == "" {
+		return false, "empty_key"
+	}
+	if len(m.cfg.AcceptedKeyPrefixes) == 0 {
+		return true, ""
+	}
+
+	m.storeMu.Lock()
+	_, inStore := m.store[key]
+	m.storeMu.Unlock()
+	if inStore {
+		return true, ""
+	}
+
+	for _, p := range m.cfg.AcceptedKeyPrefixes {
+		if p == "" || strings.HasPrefix(key, p) {
+			return true, ""
+		}
+	}
+
+	m.watchersMu.Lock()
+	defer m.watchersMu.Unlock()
+	if _, ok := m.watchers[key]; ok {
+		return true, ""
+	}
+	for prefix := range m.prefixWatchers {
+		if prefix == "" || strings.HasPrefix(key, prefix) {
+			return true, ""
+		}
+	}
+	return false, "unknown_key"
+}
+
+// isNewRemoteKeyAllowed enforces the MaxStoreKeys cap for keys that are not
+// yet in the store. Must be called before mergeValueForKey for remote inputs.
+func (m *KV) isNewRemoteKeyAllowed(key string) bool {
+	if m.cfg.MaxStoreKeys <= 0 {
+		return true
+	}
+	m.storeMu.Lock()
+	defer m.storeMu.Unlock()
+	if _, ok := m.store[key]; ok {
+		return true
+	}
+	return len(m.store) < m.cfg.MaxStoreKeys
 }
 
 // GetListeningPort returns port used for listening for memberlist communication. Useful when BindPort is set to 0.
@@ -985,6 +1073,17 @@ func (m *KV) NotifyMsg(msg []byte) {
 		return
 	}
 
+	if ok, reason := m.isRemoteKeyAcceptable(kvPair.Key); !ok {
+		m.numberOfRejectedReceivedKeys.WithLabelValues(reason).Inc()
+		level.Warn(m.logger).Log("msg", "rejected gossiped KV pair", "reason", reason, "key", kvPair.Key)
+		return
+	}
+	if !m.isNewRemoteKeyAllowed(kvPair.Key) {
+		m.numberOfRejectedReceivedKeys.WithLabelValues("max_store_keys").Inc()
+		level.Warn(m.logger).Log("msg", "rejected gossiped KV pair: store key cap reached", "key", kvPair.Key, "cap", m.cfg.MaxStoreKeys)
+		return
+	}
+
 	// we have a ring update! Let's merge it with our version of the ring for given key
 	mod, version, err := m.mergeBytesValueForKey(kvPair.Key, kvPair.Value, codec)
 
@@ -1097,6 +1196,14 @@ func (m *KV) LocalState(join bool) []byte {
 		}
 		buf.Write(ser)
 
+		if m.cfg.MaxLocalStateBytes > 0 && buf.Len() > m.cfg.MaxLocalStateBytes {
+			// Truncate the just-appended entry and stop. Metric/log captures the drop.
+			buf.Truncate(buf.Len() - (4 + len(ser)))
+			m.numberOfRejectedReceivedKeys.WithLabelValues("max_local_state_bytes").Inc()
+			level.Warn(m.logger).Log("msg", "LocalState truncated at configured max_local_state_bytes", "limit", m.cfg.MaxLocalStateBytes, "stopped_at_key", key)
+			break
+		}
+
 		m.addSentMessage(message{
 			Time:    sent,
 			Size:    len(ser),
@@ -1154,6 +1261,17 @@ func (m *KV) MergeRemoteState(data []byte, join bool) {
 		codec := m.GetCodec(kvPair.GetCodec())
 		if codec == nil {
 			level.Error(m.logger).Log("msg", "failed to parse remote state: unknown codec for key", "codec", kvPair.GetCodec(), "key", kvPair.GetKey())
+			continue
+		}
+
+		if ok, reason := m.isRemoteKeyAcceptable(kvPair.Key); !ok {
+			m.numberOfRejectedReceivedKeys.WithLabelValues(reason).Inc()
+			level.Warn(m.logger).Log("msg", "rejected KV pair from remote state", "reason", reason, "key", kvPair.Key)
+			continue
+		}
+		if !m.isNewRemoteKeyAllowed(kvPair.Key) {
+			m.numberOfRejectedReceivedKeys.WithLabelValues("max_store_keys").Inc()
+			level.Warn(m.logger).Log("msg", "rejected KV pair from remote state: store key cap reached", "key", kvPair.Key, "cap", m.cfg.MaxStoreKeys)
 			continue
 		}
 

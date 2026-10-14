@@ -36,6 +36,13 @@ func (m *KV) createAndRegisterMetrics() {
 		Help:      "Number of received broadcast user messages that were invalid. Hopefully 0.",
 	})
 
+	m.numberOfRejectedReceivedKeys = promauto.With(m.registerer).NewCounterVec(prometheus.CounterOpts{
+		Namespace: m.cfg.MetricsNamespace,
+		Subsystem: subsystem,
+		Name:      "received_broadcasts_rejected_total",
+		Help:      "Number of received KV pairs rejected because of key allow-list or store/size caps.",
+	}, []string{"reason"})
+
 	m.numberOfPushes = promauto.With(m.registerer).NewCounter(prometheus.CounterOpts{
 		Namespace: m.cfg.MetricsNamespace,
 		Subsystem: subsystem,
