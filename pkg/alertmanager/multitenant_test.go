@@ -991,14 +991,19 @@ receivers:
 	_, exists := am.alertmanagers["user1"]
 	require.True(t, exists)
 
-	// Even after a poll...
+	// The fallback must NOT have persisted an (empty) config to the alert
+	// store from this read-serving path — that would allow a GET on the
+	// Alertmanager UI to blindly overwrite a tenant's stored configuration.
+	storedUsers, err := store.ListAllUsers(ctx)
+	require.NoError(t, err)
+	require.NotContains(t, storedUsers, "user1")
+
+	// After a poll, because the fallback AM is purely in-memory and there is
+	// no stored configuration for the tenant, syncConfigs reaps it. The next
+	// request will re-materialize the fallback AM on demand.
 	err = am.loadAndSyncConfigs(ctx, reasonPeriodic)
 	require.NoError(t, err)
-
-	//  It does not remove the Alertmanager.
-	require.Len(t, am.alertmanagers, 1)
-	_, exists = am.alertmanagers["user1"]
-	require.True(t, exists)
+	require.NotContains(t, am.alertmanagers, "user1")
 
 	// Remove the Alertmanager configuration.
 	require.NoError(t, store.DeleteAlertConfig(ctx, "user1"))

@@ -1040,16 +1040,21 @@ func (am *MultitenantAlertmanager) serveRequest(w http.ResponseWriter, req *http
 }
 
 func (am *MultitenantAlertmanager) alertmanagerFromFallbackConfig(userID string) (*Alertmanager, error) {
-	// Upload an empty config so that the Alertmanager is no de-activated in the next poll
+	// Do NOT persist any state to the alert store from this read-serving path:
+	// doing so would allow a GET on a non-API Alertmanager path (e.g. the UI)
+	// to blindly overwrite a tenant's stored Alertmanager configuration and
+	// template files with an empty one when the serving instance does not
+	// currently hold an in-memory Alertmanager for the tenant (for example on
+	// a non-owner replica with sharding enabled, or in the window between a
+	// config upload and the next poll). It would also let any X-Scope-OrgID
+	// value cause unbounded durable tenant creation. The fallback
+	// Alertmanager is therefore materialized purely in memory here; the
+	// periodic sync (syncConfigs) will reap it when the tenant has no stored
+	// configuration, keeping fallback instances bounded by the sync lifecycle.
 	cfgDesc := alertspb.ToProto("", nil, userID)
-	err := am.store.SetAlertConfig(context.Background(), cfgDesc)
-	if err != nil {
-		return nil, err
-	}
 
 	// Calling setConfig with an empty configuration will use the fallback config.
-	err = am.setConfig(cfgDesc)
-	if err != nil {
+	if err := am.setConfig(cfgDesc); err != nil {
 		return nil, err
 	}
 
