@@ -8,6 +8,7 @@ import (
 	"os"
 	"path/filepath"
 	"reflect"
+	"strings"
 
 	"github.com/go-kit/log"
 	"github.com/go-kit/log/level"
@@ -45,7 +46,20 @@ var (
 	errTLSFileNotAllowed             = errors.New("setting TLS ca_file, cert_file and key_file is not allowed")
 	errSlackAPIURLFileNotAllowed     = errors.New("setting Slack api_url_file and global slack_api_url_file is not allowed")
 	errVictorOpsAPIKeyFileNotAllowed = errors.New("setting VictorOps api_key_file is not allowed")
+	errOpsGenieAPIKeyFileNotAllowed  = errors.New("setting OpsGenie api_key_file and global opsgenie_api_key_file is not allowed")
+	errFileFieldNotAllowed           = errors.New("setting a *_file field in the Alertmanager configuration is not allowed")
 )
+
+// allowedFileFields is the explicit, reviewed list of YAML tags whose names end
+// in "_file" but which Cortex has deliberately decided are safe for tenants to
+// set. If a new *_file field is introduced by the vendored Alertmanager /
+// prometheus-common config packages, it will be rejected by the generic walker
+// below (and the TestNoNewVendoredFileFields unit test will fail) until it is
+// either explicitly denied by a per-type check or added here after review.
+var allowedFileFields = map[string]struct{}{
+	// Currently no *_file field is on the allow-list. Every known *_file field
+	// is a file-read primitive and must be explicitly denied.
+}
 
 // UserConfig is used to communicate a users alertmanager configs
 type UserConfig struct {
@@ -350,6 +364,38 @@ func validateAlertmanagerConfig(cfg interface{}) error {
 		if err := validateVictorOpsConfig(v.Interface().(config.VictorOpsConfig)); err != nil {
 			return err
 		}
+
+	case reflect.TypeOf(config.OpsGenieConfig{}):
+		if err := validateOpsGenieConfig(v.Interface().(config.OpsGenieConfig)); err != nil {
+			return err
+		}
+	}
+
+	// Generic defence-in-depth: reject any non-empty string field whose YAML
+	// tag name ends in "_file" and is not in the reviewed allow-list. This
+	// catches new file-reading options added by future vendored Alertmanager
+	// upgrades even if a per-type validator above has not yet been written.
+	if t.Kind() == reflect.Struct {
+		for i := 0; i < t.NumField(); i++ {
+			field := t.Field(i)
+			if field.Type.Kind() != reflect.String {
+				continue
+			}
+			yamlName := yamlFieldName(field)
+			if yamlName == "" || !strings.HasSuffix(yamlName, "_file") {
+				continue
+			}
+			if _, ok := allowedFileFields[yamlName]; ok {
+				continue
+			}
+			fieldValue := v.FieldByIndex(field.Index)
+			if !fieldValue.CanInterface() {
+				continue
+			}
+			if fieldValue.String() != "" {
+				return errors.Wrapf(errFileFieldNotAllowed, "field %q (%s.%s)", yamlName, t.PkgPath()+"."+t.Name(), field.Name)
+			}
+		}
 	}
 
 	// If the input config is a struct, recursively iterate on all fields.
@@ -429,7 +475,41 @@ func validateGlobalConfig(cfg config.GlobalConfig) error {
 	if cfg.SlackAPIURLFile != "" {
 		return errSlackAPIURLFileNotAllowed
 	}
+	if cfg.OpsGenieAPIKeyFile != "" {
+		return errOpsGenieAPIKeyFileNotAllowed
+	}
 	return nil
+}
+
+// validateOpsGenieConfig validates the OpsGenie receiver config and returns an
+// error if it contains settings not allowed by Cortex. The APIKeyFile field
+// would otherwise be read from disk at notify time and sent to the
+// tenant-controlled api_url via the Authorization header.
+func validateOpsGenieConfig(cfg config.OpsGenieConfig) error {
+	if cfg.APIKeyFile != "" {
+		return errOpsGenieAPIKeyFileNotAllowed
+	}
+	return nil
+}
+
+// yamlFieldName returns the YAML tag name of a struct field (the part before
+// any ",..." options). It returns the Go field name when no yaml tag is set,
+// and the empty string when the tag is "-".
+func yamlFieldName(field reflect.StructField) string {
+	tag, ok := field.Tag.Lookup("yaml")
+	if !ok {
+		return field.Name
+	}
+	if tag == "-" {
+		return ""
+	}
+	if idx := strings.Index(tag, ","); idx >= 0 {
+		tag = tag[:idx]
+	}
+	if tag == "" {
+		return field.Name
+	}
+	return tag
 }
 
 // validateSlackConfig validates the Slack config and returns an error if it contains
