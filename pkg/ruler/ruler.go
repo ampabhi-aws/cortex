@@ -63,6 +63,7 @@ const (
 	// Limit errors
 	errMaxRuleGroupsPerUserLimitExceeded        = "per-user rule groups limit (limit: %d actual: %d) exceeded"
 	errMaxRulesPerRuleGroupPerUserLimitExceeded = "per-user rules per rule group limit (limit: %d actual: %d) exceeded"
+	errMinRuleGroupEvaluationIntervalExceeded   = "rule group evaluation interval is below the per-user minimum (minimum: %s actual: %s)"
 
 	// errors
 	errListAllUser = "unable to list the ruler users"
@@ -837,6 +838,36 @@ func (r *Ruler) AssertMaxRulesPerRuleGroup(userID string, rules int) error {
 		return nil
 	}
 	return fmt.Errorf(errMaxRulesPerRuleGroupPerUserLimitExceeded, limit, rules)
+}
+
+// MinRuleGroupEvaluationInterval returns the effective minimum evaluation interval that
+// applies to rule groups owned by userID. It is max(per-tenant min, cfg.EvaluationInterval):
+// a tenant override cannot raise the minimum above the operator's default by lowering the
+// override, but it also cannot drop below -ruler.evaluation-interval.
+func (r *Ruler) MinRuleGroupEvaluationInterval(userID string) time.Duration {
+	min := r.limits.RulerMinRuleEvaluationInterval(userID)
+	if min <= 0 {
+		// Fall back to the operator-configured default evaluation interval.
+		return r.cfg.EvaluationInterval
+	}
+	if r.cfg.EvaluationInterval > min {
+		return r.cfg.EvaluationInterval
+	}
+	return min
+}
+
+// AssertMinRuleGroupInterval returns an error if interval is a non-zero value below the
+// effective per-tenant minimum evaluation interval (see MinRuleGroupEvaluationInterval).
+// An interval of 0 is accepted because the Prometheus manager will substitute the default.
+func (r *Ruler) AssertMinRuleGroupInterval(userID string, interval time.Duration) error {
+	if interval <= 0 {
+		return nil
+	}
+	min := r.MinRuleGroupEvaluationInterval(userID)
+	if min <= 0 || interval >= min {
+		return nil
+	}
+	return fmt.Errorf(errMinRuleGroupEvaluationIntervalExceeded, min, interval)
 }
 
 func (r *Ruler) DeleteTenantConfiguration(w http.ResponseWriter, req *http.Request) {
