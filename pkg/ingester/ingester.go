@@ -130,6 +130,7 @@ func (cfg *Config) RegisterFlags(f *flag.FlagSet) {
 	f.Int64Var(&cfg.DefaultLimits.MaxInMemoryTenants, "ingester.instance-limits.max-tenants", 0, "Max users that this ingester can hold. Requests from additional users will be rejected. This limit only works when using blocks engine. 0 = unlimited.")
 	f.Int64Var(&cfg.DefaultLimits.MaxInMemorySeries, "ingester.instance-limits.max-series", 0, "Max series that this ingester can hold (across all tenants). Requests to create additional series will be rejected. This limit only works when using blocks engine. 0 = unlimited.")
 	f.Int64Var(&cfg.DefaultLimits.MaxInflightPushRequests, "ingester.instance-limits.max-inflight-push-requests", 0, "Max inflight push requests that this ingester can handle (across all tenants). Additional requests will be rejected. 0 = unlimited.")
+	f.Int64Var(&cfg.DefaultLimits.MaxInflightQueryRequests, "ingester.instance-limits.max-inflight-query-requests", 0, "Max inflight query/metadata requests that this ingester can handle (across all tenants). Additional requests will be rejected. 0 = unlimited.")
 
 	f.StringVar(&cfg.IgnoreSeriesLimitForMetricNames, "ingester.ignore-series-limit-for-metric-names", "", "Comma-separated list of metric names, for which -ingester.max-series-per-metric and -ingester.max-global-series-per-metric limits will be ignored. Does not affect max-series-per-user or max-global-series-per-metric limits.")
 }
@@ -181,8 +182,9 @@ type Ingester struct {
 	TSDBState TSDBState
 
 	// Rate of pushed samples. Only used by V2-ingester to limit global samples push rate.
-	ingestionRate        *util_math.EwmaRate
-	inflightPushRequests atomic.Int64
+	ingestionRate         *util_math.EwmaRate
+	inflightPushRequests  atomic.Int64
+	inflightQueryRequests atomic.Int64
 }
 
 // Shipper interface is used to have an easy way to mock it in tests.
@@ -1165,6 +1167,12 @@ func (i *Ingester) Query(ctx context.Context, req *client.QueryRequest) (*client
 		return nil, err
 	}
 
+	releaseSlot, err := i.acquireInflightQuerySlot()
+	if err != nil {
+		return nil, err
+	}
+	defer releaseSlot()
+
 	userID, err := tenant.TenantID(ctx)
 	if err != nil {
 		return nil, err
@@ -1210,6 +1218,13 @@ func (i *Ingester) Query(ctx context.Context, req *client.QueryRequest) (*client
 			continue
 		}
 
+		// Enforce the per-tenant max-series-per-query limit before allocating the
+		// next TimeSeries. This bounds the memory a single ingester Query RPC
+		// can allocate; without it a tenant can force unbounded materialization.
+		if err := i.limiter.AssertMaxSeriesPerQuery(userID, len(result.Timeseries)); err != nil {
+			return nil, err
+		}
+
 		ts := cortexpb.TimeSeries{
 			Labels: cortexpb.FromLabelsToLabelAdapters(series.Labels()),
 		}
@@ -1235,6 +1250,12 @@ func (i *Ingester) QueryExemplars(ctx context.Context, req *client.ExemplarQuery
 	if err := i.checkRunning(); err != nil {
 		return nil, err
 	}
+
+	releaseSlot, err := i.acquireInflightQuerySlot()
+	if err != nil {
+		return nil, err
+	}
+	defer releaseSlot()
 
 	userID, err := tenant.TenantID(ctx)
 	if err != nil {
@@ -1287,6 +1308,12 @@ func (i *Ingester) LabelValues(ctx context.Context, req *client.LabelValuesReque
 	if err := i.checkRunning(); err != nil {
 		return nil, err
 	}
+
+	releaseSlot, err := i.acquireInflightQuerySlot()
+	if err != nil {
+		return nil, err
+	}
+	defer releaseSlot()
 
 	labelName, startTimestampMs, endTimestampMs, matchers, err := client.FromLabelValuesRequest(req)
 	if err != nil {
@@ -1354,6 +1381,12 @@ func (i *Ingester) LabelNames(ctx context.Context, req *client.LabelNamesRequest
 		return nil, err
 	}
 
+	releaseSlot, err := i.acquireInflightQuerySlot()
+	if err != nil {
+		return nil, err
+	}
+	defer releaseSlot()
+
 	userID, err := tenant.TenantID(ctx)
 	if err != nil {
 		return nil, err
@@ -1416,6 +1449,12 @@ func (i *Ingester) MetricsForLabelMatchers(ctx context.Context, req *client.Metr
 		return nil, err
 	}
 
+	releaseSlot, err := i.acquireInflightQuerySlot()
+	if err != nil {
+		return nil, err
+	}
+	defer releaseSlot()
+
 	userID, err := tenant.TenantID(ctx)
 	if err != nil {
 		return nil, err
@@ -1474,6 +1513,14 @@ func (i *Ingester) MetricsForLabelMatchers(ctx context.Context, req *client.Metr
 			return nil, ctx.Err()
 		}
 
+		// Enforce the per-tenant max-series-per-query limit before allocating the
+		// next Metric entry. Without this guard, a single metadata query can force
+		// the ingester to materialize one entry per matching series (up to the
+		// per-tenant active series limit) into one response.
+		if err := i.limiter.AssertMaxSeriesPerQuery(userID, len(result.Metric)); err != nil {
+			return nil, err
+		}
+
 		result.Metric = append(result.Metric, &cortexpb.Metric{
 			Labels: cortexpb.FromLabelsToLabelAdapters(mergedSet.At().Labels()),
 		})
@@ -1483,26 +1530,107 @@ func (i *Ingester) MetricsForLabelMatchers(ctx context.Context, req *client.Metr
 }
 
 func (i *Ingester) MetricsForLabelMatchersStream(req *client.MetricsForLabelMatchersRequest, stream client.Ingester_MetricsForLabelMatchersStreamServer) error {
-	result, err := i.MetricsForLabelMatchers(stream.Context(), req)
+	if err := i.checkRunning(); err != nil {
+		return err
+	}
+
+	releaseSlot, err := i.acquireInflightQuerySlot()
+	if err != nil {
+		return err
+	}
+	defer releaseSlot()
+
+	ctx := stream.Context()
+
+	userID, err := tenant.TenantID(ctx)
 	if err != nil {
 		return err
 	}
 
-	for i := 0; i < len(result.Metric); i += metadataStreamBatchSize {
-		j := i + metadataStreamBatchSize
-		if j > len(result.Metric) {
-			j = len(result.Metric)
+	db := i.getTSDB(userID)
+	if db == nil {
+		return nil
+	}
+
+	_, _, matchersSet, err := client.FromMetricsForLabelMatchersRequest(req)
+	if err != nil {
+		return err
+	}
+
+	mint, maxt, err := metadataQueryRange(req.StartTimestampMs, req.EndTimestampMs, db)
+	if err != nil {
+		return err
+	}
+
+	q, err := db.Querier(ctx, mint, maxt)
+	if err != nil {
+		return err
+	}
+	defer q.Close()
+
+	var sets []storage.SeriesSet
+	for _, matchers := range matchersSet {
+		if ctx.Err() != nil {
+			return ctx.Err()
 		}
-		resp := &client.MetricsForLabelMatchersStreamResponse{
-			Metric: result.Metric[i:j],
+		hints := &storage.SelectHints{
+			Start: mint,
+			End:   maxt,
+			Func:  "series",
 		}
-		err := client.SendMetricsForLabelMatchersStream(stream, resp)
-		if err != nil {
+		sets = append(sets, q.Select(true, hints, matchers...))
+	}
+
+	// Reuse a single batch buffer so that peak memory is bounded by the batch
+	// size rather than by the total number of matching series.
+	batch := make([]*cortexpb.Metric, 0, metadataStreamBatchSize)
+	total := 0
+
+	flush := func() error {
+		if len(batch) == 0 {
+			return nil
+		}
+		if err := client.SendMetricsForLabelMatchersStream(stream, &client.MetricsForLabelMatchersStreamResponse{
+			Metric: batch,
+		}); err != nil {
 			return err
+		}
+		// Reset the slice length without re-allocating. Elements will be
+		// overwritten on the next iteration; the server has already serialized
+		// the batch, so dropping references here is safe.
+		for idx := range batch {
+			batch[idx] = nil
+		}
+		batch = batch[:0]
+		return nil
+	}
+
+	mergedSet := storage.NewMergeSeriesSet(sets, storage.ChainedSeriesMerge)
+	for mergedSet.Next() {
+		if ctx.Err() != nil {
+			return ctx.Err()
+		}
+
+		// Enforce the per-tenant max-series-per-query limit so that a single
+		// metadata stream cannot cause the ingester to emit (and allocate
+		// intermediate state for) an unbounded number of series.
+		if err := i.limiter.AssertMaxSeriesPerQuery(userID, total); err != nil {
+			return err
+		}
+
+		batch = append(batch, &cortexpb.Metric{
+			Labels: cortexpb.FromLabelsToLabelAdapters(mergedSet.At().Labels()),
+		})
+		total++
+
+		if len(batch) >= metadataStreamBatchSize {
+			if err := flush(); err != nil {
+				return err
+			}
 		}
 	}
 
-	return nil
+	return flush()
 }
 
 // MetricsMetadata returns all the metric metadata of a user.
@@ -1598,6 +1726,12 @@ func (i *Ingester) QueryStream(req *client.QueryRequest, stream client.Ingester_
 	if err := i.checkRunning(); err != nil {
 		return err
 	}
+
+	releaseSlot, err := i.acquireInflightQuerySlot()
+	if err != nil {
+		return err
+	}
+	defer releaseSlot()
 
 	spanlog, ctx := spanlogger.New(stream.Context(), "QueryStream")
 	defer spanlog.Finish()
@@ -2617,6 +2751,23 @@ func (i *Ingester) getInstanceLimits() *InstanceLimits {
 	}
 
 	return l
+}
+
+// acquireInflightQuerySlot increments the inflight query request counter and
+// returns a release function. If the configured instance-level inflight-query
+// limit is reached, it returns errTooManyInflightQueryRequests and the slot is
+// released before returning. The release function MUST be called on the
+// success path (deferred by the caller).
+func (i *Ingester) acquireInflightQuerySlot() (release func(), err error) {
+	inflight := i.inflightQueryRequests.Inc()
+	release = func() { i.inflightQueryRequests.Dec() }
+
+	gl := i.getInstanceLimits()
+	if gl != nil && gl.MaxInflightQueryRequests > 0 && inflight > gl.MaxInflightQueryRequests {
+		release()
+		return nil, errTooManyInflightQueryRequests
+	}
+	return release, nil
 }
 
 // stopIncomingRequests is called during the shutdown process.
