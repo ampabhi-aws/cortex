@@ -52,6 +52,27 @@ func TestFirewallDialer(t *testing.T) {
 				{"2001:4860:4860::8844", false},    // Google DNS
 				{"::ffff:172.217.168.78", false},   // IPv6 mapped v4 non-private
 				{"::ffff:192.168.0.1", true},       // IPv6 mapped v4 private
+				// Unspecified addresses: on Linux connect() to 0.0.0.0 / ::
+				// is redirected to the local host, so these must be blocked.
+				{"0.0.0.0", true},
+				{"::", true},
+				// Reserved / non-routable ranges.
+				{"0.1.2.3", true},              // 0.0.0.0/8 "this network"
+				{"100.64.0.1", true},           // CGNAT (RFC6598)
+				{"100.100.100.200", true},      // Alibaba Cloud IMDS
+				{"169.254.169.254", true},      // AWS/GCP IMDS (link-local)
+				{"192.0.0.1", true},            // IETF protocol assignments
+				{"192.0.2.1", true},            // TEST-NET-1
+				{"198.18.0.1", true},           // Benchmarking
+				{"198.51.100.1", true},         // TEST-NET-2
+				{"203.0.113.1", true},          // TEST-NET-3
+				{"240.0.0.1", true},            // Reserved for future use
+				{"255.255.255.255", true},      // Limited broadcast
+				{"224.0.0.1", true},            // Multicast
+				{"64:ff9b::1", true},           // NAT64 well-known
+				{"fec0::1", true},              // Deprecated site-local
+				{"ff01::1", true},              // Interface-local multicast
+				{"ff02::1", true},              // Link-local multicast
 			},
 		},
 		"should support blocking custom CIDRs": {
