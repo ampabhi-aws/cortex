@@ -284,6 +284,10 @@ var (
 	ErrNoNamespace = errors.New("a namespace must be provided in the request")
 	// ErrNoGroupName signals a group name url parameter was not found
 	ErrNoGroupName = errors.New("a matching group name must be provided in the request")
+	// ErrInvalidNamespace signals that the namespace contains disallowed path characters
+	ErrInvalidNamespace = errors.New("invalid namespace: must not be empty or contain path separators or path traversal segments")
+	// ErrInvalidGroupName signals that the group name contains disallowed path characters
+	ErrInvalidGroupName = errors.New("invalid group name: must not be empty or contain path separators or path traversal segments")
 	// ErrNoRuleGroups signals the rule group requested does not exist
 	ErrNoRuleGroups = errors.New("no rule groups found")
 	// ErrBadRuleGroup is returned when the provided rule group can not be unmarshalled
@@ -323,8 +327,26 @@ func respondAccepted(w http.ResponseWriter, logger log.Logger) {
 	}
 }
 
+// isSafePathComponent reports whether s is safe to use as a single filesystem
+// path component derived from an untrusted URL path variable. It rejects empty
+// values, path separators ('/' and '\\'), relative-path segments ('.' and
+// '..') and embedded NUL bytes. This mirrors the containment contract that the
+// bucket-backed rule store achieves via base64 encoding and the Alertmanager's
+// safeTemplateFilepath check.
+func isSafePathComponent(s string) bool {
+	if s == "" || s == "." || s == ".." {
+		return false
+	}
+	if strings.ContainsAny(s, "/\\\x00") {
+		return false
+	}
+	return true
+}
+
 // parseNamespace parses the namespace from the provided set of params, in this
-// api these params are derived from the url path
+// api these params are derived from the url path. It percent-decodes the value
+// and rejects any value that would allow it to escape its per-tenant directory
+// when used as a filesystem path component (see isSafePathComponent).
 func parseNamespace(params map[string]string) (string, error) {
 	namespace, exists := params["namespace"]
 	if !exists {
@@ -333,14 +355,20 @@ func parseNamespace(params map[string]string) (string, error) {
 
 	namespace, err := url.PathUnescape(namespace)
 	if err != nil {
-		return "", err
+		return "", ErrInvalidNamespace
+	}
+
+	if !isSafePathComponent(namespace) {
+		return "", ErrInvalidNamespace
 	}
 
 	return namespace, nil
 }
 
 // parseGroupName parses the group name from the provided set of params, in this
-// api these params are derived from the url path
+// api these params are derived from the url path. It percent-decodes the value
+// and rejects any value that would allow it to escape its per-tenant directory
+// when used as a filesystem path component (see isSafePathComponent).
 func parseGroupName(params map[string]string) (string, error) {
 	groupName, exists := params["groupName"]
 	if !exists {
@@ -349,7 +377,11 @@ func parseGroupName(params map[string]string) (string, error) {
 
 	groupName, err := url.PathUnescape(groupName)
 	if err != nil {
-		return "", err
+		return "", ErrInvalidGroupName
+	}
+
+	if !isSafePathComponent(groupName) {
+		return "", ErrInvalidGroupName
 	}
 
 	return groupName, nil
@@ -395,7 +427,8 @@ func (a *API) ListRules(w http.ResponseWriter, req *http.Request) {
 	level.Debug(logger).Log("msg", "retrieving rule groups with namespace", "userID", userID, "namespace", namespace)
 	rgs, err := a.store.ListRuleGroupsForUserAndNamespace(req.Context(), userID, namespace)
 	if err != nil {
-		http.Error(w, err.Error(), http.StatusBadRequest)
+		level.Error(logger).Log("msg", "unable to list rule groups", "userID", userID, "err", err.Error())
+		http.Error(w, "unable to list rule groups", http.StatusBadRequest)
 		return
 	}
 
@@ -407,7 +440,8 @@ func (a *API) ListRules(w http.ResponseWriter, req *http.Request) {
 
 	err = a.store.LoadRuleGroups(req.Context(), map[string]rulespb.RuleGroupList{userID: rgs})
 	if err != nil {
-		http.Error(w, err.Error(), http.StatusBadRequest)
+		level.Error(logger).Log("msg", "unable to load rule groups", "userID", userID, "err", err.Error())
+		http.Error(w, "unable to load rule groups", http.StatusBadRequest)
 		return
 	}
 
@@ -431,7 +465,8 @@ func (a *API) GetRuleGroup(w http.ResponseWriter, req *http.Request) {
 			http.Error(w, err.Error(), http.StatusNotFound)
 			return
 		}
-		http.Error(w, err.Error(), http.StatusBadRequest)
+		level.Error(logger).Log("msg", "unable to get rule group", "userID", userID, "err", err.Error())
+		http.Error(w, "unable to get rule group", http.StatusBadRequest)
 		return
 	}
 

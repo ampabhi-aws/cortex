@@ -5,6 +5,7 @@ import (
 	"flag"
 	"os"
 	"path/filepath"
+	"strings"
 
 	"github.com/pkg/errors"
 	promRules "github.com/prometheus/prometheus/rules"
@@ -168,11 +169,39 @@ func (l *Client) loadAllRulesGroupsForUser(ctx context.Context, userID string) (
 }
 
 func (l *Client) loadAllRulesGroupsForUserAndNamespace(_ context.Context, userID string, namespace string) (rulespb.RuleGroupList, error) {
-	filename := filepath.Join(l.cfg.Directory, userID, namespace)
+	// Defense in depth: refuse any namespace that is not a single safe path
+	// component so a traversal cannot escape the per-tenant directory even if
+	// upstream validation is bypassed. The API layer
+	// (pkg/ruler/api.go:parseNamespace) performs the same check; keeping it
+	// here protects any other caller of the local rule store.
+	if namespace == "" || namespace == "." || namespace == ".." ||
+		strings.ContainsAny(namespace, "/\\\x00") {
+		return nil, errors.New("invalid namespace")
+	}
+
+	userDir, err := filepath.Abs(filepath.Join(l.cfg.Directory, userID))
+	if err != nil {
+		return nil, errors.New("invalid rule store configuration")
+	}
+	filename, err := filepath.Abs(filepath.Join(userDir, namespace))
+	if err != nil {
+		return nil, errors.New("invalid namespace")
+	}
+
+	// Ensure the resolved rule file is still inside the per-tenant directory.
+	// We require userDir to be a true path prefix (i.e. userDir + separator)
+	// so that "<dir>/tenantA" cannot match "<dir>/tenantA-other". This mirrors
+	// safeTemplateFilepath in the Alertmanager.
+	sep := string(filepath.Separator)
+	if filename != userDir && !strings.HasPrefix(filename, userDir+sep) {
+		return nil, errors.New("invalid namespace")
+	}
 
 	rulegroups, allErrors := l.loader.Load(filename)
 	if len(allErrors) > 0 {
-		return nil, errors.Wrapf(allErrors[0], "error parsing %s", filename)
+		// Do not leak the resolved filesystem path or raw parse errors (which
+		// may embed file content fragments) back to API callers.
+		return nil, errors.Errorf("error parsing namespace %q", namespace)
 	}
 
 	var list rulespb.RuleGroupList
