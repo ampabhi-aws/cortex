@@ -444,7 +444,7 @@ Displays a web page with the ruler hash ring status, including the state, health
 GET /ruler/rule_groups
 ```
 
-List all tenant rules. This endpoint is not part of ruler-API and is always available regardless of whether ruler-API is enabled or not. It should not be exposed to end users. This endpoint returns a YAML dictionary with all the rule groups for each tenant and `200` status code on success.
+List rule groups for the tenant identified by the request's `X-Scope-OrgID` header. This endpoint is not part of ruler-API and is always available regardless of whether ruler-API is enabled or not. It returns a YAML dictionary with the rule groups owned by the authenticated tenant and a `200` status code on success. Requests without a tenant are rejected with `401 Unauthorized`.
 
 ### List rules
 
