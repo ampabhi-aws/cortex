@@ -56,6 +56,12 @@ const (
 	// store-gateways. If no more store-gateways are left (ie. due to lower replication
 	// factor) than we'll end the retries earlier.
 	maxFetchSeriesAttempts = 3
+
+	// The maximum number of concurrent in-flight store-gateway metadata (label
+	// names/values) requests per query. Bounding this prevents a single tenant
+	// request from fanning out to an unbounded number of store-gateways and
+	// buffering a per-connection worst-case response from each one in parallel.
+	maxConcurrentMetadataFetchesPerQuery = 100
 )
 
 var (
@@ -739,7 +745,14 @@ func (q *blocksStoreQuerier) fetchLabelNamesFromStore(
 		warnings      = storage.Warnings(nil)
 		queriedBlocks = []ulid.ULID(nil)
 		spanLog       = spanlogger.FromContext(ctx)
+		queryLimiter  = limiter.QueryLimiterFromContextWithFallback(ctx)
 	)
+
+	// Cap the number of in-flight store-gateway metadata requests so we don't
+	// fan out to an unbounded number of store-gateways concurrently, each of
+	// which can return a worst-case gRPC-sized response (see pkg/querier/
+	// store_gateway_client.go MaxRecvMsgSize).
+	g.SetLimit(maxConcurrentMetadataFetchesPerQuery)
 
 	// Concurrently fetch series from all clients.
 	for c, blockIDs := range clients {
@@ -760,6 +773,14 @@ func (q *blocksStoreQuerier) fetchLabelNamesFromStore(
 					return nil
 				}
 				return errors.Wrapf(err, "failed to fetch series from %s", c.RemoteAddress())
+			}
+
+			// Account every response against the per-query data-bytes budget
+			// before buffering it, mirroring fetchSeriesFromStores. The limiter
+			// is kept on the context so the accumulated byte count is preserved
+			// across consistency-check retry attempts.
+			if dataBytesLimitErr := queryLimiter.AddDataBytes(namesResp.Size()); dataBytesLimitErr != nil {
+				return validation.LimitError(dataBytesLimitErr.Error())
 			}
 
 			myQueriedBlocks := []ulid.ULID(nil)
@@ -820,7 +841,14 @@ func (q *blocksStoreQuerier) fetchLabelValuesFromStore(
 		warnings      = storage.Warnings(nil)
 		queriedBlocks = []ulid.ULID(nil)
 		spanLog       = spanlogger.FromContext(ctx)
+		queryLimiter  = limiter.QueryLimiterFromContextWithFallback(ctx)
 	)
+
+	// Cap the number of in-flight store-gateway metadata requests so we don't
+	// fan out to an unbounded number of store-gateways concurrently, each of
+	// which can return a worst-case gRPC-sized response (see pkg/querier/
+	// store_gateway_client.go MaxRecvMsgSize).
+	g.SetLimit(maxConcurrentMetadataFetchesPerQuery)
 
 	// Concurrently fetch series from all clients.
 	for c, blockIDs := range clients {
@@ -841,6 +869,14 @@ func (q *blocksStoreQuerier) fetchLabelValuesFromStore(
 					return nil
 				}
 				return errors.Wrapf(err, "failed to fetch series from %s", c.RemoteAddress())
+			}
+
+			// Account every response against the per-query data-bytes budget
+			// before buffering it, mirroring fetchSeriesFromStores. The limiter
+			// is kept on the context so the accumulated byte count is preserved
+			// across consistency-check retry attempts.
+			if dataBytesLimitErr := queryLimiter.AddDataBytes(valuesResp.Size()); dataBytesLimitErr != nil {
+				return validation.LimitError(dataBytesLimitErr.Error())
 			}
 
 			myQueriedBlocks := []ulid.ULID(nil)
