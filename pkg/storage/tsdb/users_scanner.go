@@ -47,10 +47,16 @@ func (s *UsersScanner) ScanUsers(ctx context.Context) (users, markedForDeletion 
 	for ix := 0; ix < len(users); {
 		userID := users[ix]
 
-		// Check if it's owned by this instance.
+		// Check if it's owned by this instance. If the ownership check errors we
+		// fail closed and drop the tenant from this scan: downstream consumers
+		// (notably the blocks cleaner) perform destructive work on the returned
+		// tenants and rely on the single-owner guarantee, so a tenant whose
+		// ownership we cannot establish must not be treated as owned.
 		owned, err := s.isOwned(userID)
 		if err != nil {
-			level.Warn(s.logger).Log("msg", "unable to check if user is owned by this shard", "user", userID, "err", err)
+			level.Warn(s.logger).Log("msg", "unable to check if user is owned by this shard, skipping user", "user", userID, "err", err)
+			users = append(users[:ix], users[ix+1:]...)
+			continue
 		} else if !owned {
 			users = append(users[:ix], users[ix+1:]...)
 			continue

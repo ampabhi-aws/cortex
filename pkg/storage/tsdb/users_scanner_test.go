@@ -31,7 +31,25 @@ func TestUsersScanner_ScanUsers_ShouldReturnedOwnedUsersOnly(t *testing.T) {
 
 }
 
-func TestUsersScanner_ScanUsers_ShouldReturnUsersForWhichOwnerCheckOrTenantDeletionCheckFailed(t *testing.T) {
+func TestUsersScanner_ScanUsers_ShouldSkipUsersForWhichOwnerCheckFailed(t *testing.T) {
+	bucketClient := &bucket.ClientMock{}
+	bucketClient.MockIter("", []string{"user-1", "user-2"}, nil)
+
+	isOwned := func(userID string) (bool, error) {
+		return false, errors.New("failed to check if user is owned")
+	}
+
+	s := NewUsersScanner(bucketClient, isOwned, log.NewNopLogger())
+	actual, deleted, err := s.ScanUsers(context.Background())
+	require.NoError(t, err)
+	// Fail-closed: when the ownership check errors, the tenant must be dropped
+	// so destructive consumers (blocks cleaner) do not operate on a tenant
+	// whose single-owner guarantee could not be established.
+	assert.Empty(t, actual)
+	assert.Empty(t, deleted)
+}
+
+func TestUsersScanner_ScanUsers_ShouldReturnUsersForWhichTenantDeletionCheckFailed(t *testing.T) {
 	expected := []string{"user-1", "user-2"}
 
 	bucketClient := &bucket.ClientMock{}
@@ -40,7 +58,7 @@ func TestUsersScanner_ScanUsers_ShouldReturnUsersForWhichOwnerCheckOrTenantDelet
 	bucketClient.MockExists(path.Join("user-2", TenantDeletionMarkPath), false, errors.New("fail"))
 
 	isOwned := func(userID string) (bool, error) {
-		return false, errors.New("failed to check if user is owned")
+		return true, nil
 	}
 
 	s := NewUsersScanner(bucketClient, isOwned, log.NewNopLogger())
