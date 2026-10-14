@@ -222,23 +222,21 @@ Displays a web page with the distributor hash ring status, including the state, 
 
 ```
 GET /distributor/all_user_stats
-
-# Legacy
-GET /all_user_stats
 ```
 
 Displays a web page with per-tenant statistics updated in realtime, including the total number of active series across all ingesters and the current ingestion rate (samples / sec).
+
+This is an administrative endpoint: it enumerates **every** tenant's identifier, active series count and ingestion rate (API, rule and total) regardless of any `X-Scope-OrgID` header on the request. Cortex does not implement authentication itself (see the [authentication and authorisation](../guides/authentication-and-authorisation.md) guide), so the operator **must** restrict access to this path at the reverse proxy / network layer; it must not be exposed to tenant traffic. The legacy root alias `GET /all_user_stats` has been removed; use the `/distributor/`-prefixed path.
 
 ### HA tracker status
 
 ```
 GET /distributor/ha_tracker
-
-# Legacy
-GET /ha-tracker
 ```
 
 Displays a web page with the current status of the HA tracker, including the elected replica for each Prometheus HA cluster.
+
+This is an administrative endpoint: it lists the elected replica for **every** tenant's HA cluster(s), including the tenant identifier, cluster name and replica label value, regardless of any `X-Scope-OrgID` header on the request. As with the tenants-stats page, the operator **must** restrict access to this path at the reverse proxy / network layer; it must not be exposed to tenant traffic. The legacy root alias `GET /ha-tracker` has been removed; use the `/distributor/`-prefixed path.
 
 
 ## Ingester
