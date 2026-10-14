@@ -83,6 +83,23 @@ func (t *SingleResolver) TenantID(ctx context.Context) (string, error) {
 		return "", err
 	}
 
+	// Reject empty tenant IDs. The weaveworks middleware already rejects
+	// a missing header, but a context injected directly (e.g. internally)
+	// may carry an empty string.
+	if id == "" {
+		return "", user.ErrNoOrgID
+	}
+
+	// Enforce the documented character allow-list (which also guarantees
+	// valid UTF-8) and the 150-byte length cap on every tenant ID,
+	// regardless of which resolver is active. This prevents tenant IDs
+	// that would be ambiguous in composite cache keys (e.g. containing
+	// ':') or that would panic Prometheus label-value validation
+	// (non-UTF-8 bytes) from flowing into shared components.
+	if err := ValidTenantID(id); err != nil {
+		return "", err
+	}
+
 	if containsUnsafePathSegments(id) {
 		return "", errInvalidTenantID
 	}
@@ -127,6 +144,13 @@ func (t *MultiResolver) TenantIDs(ctx context.Context) ([]string, error) {
 	orgID, err := user.ExtractOrgID(ctx)
 	if err != nil {
 		return nil, err
+	}
+
+	// Reject an empty header value explicitly. The weaveworks middleware
+	// returns ErrNoOrgID on a missing header, but a context injected
+	// directly may still carry an empty string.
+	if orgID == "" {
+		return nil, user.ErrNoOrgID
 	}
 
 	orgIDs := strings.Split(orgID, tenantIDsLabelSeparator)
