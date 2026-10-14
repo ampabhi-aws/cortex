@@ -3,6 +3,7 @@ package configdb
 import (
 	"context"
 	"errors"
+	"sync"
 
 	"github.com/cortexproject/cortex/pkg/alertmanager/alertspb"
 	"github.com/cortexproject/cortex/pkg/configs/client"
@@ -21,6 +22,12 @@ var (
 // Store is a concrete implementation of RuleStore that sources rules from the config service
 type Store struct {
 	configClient client.Client
+
+	// mtx guards since and alertConfigs. reloadConfigs is called from many
+	// goroutines (the multitenant alertmanager sync loop and the HTTP API
+	// fan-out), so concurrent map writes to alertConfigs would otherwise
+	// trigger an unrecoverable Go runtime fatal error.
+	mtx          sync.Mutex
 	since        userconfig.ID
 	alertConfigs map[string]alertspb.AlertConfigDesc
 }
@@ -114,6 +121,9 @@ func (c *Store) DeleteFullState(ctx context.Context, user string) error {
 }
 
 func (c *Store) reloadConfigs(ctx context.Context) (map[string]alertspb.AlertConfigDesc, error) {
+	c.mtx.Lock()
+	defer c.mtx.Unlock()
+
 	configs, err := c.configClient.GetAlerts(ctx, c.since)
 	if err != nil {
 		return nil, err
@@ -142,5 +152,11 @@ func (c *Store) reloadConfigs(ctx context.Context) (map[string]alertspb.AlertCon
 
 	c.since = configs.GetLatestConfigID()
 
-	return c.alertConfigs, nil
+	// Return a defensive shallow copy of the cached map so callers can safely
+	// read and iterate without racing other reloads.
+	out := make(map[string]alertspb.AlertConfigDesc, len(c.alertConfigs))
+	for user, cfg := range c.alertConfigs {
+		out[user] = cfg
+	}
+	return out, nil
 }
