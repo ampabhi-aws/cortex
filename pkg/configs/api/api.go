@@ -10,6 +10,7 @@ import (
 	"io"
 	"mime"
 	"net/http"
+	"reflect"
 	"strconv"
 	"strings"
 
@@ -19,6 +20,7 @@ import (
 	"github.com/gorilla/mux"
 	amconfig "github.com/prometheus/alertmanager/config"
 	amtemplate "github.com/prometheus/alertmanager/template"
+	commoncfg "github.com/prometheus/common/config"
 
 	"github.com/cortexproject/cortex/pkg/configs/db"
 	"github.com/cortexproject/cortex/pkg/configs/userconfig"
@@ -30,6 +32,12 @@ import (
 var (
 	ErrEmailNotificationsAreDisabled   = errors.New("email notifications are disabled")
 	ErrWebhookNotificationsAreDisabled = errors.New("webhook notifications are disabled")
+
+	errPasswordFileNotAllowed        = errors.New("setting password_file, bearer_token_file and credentials_file is not allowed")
+	errOAuth2SecretFileNotAllowed    = errors.New("setting OAuth2 client_secret_file is not allowed")
+	errTLSFileNotAllowed             = errors.New("setting TLS ca_file, cert_file and key_file is not allowed")
+	errSlackAPIURLFileNotAllowed     = errors.New("setting Slack api_url_file and global slack_api_url_file is not allowed")
+	errVictorOpsAPIKeyFileNotAllowed = errors.New("setting VictorOps api_key_file is not allowed")
 )
 
 // Config configures Configs API
@@ -236,6 +244,113 @@ func validateAlertmanagerConfig(cfg string, noCfg NotificationsConfig) error {
 		}
 		if noCfg.DisableWebHook && len(recv.WebhookConfigs) > 0 {
 			return ErrWebhookNotificationsAreDisabled
+		}
+	}
+
+	// Reject tenant-specified server-side file paths (bearer_token_file,
+	// password_file, credentials_file, ca_file, cert_file, key_file,
+	// slack_api_url_file, api_url_file, api_key_file, oauth2.client_secret_file).
+	// A tenant that could set any of these would coerce the Alertmanager into
+	// reading arbitrary server-local files and exfiltrating them through
+	// notification HTTP headers (CVE-2021-31232 class). The HTTP configuration
+	// API in pkg/alertmanager/api.go already rejects these settings; the
+	// configdb-backed path must enforce the same policy before persisting.
+	if err := validateAlertmanagerConfigNoFilePaths(amCfg); err != nil {
+		return err
+	}
+
+	return nil
+}
+
+// validateAlertmanagerConfigNoFilePaths recursively scans the loaded
+// alertmanager config looking for data types that may reference server-side
+// files and rejects any tenant-provided file path. This mirrors the policy
+// implemented by pkg/alertmanager.validateAlertmanagerConfig so that
+// configurations persisted through the deprecated configs service cannot be
+// used to exfiltrate local files via notification HTTP clients.
+func validateAlertmanagerConfigNoFilePaths(cfg interface{}) error {
+	v := reflect.ValueOf(cfg)
+	if !v.IsValid() || v.IsZero() {
+		return nil
+	}
+
+	if v.Kind() == reflect.Ptr {
+		v = v.Elem()
+	}
+	t := v.Type()
+
+	switch t {
+	case reflect.TypeOf(amconfig.GlobalConfig{}):
+		g := v.Interface().(amconfig.GlobalConfig)
+		if g.SlackAPIURLFile != "" {
+			return errSlackAPIURLFileNotAllowed
+		}
+
+	case reflect.TypeOf(commoncfg.HTTPClientConfig{}):
+		h := v.Interface().(commoncfg.HTTPClientConfig)
+		if h.BasicAuth != nil && h.BasicAuth.PasswordFile != "" {
+			return errPasswordFileNotAllowed
+		}
+		if h.Authorization != nil && h.Authorization.CredentialsFile != "" {
+			return errPasswordFileNotAllowed
+		}
+		if h.BearerTokenFile != "" {
+			return errPasswordFileNotAllowed
+		}
+		if h.OAuth2 != nil && h.OAuth2.ClientSecretFile != "" {
+			return errOAuth2SecretFileNotAllowed
+		}
+		if h.TLSConfig.CAFile != "" || h.TLSConfig.CertFile != "" || h.TLSConfig.KeyFile != "" {
+			return errTLSFileNotAllowed
+		}
+
+	case reflect.TypeOf(commoncfg.TLSConfig{}):
+		tls := v.Interface().(commoncfg.TLSConfig)
+		if tls.CAFile != "" || tls.CertFile != "" || tls.KeyFile != "" {
+			return errTLSFileNotAllowed
+		}
+
+	case reflect.TypeOf(amconfig.SlackConfig{}):
+		s := v.Interface().(amconfig.SlackConfig)
+		if s.APIURLFile != "" {
+			return errSlackAPIURLFileNotAllowed
+		}
+
+	case reflect.TypeOf(amconfig.VictorOpsConfig{}):
+		vo := v.Interface().(amconfig.VictorOpsConfig)
+		if vo.APIKeyFile != "" {
+			return errVictorOpsAPIKeyFileNotAllowed
+		}
+	}
+
+	switch t.Kind() {
+	case reflect.Struct:
+		for i := 0; i < t.NumField(); i++ {
+			field := t.Field(i)
+			fieldValue := v.FieldByIndex(field.Index)
+			if fieldValue.CanInterface() {
+				if err := validateAlertmanagerConfigNoFilePaths(fieldValue.Interface()); err != nil {
+					return err
+				}
+			}
+		}
+	case reflect.Slice, reflect.Array:
+		for i := 0; i < v.Len(); i++ {
+			fieldValue := v.Index(i)
+			if fieldValue.CanInterface() {
+				if err := validateAlertmanagerConfigNoFilePaths(fieldValue.Interface()); err != nil {
+					return err
+				}
+			}
+		}
+	case reflect.Map:
+		for _, key := range v.MapKeys() {
+			fieldValue := v.MapIndex(key)
+			if fieldValue.CanInterface() {
+				if err := validateAlertmanagerConfigNoFilePaths(fieldValue.Interface()); err != nil {
+					return err
+				}
+			}
 		}
 	}
 
