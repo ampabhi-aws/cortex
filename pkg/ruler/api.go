@@ -149,7 +149,12 @@ func (a *API) PrometheusRules(w http.ResponseWriter, req *http.Request) {
 	rgs, err := a.ruler.GetRules(req.Context())
 
 	if err != nil {
-		respondError(logger, w, err.Error())
+		// Log the detailed error (which may contain internal ruler instance
+		// addresses and gRPC causes) server-side, but return a generic
+		// message to the tenant to avoid leaking internal topology details
+		// across the tenant API boundary.
+		level.Error(logger).Log("msg", "error retrieving rules", "err", err)
+		respondError(logger, w, "unable to retrieve rules")
 		return
 	}
 
@@ -241,7 +246,12 @@ func (a *API) PrometheusAlerts(w http.ResponseWriter, req *http.Request) {
 	rgs, err := a.ruler.GetRules(req.Context())
 
 	if err != nil {
-		respondError(logger, w, err.Error())
+		// Log the detailed error (which may contain internal ruler instance
+		// addresses and gRPC causes) server-side, but return a generic
+		// message to the tenant to avoid leaking internal topology details
+		// across the tenant API boundary.
+		level.Error(logger).Log("msg", "error retrieving rules", "err", err)
+		respondError(logger, w, "unable to retrieve alerts")
 		return
 	}
 
