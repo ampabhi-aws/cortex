@@ -13,8 +13,13 @@ type PrefixedBucketClient struct {
 	prefix string
 }
 
-// NewPrefixedBucketClient returns a new PrefixedBucketClient.
+// NewPrefixedBucketClient returns a new PrefixedBucketClient. It panics if
+// prefix is empty as a defense-in-depth measure: an empty prefix would
+// collapse per-tenant namespaces onto the shared bucket root.
 func NewPrefixedBucketClient(bucket objstore.Bucket, prefix string) *PrefixedBucketClient {
+	if prefix == "" {
+		panic("bucket: NewPrefixedBucketClient called with empty prefix")
+	}
 	return &PrefixedBucketClient{
 		bucket: bucket,
 		prefix: prefix,
