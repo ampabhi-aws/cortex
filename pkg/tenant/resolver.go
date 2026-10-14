@@ -62,12 +62,13 @@ func NewSingleResolver() *SingleResolver {
 type SingleResolver struct {
 }
 
-// containsUnsafePathSegments will return true if the string is a directory
-// reference like `.` and `..` or if any path separator character like `/` and
-// `\` can be found.
+// containsUnsafePathSegments will return true if the string is empty, is a
+// directory reference like `.` and `..` or if any path separator character
+// like `/` and `\` can be found. An empty tenant ID is unsafe because
+// filepath.Join(dir, "") collapses to the shared parent directory.
 func containsUnsafePathSegments(id string) bool {
-	// handle the relative reference to current and parent path.
-	if id == "." || id == ".." {
+	// handle the empty string and the relative reference to current and parent path.
+	if id == "" || id == "." || id == ".." {
 		return true
 	}
 
