@@ -191,7 +191,7 @@ func TestRuler_Create(t *testing.T) {
 		{
 			name: "with no rule group name",
 			input: `
-interval: 15s
+interval: 1m
 rules:
 - record: up_rule
   expr: up
@@ -203,7 +203,7 @@ rules:
 			name: "with no rules",
 			input: `
 name: rg_name
-interval: 15s
+interval: 1m
 `,
 			status: 400,
 			err:    errors.New("invalid rules config: rule group 'rg_name' has no rules"),
@@ -213,7 +213,7 @@ interval: 15s
 			status: 202,
 			input: `
 name: test
-interval: 15s
+interval: 1m
 rules:
 - record: up_rule
   expr: up{}
@@ -225,7 +225,7 @@ rules:
   labels:
     test: test
 `,
-			output: "name: test\ninterval: 15s\nrules:\n    - record: up_rule\n      expr: up{}\n    - alert: up_alert\n      expr: sum(up{}) > 1\n      for: 30s\n      labels:\n        test: test\n      annotations:\n        test: test\n",
+			output: "name: test\ninterval: 1m\nrules:\n    - record: up_rule\n      expr: up{}\n    - alert: up_alert\n      expr: sum(up{}) > 1\n      for: 30s\n      labels:\n        test: test\n      annotations:\n        test: test\n",
 		},
 	}
 
@@ -317,7 +317,7 @@ func TestRuler_LimitsPerGroup(t *testing.T) {
 			status: 400,
 			input: `
 name: test
-interval: 15s
+interval: 1m
 rules:
 - record: up_rule
   expr: up{}
@@ -371,7 +371,7 @@ func TestRuler_RulerGroupLimits(t *testing.T) {
 			status: 202,
 			input: `
 name: test_first_group_will_succeed
-interval: 15s
+interval: 1m
 rules:
 - record: up_rule
   expr: up{}
@@ -383,7 +383,7 @@ rules:
 			status: 400,
 			input: `
 name: test_second_group_will_fail
-interval: 15s
+interval: 1m
 rules:
 - record: up_rule
   expr: up{}
