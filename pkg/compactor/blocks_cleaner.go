@@ -261,10 +261,18 @@ func (c *BlocksCleaner) deleteUserMarkedForDeletion(ctx context.Context, userID 
 		return errors.Wrap(err, "cannot find tenant deletion mark anymore")
 	}
 
-	// If we have just deleted some blocks, update "finished" time. Also update "finished" time if it wasn't set yet, but there are no blocks.
-	// Note: this UPDATES the tenant deletion mark. Components that use caching bucket will NOT SEE this update,
-	// but that is fine -- they only check whether tenant deletion marker exists or not.
-	if deletedBlocks > 0 || mark.FinishedTime == 0 {
+	// Update "finished" time once, when it has not been set yet. We used to
+	// also reset "finished" time on every cleanup cycle that deleted blocks
+	// (so that the tenant cleanup delay effectively restarted while the
+	// tenant kept ingesting), but that made the deleting state self-renewing
+	// and unbounded for a tenant whose remote-write agents kept producing
+	// new blocks. Setting the timer once bounds the deleting state to at
+	// most TenantCleanupDelay after the first successful deletion pass.
+	//
+	// Note: this UPDATES the tenant deletion mark. Components that use
+	// caching bucket will NOT SEE this update, but that is fine -- they only
+	// check whether tenant deletion marker exists or not.
+	if mark.FinishedTime == 0 {
 		level.Info(userLogger).Log("msg", "updating finished time in tenant deletion mark")
 		mark.FinishedTime = time.Now().Unix()
 		return errors.Wrap(cortex_tsdb.WriteTenantDeletionMark(ctx, c.bucketClient, userID, c.cfgProvider, mark), "failed to update tenant deletion mark")
