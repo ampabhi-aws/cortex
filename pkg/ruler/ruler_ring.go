@@ -35,6 +35,12 @@ type RingConfig struct {
 	HeartbeatPeriod  time.Duration `yaml:"heartbeat_period"`
 	HeartbeatTimeout time.Duration `yaml:"heartbeat_timeout"`
 
+	// TokenSalt is a cluster-wide shared secret mixed into the hash used to
+	// pick which ruler replica owns a rule group. All rulers in the same
+	// cluster must be configured with the same value. When left empty the
+	// hash is computed exactly as in previous versions (backwards compatible).
+	TokenSalt string `yaml:"token_salt" doc:"hidden"`
+
 	// Instance details
 	InstanceID             string   `yaml:"instance_id" doc:"hidden"`
 	InstanceInterfaceNames []string `yaml:"instance_interface_names"`
@@ -60,6 +66,7 @@ func (cfg *RingConfig) RegisterFlags(f *flag.FlagSet) {
 	cfg.KVStore.RegisterFlagsWithPrefix("ruler.ring.", "rulers/", f)
 	f.DurationVar(&cfg.HeartbeatPeriod, "ruler.ring.heartbeat-period", 5*time.Second, "Period at which to heartbeat to the ring. 0 = disabled.")
 	f.DurationVar(&cfg.HeartbeatTimeout, "ruler.ring.heartbeat-timeout", time.Minute, "The heartbeat timeout after which rulers are considered unhealthy within the ring. 0 = never (timeout disabled).")
+	f.StringVar(&cfg.TokenSalt, "ruler.ring.token-salt", "", "Cluster-wide shared secret mixed into the hash used to assign rule groups to rulers. Must be identical on every ruler in the cluster. When empty, rule-group placement is derived from tenant-supplied namespace/group names alone, which lets a tenant precompute the hash offline and concentrate its groups on a chosen replica.")
 
 	// Instance flags
 	cfg.InstanceInterfaceNames = []string{"eth0", "en0"}
