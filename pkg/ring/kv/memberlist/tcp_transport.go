@@ -74,7 +74,7 @@ func (cfg *TCPTransportConfig) RegisterFlagsWithPrefix(f *flag.FlagSet, prefix s
 	f.DurationVar(&cfg.PacketWriteTimeout, prefix+"memberlist.packet-write-timeout", 5*time.Second, "Timeout for writing 'packet' data.")
 	f.BoolVar(&cfg.TransportDebug, prefix+"memberlist.transport-debug", false, "Log debug transport messages. Note: global log.level must be at debug level as well.")
 
-	f.BoolVar(&cfg.TLSEnabled, prefix+"memberlist.tls-enabled", false, "Enable TLS on the memberlist transport layer.")
+	f.BoolVar(&cfg.TLSEnabled, prefix+"memberlist.tls-enabled", false, "Enable TLS on the memberlist transport layer. When enabled, the gossip listener requires mutual TLS: peers must present a client certificate signed by the CA configured via -memberlist.tls-ca-path. The tls_insecure_skip_verify and tls_server_name options only affect outgoing (dial) connections and are ignored on the server side. The gossip port (default 7946) MUST also be network-isolated to peers in the Cortex cluster.")
 	cfg.TLS.RegisterFlagsWithPrefix(prefix+"memberlist", f)
 }
 
@@ -88,7 +88,12 @@ type TCPTransport struct {
 	connCh       chan net.Conn
 	wg           sync.WaitGroup
 	tcpListeners []net.Listener
-	tlsConfig    *tls.Config
+	// tlsConfig is the *client*-side TLS config, used when dialing peers.
+	tlsConfig *tls.Config
+	// serverTLSConfig is the server-side TLS config used when accepting peer
+	// connections. It requires and verifies peer client certificates against
+	// the configured CA so that only authenticated cluster members can gossip.
+	serverTLSConfig *tls.Config
 
 	shutdown atomic.Int32
 
@@ -131,6 +136,17 @@ func NewTCPTransport(config TCPTransportConfig, logger log.Logger) (*TCPTranspor
 		if err != nil {
 			return nil, errors.Wrap(err, "unable to create TLS config")
 		}
+		// Build a dedicated server-side TLS config that requires mutual TLS,
+		// so that peers accepted by the gossip listener MUST present a client
+		// certificate signed by the configured CA. The client-only tls.Config
+		// produced by GetTLSConfig() (used for dialing peers) MUST NOT be
+		// reused for the listener, because it leaves ClientAuth at the Go
+		// zero value (tls.NoClientCert) and ignores RootCAs on the server
+		// side, letting any host open the gossip port without authentication.
+		t.serverTLSConfig, err = config.TLS.GetServerTLSConfig()
+		if err != nil {
+			return nil, errors.Wrap(err, "unable to create server TLS config for memberlist transport")
+		}
 	}
 
 	t.registerMetrics(config.MetricsRegisterer)
@@ -151,7 +167,7 @@ func NewTCPTransport(config TCPTransportConfig, logger log.Logger) (*TCPTranspor
 
 		var tcpLn net.Listener
 		if config.TLSEnabled {
-			tcpLn, err = tls.Listen("tcp", tcpAddr.String(), t.tlsConfig)
+			tcpLn, err = tls.Listen("tcp", tcpAddr.String(), t.serverTLSConfig)
 			if err != nil {
 				return nil, errors.Wrapf(err, "failed to start TLS TCP listener on %q port %d", addr, port)
 			}
@@ -301,7 +317,8 @@ func (t *TCPTransport) handleConnection(conn net.Conn) {
 
 		if !bytes.Equal(receivedDigest, expectedDigest[:]) {
 			t.receivedPacketsErrors.Inc()
-			level.Warn(t.logger).Log("msg", "packet digest mismatch", "expected", fmt.Sprintf("%x", expectedDigest), "received", fmt.Sprintf("%x", receivedDigest), "data_length", len(buf), "remote", conn.RemoteAddr())
+			level.Warn(t.logger).Log("msg", "packet digest mismatch, dropping packet", "expected", fmt.Sprintf("%x", expectedDigest), "received", fmt.Sprintf("%x", receivedDigest), "data_length", len(buf), "remote", conn.RemoteAddr())
+			return
 		}
 
 		t.debugLog().Log("msg", "Received packet", "addr", addr(addrBuf), "size", len(buf), "hash", fmt.Sprintf("%x", receivedDigest))
