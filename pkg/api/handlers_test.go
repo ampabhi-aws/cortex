@@ -189,3 +189,109 @@ func TestConfigOverrideHandler(t *testing.T) {
 	assert.NoError(t, err)
 	assert.Equal(t, []byte("config"), body)
 }
+
+func TestRedactSensitiveYAML(t *testing.T) {
+	tests := map[string]struct {
+		in       string
+		expected string
+	}{
+		"swift password redacted": {
+			in:       "password: hunter2\n",
+			expected: "password: ********\n",
+		},
+		"etcd nested password redacted": {
+			in:       "kvstore:\n  etcd:\n    password: etcd-secret\n",
+			expected: "kvstore:\n  etcd:\n    password: ********\n",
+		},
+		"basic_auth_password redacted": {
+			in:       "basic_auth_password: s3cret\n",
+			expected: "basic_auth_password: ********\n",
+		},
+		"configs.database.uri DSN redacted": {
+			in:       "uri: postgres://user:password@host/db\n",
+			expected: "uri: ********\n",
+		},
+		"s3 access_key_id redacted": {
+			in:       "access_key_id: AKIAIOSFODNN7EXAMPLE\n",
+			expected: "access_key_id: ********\n",
+		},
+		"double-quoted access_key_id redacted": {
+			in:       "access_key_id: \"abc\"\n",
+			expected: "access_key_id: ********\n",
+		},
+		"already masked value preserved": {
+			in:       "password: '********'\n",
+			expected: "password: '********'\n",
+		},
+		"empty value preserved": {
+			in:       "password:\n",
+			expected: "password:\n",
+		},
+		"null value preserved": {
+			in:       "password: null\n",
+			expected: "password: null\n",
+		},
+		"non-sensitive fields untouched": {
+			in:       "username: alice\nendpoint: localhost:9200\nnum_tokens: 128\ntokens_file_path: /var/tokens\n",
+			expected: "username: alice\nendpoint: localhost:9200\nnum_tokens: 128\ntokens_file_path: /var/tokens\n",
+		},
+		"idempotent on already-redacted output": {
+			in:       "password: ********\naccess_key_id: ********\n",
+			expected: "password: ********\naccess_key_id: ********\n",
+		},
+		"block-start value left untouched": {
+			in:       "credentials: {}\n",
+			expected: "credentials: {}\n",
+		},
+	}
+
+	for name, tc := range tests {
+		tc := tc
+		t.Run(name, func(t *testing.T) {
+			got := string(redactSensitiveYAML([]byte(tc.in)))
+			require.Equal(t, tc.expected, got)
+		})
+	}
+}
+
+func TestDefaultConfigHandlerRedacts(t *testing.T) {
+	type inner struct {
+		Password      string `yaml:"password"`
+		Username      string `yaml:"username"`
+		TokensFile    string `yaml:"tokens_file_path"`
+		NumTokens     int    `yaml:"num_tokens"`
+	}
+	type secretConfig struct {
+		URI         string `yaml:"uri"`
+		AccessKeyID string `yaml:"access_key_id"`
+		KVStore     inner  `yaml:"kvstore"`
+	}
+	actual := &secretConfig{
+		URI:         "postgres://user:secret@host/db",
+		AccessKeyID: "AKIAIOSFODNN7EXAMPLE",
+		KVStore: inner{
+			Password:   "hunter2",
+			Username:   "alice",
+			TokensFile: "/var/tokens",
+			NumTokens:  128,
+		},
+	}
+	req := httptest.NewRequest("GET", "http://test.com/config", nil)
+	w := httptest.NewRecorder()
+
+	DefaultConfigHandler(actual, actual)(w, req)
+	resp := w.Result()
+	require.Equal(t, http.StatusOK, resp.StatusCode)
+	body, err := io.ReadAll(resp.Body)
+	require.NoError(t, err)
+
+	out := string(body)
+	assert.NotContains(t, out, "secret")
+	assert.NotContains(t, out, "AKIAIOSFODNN7EXAMPLE")
+	assert.NotContains(t, out, "hunter2")
+	assert.Contains(t, out, "********")
+	// Non-sensitive fields must survive.
+	assert.Contains(t, out, "alice")
+	assert.Contains(t, out, "/var/tokens")
+	assert.Contains(t, out, "128")
+}

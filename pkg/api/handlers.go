@@ -1,6 +1,7 @@
 package api
 
 import (
+	"bytes"
 	"context"
 	"html/template"
 	"net/http"
@@ -21,6 +22,7 @@ import (
 	v1 "github.com/prometheus/prometheus/web/api/v1"
 	"github.com/weaveworks/common/instrument"
 	"github.com/weaveworks/common/middleware"
+	yaml "gopkg.in/yaml.v2"
 
 	"github.com/cortexproject/cortex/pkg/purger"
 	"github.com/cortexproject/cortex/pkg/querier"
@@ -117,6 +119,77 @@ func (cfg *Config) configHandler(actualCfg interface{}, defaultCfg interface{}) 
 	return DefaultConfigHandler(actualCfg, defaultCfg)
 }
 
+// configRedactionPattern matches YAML scalar lines whose key name ends in a
+// credential-shaped suffix (password, secret, token, credentials, dsn,
+// access_key_id, api_key, bearer_token) or is exactly "uri" and whose value
+// is a non-empty inline scalar. Keys are matched case-insensitively against
+// snake_case YAML output. Values that are empty or already masked
+// (`********` as emitted by flagext.Secret.MarshalYAML) are left untouched
+// so the redaction pass is idempotent.
+var configRedactionPattern = regexp.MustCompile(
+	`(?mi)^(?P<prefix>\s*)(?P<key>(?:[a-z0-9_]+_)?(?:password|secret|credentials|credential|dsn|access_key_id|api_key|bearer_token|auth_token)|token|uri)(?P<sep>\s*:\s*)(?P<value>.+?)\s*$`,
+)
+
+// redactSensitiveYAML performs a defence-in-depth redaction pass over
+// YAML-marshalled configuration. It is a safety net on top of using
+// flagext.Secret for individual fields: it masks any inline scalar value
+// whose key name looks credential-shaped (see configRedactionPattern) that
+// has somehow been left as a plain string. Already-empty values and already
+// masked (`********`) values are left untouched.
+func redactSensitiveYAML(in []byte) []byte {
+	return configRedactionPattern.ReplaceAllFunc(in, func(line []byte) []byte {
+		sub := configRedactionPattern.FindSubmatch(line)
+		if len(sub) < 5 {
+			return line
+		}
+		value := bytes.TrimSpace(sub[4])
+		// Skip empty values, YAML null, inline aliases, inline block starts,
+		// quoted-empty values and the standard flagext.Secret mask. These are
+		// either non-secret or already masked, and preserving them keeps the
+		// pass idempotent.
+		unquoted := value
+		if len(unquoted) >= 2 {
+			first, last := unquoted[0], unquoted[len(unquoted)-1]
+			if (first == '"' && last == '"') || (first == '\'' && last == '\'') {
+				unquoted = unquoted[1 : len(unquoted)-1]
+			}
+		}
+		if len(unquoted) == 0 ||
+			bytes.Equal(unquoted, []byte("********")) ||
+			bytes.Equal(unquoted, []byte("null")) ||
+			bytes.Equal(unquoted, []byte("~")) {
+			return line
+		}
+		// Values that start with YAML flow / alias / anchor indicators are
+		// structured (maps, sequences, aliases, anchors); leave them to any
+		// nested matches instead of mangling the YAML.
+		switch value[0] {
+		case '{', '[', '&', '*':
+			return line
+		}
+		out := make([]byte, 0, len(sub[1])+len(sub[2])+len(sub[3])+len("********"))
+		out = append(out, sub[1]...)
+		out = append(out, sub[2]...)
+		out = append(out, sub[3]...)
+		out = append(out, []byte("********")...)
+		return out
+	})
+}
+
+// writeRedactedYAMLResponse marshals v to YAML, runs the redaction pass and
+// writes the result as the HTTP response, matching util.WriteYAMLResponse's
+// headers and error handling.
+func writeRedactedYAMLResponse(w http.ResponseWriter, v interface{}) {
+	data, err := yaml.Marshal(v)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	data = redactSensitiveYAML(data)
+	w.Header().Set("Content-Type", "text/plain; charset=utf-8")
+	_, _ = w.Write(data)
+}
+
 func DefaultConfigHandler(actualCfg interface{}, defaultCfg interface{}) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		var output interface{}
@@ -147,7 +220,7 @@ func DefaultConfigHandler(actualCfg interface{}, defaultCfg interface{}) http.Ha
 			output = actualCfg
 		}
 
-		util.WriteYAMLResponse(w, output)
+		writeRedactedYAMLResponse(w, output)
 	}
 }
 
