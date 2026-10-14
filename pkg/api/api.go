@@ -416,5 +416,8 @@ func (a *API) RegisterServiceMapHandler(handler http.Handler) {
 
 func (a *API) RegisterMemberlistKV(handler http.Handler) {
 	a.indexPage.AddLink(SectionAdminEndpoints, "/memberlist", "Memberlist Status")
-	a.RegisterRoute("/memberlist", handler, false, "GET")
+	// POST is allowed so state-changing actions (e.g. deleteMessages) cannot be
+	// triggered via a GET (which is susceptible to CSRF and side-effect-free
+	// expectations); the handler enforces that mutations require POST.
+	a.RegisterRoute("/memberlist", handler, false, "GET", "POST")
 }
