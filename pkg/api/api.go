@@ -246,8 +246,13 @@ func (a *API) RegisterDistributor(d *distributor.Distributor, pushConfig distrib
 
 	// Legacy Routes
 	a.RegisterRoute(path.Join(a.cfg.LegacyHTTPPrefix, "/push"), push.Handler(pushConfig.MaxRecvMsgSize, a.sourceIPs, a.cfg.wrapDistributorPush(d)), true, "POST")
-	a.RegisterRoute("/all_user_stats", http.HandlerFunc(d.AllUserStatsHandler), false, "GET")
-	a.RegisterRoute("/ha-tracker", d.HATracker, false, "GET")
+	// Note: the legacy root-path aliases "/all_user_stats" and "/ha-tracker" have
+	// been removed because they are registered without authentication and both
+	// handlers enumerate state for every tenant (see AllUserStatsHandler and
+	// haTracker.ServeHTTP). The non-legacy admin paths /distributor/all_user_stats
+	// and /distributor/ha_tracker remain available and are listed in the Admin
+	// endpoints index: operators MUST block them at the reverse proxy because they
+	// disclose cross-tenant information.
 }
 
 // Ingester is defined as an interface to allow for alternative implementations
