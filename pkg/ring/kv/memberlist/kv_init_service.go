@@ -111,12 +111,22 @@ func (kvs *KVInitService) ServeHTTP(w http.ResponseWriter, req *http.Request) {
 
 	if err := req.ParseForm(); err == nil {
 		if req.Form[downloadKeyParam] != nil {
-			downloadKey(w, kv, kv.storeCopy(), req.Form[downloadKeyParam][0]) // Use first value, ignore the rest.
+			key := req.Form[downloadKeyParam][0] // Use first value, ignore the rest.
+			if isSensitiveKey(key) {
+				http.Error(w, "access to this key is not permitted via this endpoint", http.StatusForbidden)
+				return
+			}
+			downloadKey(w, kv, kv.storeCopy(), key)
 			return
 		}
 
 		if req.Form[viewKeyParam] != nil {
-			viewKey(w, kv.storeCopy(), req.Form[viewKeyParam][0], getFormat(req))
+			key := req.Form[viewKeyParam][0]
+			if isSensitiveKey(key) {
+				http.Error(w, "access to this key is not permitted via this endpoint", http.StatusForbidden)
+				return
+			}
+			viewKey(w, kv.storeCopy(), key, getFormat(req))
 			return
 		}
 
@@ -131,6 +141,10 @@ func (kvs *KVInitService) ServeHTTP(w http.ResponseWriter, req *http.Request) {
 
 			for _, m := range append(sent, received...) {
 				if m.ID == msgID {
+					if isSensitiveKey(m.Pair.Key) {
+						http.Error(w, "access to this key is not permitted via this endpoint", http.StatusForbidden)
+						return
+					}
 					viewMessage(w, kv, m, getFormat(req))
 					return
 				}
@@ -141,6 +155,13 @@ func (kvs *KVInitService) ServeHTTP(w http.ResponseWriter, req *http.Request) {
 		}
 
 		if len(req.Form[deleteMessagesParam]) > 0 && req.Form[deleteMessagesParam][0] == "true" {
+			// Require POST so a GET (or a cross-origin link/image preload) cannot
+			// mutate server-side state without an explicit action from the operator.
+			if req.Method != http.MethodPost {
+				w.Header().Set("Allow", http.MethodPost)
+				http.Error(w, "deleteMessages requires POST", http.StatusMethodNotAllowed)
+				return
+			}
 			kv.deleteSentReceivedMessages()
 
 			// Redirect back.
@@ -161,9 +182,9 @@ func (kvs *KVInitService) ServeHTTP(w http.ResponseWriter, req *http.Request) {
 		Now:              time.Now(),
 		Memberlist:       kv.memberlist,
 		SortedMembers:    members,
-		Store:            kv.storeCopy(),
-		SentMessages:     sent,
-		ReceivedMessages: received,
+		Store:            redactStore(kv.storeCopy()),
+		SentMessages:     redactMessages(sent),
+		ReceivedMessages: redactMessages(received),
 	}
 
 	accept := req.Header.Get("Accept")
@@ -187,6 +208,51 @@ func (kvs *KVInitService) ServeHTTP(w http.ResponseWriter, req *http.Request) {
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 	}
+}
+
+// isSensitiveKey reports whether the KV key appears to embed tenant-identifying
+// information (e.g. HA-tracker keys of the form "<tenant>/<cluster>"). The
+// ring KV keys used by Cortex (ingester/distributor/ruler/compactor/
+// store-gateway/alertmanager rings) are single tokens without a '/'. Any key
+// containing '/' is treated as potentially tenant-bearing and is omitted from
+// the admin page output and refused for direct view/download, as a
+// defense-in-depth measure in case any non-ring KV is wired to the memberlist
+// backend.
+func isSensitiveKey(key string) bool {
+	return strings.Contains(key, "/")
+}
+
+// redactStore returns a copy of the store with sensitive keys removed, so the
+// admin page / JSON dump does not leak tenant identifiers that may be embedded
+// in KV keys.
+func redactStore(store map[string]valueDesc) map[string]valueDesc {
+	if store == nil {
+		return nil
+	}
+	out := make(map[string]valueDesc, len(store))
+	for k, v := range store {
+		if isSensitiveKey(k) {
+			continue
+		}
+		out[k] = v
+	}
+	return out
+}
+
+// redactMessages returns a copy of the message slice with messages whose Pair
+// key is sensitive filtered out, matching the KV store redaction.
+func redactMessages(msgs []message) []message {
+	if len(msgs) == 0 {
+		return msgs
+	}
+	out := make([]message, 0, len(msgs))
+	for _, m := range msgs {
+		if isSensitiveKey(m.Pair.Key) {
+			continue
+		}
+		out = append(out, m)
+	}
+	return out
 }
 
 func getFormat(req *http.Request) string {
@@ -360,7 +426,7 @@ const pageContent = `
 
 		<h2>Received Messages</h2>
 
-		<a href="?deleteMessages=true">Delete All Messages (received and sent)</a>
+		<form method="POST" action="?deleteMessages=true" style="display:inline"><button type="submit">Delete All Messages (received and sent)</button></form>
 
 		<table width="100%" border="1">
 			<thead>
@@ -396,7 +462,7 @@ const pageContent = `
 
 		<h2>Sent Messages</h2>
 
-		<a href="?deleteMessages=true">Delete All Messages (received and sent)</a>
+		<form method="POST" action="?deleteMessages=true" style="display:inline"><button type="submit">Delete All Messages (received and sent)</button></form>
 
 		<table width="100%" border="1">
 			<thead>
