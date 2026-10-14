@@ -28,6 +28,15 @@ import (
 const (
 	maxCasRetries              = 10          // max retries in CAS operation
 	noChangeDetectedRetrySleep = time.Second // how long to sleep after no change was detected in CAS
+
+	// defaultMaxValueSize is the default upper bound on the size of a single
+	// KeyValuePair.Value accepted from a peer in NotifyMsg/MergeRemoteState,
+	// evaluated before snappy-decoding. It is deliberately comfortably larger
+	// than realistic gossiped ring/alertmanager/compactor values while being
+	// orders of magnitude smaller than the memory an attacker can force via
+	// snappy/proto amplification without this check. Operators with unusually
+	// large rings can raise it via -<prefix>memberlist.max-value-size.
+	defaultMaxValueSize = 4 * 1024 * 1024
 )
 
 // Client implements kv.Client interface, by using memberlist.KV
@@ -165,6 +174,13 @@ type KVConfig struct {
 
 	// Codecs to register. Codecs need to be registered before joining other members.
 	Codecs []codec.Codec `yaml:"-"`
+
+	// MaxValueSize is the maximum size, in bytes, of a KeyValuePair.Value accepted
+	// from a peer in NotifyMsg or MergeRemoteState before snappy-decoding. Values
+	// larger than this are dropped. 0 disables the check (not recommended on
+	// untrusted networks). This bound prevents a tiny attacker-controlled gossip
+	// frame from forcing multi-gigabyte allocations in snappy/proto decoders.
+	MaxValueSize int `yaml:"max_value_size"`
 }
 
 // RegisterFlagsWithPrefix registers flags.
@@ -193,6 +209,7 @@ func (cfg *KVConfig) RegisterFlagsWithPrefix(f *flag.FlagSet, prefix string) {
 	f.BoolVar(&cfg.EnableCompression, prefix+"memberlist.compression-enabled", mlDefaults.EnableCompression, "Enable message compression. This can be used to reduce bandwidth usage at the cost of slightly more CPU utilization.")
 	f.StringVar(&cfg.AdvertiseAddr, prefix+"memberlist.advertise-addr", mlDefaults.AdvertiseAddr, "Gossip address to advertise to other members in the cluster. Used for NAT traversal.")
 	f.IntVar(&cfg.AdvertisePort, prefix+"memberlist.advertise-port", mlDefaults.AdvertisePort, "Gossip port to advertise to other members in the cluster. Used for NAT traversal.")
+	f.IntVar(&cfg.MaxValueSize, prefix+"memberlist.max-value-size", defaultMaxValueSize, "Maximum size, in bytes, of a single KV value accepted from a peer before snappy-decoding. Values exceeding this are dropped to protect against decompression bombs. 0 to disable the check.")
 
 	cfg.TCPTransport.RegisterFlagsWithPrefix(f, prefix)
 }
@@ -1186,8 +1203,23 @@ func (m *KV) MergeRemoteState(data []byte, join bool) {
 	}
 }
 
-func (m *KV) mergeBytesValueForKey(key string, incomingData []byte, codec codec.Codec) (Mergeable, uint, error) {
-	decodedValue, err := codec.Decode(incomingData)
+func (m *KV) mergeBytesValueForKey(key string, incomingData []byte, c codec.Codec) (Mergeable, uint, error) {
+	// Bound untrusted gossip values before handing them to the codec. The
+	// snappy/protobuf decoders can amplify very small inputs into gigabyte-scale
+	// allocations, so reject oversize payloads up-front. A limit of 0 disables
+	// the check (opt-out for operators who have other controls in place).
+	if m.cfg.MaxValueSize > 0 && len(incomingData) > m.cfg.MaxValueSize {
+		return nil, 0, fmt.Errorf("value for key %q is too large: %d bytes (max %d)", key, len(incomingData), m.cfg.MaxValueSize)
+	}
+
+	// If the codec is a snappy/proto codec, propagate the same cap so that the
+	// snappy decoder refuses to allocate a decoded buffer larger than the limit
+	// (based on the varint length prefix) before even attempting to decompress.
+	if pc, ok := c.(codec.Proto); ok && m.cfg.MaxValueSize > 0 {
+		c = pc.WithMaxDecodedSize(m.cfg.MaxValueSize)
+	}
+
+	decodedValue, err := c.Decode(incomingData)
 	if err != nil {
 		return nil, 0, fmt.Errorf("failed to decode value: %v", err)
 	}
@@ -1197,7 +1229,15 @@ func (m *KV) mergeBytesValueForKey(key string, incomingData []byte, codec codec.
 		return nil, 0, fmt.Errorf("expected Mergeable, got: %T", decodedValue)
 	}
 
-	return m.mergeValueForKey(key, incomingValue, 0, codec)
+	// Give the merged value a chance to validate itself (e.g. cap per-instance
+	// token counts) before we touch the shared store under the lock.
+	if v, ok := incomingValue.(interface{ Validate() error }); ok {
+		if err := v.Validate(); err != nil {
+			return nil, 0, fmt.Errorf("invalid value for key %q: %v", key, err)
+		}
+	}
+
+	return m.mergeValueForKey(key, incomingValue, 0, c)
 }
 
 // Merges incoming value with value we have in our store. Returns "a change" that can be sent to other
