@@ -7,9 +7,11 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 
 	"github.com/cortexproject/cortex/pkg/configs/userconfig"
+	"github.com/cortexproject/cortex/pkg/util/flagext"
 
 	"github.com/stretchr/testify/require"
 	"github.com/weaveworks/common/user"
@@ -24,6 +26,8 @@ var (
 	counter  int
 )
 
+const testPrivateAPIAuthToken = "test-operator-token"
+
 // setup sets up the environment for the tests.
 func setup(t *testing.T) {
 	database = dbtest.Setup(t)
@@ -31,6 +35,7 @@ func setup(t *testing.T) {
 		Notifications: NotificationsConfig{
 			DisableEmail: true,
 		},
+		PrivateAPIAuthToken: flagext.Secret{Value: testPrivateAPIAuthToken},
 	})
 	counter = 0
 }
@@ -42,6 +47,7 @@ func setupWithEmailEnabled(t *testing.T) {
 		Notifications: NotificationsConfig{
 			DisableEmail: false,
 		},
+		PrivateAPIAuthToken: flagext.Secret{Value: testPrivateAPIAuthToken},
 	})
 	counter = 0
 }
@@ -51,11 +57,15 @@ func cleanup(t *testing.T) {
 	dbtest.Cleanup(t, database)
 }
 
-// request makes a request to the configs API.
+// request makes a request to the configs API. Private endpoints are
+// authenticated with the configured operator bearer token.
 func request(t *testing.T, method, urlStr string, body io.Reader) *httptest.ResponseRecorder {
 	w := httptest.NewRecorder()
 	r, err := http.NewRequest(method, urlStr, body)
 	require.NoError(t, err)
+	if strings.HasPrefix(urlStr, "/private/") {
+		r.Header.Set("Authorization", "Bearer "+testPrivateAPIAuthToken)
+	}
 	app.ServeHTTP(w, r)
 	return w
 }

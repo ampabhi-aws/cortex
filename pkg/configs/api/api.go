@@ -1,6 +1,7 @@
 package api
 
 import (
+	"crypto/subtle"
 	"database/sql"
 	"encoding/json"
 	"errors"
@@ -24,6 +25,7 @@ import (
 	"github.com/cortexproject/cortex/pkg/configs/userconfig"
 	"github.com/cortexproject/cortex/pkg/tenant"
 	"github.com/cortexproject/cortex/pkg/util"
+	"github.com/cortexproject/cortex/pkg/util/flagext"
 	util_log "github.com/cortexproject/cortex/pkg/util/log"
 )
 
@@ -35,6 +37,16 @@ var (
 // Config configures Configs API
 type Config struct {
 	Notifications NotificationsConfig `yaml:"notifications"`
+
+	// PrivateAPIAuthToken, when non-empty, is required as an
+	// `Authorization: Bearer <token>` HTTP header on the
+	// /private/api/prom/configs/* endpoints which return every tenant's
+	// rule files and raw Alertmanager configuration (including embedded
+	// receiver secrets). When empty (the default) those endpoints are
+	// disabled and respond with 403 Forbidden, because they perform no
+	// per-tenant scoping and must only be reachable by trusted internal
+	// consumers (the ruler/alertmanager configdb clients).
+	PrivateAPIAuthToken flagext.Secret `yaml:"private_api_auth_token"`
 }
 
 // NotificationsConfig configures Alertmanager notifications method.
@@ -47,6 +59,34 @@ type NotificationsConfig struct {
 func (cfg *Config) RegisterFlags(f *flag.FlagSet) {
 	f.BoolVar(&cfg.Notifications.DisableEmail, "configs.notifications.disable-email", false, "Disable Email notifications for Alertmanager.")
 	f.BoolVar(&cfg.Notifications.DisableWebHook, "configs.notifications.disable-webhook", false, "Disable WebHook notifications for Alertmanager.")
+	f.Var(&cfg.PrivateAPIAuthToken, "configs.private-api-auth-token", "Shared operator bearer token required on the /private/api/prom/configs/{rules,alertmanager} endpoints, which return every tenant's rules and raw Alertmanager configuration. These endpoints return cross-tenant data (including embedded notification secrets) and must only be reachable by trusted internal consumers (the ruler/alertmanager configdb clients). When this is empty (the default), the endpoints are disabled and respond with 403 Forbidden. Operators that run the configdb-backed ruler/alertmanager must set this flag to a strong random value here and on the matching -<ruler|alertmanager>.configs.private-api-auth-token client flag, and should additionally restrict the HTTP listener so these paths are not reachable by tenants.")
+}
+
+// authorizePrivate returns true when the request carries the operator bearer
+// token configured via -configs.private-api-auth-token. When the token is not
+// configured (the default), the endpoints are disabled and the request is
+// rejected unconditionally so the all-tenant dump is not reachable on the
+// tenant-facing listener.
+func (a *API) authorizePrivate(w http.ResponseWriter, r *http.Request) bool {
+	expected := a.cfg.PrivateAPIAuthToken.Value
+	if expected == "" {
+		http.Error(w, "private configs API is disabled: set -configs.private-api-auth-token to enable it", http.StatusForbidden)
+		return false
+	}
+
+	const prefix = "Bearer "
+	auth := r.Header.Get("Authorization")
+	if !strings.HasPrefix(auth, prefix) {
+		w.Header().Set("WWW-Authenticate", `Bearer realm="configs"`)
+		http.Error(w, "missing or invalid Authorization header", http.StatusUnauthorized)
+		return false
+	}
+	provided := auth[len(prefix):]
+	if subtle.ConstantTimeCompare([]byte(provided), []byte(expected)) != 1 {
+		http.Error(w, "invalid operator token", http.StatusUnauthorized)
+		return false
+	}
+	return true
 }
 
 // API implements the configs api.
@@ -264,6 +304,9 @@ type ConfigsView struct {
 }
 
 func (a *API) getConfigs(w http.ResponseWriter, r *http.Request) {
+	if !a.authorizePrivate(w, r) {
+		return
+	}
 	var cfgs map[string]userconfig.View
 	var cfgErr error
 	logger := util_log.WithContext(r.Context(), util_log.Logger)
