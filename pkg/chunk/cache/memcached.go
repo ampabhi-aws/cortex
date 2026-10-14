@@ -134,7 +134,7 @@ func memcacheStatusCode(err error) string {
 
 // Fetch gets keys from the cache. The keys that are found must be in the order of the keys requested.
 func (c *Memcached) Fetch(ctx context.Context, keys []string) (found []string, bufs [][]byte, missed []string) {
-	if c.cfg.BatchSize == 0 {
+	if c.cfg.BatchSize == 0 || c.inputCh == nil {
 		found, bufs, missed = c.fetch(ctx, keys)
 		return
 	}
@@ -190,6 +190,8 @@ func (c *Memcached) fetchKeysBatched(ctx context.Context, keys []string) (found 
 		for i, j := 0, 0; i < len(keys); i += batchSize {
 			batchKeys := keys[i:math.Min(i+batchSize, len(keys))]
 			select {
+			case <-ctx.Done():
+				return
 			case <-c.quit:
 				return
 			case c.inputCh <- &work{
@@ -214,6 +216,8 @@ func (c *Memcached) fetchKeysBatched(ctx context.Context, keys []string) (found 
 loopResults:
 	for i := 0; i < numResults; i++ {
 		select {
+		case <-ctx.Done():
+			break loopResults
 		case <-c.quit:
 			break loopResults
 		case result := <-resultsCh:
