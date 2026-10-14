@@ -301,16 +301,19 @@ func normalizeIngestersMap(inputRing *Desc) {
 			sort.Sort(Tokens(ing.Tokens))
 		}
 
-		// tokens are sorted now, we can easily remove duplicates.
-		prev := ing.Tokens[0]
-		for ix := 1; ix < len(ing.Tokens); {
-			if ing.Tokens[ix] == prev {
-				ing.Tokens = append(ing.Tokens[:ix], ing.Tokens[ix+1:]...)
-			} else {
-				prev = ing.Tokens[ix]
-				ix++
+		// Tokens are sorted now; remove duplicates in a single O(n) pass
+		// using a write index. The previous implementation used
+		// append(Tokens[:ix], Tokens[ix+1:]...) which is O(n) per duplicate
+		// and therefore O(n^2) overall. A single crafted gossip message with
+		// a large number of duplicate tokens could pin CPU for minutes while
+		// holding the KV store lock.
+		out := ing.Tokens[:1]
+		for _, t := range ing.Tokens[1:] {
+			if t != out[len(out)-1] {
+				out = append(out, t)
 			}
 		}
+		ing.Tokens = out
 
 		// write updated value back to map
 		inputRing.Ingesters[n] = ing
