@@ -279,6 +279,11 @@ func (a *API) PrometheusAlerts(w http.ResponseWriter, req *http.Request) {
 	}
 }
 
+// maxRuleNamespaceLength is the maximum allowed length of a rule namespace.
+// It is bounded so the escaped on-disk filename stays within NAME_MAX (255)
+// even in the worst case where every byte is percent-escaped (3x expansion).
+const maxRuleNamespaceLength = 80
+
 var (
 	// ErrNoNamespace signals that no namespace was specified in the request
 	ErrNoNamespace = errors.New("a namespace must be provided in the request")
@@ -288,7 +293,27 @@ var (
 	ErrNoRuleGroups = errors.New("no rule groups found")
 	// ErrBadRuleGroup is returned when the provided rule group can not be unmarshalled
 	ErrBadRuleGroup = errors.New("unable to decoded rule group")
+	// ErrInvalidNamespace signals the namespace contains characters or forms
+	// (empty, ".", "..", path separators, NUL, or exceeds the maximum length)
+	// that cannot be safely mapped to a single on-disk filename.
+	ErrInvalidNamespace = errors.New("the rule namespace is invalid: it must not be empty, equal to '.' or '..', must not contain '/', '\\' or NUL, and must not exceed the maximum allowed length")
 )
+
+// isValidRuleNamespace reports whether the provided namespace is usable as a
+// single on-disk filename. Namespaces that are empty, equal to "." or "..",
+// contain '/', '\\' or NUL bytes, or exceed maxRuleNamespaceLength are rejected.
+func isValidRuleNamespace(namespace string) bool {
+	if namespace == "" || namespace == "." || namespace == ".." {
+		return false
+	}
+	if len(namespace) > maxRuleNamespaceLength {
+		return false
+	}
+	if strings.ContainsAny(namespace, "/\\\x00") {
+		return false
+	}
+	return true
+}
 
 func marshalAndSend(output interface{}, w http.ResponseWriter, logger log.Logger) {
 	d, err := yaml.Marshal(&output)
@@ -324,7 +349,10 @@ func respondAccepted(w http.ResponseWriter, logger log.Logger) {
 }
 
 // parseNamespace parses the namespace from the provided set of params, in this
-// api these params are derived from the url path
+// api these params are derived from the url path. It also rejects namespaces
+// that cannot be safely used as a single on-disk filename, protecting the
+// ruler mapper against tenant-controlled path traversal and name-length
+// denial of service (see CWE-22).
 func parseNamespace(params map[string]string) (string, error) {
 	namespace, exists := params["namespace"]
 	if !exists {
@@ -334,6 +362,10 @@ func parseNamespace(params map[string]string) (string, error) {
 	namespace, err := url.PathUnescape(namespace)
 	if err != nil {
 		return "", err
+	}
+
+	if !isValidRuleNamespace(namespace) {
+		return "", ErrInvalidNamespace
 	}
 
 	return namespace, nil
