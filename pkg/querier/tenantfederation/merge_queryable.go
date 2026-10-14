@@ -36,15 +36,28 @@ const (
 // If the label "__tenant_id__" is already existing, its value is overwritten
 // by the tenant ID and the previous value is exposed through a new label
 // prefixed with "original_". This behaviour is not implemented recursively.
-func NewQueryable(upstream storage.Queryable, byPassWithSingleQuerier bool) storage.Queryable {
-	return NewMergeQueryable(defaultTenantLabel, tenantQuerierCallback(upstream), byPassWithSingleQuerier)
+//
+// maxTenants, when > 0, bounds the number of tenant IDs that may be federated
+// in a single request: resolved tenant lists exceeding this count are rejected
+// before any sub-querier is constructed. A value of 0 preserves the historical
+// unlimited behaviour.
+func NewQueryable(upstream storage.Queryable, byPassWithSingleQuerier bool, maxTenants int) storage.Queryable {
+	return NewMergeQueryable(defaultTenantLabel, tenantQuerierCallback(upstream, maxTenants), byPassWithSingleQuerier)
 }
 
-func tenantQuerierCallback(queryable storage.Queryable) MergeQuerierCallback {
+func tenantQuerierCallback(queryable storage.Queryable, maxTenants int) MergeQuerierCallback {
 	return func(ctx context.Context, mint int64, maxt int64) ([]string, []storage.Querier, error) {
 		tenantIDs, err := tenant.TenantIDs(ctx)
 		if err != nil {
 			return nil, nil, err
+		}
+
+		// Enforce the configured cap on the number of tenants in a single
+		// federated request BEFORE constructing any per-tenant querier. This
+		// prevents an unbounded X-Scope-OrgID header from fanning out one
+		// querier (and one per-query resource limiter) per tenant ID.
+		if maxTenants > 0 && len(tenantIDs) > maxTenants {
+			return nil, nil, fmt.Errorf("too many tenants in the request, max: %d, actual: %d", maxTenants, len(tenantIDs))
 		}
 
 		var queriers = make([]storage.Querier, len(tenantIDs))
