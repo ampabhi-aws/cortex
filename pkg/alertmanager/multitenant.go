@@ -974,15 +974,20 @@ func (am *MultitenantAlertmanager) GetPositionForUser(userID string) int {
 		return 0
 	}
 
-	var position int
+	selfAddr := am.ringLifecycler.GetInstanceAddr()
 	for i, instance := range set.Instances {
-		if instance.Addr == am.ringLifecycler.GetInstanceAddr() {
-			position = i
-			break
+		if instance.Addr == selfAddr {
+			return i
 		}
 	}
 
-	return position
+	// This instance is not part of the tenant's replication set, so it must not act as
+	// the primary replica (position 0) for this tenant. Returning a non-primary position
+	// prevents a rogue alertmanager (e.g. one that was spun up via the fallback-config
+	// request path on a non-owning instance) from persisting state and clobbering what
+	// the actual owners have written.
+	level.Warn(am.logger).Log("msg", "this instance is not in the tenant's replication set; returning non-primary position", "user", userID)
+	return len(set.Instances)
 }
 
 // ServeHTTP serves the Alertmanager's web UI and API.
@@ -1014,6 +1019,18 @@ func (am *MultitenantAlertmanager) serveRequest(w http.ResponseWriter, req *http
 		http.Error(w, err.Error(), http.StatusUnauthorized)
 		return
 	}
+
+	// When sharding is enabled, refuse to serve a request for a tenant this instance
+	// does not own. Without this check, falling through to the fallback branch below
+	// would (a) run a rogue per-tenant Alertmanager on a non-owning instance and (b)
+	// overwrite the tenant's stored configuration with an empty one, destroying the
+	// tenant's receivers/routes and template files. Any path not proxied by the
+	// Distributor must therefore be served only by an owning replica.
+	if am.cfg.ShardingEnabled && !am.isUserOwned(userID) {
+		http.Error(w, "the Alertmanager is not configured on this instance", http.StatusNotFound)
+		return
+	}
+
 	am.alertmanagersMtx.Lock()
 	userAM, ok := am.alertmanagers[userID]
 	am.alertmanagersMtx.Unlock()
@@ -1040,16 +1057,34 @@ func (am *MultitenantAlertmanager) serveRequest(w http.ResponseWriter, req *http
 }
 
 func (am *MultitenantAlertmanager) alertmanagerFromFallbackConfig(userID string) (*Alertmanager, error) {
-	// Upload an empty config so that the Alertmanager is no de-activated in the next poll
+	ctx := context.Background()
+
+	// If a stored configuration already exists for this tenant, use it to bring the
+	// per-tenant Alertmanager up in memory. We must NEVER overwrite an existing
+	// configuration (and its template files) with a synthetic empty one from the
+	// request path - doing so permanently destroys the tenant's receivers/routes.
+	if existing, err := am.store.GetAlertConfig(ctx, userID); err == nil {
+		if err := am.setConfig(existing); err != nil {
+			return nil, err
+		}
+		am.alertmanagersMtx.Lock()
+		defer am.alertmanagersMtx.Unlock()
+		return am.alertmanagers[userID], nil
+	} else if err != alertspb.ErrNotFound {
+		return nil, err
+	}
+
+	// No stored configuration exists yet: it is safe to upload an empty descriptor so
+	// that the Alertmanager is not de-activated at the next poll. This is a
+	// conditional create (the object did not exist a moment ago) and therefore cannot
+	// clobber a tenant's real configuration or template files.
 	cfgDesc := alertspb.ToProto("", nil, userID)
-	err := am.store.SetAlertConfig(context.Background(), cfgDesc)
-	if err != nil {
+	if err := am.store.SetAlertConfig(ctx, cfgDesc); err != nil {
 		return nil, err
 	}
 
 	// Calling setConfig with an empty configuration will use the fallback config.
-	err = am.setConfig(cfgDesc)
-	if err != nil {
+	if err := am.setConfig(cfgDesc); err != nil {
 		return nil, err
 	}
 
