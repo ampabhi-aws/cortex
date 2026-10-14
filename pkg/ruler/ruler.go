@@ -63,6 +63,7 @@ const (
 	// Limit errors
 	errMaxRuleGroupsPerUserLimitExceeded        = "per-user rule groups limit (limit: %d actual: %d) exceeded"
 	errMaxRulesPerRuleGroupPerUserLimitExceeded = "per-user rules per rule group limit (limit: %d actual: %d) exceeded"
+	errRuleGroupIntervalBelowMinimum            = "rule group '%s' evaluation interval (%s) is below the minimum allowed interval (%s) for this tenant"
 
 	// errors
 	errListAllUser = "unable to list the ruler users"
@@ -837,6 +838,33 @@ func (r *Ruler) AssertMaxRulesPerRuleGroup(userID string, rules int) error {
 		return nil
 	}
 	return fmt.Errorf(errMaxRulesPerRuleGroupPerUserLimitExceeded, limit, rules)
+}
+
+// AssertMinRuleEvaluationInterval ensures that the tenant-supplied rule group
+// evaluation interval is not below the per-tenant minimum. The effective
+// minimum is the per-tenant override -ruler.min-rule-evaluation-interval if
+// configured (> 0), otherwise the operator's -ruler.evaluation-interval. A
+// zero group interval is always allowed because the ruler falls back to the
+// operator's default evaluation interval in that case.
+func (r *Ruler) AssertMinRuleEvaluationInterval(userID, groupName string, interval time.Duration) error {
+	if interval <= 0 {
+		// Not set by the tenant; the operator default (r.cfg.EvaluationInterval)
+		// will be used by the rule manager.
+		return nil
+	}
+
+	min := r.limits.RulerMinRuleEvaluationInterval(userID)
+	if min <= 0 {
+		min = r.cfg.EvaluationInterval
+	}
+	if min <= 0 {
+		return nil
+	}
+
+	if interval < min {
+		return fmt.Errorf(errRuleGroupIntervalBelowMinimum, groupName, interval, min)
+	}
+	return nil
 }
 
 func (r *Ruler) DeleteTenantConfiguration(w http.ResponseWriter, req *http.Request) {

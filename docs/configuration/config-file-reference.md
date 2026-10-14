@@ -2731,11 +2731,18 @@ The `limits_config` configures default and per-tenant limits imposed by Cortex s
 
 # Maximum number of rules per rule group per-tenant. 0 to disable.
 # CLI flag: -ruler.max-rules-per-rule-group
-[ruler_max_rules_per_rule_group: <int> | default = 0]
+[ruler_max_rules_per_rule_group: <int> | default = 20]
 
 # Maximum number of rule groups per-tenant. 0 to disable.
 # CLI flag: -ruler.max-rule-groups-per-tenant
-[ruler_max_rule_groups_per_tenant: <int> | default = 0]
+[ruler_max_rule_groups_per_tenant: <int> | default = 70]
+
+# Minimum allowed rule group evaluation interval that tenants can configure in
+# their rule groups. 0 to use -ruler.evaluation-interval as the floor; any
+# tenant-supplied group interval below this value is rejected at rule group
+# creation time.
+# CLI flag: -ruler.min-rule-evaluation-interval
+[ruler_min_rule_evaluation_interval: <duration> | default = 0s]
 
 # The default tenant's shard size when the shuffle-sharding strategy is used.
 # Must be set when the store-gateway sharding is enabled with the
