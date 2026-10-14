@@ -10,6 +10,7 @@ import (
 	"io"
 	"mime"
 	"net/http"
+	"path/filepath"
 	"strconv"
 	"strings"
 
@@ -249,6 +250,12 @@ func validateRulesFiles(c userconfig.Config) error {
 
 func validateTemplateFiles(c userconfig.Config) error {
 	for fn, content := range c.TemplateFiles {
+		// Reject filenames that contain any path component so that they cannot
+		// later be used to escape the per-tenant templates directory on
+		// alertmanagers reading from this config store.
+		if fn == "" || filepath.Base(fn) != fn || filepath.Dir(filepath.Clean(fn)) != "." || strings.ContainsRune(fn, '/') || strings.ContainsRune(fn, filepath.Separator) {
+			return fmt.Errorf("invalid template name %q: the template name cannot contain any path", fn)
+		}
 		if _, err := template.New(fn).Funcs(template.FuncMap(amtemplate.DefaultFuncs)).Parse(content); err != nil {
 			return err
 		}
