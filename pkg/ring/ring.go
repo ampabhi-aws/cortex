@@ -125,6 +125,14 @@ type Config struct {
 	ZoneAwarenessEnabled bool                   `yaml:"zone_awareness_enabled"`
 	ExcludedZones        flagext.StringSliceCSV `yaml:"excluded_zones"`
 
+	// EnableHTTPForget, when true, allows the ring status page's POST handler to
+	// unregister ("forget") instances from the hash ring. This is a destructive,
+	// cluster-wide mutation that Cortex itself does not authenticate: it is the
+	// deployer's responsibility to only expose the admin HTTP surface behind an
+	// authenticated/authorised reverse proxy. The option defaults to false so
+	// that the mutation is disabled unless the operator has explicitly opted in.
+	EnableHTTPForget bool `yaml:"enable_http_forget"`
+
 	// Whether the shuffle-sharding subring cache is disabled. This option is set
 	// internally and never exposed to the user.
 	SubringCacheDisabled bool `yaml:"-"`
@@ -143,6 +151,7 @@ func (cfg *Config) RegisterFlagsWithPrefix(prefix string, f *flag.FlagSet) {
 	f.IntVar(&cfg.ReplicationFactor, prefix+"distributor.replication-factor", 3, "The number of ingesters to write to and read from.")
 	f.BoolVar(&cfg.ZoneAwarenessEnabled, prefix+"distributor.zone-awareness-enabled", false, "True to enable the zone-awareness and replicate ingested samples across different availability zones.")
 	f.Var(&cfg.ExcludedZones, prefix+"distributor.excluded-zones", "Comma-separated list of zones to exclude from the ring. Instances in excluded zones will be filtered out from the ring.")
+	f.BoolVar(&cfg.EnableHTTPForget, prefix+"ring.enable-http-forget", false, "Enable the destructive 'forget' POST handler on the ring status pages, which unregisters an instance from the hash ring. This control is not authenticated by Cortex itself; only enable it when the admin HTTP endpoints are protected by an external reverse proxy or network policy.")
 }
 
 type instanceInfo struct {
