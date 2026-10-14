@@ -291,8 +291,16 @@ func (a *API) RegisterRuler(r *ruler.Ruler) {
 	// Legacy Ring Route
 	a.RegisterRoute("/ruler_ring", r, false, "GET", "POST")
 
-	// List all user rule groups
-	a.RegisterRoute("/ruler/rule_groups", http.HandlerFunc(r.ListAllRules), false, "GET")
+	// List all user rule groups. This endpoint is a cross-tenant admin dump
+	// (it enumerates every tenant and streams all of their rule groups) and is
+	// not scoped to the caller, so registering it on the tenant-facing HTTP
+	// listener leaks every tenant's rule configuration to any client that can
+	// reach the port. It is therefore opt-in and disabled by default; operators
+	// who need it must either expose it on a listener that is not reachable by
+	// tenants or enforce an external admin-path denylist / authorization check.
+	if r.Config().EnableListAllRulesAPI {
+		a.RegisterRoute("/ruler/rule_groups", http.HandlerFunc(r.ListAllRules), false, "GET")
+	}
 
 	ruler.RegisterRulerServer(a.server.GRPC, r)
 }

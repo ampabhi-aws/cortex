@@ -116,6 +116,14 @@ type Config struct {
 
 	EnableAPI bool `yaml:"enable_api"`
 
+	// EnableListAllRulesAPI controls whether the cross-tenant admin endpoint
+	// `GET /ruler/rule_groups` (handled by Ruler.ListAllRules) is registered.
+	// This endpoint enumerates every tenant and streams all of their rule
+	// groups and is explicitly not scoped to a caller. It is disabled by
+	// default to avoid cross-tenant disclosure on deployments that do not
+	// enforce an external admin-path denylist on the ruler HTTP listener.
+	EnableListAllRulesAPI bool `yaml:"enable_list_all_rules_api"`
+
 	EnabledTenants  flagext.StringSliceCSV `yaml:"enabled_tenants"`
 	DisabledTenants flagext.StringSliceCSV `yaml:"disabled_tenants"`
 
@@ -174,6 +182,7 @@ func (cfg *Config) RegisterFlags(f *flag.FlagSet) {
 	f.DurationVar(&cfg.FlushCheckPeriod, "ruler.flush-period", 1*time.Minute, "Period with which to attempt to flush rule groups.")
 	f.StringVar(&cfg.RulePath, "ruler.rule-path", "/rules", "file path to store temporary rule files for the prometheus rule managers")
 	f.BoolVar(&cfg.EnableAPI, "experimental.ruler.enable-api", false, "Enable the ruler api")
+	f.BoolVar(&cfg.EnableListAllRulesAPI, "ruler.enable-list-all-rules-api", false, "Enable the admin HTTP endpoint `GET /ruler/rule_groups` which lists all rule groups across all tenants. Disabled by default because the endpoint is not scoped to any tenant and reveals cross-tenant rule configuration; only enable it when the ruler HTTP port is not reachable from tenants or is protected by an external admin-path denylist.")
 	f.DurationVar(&cfg.OutageTolerance, "ruler.for-outage-tolerance", time.Hour, `Max time to tolerate outage for restoring "for" state of alert.`)
 	f.DurationVar(&cfg.ForGracePeriod, "ruler.for-grace-period", 10*time.Minute, `Minimum duration between alert and restored "for" state. This is maintained only for alerts with configured "for" time greater than grace period.`)
 	f.DurationVar(&cfg.ResendDelay, "ruler.resend-delay", time.Minute, `Minimum amount of time to wait before resending an alert to Alertmanager.`)
@@ -330,6 +339,13 @@ func enableSharding(r *Ruler, ringStore kv.Client) error {
 	}
 
 	return nil
+}
+
+// Config returns the Ruler configuration. It is intended for callers that
+// wire up HTTP routes and need to consult config fields such as
+// EnableListAllRulesAPI.
+func (r *Ruler) Config() Config {
+	return r.cfg
 }
 
 func (r *Ruler) starting(ctx context.Context) error {
