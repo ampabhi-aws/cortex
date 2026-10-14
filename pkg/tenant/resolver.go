@@ -87,6 +87,16 @@ func (t *SingleResolver) TenantID(ctx context.Context) (string, error) {
 		return "", errInvalidTenantID
 	}
 
+	// Defence in depth: cap the tenant ID length so a self-asserted header
+	// cannot be used to drive arbitrary growth in per-tenant resources
+	// (TSDB directory names, metric label values, maps keyed by tenant ID).
+	// The 150-character cap matches the documented tenant ID limit and the
+	// MultiResolver / ValidTenantID enforcement; the character set remains
+	// deliberately wider on the single-tenant path for backward compatibility.
+	if len(id) > 150 {
+		return "", errTenantIDTooLong
+	}
+
 	return id, nil
 }
 
