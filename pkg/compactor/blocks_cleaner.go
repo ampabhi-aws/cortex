@@ -194,6 +194,31 @@ func (c *BlocksCleaner) deleteUserMarkedForDeletion(ctx context.Context, userID 
 	userLogger := util_log.WithUserID(userID, c.logger)
 	userBucket := bucket.NewUserBucketClient(userID, c.bucketClient, c.cfgProvider)
 
+	// Honour the configured grace period before destroying any data: the
+	// deletion mark is written synchronously by the purger API, but the
+	// irreversible block deletions must not happen until -compactor.deletion-delay
+	// has elapsed. This gives operators (and the owning tenant) time to
+	// cancel an accidental or malicious deletion via the cancel endpoint.
+	mark, err := cortex_tsdb.ReadTenantDeletionMark(ctx, c.bucketClient, userID)
+	if err != nil {
+		return errors.Wrap(err, "failed to read tenant deletion mark")
+	}
+	if mark == nil {
+		// The mark was removed (likely cancelled) between the users scan and
+		// now. Nothing to do.
+		level.Info(userLogger).Log("msg", "tenant deletion mark no longer present, skipping deletion")
+		return nil
+	}
+	if mark.FinishedTime == 0 && c.cfg.DeletionDelay > 0 {
+		if remaining := c.cfg.DeletionDelay - time.Since(time.Unix(mark.DeletionTime, 0)); remaining > 0 {
+			level.Info(userLogger).Log("msg", "deferring tenant deletion until grace period elapses",
+				"deletion_time", time.Unix(mark.DeletionTime, 0).UTC(),
+				"grace_period", c.cfg.DeletionDelay,
+				"remaining", remaining)
+			return nil
+		}
+	}
+
 	level.Info(userLogger).Log("msg", "deleting blocks for tenant marked for deletion")
 
 	// We immediately delete the bucket index, to signal to its consumers that
@@ -204,7 +229,7 @@ func (c *BlocksCleaner) deleteUserMarkedForDeletion(ctx context.Context, userID 
 	c.tenantBucketIndexLastUpdate.DeleteLabelValues(userID)
 
 	var deletedBlocks, failed int
-	err := userBucket.Iter(ctx, "", func(name string) error {
+	err = userBucket.Iter(ctx, "", func(name string) error {
 		if err := ctx.Err(); err != nil {
 			return err
 		}
@@ -253,12 +278,14 @@ func (c *BlocksCleaner) deleteUserMarkedForDeletion(ctx context.Context, userID 
 		level.Info(userLogger).Log("msg", "deleted blocks for tenant marked for deletion", "deletedBlocks", deletedBlocks)
 	}
 
-	mark, err := cortex_tsdb.ReadTenantDeletionMark(ctx, c.bucketClient, userID)
+	// Re-read the mark so we observe any concurrent updates (e.g. another
+	// compactor replica setting FinishedTime).
+	mark, err = cortex_tsdb.ReadTenantDeletionMark(ctx, c.bucketClient, userID)
 	if err != nil {
 		return errors.Wrap(err, "failed to read tenant deletion mark")
 	}
 	if mark == nil {
-		return errors.Wrap(err, "cannot find tenant deletion mark anymore")
+		return errors.New("cannot find tenant deletion mark anymore")
 	}
 
 	// If we have just deleted some blocks, update "finished" time. Also update "finished" time if it wasn't set yet, but there are no blocks.
