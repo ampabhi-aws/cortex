@@ -863,12 +863,19 @@ func (r *Ruler) DeleteTenantConfiguration(w http.ResponseWriter, req *http.Reque
 func (r *Ruler) ListAllRules(w http.ResponseWriter, req *http.Request) {
 	logger := util_log.WithContext(req.Context(), r.logger)
 
-	userIDs, err := r.store.ListAllUsers(req.Context())
+	// Scope the response to the authenticated tenant. Although this handler is
+	// named ListAllRules, it is served on the tenant-facing HTTP listener and must
+	// not expose other tenants' rule groups. The caller's tenant is derived from
+	// the request context (populated by the auth middleware from X-Scope-OrgID),
+	// matching the behaviour of DeleteTenantConfiguration and API.parseRequest.
+	userID, err := tenant.TenantID(req.Context())
 	if err != nil {
-		level.Error(logger).Log("msg", errListAllUser, "err", err)
-		http.Error(w, fmt.Sprintf("%s: %s", errListAllUser, err.Error()), http.StatusInternalServerError)
+		// Mirror DeleteTenantConfiguration: a missing/invalid tenant is unauthenticated.
+		http.Error(w, err.Error(), http.StatusUnauthorized)
 		return
 	}
+
+	userIDs := []string{userID}
 
 	done := make(chan struct{})
 	iter := make(chan interface{})
@@ -897,7 +904,7 @@ func (r *Ruler) ListAllRules(w http.ResponseWriter, req *http.Request) {
 		return nil
 	})
 	if err != nil {
-		level.Error(logger).Log("msg", "failed to list all ruler configs", "err", err)
+		level.Error(logger).Log("msg", "failed to list ruler configs", "err", err)
 	}
 	close(iter)
 	<-done
