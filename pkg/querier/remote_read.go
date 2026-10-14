@@ -1,7 +1,9 @@
 package querier
 
 import (
+	"math"
 	"net/http"
+	"time"
 
 	"github.com/go-kit/log"
 	"github.com/go-kit/log/level"
@@ -16,6 +18,17 @@ import (
 // Queries are a set of matchers with time ranges - should not get into megabytes
 const maxRemoteReadQuerySize = 1024 * 1024
 
+// Sanity bounds for remote-read timestamps, in milliseconds. These match the
+// range that pkg/util.ParseTime (via time.Time.UnixNano()/1e6) can produce,
+// which is roughly +/-9.22e12 ms. Clamping unvalidated protobuf int64
+// timestamps to this window prevents extreme values (such as -8e18 ms) from
+// propagating into the querier/store-gateway and prevents int64 overflow in
+// downstream duration arithmetic.
+var (
+	minRemoteReadTimestampMs = int64(math.MinInt64) / int64(time.Millisecond)
+	maxRemoteReadTimestampMs = int64(math.MaxInt64) / int64(time.Millisecond)
+)
+
 // RemoteReadHandler handles Prometheus remote read requests.
 func RemoteReadHandler(q storage.Queryable, logger log.Logger) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -26,6 +39,22 @@ func RemoteReadHandler(q storage.Queryable, logger log.Logger) http.Handler {
 			level.Error(logger).Log("msg", "failed to parse proto", "err", err.Error())
 			http.Error(w, err.Error(), http.StatusBadRequest)
 			return
+		}
+
+		// Validate and clamp the time range of every sub-query up-front so that
+		// unvalidated int64 timestamps from the request body cannot be used to
+		// bypass downstream time-range guards.
+		for _, qr := range req.Queries {
+			if qr.EndTimestampMs < qr.StartTimestampMs {
+				http.Error(w, "remote read request end timestamp must not be before start timestamp", http.StatusBadRequest)
+				return
+			}
+			if qr.StartTimestampMs < minRemoteReadTimestampMs {
+				qr.StartTimestampMs = minRemoteReadTimestampMs
+			}
+			if qr.EndTimestampMs > maxRemoteReadTimestampMs {
+				qr.EndTimestampMs = maxRemoteReadTimestampMs
+			}
 		}
 
 		// Fetch samples for all queries in parallel.
