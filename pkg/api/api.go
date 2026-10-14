@@ -14,6 +14,7 @@ import (
 	"github.com/prometheus/prometheus/storage"
 	"github.com/weaveworks/common/middleware"
 	"github.com/weaveworks/common/server"
+	"github.com/weaveworks/common/user"
 
 	"github.com/cortexproject/cortex/pkg/alertmanager"
 	"github.com/cortexproject/cortex/pkg/alertmanager/alertmanagerpb"
@@ -48,6 +49,17 @@ type Config struct {
 	AlertmanagerHTTPPrefix string `yaml:"alertmanager_http_prefix"`
 	PrometheusHTTPPrefix   string `yaml:"prometheus_http_prefix"`
 
+	// Access control for cluster-wide admin endpoints that expose other
+	// tenants' identifiers or operational metadata (e.g.
+	// /distributor/all_user_stats, /distributor/ha_tracker and their legacy
+	// aliases). When ClusterWideAdminEndpointsDisabled is true these endpoints
+	// return 404. When ClusterWideAdminAllowedTenants is non-empty, only
+	// authenticated callers whose X-Scope-OrgID is in the list are allowed;
+	// otherwise the endpoints still require an authenticated tenant header
+	// (so an external authenticating proxy can gate them).
+	ClusterWideAdminEndpointsDisabled bool                   `yaml:"cluster_wide_admin_endpoints_disabled"`
+	ClusterWideAdminAllowedTenants    flagext.StringSliceCSV `yaml:"cluster_wide_admin_allowed_tenants"`
+
 	// The following configs are injected by the upstream caller.
 	ServerPrefix       string               `yaml:"-"`
 	LegacyHTTPPrefix   string               `yaml:"-"`
@@ -71,6 +83,8 @@ type Config struct {
 func (cfg *Config) RegisterFlags(f *flag.FlagSet) {
 	f.BoolVar(&cfg.ResponseCompression, "api.response-compression-enabled", false, "Use GZIP compression for API responses. Some endpoints serve large YAML or JSON blobs which can benefit from compression.")
 	f.Var(&cfg.HTTPRequestHeadersToLog, "api.http-request-headers-to-log", "Which HTTP Request headers to add to logs")
+	f.BoolVar(&cfg.ClusterWideAdminEndpointsDisabled, "api.cluster-wide-admin-endpoints-disabled", false, "When true, the cluster-wide admin HTTP endpoints that disclose other tenants' identifiers or ingest metadata (e.g. /distributor/all_user_stats, /distributor/ha_tracker and their legacy aliases) return HTTP 404. Recommended when the admin HTTP listener is reachable by tenants.")
+	f.Var(&cfg.ClusterWideAdminAllowedTenants, "api.cluster-wide-admin-allowed-tenants", "Comma-separated list of tenant IDs (X-Scope-OrgID values) that are allowed to query the cluster-wide admin HTTP endpoints (/distributor/all_user_stats, /distributor/ha_tracker and their legacy aliases). When empty any authenticated caller is allowed; when non-empty only callers whose tenant ID is in the list are allowed. These endpoints always require an authenticated tenant header.")
 	cfg.RegisterFlagsWithPrefix("", f)
 }
 
@@ -241,13 +255,47 @@ func (a *API) RegisterDistributor(d *distributor.Distributor, pushConfig distrib
 	a.indexPage.AddLink(SectionAdminEndpoints, "/distributor/ha_tracker", "HA Tracking Status")
 
 	a.RegisterRoute("/distributor/ring", d, false, "GET", "POST")
-	a.RegisterRoute("/distributor/all_user_stats", http.HandlerFunc(d.AllUserStatsHandler), false, "GET")
-	a.RegisterRoute("/distributor/ha_tracker", d.HATracker, false, "GET")
+	a.RegisterRoute("/distributor/all_user_stats", a.wrapClusterWideAdmin(http.HandlerFunc(d.AllUserStatsHandler)), true, "GET")
+	a.RegisterRoute("/distributor/ha_tracker", a.wrapClusterWideAdmin(d.HATracker), true, "GET")
 
 	// Legacy Routes
 	a.RegisterRoute(path.Join(a.cfg.LegacyHTTPPrefix, "/push"), push.Handler(pushConfig.MaxRecvMsgSize, a.sourceIPs, a.cfg.wrapDistributorPush(d)), true, "POST")
-	a.RegisterRoute("/all_user_stats", http.HandlerFunc(d.AllUserStatsHandler), false, "GET")
-	a.RegisterRoute("/ha-tracker", d.HATracker, false, "GET")
+	a.RegisterRoute("/all_user_stats", a.wrapClusterWideAdmin(http.HandlerFunc(d.AllUserStatsHandler)), true, "GET")
+	a.RegisterRoute("/ha-tracker", a.wrapClusterWideAdmin(d.HATracker), true, "GET")
+}
+
+// wrapClusterWideAdmin gates handlers that return cross-tenant data
+// (e.g. every tenant's ID, active series count and ingest rate) so that
+// deployments can either hard-disable them or restrict them to a configured
+// set of operator tenant IDs. The handler is still wrapped with the
+// configured AuthMiddleware by RegisterRoute (auth=true) so an authenticated
+// tenant header is required before this check runs.
+func (a *API) wrapClusterWideAdmin(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if a.cfg.ClusterWideAdminEndpointsDisabled {
+			http.Error(w, "not found", http.StatusNotFound)
+			return
+		}
+		if len(a.cfg.ClusterWideAdminAllowedTenants) > 0 {
+			orgID, err := user.ExtractOrgID(r.Context())
+			if err != nil || orgID == "" {
+				http.Error(w, "no org id", http.StatusUnauthorized)
+				return
+			}
+			allowed := false
+			for _, t := range a.cfg.ClusterWideAdminAllowedTenants {
+				if t == orgID {
+					allowed = true
+					break
+				}
+			}
+			if !allowed {
+				http.Error(w, "forbidden", http.StatusForbidden)
+				return
+			}
+		}
+		next.ServeHTTP(w, r)
+	})
 }
 
 // Ingester is defined as an interface to allow for alternative implementations
