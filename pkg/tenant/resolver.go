@@ -87,6 +87,17 @@ func (t *SingleResolver) TenantID(ctx context.Context) (string, error) {
 		return "", errInvalidTenantID
 	}
 
+	// Enforce the documented tenant-ID charset and length limit on the
+	// default (single-tenant) code path too, so that an unvalidated tenant
+	// ID cannot be injected into shared namespaces such as the results
+	// cache key, object-storage prefixes, local directory names, scheduler
+	// queue keys and metric labels. In particular this keeps `|` rejected
+	// as a tenant separator and rejects `:`, whitespace, control bytes and
+	// non-ASCII runes regardless of whether tenant federation is enabled.
+	if err := ValidTenantID(id); err != nil {
+		return "", err
+	}
+
 	return id, nil
 }
 
