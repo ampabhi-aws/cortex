@@ -60,14 +60,72 @@ func (api *TenantDeletionAPI) DeleteTenant(w http.ResponseWriter, r *http.Reques
 		return
 	}
 
-	level.Info(api.logger).Log("msg", "tenant deletion mark in blocks storage created", "user", userID)
+	level.Info(api.logger).Log(
+		"msg", "tenant deletion mark in blocks storage created",
+		"user", userID,
+		"note", "this endpoint only marks the blocks bucket; call POST /ruler/delete_tenant_config and POST /multitenant_alertmanager/delete_tenant_config to delete the tenant's rule groups and alertmanager configuration (which may embed notification credentials)",
+	)
 
 	w.WriteHeader(http.StatusOK)
 }
 
+// DeleteTenantStatusResponse is the JSON body returned by the tenant
+// delete-status endpoint.
+//
+// NOTE: this endpoint only reflects the state of the *blocks* storage for a
+// tenant. It does NOT examine the ruler store or the alertmanager store, and
+// therefore does not report whether a tenant's rule groups or alertmanager
+// configuration (which can embed notification credentials) have been removed.
+// Those stores must be cleaned up via the dedicated endpoints:
+//
+//	POST /ruler/delete_tenant_config
+//	POST /multitenant_alertmanager/delete_tenant_config
+//
+// The response therefore also includes `deletion_requested` (whether a
+// blocks-storage tenant deletion mark currently exists) and
+// `stores_not_covered`, which enumerates the per-tenant stores whose state is
+// not reflected in this response, so operators cannot mistake it for full
+// tenant erasure.
 type DeleteTenantStatusResponse struct {
-	TenantID      string `json:"tenant_id"`
-	BlocksDeleted bool   `json:"blocks_deleted"`
+	TenantID string `json:"tenant_id"`
+	// BlocksDeleted is true when no blocks remain under the tenant's prefix
+	// in the blocks bucket. It only reflects blocks storage.
+	BlocksDeleted bool `json:"blocks_deleted"`
+	// DeletionRequested is true when a tenant-deletion mark exists in the
+	// blocks bucket (i.e. POST /purger/delete_tenant has been called for
+	// this tenant and the mark has not been cleaned up yet).
+	DeletionRequested bool `json:"deletion_requested"`
+	// StoresNotCovered enumerates per-tenant object stores whose state is
+	// NOT reflected by this response. Operators must use the dedicated
+	// endpoints for those stores to fully delete tenant data.
+	StoresNotCovered []StoreNotCovered `json:"stores_not_covered"`
+}
+
+// StoreNotCovered describes a per-tenant object store whose deletion state is
+// not reported by the purger tenant-deletion-status endpoint, together with
+// the HTTP endpoint an operator should call to remove the tenant's data from
+// that store.
+type StoreNotCovered struct {
+	Name        string `json:"name"`
+	DeleteVia   string `json:"delete_via"`
+	Description string `json:"description"`
+}
+
+// storesNotCoveredByBlocksDeletion lists the per-tenant object stores whose
+// state the purger tenant-deletion endpoint does not touch. Keeping this list
+// in one place lets both the log emitted by DeleteTenant and the status
+// response share the same wording.
+var storesNotCoveredByBlocksDeletion = []StoreNotCovered{
+	{
+		Name:        "ruler",
+		DeleteVia:   "POST /ruler/delete_tenant_config",
+		Description: "Per-tenant rule groups. Must be deleted separately; the purger tenant-deletion endpoint does not touch the ruler store.",
+	},
+	{
+		Name:        "alertmanager",
+		DeleteVia:   "POST /multitenant_alertmanager/delete_tenant_config",
+		Description: "Per-tenant alertmanager configuration and templates (may embed notification credentials such as Slack/webhook URLs and SMTP passwords). Must be deleted separately; the purger tenant-deletion endpoint does not touch the alertmanager store.",
+	},
 }
 
 func (api *TenantDeletionAPI) DeleteTenantStatus(w http.ResponseWriter, r *http.Request) {
@@ -80,6 +138,17 @@ func (api *TenantDeletionAPI) DeleteTenantStatus(w http.ResponseWriter, r *http.
 
 	result := DeleteTenantStatusResponse{}
 	result.TenantID = userID
+	// Enumerate the per-tenant stores that this endpoint does NOT cover, so
+	// operators cannot mistake a `blocks_deleted: true` response for full
+	// tenant erasure.
+	result.StoresNotCovered = append([]StoreNotCovered(nil), storesNotCoveredByBlocksDeletion...)
+
+	result.DeletionRequested, err = cortex_tsdb.TenantDeletionMarkExists(ctx, api.bucketClient, userID)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+
 	result.BlocksDeleted, err = api.isBlocksForUserDeleted(ctx, userID)
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
