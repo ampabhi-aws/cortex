@@ -687,7 +687,13 @@ func (d *Distributor) Push(ctx context.Context, req *cortexpb.WriteRequest) (*co
 			return nil, err
 		}
 
-		skipLabelNameValidation := d.cfg.SkipLabelNameValidation || req.GetSkipLabelNameValidation()
+		// Only the operator-set config controls whether label-name validation is
+		// skipped. The per-request WriteRequest.SkipLabelNameValidation flag is
+		// client-settable (proto field 1000) and MUST NOT influence this security
+		// decision: the HTTP push handler scrubs it (see pkg/util/push/push.go),
+		// and the gRPC entry point used to pass it through unmodified. Embedders
+		// that need to disable the check should set the Config field instead.
+		skipLabelNameValidation := d.cfg.SkipLabelNameValidation
 		validatedSeries, validationErr := d.validateSeries(ts, userID, skipLabelNameValidation)
 
 		// Errors in validation are considered non-fatal, as one series in a request may contain

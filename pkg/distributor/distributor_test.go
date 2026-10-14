@@ -1520,10 +1520,11 @@ func TestDistributor_Push_LabelNameValidation(t *testing.T) {
 			skipLabelNameValidationCfg: true,
 			errExpected:                false,
 		},
-		"label name validation can be skipped via WriteRequest parameter": {
+		"WriteRequest skip_label_name_validation flag is ignored (not client-settable)": {
 			inputLabels:                inputLabels,
 			skipLabelNameValidationReq: true,
-			errExpected:                false,
+			errExpected:                true,
+			errMessage:                 `sample invalid label: "999.illegal" metric "foo{999.illegal=\"baz\"}"`,
 		},
 	}
 
