@@ -65,12 +65,20 @@ type Config struct {
 
 	// Allows and is used to configure the addition of HTTP Header fields to logs
 	HTTPRequestHeadersToLog flagext.StringSlice `yaml:"http_request_headers_to_log"`
+
+	// ConfigEndpointAuthRequired, when true, requires HTTP authentication on
+	// the `/config` endpoint. Defaults to false to preserve the historical
+	// behaviour; operators are strongly encouraged to enable this (or to block
+	// the admin path at the ingress) because the endpoint may still expose
+	// non-secret configuration that aids reconnaissance.
+	ConfigEndpointAuthRequired bool `yaml:"config_endpoint_auth_required"`
 }
 
 // RegisterFlags adds the flags required to config this to the given FlagSet.
 func (cfg *Config) RegisterFlags(f *flag.FlagSet) {
 	f.BoolVar(&cfg.ResponseCompression, "api.response-compression-enabled", false, "Use GZIP compression for API responses. Some endpoints serve large YAML or JSON blobs which can benefit from compression.")
 	f.Var(&cfg.HTTPRequestHeadersToLog, "api.http-request-headers-to-log", "Which HTTP Request headers to add to logs")
+	f.BoolVar(&cfg.ConfigEndpointAuthRequired, "api.config-endpoint-auth-required", false, "When enabled, requires HTTP authentication on the /config endpoint. Recommended as defence-in-depth to avoid exposing the running configuration to unauthenticated callers.")
 	cfg.RegisterFlagsWithPrefix("", f)
 }
 
@@ -217,7 +225,7 @@ func (a *API) RegisterAPI(httpPathPrefix string, actualCfg interface{}, defaultC
 	a.indexPage.AddLink(SectionAdminEndpoints, "/config", "Current Config (including the default values)")
 	a.indexPage.AddLink(SectionAdminEndpoints, "/config?mode=diff", "Current Config (show only values that differ from the defaults)")
 
-	a.RegisterRoute("/config", a.cfg.configHandler(actualCfg, defaultCfg), false, "GET")
+	a.RegisterRoute("/config", a.cfg.configHandler(actualCfg, defaultCfg), a.cfg.ConfigEndpointAuthRequired, "GET")
 	a.RegisterRoute("/", indexHandler(httpPathPrefix, a.indexPage), false, "GET")
 	a.RegisterRoute("/debug/fgprof", fgprof.Handler(), false, "GET")
 }
