@@ -73,6 +73,10 @@ func BenchmarkMemberlistReceiveWithRingDesc(b *testing.B) {
 	require.NoError(b, services.StartAndAwaitRunning(context.Background(), mkv))
 	defer services.StopAndAwaitTerminated(context.Background(), mkv) //nolint:errcheck
 
+	// Register the key this process participates in so that incoming gossip
+	// messages for it are accepted (see KV.isParticipatingKey).
+	mkv.RegisterKey("ring")
+
 	// Build the initial ring state:
 	// - The ring isn't actually in use, so the fields such as address/zone are not important.
 	// - The number of keys in the store has no impact for this test, so simulate a single ring.
