@@ -48,6 +48,15 @@ type Config struct {
 	AlertmanagerHTTPPrefix string `yaml:"alertmanager_http_prefix"`
 	PrometheusHTTPPrefix   string `yaml:"prometheus_http_prefix"`
 
+	// AdminEndpointsEnabled controls whether the operator-only configuration
+	// introspection endpoints (/config, /runtime_config) are exposed. When
+	// false (the default) these endpoints are not registered and return 404.
+	// When true they are registered behind AuthMiddleware; operators MUST
+	// additionally enforce authorization (e.g. a reverse proxy restricting
+	// access to trusted operator tenants) because these endpoints leak
+	// cluster-wide topology and tenant inventory. See docs/api/_index.md.
+	AdminEndpointsEnabled bool `yaml:"admin_endpoints_enabled"`
+
 	// The following configs are injected by the upstream caller.
 	ServerPrefix       string               `yaml:"-"`
 	LegacyHTTPPrefix   string               `yaml:"-"`
@@ -71,6 +80,7 @@ type Config struct {
 func (cfg *Config) RegisterFlags(f *flag.FlagSet) {
 	f.BoolVar(&cfg.ResponseCompression, "api.response-compression-enabled", false, "Use GZIP compression for API responses. Some endpoints serve large YAML or JSON blobs which can benefit from compression.")
 	f.Var(&cfg.HTTPRequestHeadersToLog, "api.http-request-headers-to-log", "Which HTTP Request headers to add to logs")
+	f.BoolVar(&cfg.AdminEndpointsEnabled, "api.admin-endpoints-enabled", false, "Expose the operator-only /config and /runtime_config HTTP endpoints. These endpoints disclose cluster-wide process configuration (with credentials masked via flagext.Secret) and per-tenant runtime overrides, and must only be enabled on listeners restricted to trusted operators. Defaults to false.")
 	cfg.RegisterFlagsWithPrefix("", f)
 }
 
@@ -214,20 +224,33 @@ func (a *API) RegisterAlertmanager(am *alertmanager.MultitenantAlertmanager, tar
 
 // RegisterAPI registers the standard endpoints associated with a running Cortex.
 func (a *API) RegisterAPI(httpPathPrefix string, actualCfg interface{}, defaultCfg interface{}) {
-	a.indexPage.AddLink(SectionAdminEndpoints, "/config", "Current Config (including the default values)")
-	a.indexPage.AddLink(SectionAdminEndpoints, "/config?mode=diff", "Current Config (show only values that differ from the defaults)")
-
-	a.RegisterRoute("/config", a.cfg.configHandler(actualCfg, defaultCfg), false, "GET")
 	a.RegisterRoute("/", indexHandler(httpPathPrefix, a.indexPage), false, "GET")
 	a.RegisterRoute("/debug/fgprof", fgprof.Handler(), false, "GET")
+
+	// The /config endpoint exposes the entire live process configuration
+	// (object-storage endpoints and buckets, KV store addresses, component
+	// listen addresses, data directories and credentials). It is only
+	// registered when explicitly opted-in by the operator; when enabled the
+	// AuthMiddleware is applied so the endpoint cannot be reached by
+	// unauthenticated clients, and operators are expected to additionally
+	// enforce authorization (e.g. by restricting access to the HTTP listener
+	// to trusted operator tenants).
+	if a.cfg.AdminEndpointsEnabled {
+		a.indexPage.AddLink(SectionAdminEndpoints, "/config", "Current Config (including the default values)")
+		a.indexPage.AddLink(SectionAdminEndpoints, "/config?mode=diff", "Current Config (show only values that differ from the defaults)")
+		a.RegisterRoute("/config", a.cfg.configHandler(actualCfg, defaultCfg), true, "GET")
+	}
 }
 
 // RegisterRuntimeConfig registers the endpoints associates with the runtime configuration
 func (a *API) RegisterRuntimeConfig(runtimeConfigHandler http.HandlerFunc) {
+	if !a.cfg.AdminEndpointsEnabled {
+		return
+	}
 	a.indexPage.AddLink(SectionAdminEndpoints, "/runtime_config", "Current Runtime Config (incl. Overrides)")
 	a.indexPage.AddLink(SectionAdminEndpoints, "/runtime_config?mode=diff", "Current Runtime Config (show only values that differ from the defaults)")
 
-	a.RegisterRoute("/runtime_config", runtimeConfigHandler, false, "GET")
+	a.RegisterRoute("/runtime_config", runtimeConfigHandler, true, "GET")
 }
 
 // RegisterDistributor registers the endpoints associated with the distributor.
