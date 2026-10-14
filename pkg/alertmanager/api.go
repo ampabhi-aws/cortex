@@ -1,7 +1,6 @@
 package alertmanager
 
 import (
-	"context"
 	"fmt"
 	"io"
 	"net/http"
@@ -20,7 +19,6 @@ import (
 	"github.com/cortexproject/cortex/pkg/alertmanager/alertspb"
 	"github.com/cortexproject/cortex/pkg/tenant"
 	"github.com/cortexproject/cortex/pkg/util"
-	"github.com/cortexproject/cortex/pkg/util/concurrency"
 	util_log "github.com/cortexproject/cortex/pkg/util/log"
 )
 
@@ -261,10 +259,14 @@ func validateUserConfig(logger log.Logger, cfg alertspb.AlertConfigDesc, limits 
 
 func (am *MultitenantAlertmanager) ListAllConfigs(w http.ResponseWriter, r *http.Request) {
 	logger := util_log.WithContext(r.Context(), am.logger)
-	userIDs, err := am.store.ListAllUsers(r.Context())
+
+	// Scope the response to the caller's tenant to prevent cross-tenant disclosure
+	// of raw Alertmanager configurations (which embed receiver secrets such as
+	// Slack/PagerDuty/SMTP/webhook credentials) and notification templates.
+	userID, err := tenant.TenantID(r.Context())
 	if err != nil {
-		level.Error(logger).Log("msg", "failed to list users of alertmanager", "err", err)
-		http.Error(w, fmt.Sprintf("%s: %s", errListAllUser, err.Error()), http.StatusInternalServerError)
+		level.Error(logger).Log("msg", errNoOrgID, "err", err.Error())
+		http.Error(w, fmt.Sprintf("%s: %s", errNoOrgID, err.Error()), http.StatusUnauthorized)
 		return
 	}
 
@@ -276,8 +278,8 @@ func (am *MultitenantAlertmanager) ListAllConfigs(w http.ResponseWriter, r *http
 		close(done)
 	}()
 
-	err = concurrency.ForEachUser(r.Context(), userIDs, fetchConcurrency, func(ctx context.Context, userID string) error {
-		cfg, err := am.store.GetAlertConfig(ctx, userID)
+	fetchErr := func() error {
+		cfg, err := am.store.GetAlertConfig(r.Context(), userID)
 		if errors.Is(err, alertspb.ErrNotFound) {
 			return nil
 		} else if err != nil {
@@ -296,9 +298,9 @@ func (am *MultitenantAlertmanager) ListAllConfigs(w http.ResponseWriter, r *http
 		}
 
 		return nil
-	})
-	if err != nil {
-		level.Error(logger).Log("msg", "failed to list all alertmanager configs", "err", err)
+	}()
+	if fetchErr != nil {
+		level.Error(logger).Log("msg", "failed to list alertmanager config", "err", fetchErr, "user", userID)
 	}
 	close(iter)
 	<-done
