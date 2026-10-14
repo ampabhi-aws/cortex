@@ -28,6 +28,25 @@ import (
 const (
 	maxCasRetries              = 10          // max retries in CAS operation
 	noChangeDetectedRetrySleep = time.Second // how long to sleep after no change was detected in CAS
+
+	// maxKeyLength bounds the length of KV store keys accepted from gossip
+	// messages. Legitimate keys used by Cortex (e.g. "ring", "collectors/ring",
+	// "compactor", "alertmanager") are very short strings, so this is a generous
+	// cap that still prevents a peer from stuffing the store with arbitrarily
+	// long keys.
+	maxKeyLength = 256
+
+	// maxStoreKeys bounds the total number of keys the gossip delegate will
+	// insert into the KV store. Even with the "participating keys" allow-list,
+	// prefix registrations (e.g. ha-tracker/*) can admit many keys from gossip;
+	// this cap keeps the store bounded even in that case.
+	maxStoreKeys = 10000
+
+	// maxLocalStateSize bounds how many bytes LocalState will serialise into
+	// one push/pull sync payload. If the store would produce more than this,
+	// extra values are skipped (and logged) rather than letting the message
+	// grow without limit.
+	maxLocalStateSize = 64 * 1024 * 1024
 )
 
 // Client implements kv.Client interface, by using memberlist.KV
@@ -56,6 +75,8 @@ func (c *Client) List(ctx context.Context, prefix string) ([]string, error) {
 		return nil, err
 	}
 
+	// Record the prefix so gossip messages whose keys match it are accepted.
+	c.kv.RegisterKeyPrefix(prefix)
 	return c.kv.List(prefix), nil
 }
 
@@ -66,6 +87,8 @@ func (c *Client) Get(ctx context.Context, key string) (interface{}, error) {
 		return nil, err
 	}
 
+	// Record the key so gossip messages for it are accepted.
+	c.kv.RegisterKey(key)
 	return c.kv.Get(key, c.codec)
 }
 
@@ -81,6 +104,7 @@ func (c *Client) CAS(ctx context.Context, key string, f func(in interface{}) (ou
 		return err
 	}
 
+	c.kv.RegisterKey(key)
 	return c.kv.CAS(ctx, key, c.codec, f)
 }
 
@@ -91,6 +115,7 @@ func (c *Client) WatchKey(ctx context.Context, key string, f func(interface{}) b
 		return
 	}
 
+	c.kv.RegisterKey(key)
 	c.kv.WatchKey(ctx, key, c.codec, f)
 }
 
@@ -102,6 +127,7 @@ func (c *Client) WatchPrefix(ctx context.Context, prefix string, f func(string, 
 		return
 	}
 
+	c.kv.RegisterKeyPrefix(prefix)
 	c.kv.WatchPrefix(ctx, prefix, c.codec, f)
 }
 
@@ -235,6 +261,16 @@ type KV struct {
 	storeMu sync.Mutex
 	store   map[string]valueDesc
 
+	// Set of KV keys this process actively participates in. Keys are added
+	// when a Client Get/List/CAS/WatchKey/WatchPrefix is invoked locally (or
+	// an explicit RegisterKey/RegisterKeyPrefix call is made). Gossip
+	// messages that reference keys outside this allowlist are dropped so a
+	// remote peer cannot inject arbitrary keys into the store or get them
+	// re-broadcast to the cluster.
+	participatingKeysMu   sync.RWMutex
+	participatingKeys     map[string]struct{}
+	participatingPrefixes map[string]struct{}
+
 	// Codec registry
 	codecs map[string]codec.Codec
 
@@ -344,12 +380,14 @@ func NewKV(cfg KVConfig, logger log.Logger, dnsProvider DNSProvider, registerer 
 		registerer: registerer,
 		provider:   dnsProvider,
 
-		store:          make(map[string]valueDesc),
-		codecs:         make(map[string]codec.Codec),
-		watchers:       make(map[string][]chan string),
-		prefixWatchers: make(map[string][]chan string),
-		shutdown:       make(chan struct{}),
-		maxCasRetries:  maxCasRetries,
+		store:                 make(map[string]valueDesc),
+		participatingKeys:     make(map[string]struct{}),
+		participatingPrefixes: make(map[string]struct{}),
+		codecs:                make(map[string]codec.Codec),
+		watchers:              make(map[string][]chan string),
+		prefixWatchers:        make(map[string][]chan string),
+		shutdown:              make(chan struct{}),
+		maxCasRetries:         maxCasRetries,
 	}
 
 	mlkv.createAndRegisterMetrics()
@@ -510,6 +548,66 @@ func (m *KV) GetCodec(codecID string) codec.Codec {
 	return m.codecs[codecID]
 }
 
+// RegisterKey records that this process participates in the given key. Only
+// gossip messages whose key is registered (either exactly or via a registered
+// prefix) are accepted. The method is safe for concurrent use. Empty keys and
+// keys longer than maxKeyLength are silently ignored.
+func (m *KV) RegisterKey(key string) {
+	if key == "" || len(key) > maxKeyLength {
+		return
+	}
+
+	m.participatingKeysMu.RLock()
+	_, ok := m.participatingKeys[key]
+	m.participatingKeysMu.RUnlock()
+	if ok {
+		return
+	}
+
+	m.participatingKeysMu.Lock()
+	m.participatingKeys[key] = struct{}{}
+	m.participatingKeysMu.Unlock()
+}
+
+// RegisterKeyPrefix records that this process participates in any key starting
+// with the given prefix. Gossip messages whose key has this prefix are
+// accepted even if the exact key has not been registered. An empty prefix is
+// ignored (it would re-open the "accept any key" behaviour the allowlist is
+// designed to prevent).
+func (m *KV) RegisterKeyPrefix(prefix string) {
+	if prefix == "" {
+		return
+	}
+
+	m.participatingKeysMu.RLock()
+	_, ok := m.participatingPrefixes[prefix]
+	m.participatingKeysMu.RUnlock()
+	if ok {
+		return
+	}
+
+	m.participatingKeysMu.Lock()
+	m.participatingPrefixes[prefix] = struct{}{}
+	m.participatingKeysMu.Unlock()
+}
+
+// isParticipatingKey reports whether this process has registered the given
+// key, either directly or via a registered prefix.
+func (m *KV) isParticipatingKey(key string) bool {
+	m.participatingKeysMu.RLock()
+	defer m.participatingKeysMu.RUnlock()
+
+	if _, ok := m.participatingKeys[key]; ok {
+		return true
+	}
+	for prefix := range m.participatingPrefixes {
+		if strings.HasPrefix(key, prefix) {
+			return true
+		}
+	}
+	return false
+}
+
 // GetListeningPort returns port used for listening for memberlist communication. Useful when BindPort is set to 0.
 // This call is only valid after KV service has been started.
 func (m *KV) GetListeningPort() int {
@@ -640,6 +738,8 @@ func (m *KV) stopping(_ error) error {
 // List returns all known keys under a given prefix.
 // No communication with other nodes in the cluster is done here.
 func (m *KV) List(prefix string) []string {
+	m.RegisterKeyPrefix(prefix)
+
 	m.storeMu.Lock()
 	defer m.storeMu.Unlock()
 
@@ -655,6 +755,7 @@ func (m *KV) List(prefix string) []string {
 // Get returns current value associated with given key.
 // No communication with other nodes in the cluster is done here.
 func (m *KV) Get(key string, codec codec.Codec) (interface{}, error) {
+	m.RegisterKey(key)
 	val, _, err := m.get(key, codec)
 	return val, err
 }
@@ -679,6 +780,8 @@ func (m *KV) get(key string, codec codec.Codec) (out interface{}, version uint, 
 //
 // Watching ends when 'f' returns false, context is done, or this client is shut down.
 func (m *KV) WatchKey(ctx context.Context, key string, codec codec.Codec, f func(interface{}) bool) {
+	m.RegisterKey(key)
+
 	// keep one extra notification, to avoid missing notification if we're busy running the function
 	w := make(chan string, 1)
 
@@ -726,6 +829,8 @@ func (m *KV) WatchKey(ctx context.Context, key string, codec codec.Codec, f func
 //
 // Watching ends when 'f' returns false, context is done, or this client is shut down.
 func (m *KV) WatchPrefix(ctx context.Context, prefix string, codec codec.Codec, f func(string, interface{}) bool) {
+	m.RegisterKeyPrefix(prefix)
+
 	// we use bigger buffer here, since keys are interesting and we don't want to lose them.
 	w := make(chan string, 16)
 
@@ -825,6 +930,8 @@ func (m *KV) notifyWatchers(key string) {
 // detect removals. If Merge doesn't result in any change (returns nil), then operation fails and is retried again.
 // After too many failed retries, this method returns error.
 func (m *KV) CAS(ctx context.Context, key string, codec codec.Codec, f func(in interface{}) (out interface{}, retry bool, err error)) error {
+	m.RegisterKey(key)
+
 	var lastError error
 
 outer:
@@ -978,6 +1085,21 @@ func (m *KV) NotifyMsg(msg []byte) {
 		return
 	}
 
+	if len(kvPair.Key) > maxKeyLength {
+		level.Warn(m.logger).Log("msg", "received an invalid KV Pair (key too long)", "key_length", len(kvPair.Key))
+		m.numberOfInvalidReceivedMessages.Inc()
+		return
+	}
+
+	if !m.isParticipatingKey(kvPair.Key) {
+		// Drop the message: this process does not participate in that key,
+		// so merging it would allow a remote peer to inject arbitrary keys
+		// into our KV store and have them re-broadcast cluster-wide.
+		level.Warn(m.logger).Log("msg", "received KV Pair for key this process does not participate in; dropping", "key", kvPair.Key)
+		m.numberOfInvalidReceivedMessages.Inc()
+		return
+	}
+
 	codec := m.GetCodec(kvPair.GetCodec())
 	if codec == nil {
 		m.numberOfInvalidReceivedMessages.Inc()
@@ -1103,6 +1225,14 @@ func (m *KV) LocalState(join bool) []byte {
 			Pair:    kvPair, // Makes a copy of kvPair.
 			Version: val.version,
 		})
+
+		// Cap the total serialised size so a bloated store cannot produce an
+		// unbounded push/pull payload. Legitimate state is far below this
+		// limit; hitting it is a signal of a bug or an injection attempt.
+		if buf.Len() >= maxLocalStateSize {
+			level.Warn(m.logger).Log("msg", "local state exceeds maximum serialised size; truncating", "size", buf.Len(), "limit", maxLocalStateSize)
+			break
+		}
 	}
 
 	m.totalSizeOfPulls.Add(float64(buf.Len()))
@@ -1150,6 +1280,28 @@ func (m *KV) MergeRemoteState(data []byte, join bool) {
 		}
 
 		data = data[kvPairLength:]
+
+		if len(kvPair.Key) == 0 {
+			level.Warn(m.logger).Log("msg", "received an invalid KV Pair in remote state (empty key)")
+			m.numberOfInvalidReceivedMessages.Inc()
+			continue
+		}
+
+		if len(kvPair.Key) > maxKeyLength {
+			level.Warn(m.logger).Log("msg", "received an invalid KV Pair in remote state (key too long)", "key_length", len(kvPair.Key))
+			m.numberOfInvalidReceivedMessages.Inc()
+			continue
+		}
+
+		if !m.isParticipatingKey(kvPair.Key) {
+			// Drop the KV pair: this process does not participate in that
+			// key, so merging it would allow a remote peer to inject
+			// arbitrary keys into our KV store (and have them re-broadcast
+			// to the rest of the cluster).
+			level.Warn(m.logger).Log("msg", "received remote state KV Pair for key this process does not participate in; dropping", "key", kvPair.Key)
+			m.numberOfInvalidReceivedMessages.Inc()
+			continue
+		}
 
 		codec := m.GetCodec(kvPair.GetCodec())
 		if codec == nil {
@@ -1205,8 +1357,22 @@ func (m *KV) mergeBytesValueForKey(key string, incomingData []byte, codec codec.
 // If CAS version is specified, then merging will fail if state has changed already, and errVersionMismatch is reported.
 // If no modification occurred, new version is 0.
 func (m *KV) mergeValueForKey(key string, incomingValue Mergeable, casVersion uint, codec codec.Codec) (Mergeable, uint, error) {
+	// Defence-in-depth: refuse to store (and therefore to broadcast or dump
+	// in LocalState) any key that is not registered with this process. The
+	// Client wrappers and KV.Get/List/CAS/WatchKey/WatchPrefix already
+	// register the keys they use, so legitimate call sites are unaffected.
+	if !m.isParticipatingKey(key) {
+		return nil, 0, fmt.Errorf("refusing to merge value for unregistered key %q", key)
+	}
+
 	m.storeMu.Lock()
 	defer m.storeMu.Unlock()
+
+	// Enforce a hard cap on the number of keys in the store. New keys past
+	// the cap are refused; updates to existing keys are still allowed.
+	if _, exists := m.store[key]; !exists && len(m.store) >= maxStoreKeys {
+		return nil, 0, fmt.Errorf("refusing to add key %q: KV store at maximum capacity (%d keys)", key, maxStoreKeys)
+	}
 
 	// Note that we do not take a deep copy of curr.value here, it is modified in-place.
 	// This is safe because the entire function runs under the store lock; we do not return
