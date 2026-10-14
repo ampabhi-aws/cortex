@@ -28,6 +28,13 @@ func Handler(maxRecvMsgSize int, sourceIPs *middleware.SourceIPExtractor, push F
 				logger = log.WithSourceIPs(source, logger)
 			}
 		}
+		// Wrap the body with http.MaxBytesReader so a client cannot stream more
+		// bytes than -distributor.max-recv-msg-size regardless of what the
+		// Content-Length header claims; this also makes the body cap enforced
+		// before the full body has been buffered.
+		if maxRecvMsgSize > 0 {
+			r.Body = http.MaxBytesReader(w, r.Body, int64(maxRecvMsgSize))
+		}
 		var req cortexpb.PreallocWriteRequest
 		err := util.ParseProtoReader(ctx, r.Body, int(r.ContentLength), maxRecvMsgSize, &req, util.RawSnappy)
 		if err != nil {
