@@ -47,10 +47,18 @@ func (s *UsersScanner) ScanUsers(ctx context.Context) (users, markedForDeletion 
 	for ix := 0; ix < len(users); {
 		userID := users[ix]
 
-		// Check if it's owned by this instance.
+		// Check if it's owned by this instance. Fail closed on error: if we cannot
+		// verify ownership we must assume the user is not owned, otherwise every
+		// replica treats the tenant as owned when the ownership check errors (eg.
+		// a non-ACTIVE/stale ring instance during rolling restarts), which can
+		// lead to concurrent block deletion and bucket-index overwrites for the
+		// same tenant. This matches the behavior of the compaction path which
+		// also skips the tenant on an ownership error.
 		owned, err := s.isOwned(userID)
 		if err != nil {
 			level.Warn(s.logger).Log("msg", "unable to check if user is owned by this shard", "user", userID, "err", err)
+			users = append(users[:ix], users[ix+1:]...)
+			continue
 		} else if !owned {
 			users = append(users[:ix], users[ix+1:]...)
 			continue
