@@ -5,6 +5,7 @@ import (
 	"context"
 	"crypto/rand"
 	"encoding/binary"
+	"encoding/hex"
 	"errors"
 	"flag"
 	"fmt"
@@ -13,7 +14,6 @@ import (
 	"strings"
 	"sync"
 	"time"
-
 	"github.com/go-kit/log"
 	"github.com/go-kit/log/level"
 	"github.com/hashicorp/memberlist"
@@ -157,6 +157,14 @@ type KVConfig struct {
 	// How much space to use to keep received and sent messages in memory (for troubleshooting).
 	MessageHistoryBufferBytes int `yaml:"message_history_buffer_bytes"`
 
+	// GossipSecretKey is the symmetric key used by memberlist to encrypt and
+	// authenticate every gossip message. When set, memberlist's
+	// GossipVerifyIncoming/GossipVerifyOutgoing are enabled (the memberlist
+	// default), so packets without a valid authenticated tag are dropped.
+	// The value is a hex-encoded 16, 24 or 32 byte key (AES-128/192/256-GCM).
+	// All members of the cluster MUST be configured with the same key.
+	GossipSecretKey string `yaml:"gossip_secret_key"`
+
 	TCPTransport TCPTransportConfig `yaml:",inline"`
 
 	// Where to put custom metrics. Metrics are not registered, if this is nil.
@@ -193,6 +201,7 @@ func (cfg *KVConfig) RegisterFlagsWithPrefix(f *flag.FlagSet, prefix string) {
 	f.BoolVar(&cfg.EnableCompression, prefix+"memberlist.compression-enabled", mlDefaults.EnableCompression, "Enable message compression. This can be used to reduce bandwidth usage at the cost of slightly more CPU utilization.")
 	f.StringVar(&cfg.AdvertiseAddr, prefix+"memberlist.advertise-addr", mlDefaults.AdvertiseAddr, "Gossip address to advertise to other members in the cluster. Used for NAT traversal.")
 	f.IntVar(&cfg.AdvertisePort, prefix+"memberlist.advertise-port", mlDefaults.AdvertisePort, "Gossip port to advertise to other members in the cluster. Used for NAT traversal.")
+	f.StringVar(&cfg.GossipSecretKey, prefix+"memberlist.gossip-secret-key", "", "Hex-encoded symmetric key (16, 24 or 32 bytes) used by memberlist to encrypt and authenticate every gossip message. When set, incoming packets without a valid authenticated tag are dropped and outgoing packets are encrypted. All cluster members MUST share the same key. In addition to this, the gossip port MUST be network-isolated so that only trusted peers can reach it.")
 
 	cfg.TCPTransport.RegisterFlagsWithPrefix(f, prefix)
 }
@@ -386,6 +395,25 @@ func (m *KV) buildMemberlistConfig() (*memberlist.Config, error) {
 
 	mlCfg.AdvertiseAddr = m.cfg.AdvertiseAddr
 	mlCfg.AdvertisePort = m.cfg.AdvertisePort
+
+	if m.cfg.GossipSecretKey != "" {
+		secret, err := hex.DecodeString(m.cfg.GossipSecretKey)
+		if err != nil {
+			return nil, fmt.Errorf("invalid memberlist.gossip-secret-key: must be hex-encoded: %w", err)
+		}
+		switch len(secret) {
+		case 16, 24, 32:
+		default:
+			return nil, fmt.Errorf("invalid memberlist.gossip-secret-key: decoded key must be 16, 24 or 32 bytes long, got %d bytes", len(secret))
+		}
+		mlCfg.SecretKey = secret
+		// memberlist.DefaultLANConfig already sets GossipVerifyIncoming and
+		// GossipVerifyOutgoing to true, but set them explicitly here so the
+		// authenticated-gossip property is obvious and cannot be silently
+		// disabled by a future change to the memberlist defaults.
+		mlCfg.GossipVerifyIncoming = true
+		mlCfg.GossipVerifyOutgoing = true
+	}
 
 	if m.cfg.NodeName != "" {
 		mlCfg.Name = m.cfg.NodeName

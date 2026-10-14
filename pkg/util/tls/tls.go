@@ -73,6 +73,47 @@ func (cfg *ClientConfig) GetTLSConfig() (*tls.Config, error) {
 	return config, nil
 }
 
+// GetServerTLSConfig initialises a server-side tls.Config from the same
+// options as GetTLSConfig, but applied to the serving side of a listener.
+//
+// Unlike GetTLSConfig, this intentionally ignores InsecureSkipVerify and
+// ServerName (which are only meaningful for a TLS client) and instead
+// configures ClientAuth: tls.RequireAndVerifyClientCert together with
+// ClientCAs populated from CAPath, so an incoming peer MUST present a
+// certificate signed by the configured CA. The server certificate and key
+// come from CertPath/KeyPath. A CA path is required to validate peer
+// certificates: without one no peer could ever be verified.
+func (cfg *ClientConfig) GetServerTLSConfig() (*tls.Config, error) {
+	config := &tls.Config{
+		ClientAuth: tls.RequireAndVerifyClientCert,
+	}
+
+	if cfg.CAPath == "" {
+		return nil, errors.New("a CA certificate path (tls_ca_path) is required to authenticate peers on the server-side TLS listener")
+	}
+
+	caCert, err := os.ReadFile(cfg.CAPath)
+	if err != nil {
+		return nil, errors.Wrapf(err, "error loading ca cert: %s", cfg.CAPath)
+	}
+	caCertPool := x509.NewCertPool()
+	if !caCertPool.AppendCertsFromPEM(caCert) {
+		return nil, errors.Errorf("failed to append any CA certificate from %s", cfg.CAPath)
+	}
+	config.ClientCAs = caCertPool
+
+	if cfg.CertPath == "" || cfg.KeyPath == "" {
+		return nil, errors.New("both a server certificate (tls_cert_path) and key (tls_key_path) are required for the server-side TLS listener")
+	}
+	serverCert, err := tls.LoadX509KeyPair(cfg.CertPath, cfg.KeyPath)
+	if err != nil {
+		return nil, errors.Wrapf(err, "failed to load TLS certificate %s,%s", cfg.CertPath, cfg.KeyPath)
+	}
+	config.Certificates = []tls.Certificate{serverCert}
+
+	return config, nil
+}
+
 // GetGRPCDialOptions creates GRPC DialOptions for TLS
 func (cfg *ClientConfig) GetGRPCDialOptions(enabled bool) ([]grpc.DialOption, error) {
 	if !enabled {
