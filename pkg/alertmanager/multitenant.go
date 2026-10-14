@@ -814,6 +814,27 @@ func (am *MultitenantAlertmanager) setConfig(cfg alertspb.AlertConfigDesc) error
 	var userTemplateDir = filepath.Join(am.getTenantDirectory(cfg.User), templatesDir)
 	var pathsToRemove = make(map[string]struct{})
 
+	// Enforce template count/size limits and validate every template filename
+	// at the point of use. Configurations may have been persisted by older
+	// code paths (e.g. the legacy configdb backend) that do not validate
+	// template filenames, so we must defensively re-check them here before
+	// writing anything to disk.
+	if l := am.limits.AlertmanagerMaxTemplatesCount(cfg.User); l > 0 && len(cfg.Templates) > l {
+		return fmt.Errorf(errTooManyTemplates, len(cfg.Templates), l)
+	}
+	if maxSize := am.limits.AlertmanagerMaxTemplateSize(cfg.User); maxSize > 0 {
+		for _, tmpl := range cfg.Templates {
+			if size := len(tmpl.GetBody()); size > maxSize {
+				return fmt.Errorf(errTemplateTooBig, tmpl.GetFilename(), size, maxSize)
+			}
+		}
+	}
+	for _, tmpl := range cfg.Templates {
+		if err := validateTemplateFilename(tmpl.Filename); err != nil {
+			return err
+		}
+	}
+
 	// List existing files to keep track the ones to be removed
 	if oldTemplateFiles, err := os.ReadDir(userTemplateDir); err == nil {
 		for _, file := range oldTemplateFiles {
@@ -1323,10 +1344,15 @@ func safeTemplateFilepath(dir, templateName string) (string, error) {
 		return "", err
 	}
 
-	// Ensure the actual path of the template is within the expected directory.
-	// This check is a counter-measure to make sure the tenant is not trying to
-	// escape its own directory on disk.
-	if !strings.HasPrefix(actualPath, containerDir) {
+	// Ensure the actual path of the template is strictly within the expected
+	// directory. We compute the relative path from the container directory and
+	// require it to be a local path (i.e. not escaping with ".." and not
+	// absolute). A bare strings.HasPrefix check is not sufficient because it
+	// has no path-separator boundary and would accept sibling directories
+	// whose names begin with the container directory name (e.g.
+	// "<dir>/templates" vs "<dir>/templates-evil").
+	rel, err := filepath.Rel(containerDir, actualPath)
+	if err != nil || rel == ".." || strings.HasPrefix(rel, ".."+string(os.PathSeparator)) || filepath.IsAbs(rel) {
 		return "", fmt.Errorf("invalid template name %q: the template filepath is escaping the per-tenant local directory", templateName)
 	}
 
