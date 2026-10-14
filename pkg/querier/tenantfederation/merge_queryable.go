@@ -3,6 +3,7 @@ package tenantfederation
 import (
 	"context"
 	"fmt"
+	"net/http"
 	"sort"
 	"strings"
 
@@ -11,6 +12,7 @@ import (
 	"github.com/prometheus/prometheus/storage"
 	"github.com/prometheus/prometheus/tsdb/chunkenc"
 	tsdb_errors "github.com/prometheus/prometheus/tsdb/errors"
+	"github.com/weaveworks/common/httpgrpc"
 	"github.com/weaveworks/common/user"
 
 	"github.com/cortexproject/cortex/pkg/tenant"
@@ -37,14 +39,31 @@ const (
 // by the tenant ID and the previous value is exposed through a new label
 // prefixed with "original_". This behaviour is not implemented recursively.
 func NewQueryable(upstream storage.Queryable, byPassWithSingleQuerier bool) storage.Queryable {
-	return NewMergeQueryable(defaultTenantLabel, tenantQuerierCallback(upstream), byPassWithSingleQuerier)
+	return NewQueryableWithMaxTenants(upstream, 0, byPassWithSingleQuerier)
 }
 
-func tenantQuerierCallback(queryable storage.Queryable) MergeQuerierCallback {
+// NewQueryableWithMaxTenants is like NewQueryable but additionally enforces an
+// upper bound on the number of tenants that may be federated in a single
+// request. When maxTenants > 0 and the request lists more tenants than
+// maxTenants, the request is rejected with HTTP 400 before any per-tenant
+// querier is allocated. A non-positive maxTenants disables the check.
+func NewQueryableWithMaxTenants(upstream storage.Queryable, maxTenants int, byPassWithSingleQuerier bool) storage.Queryable {
+	return NewMergeQueryable(defaultTenantLabel, tenantQuerierCallback(upstream, maxTenants), byPassWithSingleQuerier)
+}
+
+func tenantQuerierCallback(queryable storage.Queryable, maxTenants int) MergeQuerierCallback {
 	return func(ctx context.Context, mint int64, maxt int64) ([]string, []storage.Querier, error) {
 		tenantIDs, err := tenant.TenantIDs(ctx)
 		if err != nil {
 			return nil, nil, err
+		}
+
+		// Reject federated requests with more than the configured number of
+		// tenants before any per-tenant querier is allocated. This bounds the
+		// fan-out (ingester gRPC, bucket-index object-store reads, cached
+		// bucket-index entries) that a single client request can trigger.
+		if maxTenants > 0 && len(tenantIDs) > maxTenants {
+			return nil, nil, httpgrpc.Errorf(http.StatusBadRequest, "too many tenant IDs in request: %d exceeds the max-tenants limit of %d (set via -tenant-federation.max-tenants)", len(tenantIDs), maxTenants)
 		}
 
 		var queriers = make([]storage.Querier, len(tenantIDs))
