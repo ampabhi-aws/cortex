@@ -62,12 +62,14 @@ func NewSingleResolver() *SingleResolver {
 type SingleResolver struct {
 }
 
-// containsUnsafePathSegments will return true if the string is a directory
-// reference like `.` and `..` or if any path separator character like `/` and
-// `\` can be found.
+// containsUnsafePathSegments will return true if the string is empty, a
+// directory reference like `.` and `..`, or if any path separator character
+// like `/` and `\` can be found. An empty tenant ID is unsafe because
+// filepath.Join(dir, "") == dir and prefix+"/"+"" collapses the per-tenant
+// scope to the shared parent scope.
 func containsUnsafePathSegments(id string) bool {
-	// handle the relative reference to current and parent path.
-	if id == "." || id == ".." {
+	// handle the empty tenant ID and relative references to current/parent path.
+	if id == "" || id == "." || id == ".." {
 		return true
 	}
 
@@ -131,6 +133,10 @@ func (t *MultiResolver) TenantIDs(ctx context.Context) ([]string, error) {
 
 	orgIDs := strings.Split(orgID, tenantIDsLabelSeparator)
 	for _, orgID := range orgIDs {
+		// Reject empty '|'-separated segments (e.g. header values such as
+		// "|", "a|" and "|a"): ValidTenantID now returns an error for "",
+		// but also check containsUnsafePathSegments explicitly as defence in
+		// depth since both guard against path/prefix collapsing.
 		if err := ValidTenantID(orgID); err != nil {
 			return nil, err
 		}

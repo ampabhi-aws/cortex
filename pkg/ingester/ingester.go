@@ -905,6 +905,13 @@ func (i *Ingester) Push(ctx context.Context, req *cortexpb.WriteRequest) (*corte
 	if err != nil {
 		return nil, err
 	}
+	// Defence in depth: reject an empty tenant ID. The tenant resolver already
+	// rejects empty tenant IDs; this guard mirrors the ones in
+	// pkg/storegateway/bucket_stores.go and pkg/ruler/api.go, and prevents the
+	// ingester from opening a TSDB on the shared blocks root directory.
+	if userID == "" {
+		return nil, httpgrpc.Errorf(http.StatusBadRequest, "empty tenant ID")
+	}
 
 	il := i.getInstanceLimits()
 	if il != nil && il.MaxIngestionRate > 0 {
