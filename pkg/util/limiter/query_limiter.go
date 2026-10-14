@@ -54,6 +54,15 @@ func AddQueryLimiterToContext(ctx context.Context, limiter *QueryLimiter) contex
 	return context.WithValue(ctx, ctxKey, limiter)
 }
 
+// QueryLimiterFromContext returns the QueryLimiter installed in the context,
+// if any. ok is false when no limiter is attached. Use this to decide whether
+// to install a new per-query limiter or keep an existing one (e.g. a shared
+// limiter installed by a federated-query parent).
+func QueryLimiterFromContext(ctx context.Context) (ql *QueryLimiter, ok bool) {
+	ql, ok = ctx.Value(ctxKey).(*QueryLimiter)
+	return
+}
+
 // QueryLimiterFromContextWithFallback returns a QueryLimiter from the current context.
 // If there is not a QueryLimiter on the context it will return a new no-op limiter.
 func QueryLimiterFromContextWithFallback(ctx context.Context) *QueryLimiter {

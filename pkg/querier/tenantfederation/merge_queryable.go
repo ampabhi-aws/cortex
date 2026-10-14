@@ -31,20 +31,51 @@ const (
 // and results for request with a single querier will not contain the
 // "__tenant_id__" label. This allows a smoother transition, when enabling
 // tenant federation in a cluster.
+// maxTenants, when > 0, bounds the number of tenants a single federated
+// request may address; requests whose resolved tenant list exceeds this
+// value are rejected before any sub-querier is created.
+// If limiterCallback is non-nil, it is invoked once with the resolved tenant
+// list and the returned context (which is expected to carry a shared
+// per-query resource limiter) is used as the parent context for all per-
+// tenant sub-queriers so that the series/chunk/byte budget is not multiplied
+// by the number of federated tenants.
 // The result contains a label "__tenant_id__" to identify the tenant ID that
 // it originally resulted from.
 // If the label "__tenant_id__" is already existing, its value is overwritten
 // by the tenant ID and the previous value is exposed through a new label
 // prefixed with "original_". This behaviour is not implemented recursively.
-func NewQueryable(upstream storage.Queryable, byPassWithSingleQuerier bool) storage.Queryable {
-	return NewMergeQueryable(defaultTenantLabel, tenantQuerierCallback(upstream), byPassWithSingleQuerier)
+func NewQueryable(upstream storage.Queryable, maxTenants int, byPassWithSingleQuerier bool, limiterCallback QueryLimiterCallback) storage.Queryable {
+	return NewMergeQueryable(defaultTenantLabel, tenantQuerierCallback(upstream, maxTenants, limiterCallback), byPassWithSingleQuerier)
 }
 
-func tenantQuerierCallback(queryable storage.Queryable) MergeQuerierCallback {
+// QueryLimiterCallback is invoked once per federated request with the resolved
+// tenant list. It must return a context derived from the one passed in that
+// carries a shared per-query resource limiter so the limiter is aggregated
+// across the federated tenants instead of being allocated per tenant.
+type QueryLimiterCallback func(ctx context.Context, tenantIDs []string) context.Context
+
+// errTooManyTenants is returned when a federated query addresses more tenants
+// than the configured maximum.
+func errTooManyTenants(got, max int) error {
+	return fmt.Errorf("too many tenants in federated query: %d requested, limit is %d", got, max)
+}
+
+func tenantQuerierCallback(queryable storage.Queryable, maxTenants int, limiterCallback QueryLimiterCallback) MergeQuerierCallback {
 	return func(ctx context.Context, mint int64, maxt int64) ([]string, []storage.Querier, error) {
 		tenantIDs, err := tenant.TenantIDs(ctx)
 		if err != nil {
 			return nil, nil, err
+		}
+
+		if maxTenants > 0 && len(tenantIDs) > maxTenants {
+			return nil, nil, errTooManyTenants(len(tenantIDs), maxTenants)
+		}
+
+		// Install a shared per-query resource limiter (built from the
+		// aggregated per-tenant limits) on the parent context so every
+		// sub-querier reuses it instead of allocating its own.
+		if limiterCallback != nil {
+			ctx = limiterCallback(ctx, tenantIDs)
 		}
 
 		var queriers = make([]storage.Querier, len(tenantIDs))
