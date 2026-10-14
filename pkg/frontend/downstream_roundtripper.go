@@ -1,6 +1,7 @@
 package frontend
 
 import (
+	"errors"
 	"net/http"
 	"net/url"
 	"path"
@@ -37,5 +38,19 @@ func (d downstreamRoundTripper) RoundTrip(r *http.Request) (*http.Response, erro
 	r.URL.Host = d.downstreamURL.Host
 	r.URL.Path = path.Join(d.downstreamURL.Path, r.URL.Path)
 	r.Host = ""
-	return d.transport.RoundTrip(r)
+	resp, err := d.transport.RoundTrip(r)
+	if err != nil {
+		// Strip the URL from any *url.Error returned by the transport.
+		// The URL embeds the operator's internal downstream scheme, host,
+		// port, path and (via the wrapped net.OpError) the dialed IP, none
+		// of which should ever reach tenants if this error is logged or
+		// serialised. Keep the operation and underlying error so operators
+		// still get useful detail in server-side logs.
+		var uerr *url.Error
+		if errors.As(err, &uerr) {
+			return nil, &url.Error{Op: uerr.Op, URL: "", Err: uerr.Err}
+		}
+		return nil, err
+	}
+	return resp, nil
 }

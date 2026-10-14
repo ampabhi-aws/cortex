@@ -137,7 +137,7 @@ func (f *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	queryResponseTime := time.Since(startTime)
 
 	if err != nil {
-		writeError(w, err)
+		writeError(r.Context(), f.log, w, err)
 		return
 	}
 
@@ -239,15 +239,33 @@ func formatQueryString(queryString url.Values) (fields []interface{}) {
 	return fields
 }
 
-func writeError(w http.ResponseWriter, err error) {
-	switch err {
-	case context.Canceled:
+// writeError writes an HTTP error response for err. It maps well-known
+// error kinds to their intended status codes and, critically, never writes
+// an arbitrary Go error string to the response: raw errors (e.g. a
+// *url.Error from the downstream round-tripper) can embed internal
+// hostnames, ports and IP addresses that must not leak to tenants.
+// Non-httpgrpc errors are logged in full on the server and the client
+// receives a generic "internal server error" body.
+func writeError(ctx context.Context, logger log.Logger, w http.ResponseWriter, err error) {
+	switch {
+	case errors.Is(err, context.Canceled):
 		err = errCanceled
-	case context.DeadlineExceeded:
+	case errors.Is(err, context.DeadlineExceeded):
 		err = errDeadlineExceeded
+	case util.IsRequestBodyTooLarge(err):
+		err = errRequestEntityTooLarge
 	default:
-		if util.IsRequestBodyTooLarge(err) {
-			err = errRequestEntityTooLarge
+		// If the error already carries an intentionally user-facing
+		// httpgrpc body, keep it as-is. Otherwise, log the full detail
+		// server-side and return a generic body to the client so that
+		// internal error text (downstream URL, host:port, dialed IP,
+		// transport/TLS detail, process state, ...) is not disclosed.
+		if _, ok := httpgrpc.HTTPResponseFromError(err); !ok {
+			if logger == nil {
+				logger = util_log.Logger
+			}
+			level.Error(util_log.WithContext(ctx, logger)).Log("msg", "error processing request", "err", err)
+			err = httpgrpc.Errorf(http.StatusInternalServerError, "internal server error")
 		}
 	}
 	server.WriteError(w, err)
