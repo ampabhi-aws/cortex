@@ -524,6 +524,10 @@ func (am *MultitenantAlertmanager) migrateStateFilesToPerTenantDirectories() err
 	}
 
 	for userID, files := range st {
+		if err := validateTenantIDForLocalStorage(userID); err != nil {
+			level.Warn(am.logger).Log("msg", "skipping migration of alertmanager state for tenant with unsafe ID", "user", userID, "err", err)
+			continue
+		}
 		tenantDir := am.getTenantDirectory(userID)
 		err := os.MkdirAll(tenantDir, 0777)
 		if err != nil {
@@ -808,6 +812,14 @@ func (am *MultitenantAlertmanager) syncConfigs(cfgs map[string]alertspb.AlertCon
 // setConfig applies the given configuration to the alertmanager for `userID`,
 // creating an alertmanager if it doesn't already exist.
 func (am *MultitenantAlertmanager) setConfig(cfg alertspb.AlertConfigDesc) error {
+	// Validate the tenant ID before using it to build any filesystem path.
+	// This prevents a tenant whose ID contains filesystem-glob metacharacters
+	// (e.g. `*`) from making the per-tenant templates path a glob pattern that
+	// expands into other tenants' template directories.
+	if err := validateTenantIDForLocalStorage(cfg.User); err != nil {
+		return err
+	}
+
 	var userAmConfig *amconfig.Config
 	var err error
 	var hasTemplateChanges bool
@@ -924,6 +936,12 @@ func (am *MultitenantAlertmanager) getTenantDirectory(userID string) string {
 }
 
 func (am *MultitenantAlertmanager) newAlertmanager(userID string, amConfig *amconfig.Config, rawCfg string) (*Alertmanager, error) {
+	// Defence in depth: ensure the tenant ID is safe to use as a directory
+	// name before deriving any filesystem path from it.
+	if err := validateTenantIDForLocalStorage(userID); err != nil {
+		return nil, err
+	}
+
 	reg := prometheus.NewRegistry()
 
 	tenantDir := am.getTenantDirectory(userID)
@@ -1291,6 +1309,37 @@ func (am *MultitenantAlertmanager) ReadState(ctx context.Context, req *alertmana
 	}, nil
 }
 
+// globMetaCharacters are filesystem-glob metacharacters that are expanded by
+// filepath.Glob / template.FromGlobs. We reject them in tenant IDs and template
+// filenames to prevent a tenant from being able to craft a path that globs into
+// another tenant's directory.
+const globMetaCharacters = "*?[]\\"
+
+// containsGlobMetaCharacter reports whether s contains any character that would
+// be interpreted as a wildcard/metacharacter by filepath.Glob.
+func containsGlobMetaCharacter(s string) bool {
+	return strings.ContainsAny(s, globMetaCharacters)
+}
+
+// validateTenantIDForLocalStorage returns an error if the tenant ID cannot be
+// safely used as a filesystem directory name for the per-tenant Alertmanager
+// data directory. In particular it rejects glob metacharacters so that a
+// tenant ID cannot turn a derived path into a glob pattern that matches other
+// tenants' directories (see template.FromGlobs -> filepath.Glob).
+func validateTenantIDForLocalStorage(userID string) error {
+	if userID == "" {
+		return fmt.Errorf("invalid tenant ID: must not be empty")
+	}
+	if containsGlobMetaCharacter(userID) {
+		return fmt.Errorf("invalid tenant ID %q: must not contain any of the characters %q", userID, globMetaCharacters)
+	}
+	// Defence in depth: also disallow path separators and traversal segments.
+	if strings.ContainsAny(userID, `/\`) || userID == "." || userID == ".." {
+		return fmt.Errorf("invalid tenant ID %q: must not contain path separators or traversal segments", userID)
+	}
+	return nil
+}
+
 // validateTemplateFilename validated the template filename and returns error if it's not valid.
 // The validation done in this function is a first fence to avoid having a tenant submitting
 // a config which may escape the per-tenant data directory on disk.
@@ -1304,13 +1353,27 @@ func validateTemplateFilename(filename string) error {
 		return fmt.Errorf("invalid template name %q: the template name cannot contain any path", filename)
 	}
 
+	// Reject glob metacharacters so a template name cannot turn the resulting
+	// path into a wildcard pattern expanded by filepath.Glob / template.FromGlobs.
+	if containsGlobMetaCharacter(filename) {
+		return fmt.Errorf("invalid template name %q: the template name cannot contain any of the characters %q", filename, globMetaCharacters)
+	}
+
 	return nil
 }
 
 // safeTemplateFilepath builds and return the template filepath within the provided dir.
 // This function also performs a security check to make sure the provided templateName
-// doesn't contain a relative path escaping the provided dir.
+// doesn't contain a relative path escaping the provided dir, nor glob metacharacters
+// that would be expanded by filepath.Glob / template.FromGlobs.
 func safeTemplateFilepath(dir, templateName string) (string, error) {
+	// Reject glob metacharacters in the template name up front: they would
+	// survive filepath.Abs/Clean and be expanded as wildcards by the
+	// downstream template.FromGlobs call.
+	if containsGlobMetaCharacter(templateName) {
+		return "", fmt.Errorf("invalid template name %q: the template name cannot contain any of the characters %q", templateName, globMetaCharacters)
+	}
+
 	// We expect all template files to be stored and referenced within the provided directory.
 	containerDir, err := filepath.Abs(dir)
 	if err != nil {
@@ -1324,9 +1387,11 @@ func safeTemplateFilepath(dir, templateName string) (string, error) {
 	}
 
 	// Ensure the actual path of the template is within the expected directory.
-	// This check is a counter-measure to make sure the tenant is not trying to
-	// escape its own directory on disk.
-	if !strings.HasPrefix(actualPath, containerDir) {
+	// Use filepath.Rel plus a separator/traversal check instead of a prefix
+	// comparison, which is unsafe when containerDir happens to be a prefix of a
+	// sibling path (e.g. "/data/tenant" is a prefix of "/data/tenant2").
+	rel, err := filepath.Rel(containerDir, actualPath)
+	if err != nil || rel == ".." || strings.HasPrefix(rel, ".."+string(filepath.Separator)) || filepath.IsAbs(rel) {
 		return "", fmt.Errorf("invalid template name %q: the template filepath is escaping the per-tenant local directory", templateName)
 	}
 
