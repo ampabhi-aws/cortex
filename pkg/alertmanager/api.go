@@ -261,6 +261,21 @@ func validateUserConfig(logger log.Logger, cfg alertspb.AlertConfigDesc, limits 
 
 func (am *MultitenantAlertmanager) ListAllConfigs(w http.ResponseWriter, r *http.Request) {
 	logger := util_log.WithContext(r.Context(), am.logger)
+
+	// This endpoint returns every tenant's Alertmanager configuration, which
+	// stores notification secrets inline (Slack/webhook URLs, SMTP passwords,
+	// PagerDuty/OpsGenie/VictorOps keys, bearer tokens, OAuth2 client secrets).
+	// It must therefore never be reachable anonymously. Require an authenticated
+	// caller (identified by X-Scope-OrgID) regardless of how the route was
+	// registered by the API layer, so that misconfiguration there cannot expose
+	// cross-tenant secrets. Operators who need this endpoint are expected to
+	// gate access to it in their reverse proxy / admin network.
+	if _, err := tenant.TenantID(r.Context()); err != nil {
+		level.Warn(logger).Log("msg", "rejected unauthenticated request to list all alertmanager configs", "err", err.Error())
+		http.Error(w, fmt.Sprintf("%s: %s", errNoOrgID, err.Error()), http.StatusUnauthorized)
+		return
+	}
+
 	userIDs, err := am.store.ListAllUsers(r.Context())
 	if err != nil {
 		level.Error(logger).Log("msg", "failed to list users of alertmanager", "err", err)
