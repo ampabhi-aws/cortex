@@ -5,6 +5,7 @@ import (
 	"net/url"
 	"path/filepath"
 	"sort"
+	"strings"
 
 	"github.com/go-kit/log"
 	"github.com/go-kit/log/level"
@@ -86,9 +87,24 @@ func (m *mapper) MapRules(user string, ruleConfigs map[string][]rulefmt.RuleGrou
 		encodedFileName := url.PathEscape(filename)
 		fullFileName := filepath.Join(path, encodedFileName)
 
+		// Defence-in-depth: make sure the joined path still points inside the
+		// per-tenant directory. A namespace of `.` or `..` would survive
+		// url.PathEscape (dots are unreserved) and let filepath.Join collapse
+		// out of `path`; such entries are skipped with a per-namespace warning
+		// instead of aborting the whole tenant sync.
+		cleanedPath := filepath.Clean(fullFileName)
+		cleanedDir := filepath.Clean(path)
+		if cleanedPath == cleanedDir || !strings.HasPrefix(cleanedPath, cleanedDir+string(filepath.Separator)) {
+			level.Warn(m.logger).Log("msg", "skipping rule namespace that does not map inside the tenant directory", "user", user, "namespace", filename, "resolved", cleanedPath)
+			continue
+		}
+
 		fileUpdated, err := m.writeRuleGroupsIfNewer(groups, fullFileName)
 		if err != nil {
-			return false, nil, err
+			// Skip only the offending namespace so a single bad rule group does
+			// not poison the tenant's whole rule sync.
+			level.Warn(m.logger).Log("msg", "unable to write rule file for namespace, skipping", "user", user, "namespace", filename, "file", fullFileName, "err", err)
+			continue
 		}
 		filenames = append(filenames, fullFileName)
 		anyUpdated = anyUpdated || fileUpdated
