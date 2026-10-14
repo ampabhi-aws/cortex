@@ -288,7 +288,36 @@ var (
 	ErrNoRuleGroups = errors.New("no rule groups found")
 	// ErrBadRuleGroup is returned when the provided rule group can not be unmarshalled
 	ErrBadRuleGroup = errors.New("unable to decoded rule group")
+	// ErrInvalidNamespace signals that the namespace from the request is unsafe or malformed
+	ErrInvalidNamespace = errors.New("invalid namespace")
+	// ErrInvalidGroupName signals that the group name from the request is unsafe or malformed
+	ErrInvalidGroupName = errors.New("invalid group name")
 )
+
+// maxRuleAPIPathSegmentLen is a conservative upper bound on the length of the
+// {namespace} and {groupName} URL path segments. It is well above any realistic
+// human-authored namespace but small enough to prevent pathological inputs from
+// reaching the filesystem layer.
+const maxRuleAPIPathSegmentLen = 255
+
+// isUnsafePathSegment returns true if the segment is empty, is the directory
+// reference "." or "..", contains a path separator ("/" or "\"), contains a
+// NUL byte, or exceeds maxRuleAPIPathSegmentLen. It mirrors the hardening
+// applied to tenant IDs in pkg/tenant/resolver.go (CVE-2021-36157) and extends
+// it to the ruler API's namespace and group name URL segments to prevent path
+// traversal into other tenants or arbitrary files on the ruler host.
+func isUnsafePathSegment(s string) bool {
+	if s == "" {
+		return true
+	}
+	if s == "." || s == ".." {
+		return true
+	}
+	if len(s) > maxRuleAPIPathSegmentLen {
+		return true
+	}
+	return strings.ContainsAny(s, "\\/\x00")
+}
 
 func marshalAndSend(output interface{}, w http.ResponseWriter, logger log.Logger) {
 	d, err := yaml.Marshal(&output)
@@ -336,6 +365,10 @@ func parseNamespace(params map[string]string) (string, error) {
 		return "", err
 	}
 
+	if isUnsafePathSegment(namespace) {
+		return "", ErrInvalidNamespace
+	}
+
 	return namespace, nil
 }
 
@@ -350,6 +383,10 @@ func parseGroupName(params map[string]string) (string, error) {
 	groupName, err := url.PathUnescape(groupName)
 	if err != nil {
 		return "", err
+	}
+
+	if isUnsafePathSegment(groupName) {
+		return "", ErrInvalidGroupName
 	}
 
 	return groupName, nil

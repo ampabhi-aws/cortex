@@ -5,6 +5,7 @@ import (
 	"flag"
 	"os"
 	"path/filepath"
+	"strings"
 
 	"github.com/pkg/errors"
 	promRules "github.com/prometheus/prometheus/rules"
@@ -168,11 +169,23 @@ func (l *Client) loadAllRulesGroupsForUser(ctx context.Context, userID string) (
 }
 
 func (l *Client) loadAllRulesGroupsForUserAndNamespace(_ context.Context, userID string, namespace string) (rulespb.RuleGroupList, error) {
-	filename := filepath.Join(l.cfg.Directory, userID, namespace)
+	// Defence in depth: even though the ruler API now rejects namespace values
+	// that contain path separators or traversal segments, make the store itself
+	// refuse to open any file that escapes the per-user rules directory.
+	userRoot := filepath.Join(l.cfg.Directory, userID)
+	filename := filepath.Join(userRoot, namespace)
+	cleanedUserRoot := filepath.Clean(userRoot) + string(filepath.Separator)
+	cleanedFilename := filepath.Clean(filename)
+	if cleanedFilename != filepath.Clean(userRoot) && !strings.HasPrefix(cleanedFilename, cleanedUserRoot) {
+		return nil, errors.New("invalid namespace")
+	}
 
-	rulegroups, allErrors := l.loader.Load(filename)
+	rulegroups, allErrors := l.loader.Load(cleanedFilename)
 	if len(allErrors) > 0 {
-		return nil, errors.Wrapf(allErrors[0], "error parsing %s", filename)
+		// Do not echo the resolved filesystem path back to the caller; it leaks
+		// server-side layout and (for traversal attempts) confirms file
+		// existence.
+		return nil, errors.Wrap(allErrors[0], "error parsing rules")
 	}
 
 	var list rulespb.RuleGroupList

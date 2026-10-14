@@ -1,7 +1,7 @@
 package ruler
 
 import (
-	"net/url"
+	"encoding/base64"
 	"os"
 	"testing"
 
@@ -16,14 +16,14 @@ import (
 var (
 	testUser = "user1"
 
-	fileOneEncoded = url.PathEscape("file /one")
-	fileTwoEncoded = url.PathEscape("file /two")
+	fileOneEncoded = base64.URLEncoding.EncodeToString([]byte("file /one"))
+	fileTwoEncoded = base64.URLEncoding.EncodeToString([]byte("file /two"))
 
 	fileOnePath = "/rules/user1/" + fileOneEncoded
 	fileTwoPath = "/rules/user1/" + fileTwoEncoded
 
 	specialCharFile        = "+A_/ReallyStrange<>NAME:SPACE/?"
-	specialCharFileEncoded = url.PathEscape(specialCharFile)
+	specialCharFileEncoded = base64.URLEncoding.EncodeToString([]byte(specialCharFile))
 	specialCharFilePath    = "/rules/user1/" + specialCharFileEncoded
 
 	initialRuleSet           map[string][]rulefmt.RuleGroup
