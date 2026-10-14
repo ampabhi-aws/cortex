@@ -222,12 +222,20 @@ func (a *API) RegisterAPI(httpPathPrefix string, actualCfg interface{}, defaultC
 	a.RegisterRoute("/debug/fgprof", fgprof.Handler(), false, "GET")
 }
 
-// RegisterRuntimeConfig registers the endpoints associates with the runtime configuration
+// RegisterRuntimeConfig registers the endpoints associated with the runtime configuration.
+//
+// The /runtime_config endpoint exposes the full in-memory runtime configuration,
+// which includes the complete tenant inventory and every tenant's limit overrides
+// (e.g. ingestion rates, retention, per-tenant S3 SSE/KMS settings, and the
+// Alertmanager receivers firewall state). It is an operator-only administrative
+// endpoint and must not be exposed to end users; it is registered behind the API
+// auth middleware and should additionally be restricted at the deployment layer
+// (e.g. by an authenticating reverse proxy or a dedicated admin listener).
 func (a *API) RegisterRuntimeConfig(runtimeConfigHandler http.HandlerFunc) {
 	a.indexPage.AddLink(SectionAdminEndpoints, "/runtime_config", "Current Runtime Config (incl. Overrides)")
 	a.indexPage.AddLink(SectionAdminEndpoints, "/runtime_config?mode=diff", "Current Runtime Config (show only values that differ from the defaults)")
 
-	a.RegisterRoute("/runtime_config", runtimeConfigHandler, false, "GET")
+	a.RegisterRoute("/runtime_config", runtimeConfigHandler, true, "GET")
 }
 
 // RegisterDistributor registers the endpoints associated with the distributor.
