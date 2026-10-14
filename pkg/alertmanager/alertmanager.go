@@ -496,7 +496,9 @@ func buildReceiverIntegrations(nc *config.Receiver, tmpl *template.Template, fir
 		add("webhook", i, c, func(l log.Logger) (notify.Notifier, error) { return webhook.New(c, tmpl, l, httpOps...) })
 	}
 	for i, c := range nc.EmailConfigs {
-		add("email", i, c, func(l log.Logger) (notify.Notifier, error) { return email.New(c, tmpl, l), nil })
+		add("email", i, c, func(l log.Logger) (notify.Notifier, error) {
+			return newFirewalledEmailNotifier(c, email.New(c, tmpl, l), firewallDialer), nil
+		})
 	}
 	for i, c := range nc.PagerdutyConfigs {
 		add("pagerduty", i, c, func(l log.Logger) (notify.Notifier, error) { return pagerduty.New(c, tmpl, l, httpOps...) })
@@ -570,6 +572,43 @@ func (p firewallDialerConfigProvider) BlockCIDRNetworks() []flagext.CIDR {
 
 func (p firewallDialerConfigProvider) BlockPrivateAddresses() bool {
 	return p.limits.AlertmanagerReceiversBlockPrivateAddresses(p.userID)
+}
+
+// firewalledEmailNotifier wraps the upstream email notifier so that the
+// Alertmanager receivers firewall is enforced on the SMTP smarthost.
+//
+// The upstream email notifier (vendored from Prometheus Alertmanager) opens
+// its SMTP connection with a bare net.Dialer / tls.Dial and does not accept a
+// commoncfg.HTTPClientOption, so it cannot be given the FirewallDialer the
+// other notifiers use. Instead we validate the configured smarthost against
+// the same AlertmanagerReceiversBlockCIDRNetworks /
+// AlertmanagerReceiversBlockPrivateAddresses policy before each Notify call
+// and refuse the send if the destination is blocked. The validation
+// re-resolves DNS on every send attempt to make DNS rebinding ineffective
+// against this check.
+type firewalledEmailNotifier struct {
+	conf     *config.EmailConfig
+	notifier notify.Notifier
+	dialer   *util_net.FirewallDialer
+}
+
+func newFirewalledEmailNotifier(conf *config.EmailConfig, notifier notify.Notifier, dialer *util_net.FirewallDialer) *firewalledEmailNotifier {
+	return &firewalledEmailNotifier{
+		conf:     conf,
+		notifier: notifier,
+		dialer:   dialer,
+	}
+}
+
+func (n *firewalledEmailNotifier) Notify(ctx context.Context, alerts ...*types.Alert) (bool, error) {
+	if n.dialer != nil {
+		if err := n.dialer.ValidateHostPort(ctx, n.conf.Smarthost.Host, n.conf.Smarthost.Port); err != nil {
+			// Do not retry: the destination is policy-blocked by the operator
+			// and the config will keep failing until the tenant updates it.
+			return false, errors.Wrapf(err, "blocked by alertmanager receivers firewall for smarthost %q", n.conf.Smarthost.String())
+		}
+	}
+	return n.notifier.Notify(ctx, alerts...)
 }
 
 type tenantRateLimits struct {

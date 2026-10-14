@@ -34,6 +34,58 @@ func (d *FirewallDialer) DialContext(ctx context.Context, network, address strin
 	return d.parent.DialContext(ctx, network, address)
 }
 
+// ValidateHostPort resolves host and verifies that every resolved IP passes the
+// configured firewall policy (blocked private addresses / blocked CIDR
+// networks). It is intended for notifiers that cannot be given a dialer and
+// therefore cannot delegate their connection to FirewallDialer. Callers should
+// invoke this immediately before each send attempt so that DNS re-resolution
+// defeats DNS rebinding against a cached decision.
+//
+// If no firewall is configured, ValidateHostPort returns nil without
+// performing DNS resolution. If host is already an IP literal, only that IP is
+// checked. Otherwise all A/AAAA records are checked and the call fails closed
+// if any single resolved IP is blocked.
+func (d *FirewallDialer) ValidateHostPort(ctx context.Context, host, port string) error {
+	blockPrivateAddresses := d.cfgProvider.BlockPrivateAddresses()
+	blockCIDRNetworks := d.cfgProvider.BlockCIDRNetworks()
+
+	// Skip any control if no firewall has been configured.
+	if !blockPrivateAddresses && len(blockCIDRNetworks) == 0 {
+		return nil
+	}
+
+	if host == "" {
+		return errInvalidAddress
+	}
+
+	// If the host is already an IP literal, validate it directly without
+	// touching DNS.
+	if ip := net.ParseIP(host); ip != nil {
+		return d.control("", net.JoinHostPort(ip.String(), port), nil)
+	}
+
+	resolver := d.parent.Resolver
+	if resolver == nil {
+		resolver = net.DefaultResolver
+	}
+
+	ips, err := resolver.LookupIPAddr(ctx, host)
+	if err != nil {
+		return errors.Wrap(err, "resolve host")
+	}
+	if len(ips) == 0 {
+		return errBlockedAddress
+	}
+
+	for _, ip := range ips {
+		if err := d.control("", net.JoinHostPort(ip.IP.String(), port), nil); err != nil {
+			return err
+		}
+	}
+
+	return nil
+}
+
 func (d *FirewallDialer) control(_, address string, _ syscall.RawConn) error {
 	blockPrivateAddresses := d.cfgProvider.BlockPrivateAddresses()
 	blockCIDRNetworks := d.cfgProvider.BlockCIDRNetworks()
