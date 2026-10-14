@@ -134,6 +134,8 @@ GET /runtime_config
 
 Displays the runtime configuration currently applied to Cortex (in YAML format), including default values. Please be aware that the endpoint will be only available if Cortex is configured with the `-runtime-config.file` option.
 
+This endpoint exposes the full tenant inventory and every tenant's limit overrides (ingestion rates, retention, per-tenant S3 SSE/KMS settings, Alertmanager receivers firewall state, etc.). It is an operator-only administrative endpoint and should not be exposed to end users; restrict access at the deployment layer (for example via an authenticating reverse proxy or a dedicated admin listener).
+
 #### Different modes
 
 ```
