@@ -248,6 +248,12 @@ func (f *Frontend) QueryResult(ctx context.Context, qrReq *frontendv2pb.QueryRes
 	}
 	userID := tenant.JoinTenantIDs(tenantIDs)
 
+	// Reject malformed results that omit the HttpResponse submessage, so a
+	// nil pointer can never reach the receiver on freq.response.
+	if qrReq.HttpResponse == nil {
+		return nil, errors.New("invalid query result: missing HttpResponse")
+	}
+
 	req := f.requests.get(qrReq.QueryID)
 	// It is possible that some old response belonging to different user was received, if frontend has restarted.
 	// To avoid leaking query results between users, we verify the user here.

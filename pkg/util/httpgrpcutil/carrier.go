@@ -27,7 +27,7 @@ func (c *HttpgrpcHeadersCarrier) ForeachKey(handler func(key, val string) error)
 }
 
 func GetParentSpanForRequest(tracer opentracing.Tracer, req *httpgrpc.HTTPRequest) (opentracing.SpanContext, error) {
-	if tracer == nil {
+	if tracer == nil || req == nil {
 		return nil, nil
 	}
 

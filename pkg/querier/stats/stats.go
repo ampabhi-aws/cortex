@@ -115,6 +115,10 @@ func (s *Stats) Merge(other *Stats) {
 }
 
 func ShouldTrackHTTPGRPCResponse(r *httpgrpc.HTTPResponse) bool {
-	// Do no track statistics for requests failed because of a server error.
+	// Do not track statistics for malformed messages missing the HTTP response
+	// envelope (nil pointer) or those that failed with a server error.
+	if r == nil {
+		return false
+	}
 	return r.Code < 500
 }
