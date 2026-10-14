@@ -1,11 +1,13 @@
 package querier
 
 import (
+	"fmt"
 	"net/http"
 
 	"github.com/go-kit/log"
 	"github.com/go-kit/log/level"
 	"github.com/prometheus/prometheus/storage"
+	"golang.org/x/sync/errgroup"
 
 	"github.com/cortexproject/cortex/pkg/cortexpb"
 	"github.com/cortexproject/cortex/pkg/ingester/client"
@@ -15,6 +17,21 @@ import (
 
 // Queries are a set of matchers with time ranges - should not get into megabytes
 const maxRemoteReadQuerySize = 1024 * 1024
+
+// maxRemoteReadQueries caps the number of sub-queries that a single remote
+// read request is allowed to carry. Even though the request body is already
+// bounded to maxRemoteReadQuerySize bytes (decompressed), individual
+// QueryRequest entries are small enough that a 1 MiB body can hold tens or
+// hundreds of thousands of entries. Each sub-query fans out to every
+// ingester and store-gateway, so we refuse requests whose fan-out is clearly
+// outside the Prometheus remote-read protocol's reasonable use.
+const maxRemoteReadQueries = 100
+
+// maxRemoteReadQueryParallelism bounds the number of sub-queries that are
+// executed concurrently inside a single remote read request. It prevents a
+// single request from monopolising goroutines, ingester streams and
+// store-gateway slots on the querier.
+const maxRemoteReadQueryParallelism = 10
 
 // RemoteReadHandler handles Prometheus remote read requests.
 func RemoteReadHandler(q storage.Queryable, logger log.Logger) http.Handler {
@@ -28,23 +45,41 @@ func RemoteReadHandler(q storage.Queryable, logger log.Logger) http.Handler {
 			return
 		}
 
-		// Fetch samples for all queries in parallel.
+		// Reject requests whose fan-out is unreasonably large before starting
+		// any work. A single remote read request should not expand into more
+		// than a handful of storage queries.
+		if len(req.Queries) > maxRemoteReadQueries {
+			err := fmt.Errorf("too many queries in remote read request: %d, limit: %d", len(req.Queries), maxRemoteReadQueries)
+			level.Warn(logger).Log("msg", "rejecting remote read request", "err", err.Error())
+			http.Error(w, err.Error(), http.StatusBadRequest)
+			return
+		}
+
+		// Fetch samples for all queries in parallel, but with a bounded worker
+		// pool so a single request cannot create unbounded goroutines or fan
+		// out to every ingester/store-gateway without any throttling.
 		resp := client.ReadResponse{
 			Results: make([]*client.QueryResponse, len(req.Queries)),
 		}
-		errors := make(chan error)
+		g, gCtx := errgroup.WithContext(ctx)
+		g.SetLimit(maxRemoteReadQueryParallelism)
 		for i, qr := range req.Queries {
-			go func(i int, qr *client.QueryRequest) {
+			i, qr := i, qr
+			g.Go(func() error {
 				from, to, matchers, err := client.FromQueryRequest(qr)
 				if err != nil {
-					errors <- err
-					return
+					return err
+				}
+				// Require at least one label matcher. An unrestricted Select
+				// invites arbitrarily large fan-outs for essentially no work
+				// on the caller side, which is the shape that drives the DoS.
+				if len(matchers) == 0 {
+					return fmt.Errorf("remote read query must contain at least one label matcher")
 				}
 
-				querier, err := q.Querier(ctx, int64(from), int64(to))
+				querier, err := q.Querier(gCtx, int64(from), int64(to))
 				if err != nil {
-					errors <- err
-					return
+					return err
 				}
 
 				params := &storage.SelectHints{
@@ -52,20 +87,17 @@ func RemoteReadHandler(q storage.Queryable, logger log.Logger) http.Handler {
 					End:   int64(to),
 				}
 				seriesSet := querier.Select(false, params, matchers...)
-				resp.Results[i], err = seriesSetToQueryResponse(seriesSet)
-				errors <- err
-			}(i, qr)
+				result, err := seriesSetToQueryResponse(seriesSet)
+				if err != nil {
+					return err
+				}
+				resp.Results[i] = result
+				return nil
+			})
 		}
 
-		var lastErr error
-		for range req.Queries {
-			err := <-errors
-			if err != nil {
-				lastErr = err
-			}
-		}
-		if lastErr != nil {
-			http.Error(w, lastErr.Error(), http.StatusBadRequest)
+		if err := g.Wait(); err != nil {
+			http.Error(w, err.Error(), http.StatusBadRequest)
 			return
 		}
 		w.Header().Add("Content-Type", "application/x-protobuf")
