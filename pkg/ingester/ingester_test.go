@@ -3181,9 +3181,19 @@ func Test_Ingester_AllUserStats(t *testing.T) {
 		db.ingestedRuleSamples.Tick()
 	}
 
-	// Get label names
-	res, err := i.AllUserStats(context.Background(), &client.UserStatsRequest{})
+	// Get label names: AllUserStats is now scoped to the caller's tenant
+	// (see pkg/ingester/ingester.go) so we must query it once per tenant
+	// and expect a single entry back.
+	ctx1 := user.InjectOrgID(context.Background(), "user-1")
+	res1, err := i.AllUserStats(ctx1, &client.UserStatsRequest{})
 	require.NoError(t, err)
+
+	ctx2 := user.InjectOrgID(context.Background(), "user-2")
+	res2, err := i.AllUserStats(ctx2, &client.UserStatsRequest{})
+	require.NoError(t, err)
+
+	got := append([]*client.UserIDStatsResponse{}, res1.Stats...)
+	got = append(got, res2.Stats...)
 
 	expect := []*client.UserIDStatsResponse{
 		{
@@ -3205,7 +3215,18 @@ func Test_Ingester_AllUserStats(t *testing.T) {
 			},
 		},
 	}
-	assert.ElementsMatch(t, expect, res.Stats)
+	assert.ElementsMatch(t, expect, got)
+
+	// A caller without an org ID must be rejected (tenant scoping enforced).
+	_, err = i.AllUserStats(context.Background(), &client.UserStatsRequest{})
+	require.Error(t, err)
+
+	// A caller whose tenant has no TSDB on this ingester gets an empty
+	// response rather than cross-tenant data.
+	ctxOther := user.InjectOrgID(context.Background(), "user-unknown")
+	resOther, err := i.AllUserStats(ctxOther, &client.UserStatsRequest{})
+	require.NoError(t, err)
+	require.Empty(t, resOther.Stats)
 }
 
 func TestIngesterCompactIdleBlock(t *testing.T) {
