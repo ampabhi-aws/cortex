@@ -1203,11 +1203,17 @@ func (i *Ingester) Query(ctx context.Context, req *client.QueryRequest) (*client
 
 	numSamples := 0
 
+	maxSeriesPerQuery := i.limiter.MaxSeriesPerQuery(userID)
+
 	result := &client.QueryResponse{}
 	for ss.Next() {
 		series := ss.At()
 		if sm.IsSharded() && !sm.MatchesLabels(series.Labels()) {
 			continue
+		}
+
+		if maxSeriesPerQuery > 0 && len(result.Timeseries) >= maxSeriesPerQuery {
+			return nil, validation.LimitError(fmt.Sprintf("the query hit the max number of series limit (limit: %d series)", maxSeriesPerQuery))
 		}
 
 		ts := cortexpb.TimeSeries{
@@ -1319,6 +1325,10 @@ func (i *Ingester) LabelValues(ctx context.Context, req *client.LabelValuesReque
 		return nil, err
 	}
 
+	if maxSeriesPerQuery := i.limiter.MaxSeriesPerQuery(userID); maxSeriesPerQuery > 0 && len(vals) > maxSeriesPerQuery {
+		return nil, validation.LimitError(fmt.Sprintf("the query hit the max number of series limit (limit: %d series)", maxSeriesPerQuery))
+	}
+
 	return &client.LabelValuesResponse{
 		LabelValues: vals,
 	}, nil
@@ -1378,6 +1388,10 @@ func (i *Ingester) LabelNames(ctx context.Context, req *client.LabelNamesRequest
 	names, _, err := q.LabelNames()
 	if err != nil {
 		return nil, err
+	}
+
+	if maxSeriesPerQuery := i.limiter.MaxSeriesPerQuery(userID); maxSeriesPerQuery > 0 && len(names) > maxSeriesPerQuery {
+		return nil, validation.LimitError(fmt.Sprintf("the query hit the max number of series limit (limit: %d series)", maxSeriesPerQuery))
 	}
 
 	return &client.LabelNamesResponse{
@@ -1467,11 +1481,17 @@ func (i *Ingester) MetricsForLabelMatchers(ctx context.Context, req *client.Metr
 		Metric: make([]*cortexpb.Metric, 0),
 	}
 
+	maxSeriesPerQuery := i.limiter.MaxSeriesPerQuery(userID)
+
 	mergedSet := storage.NewMergeSeriesSet(sets, storage.ChainedSeriesMerge)
 	for mergedSet.Next() {
 		// Interrupt if the context has been canceled.
 		if ctx.Err() != nil {
 			return nil, ctx.Err()
+		}
+
+		if maxSeriesPerQuery > 0 && len(result.Metric) >= maxSeriesPerQuery {
+			return nil, validation.LimitError(fmt.Sprintf("the query hit the max number of series limit (limit: %d series)", maxSeriesPerQuery))
 		}
 
 		result.Metric = append(result.Metric, &cortexpb.Metric{
@@ -1656,11 +1676,16 @@ func (i *Ingester) queryStreamChunks(ctx context.Context, db *userTSDB, from, th
 
 	chunkSeries := make([]client.TimeSeriesChunk, 0, queryStreamBatchSize)
 	batchSizeBytes := 0
+	maxSeriesPerQuery := i.limiter.MaxSeriesPerQuery(db.userID)
 	for ss.Next() {
 		series := ss.At()
 
 		if sm.IsSharded() && !sm.MatchesLabels(series.Labels()) {
 			continue
+		}
+
+		if maxSeriesPerQuery > 0 && numSeries >= maxSeriesPerQuery {
+			return 0, 0, validation.LimitError(fmt.Sprintf("the query hit the max number of series limit (limit: %d series)", maxSeriesPerQuery))
 		}
 
 		// convert labels to LabelAdapter
