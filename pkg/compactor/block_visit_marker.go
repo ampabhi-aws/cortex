@@ -116,15 +116,39 @@ func markBlocksVisitedHeartBeat(ctx context.Context, bkt objstore.Bucket, logger
 	level.Info(logger).Log("msg", fmt.Sprintf("start heart beat for blocks: %s", blocksInfo))
 	ticker := time.NewTicker(blockVisitMarkerFileUpdateInterval)
 	defer ticker.Stop()
+	// Track blocks that are still candidates for heartbeating. Blocks whose
+	// source object has been hard-deleted (meta.json missing) are dropped so
+	// that a stray visit-mark.json upload cannot resurrect a deleted block
+	// directory. When no block remains, the heartbeat exits so the goroutine
+	// does not outlive the data it is protecting.
+	active := make([]*metadata.Meta, len(blocks))
+	copy(active, blocks)
+	first := true
 heartBeat:
 	for {
 		level.Debug(logger).Log("msg", fmt.Sprintf("heart beat for blocks: %s", blocksInfo))
+
+		if !first {
+			// Only verify presence after the first write: the planner has
+			// just produced this plan from blocks it already read from the
+			// bucket, so the initial marker write is unconditional and
+			// backward-compatible. From the second iteration onward, if
+			// meta.json has disappeared, the cleaner has hard-deleted the
+			// block and we must stop refreshing its marker.
+			active = filterPresentBlocks(ctx, bkt, logger, active)
+			if len(active) == 0 {
+				level.Info(logger).Log("msg", fmt.Sprintf("all blocks for heart beat are gone, stopping: %s", blocksInfo))
+				break heartBeat
+			}
+		}
+		first = false
+
 		blockVisitMarker := BlockVisitMarker{
 			VisitTime:   time.Now().Unix(),
 			CompactorID: compactorID,
 			Version:     VisitMarkerVersion1,
 		}
-		markBlocksVisited(ctx, bkt, logger, blocks, blockVisitMarker, blockVisitMarkerWriteFailed)
+		markBlocksVisited(ctx, bkt, logger, active, blockVisitMarker, blockVisitMarkerWriteFailed)
 
 		select {
 		case <-ctx.Done():
@@ -134,4 +158,39 @@ heartBeat:
 		}
 	}
 	level.Info(logger).Log("msg", fmt.Sprintf("stop heart beat for blocks: %s", blocksInfo))
+}
+
+// filterPresentBlocks returns the subset of blocks whose meta.json still
+// exists in the bucket. A block whose meta.json has been removed has either
+// been hard-deleted by the cleaner or never finished uploading, and the
+// visit-marker heartbeat must stop refreshing its marker to avoid resurrecting
+// the block directory as a partial block the cleaner can never remove.
+func filterPresentBlocks(ctx context.Context, bkt objstore.Bucket, logger log.Logger, blocks []*metadata.Meta) []*metadata.Meta {
+	if ctx.Err() != nil {
+		return blocks
+	}
+	kept := make([]*metadata.Meta, 0, len(blocks))
+	for _, block := range blocks {
+		blockID := block.ULID.String()
+		metaPath := path.Join(blockID, metadata.MetaFilename)
+		exists, err := bkt.Exists(ctx, metaPath)
+		if err != nil {
+			if bkt.IsObjNotFoundErr(err) {
+				level.Info(logger).Log("msg", "block meta no longer in bucket, dropping from visit-marker heartbeat", "blockID", blockID)
+				continue
+			}
+			// On transient errors (e.g. network) keep the block in the
+			// active set so that a flaky bucket does not stop the
+			// heartbeat; the next tick will try again.
+			level.Warn(logger).Log("msg", "failed to verify block presence for visit-marker heartbeat, keeping block", "blockID", blockID, "err", err)
+			kept = append(kept, block)
+			continue
+		}
+		if !exists {
+			level.Info(logger).Log("msg", "block meta no longer in bucket, dropping from visit-marker heartbeat", "blockID", blockID)
+			continue
+		}
+		kept = append(kept, block)
+	}
+	return kept
 }
