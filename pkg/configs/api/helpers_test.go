@@ -31,6 +31,9 @@ func setup(t *testing.T) {
 		Notifications: NotificationsConfig{
 			DisableEmail: true,
 		},
+		PrivateAPI: PrivateAPIConfig{
+			AllowUnauthenticated: true,
+		},
 	})
 	counter = 0
 }
@@ -41,6 +44,9 @@ func setupWithEmailEnabled(t *testing.T) {
 	app = New(database, Config{
 		Notifications: NotificationsConfig{
 			DisableEmail: false,
+		},
+		PrivateAPI: PrivateAPIConfig{
+			AllowUnauthenticated: true,
 		},
 	})
 	counter = 0

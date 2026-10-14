@@ -4,11 +4,13 @@ import (
 	"encoding/json"
 	"fmt"
 	"net/http"
+	"net/http/httptest"
 	"os"
 	"path"
 	"strings"
 	"testing"
 
+	"github.com/cortexproject/cortex/pkg/configs/db/dbtest"
 	"github.com/cortexproject/cortex/pkg/configs/userconfig"
 
 	"github.com/stretchr/testify/assert"
@@ -395,4 +397,55 @@ func Test_SetConfig_ValidateTemplateFiles(t *testing.T) {
 
 	err := validateTemplateFiles(cfg)
 	assert.Equal(t, nil, err)
+}
+
+// Test_PrivateAPI_NoTokenConfigured verifies that when no shared-secret token
+// is configured and AllowUnauthenticated is false (the default), the internal
+// all-tenant /private/* endpoints are disabled so a misconfigured deployment
+// cannot leak every tenant's rules and Alertmanager configuration.
+func Test_PrivateAPI_NoTokenConfigured(t *testing.T) {
+	database = dbtest.Setup(t)
+	defer dbtest.Cleanup(t, database)
+	// Default PrivateAPIConfig: no token, AllowUnauthenticated false.
+	app = New(database, Config{})
+	for _, c := range allClients {
+		w := request(t, "GET", c.PrivateEndpoint, nil)
+		assert.Equal(t, http.StatusServiceUnavailable, w.Code, "endpoint %s", c.PrivateEndpoint)
+	}
+}
+
+// Test_PrivateAPI_RequiresBearerToken verifies that when a shared-secret token
+// is configured, requests without a matching Authorization: Bearer header are
+// rejected with 401 and matching requests succeed.
+func Test_PrivateAPI_RequiresBearerToken(t *testing.T) {
+	database = dbtest.Setup(t)
+	defer dbtest.Cleanup(t, database)
+	cfg := Config{}
+	require.NoError(t, cfg.PrivateAPI.AuthToken.Set("s3cr3t-t0k3n"))
+	app = New(database, cfg)
+	for _, c := range allClients {
+		// No credential: 401.
+		{
+			w := request(t, "GET", c.PrivateEndpoint, nil)
+			assert.Equal(t, http.StatusUnauthorized, w.Code, "endpoint %s (no header)", c.PrivateEndpoint)
+		}
+		// Wrong credential: 401.
+		{
+			w := httptest.NewRecorder()
+			r, err := http.NewRequest("GET", c.PrivateEndpoint, nil)
+			require.NoError(t, err)
+			r.Header.Set("Authorization", "Bearer wrong")
+			app.ServeHTTP(w, r)
+			assert.Equal(t, http.StatusUnauthorized, w.Code, "endpoint %s (wrong token)", c.PrivateEndpoint)
+		}
+		// Correct credential: 200.
+		{
+			w := httptest.NewRecorder()
+			r, err := http.NewRequest("GET", c.PrivateEndpoint, nil)
+			require.NoError(t, err)
+			r.Header.Set("Authorization", "Bearer s3cr3t-t0k3n")
+			app.ServeHTTP(w, r)
+			assert.Equal(t, http.StatusOK, w.Code, "endpoint %s (correct token)", c.PrivateEndpoint)
+		}
+	}
 }
