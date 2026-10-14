@@ -17,6 +17,7 @@ import (
 )
 
 var errMaxGlobalSeriesPerUserValidation = errors.New("The ingester.max-global-series-per-user limit is unsupported if distributor.shard-by-all-labels is disabled")
+var errMaxQueryParallelismNonPositive = errors.New("querier.max-query-parallelism must be a positive integer")
 
 // Supported values for enum limits
 const (
@@ -197,6 +198,13 @@ func (l *Limits) Validate(shardByAllLabels bool) error {
 	// if shard-by-all-labels is disabled
 	if l.MaxGlobalSeriesPerUser > 0 && !shardByAllLabels {
 		return errMaxGlobalSeriesPerUserValidation
+	}
+
+	// Reject non-positive max_query_parallelism: a value of 0 or negative
+	// would cause the query-frontend fan-out helper to start no workers and
+	// deadlock every split/sharded query from the affected tenant.
+	if l.MaxQueryParallelism <= 0 {
+		return errMaxQueryParallelismNonPositive
 	}
 
 	return nil
