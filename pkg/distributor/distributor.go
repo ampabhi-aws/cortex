@@ -554,6 +554,17 @@ func (d *Distributor) Push(ctx context.Context, req *cortexpb.WriteRequest) (*co
 		return nil, err
 	}
 
+	// Only trusted internal callers may skip label-name validation. The HTTP
+	// push path (pkg/util/push.Handler) scrubs this flag before invoking the
+	// distributor, but gRPC Push is reachable from any client that can set
+	// X-Scope-OrgID. Reject the request-supplied flag whenever the request
+	// originated from a tenant-facing API; the operator-set
+	// d.cfg.SkipLabelNameValidation remains the only switch that can relax
+	// label-name syntax validation for such requests.
+	if req.Source == cortexpb.API {
+		req.SkipLabelNameValidation = false
+	}
+
 	// We will report *this* request in the error too.
 	inflight := d.inflightPushRequests.Inc()
 	defer d.inflightPushRequests.Dec()

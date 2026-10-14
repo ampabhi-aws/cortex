@@ -1507,6 +1507,7 @@ func TestDistributor_Push_LabelNameValidation(t *testing.T) {
 		inputLabels                labels.Labels
 		skipLabelNameValidationCfg bool
 		skipLabelNameValidationReq bool
+		reqSource                  cortexpb.WriteRequest_SourceEnum
 		errExpected                bool
 		errMessage                 string
 	}{
@@ -1520,9 +1521,17 @@ func TestDistributor_Push_LabelNameValidation(t *testing.T) {
 			skipLabelNameValidationCfg: true,
 			errExpected:                false,
 		},
-		"label name validation can be skipped via WriteRequest parameter": {
+		"label name validation request flag is ignored for API source": {
 			inputLabels:                inputLabels,
 			skipLabelNameValidationReq: true,
+			reqSource:                  cortexpb.API,
+			errExpected:                true,
+			errMessage:                 `sample invalid label: "999.illegal" metric "foo{999.illegal=\"baz\"}"`,
+		},
+		"label name validation can be skipped via WriteRequest parameter for non-API source": {
+			inputLabels:                inputLabels,
+			skipLabelNameValidationReq: true,
+			reqSource:                  cortexpb.RULE,
 			errExpected:                false,
 		},
 	}
@@ -1538,6 +1547,9 @@ func TestDistributor_Push_LabelNameValidation(t *testing.T) {
 			})
 			req := mockWriteRequest([]labels.Labels{tc.inputLabels}, 42, 100000)
 			req.SkipLabelNameValidation = tc.skipLabelNameValidationReq
+			if tc.reqSource != cortexpb.API {
+				req.Source = tc.reqSource
+			}
 			_, err := ds[0].Push(ctx, req)
 			if tc.errExpected {
 				fromError, _ := status.FromError(err)

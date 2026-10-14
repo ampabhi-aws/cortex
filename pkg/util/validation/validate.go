@@ -49,6 +49,7 @@ const (
 	// Exemplar-specific validation reasons
 	exemplarLabelsMissing    = "exemplar_labels_missing"
 	exemplarLabelsTooLong    = "exemplar_labels_too_long"
+	exemplarLabelsBlank      = "exemplar_labels_blank"
 	exemplarTimestampInvalid = "exemplar_timestamp_invalid"
 
 	// RateLimited is one of the values for the reason to discard samples.
@@ -141,6 +142,17 @@ func ValidateExemplar(userID string, ls []cortexpb.LabelAdapter, e cortexpb.Exem
 			e.Labels,
 			e.TimestampMs,
 		)
+	}
+
+	// Validate each exemplar label name. Invalid names (empty, containing
+	// spaces, control bytes, invalid UTF-8, etc.) would otherwise be written
+	// into the ingester/TSDB where no component re-validates them, and
+	// cannot be selected or deleted through PromQL.
+	for _, l := range e.Labels {
+		if !model.LabelName(l.Name).IsValid() {
+			DiscardedExemplars.WithLabelValues(exemplarLabelsBlank, userID).Inc()
+			return newExemplarInvalidLabelError(ls, e.Labels, l.Name, e.TimestampMs)
+		}
 	}
 
 	// Exemplar label length does not include chars involved in text
