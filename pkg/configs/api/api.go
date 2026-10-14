@@ -20,6 +20,7 @@ import (
 	amconfig "github.com/prometheus/alertmanager/config"
 	amtemplate "github.com/prometheus/alertmanager/template"
 
+	"github.com/cortexproject/cortex/pkg/alertmanager"
 	"github.com/cortexproject/cortex/pkg/configs/db"
 	"github.com/cortexproject/cortex/pkg/configs/userconfig"
 	"github.com/cortexproject/cortex/pkg/tenant"
@@ -239,6 +240,23 @@ func validateAlertmanagerConfig(cfg string, noCfg NotificationsConfig) error {
 		}
 	}
 
+	// Enforce the same file-field restrictions as the v1 Alertmanager API
+	// write path. Without this check, a tenant posting to this endpoint can
+	// install a receiver whose http_config references a local file (e.g.
+	// basic_auth.password_file: /etc/cortex/cortex.yaml) and have the
+	// Alertmanager read that file at notify time and send its contents to a
+	// tenant-controlled webhook URL.
+	if err := alertmanager.ValidateAlertmanagerReceiverFiles(amCfg); err != nil {
+		return err
+	}
+
+	// Validate template filenames referenced inside the Alertmanager config.
+	for _, name := range amCfg.Templates {
+		if err := alertmanager.ValidateTemplateFilename(name); err != nil {
+			return err
+		}
+	}
+
 	return nil
 }
 
@@ -249,6 +267,14 @@ func validateRulesFiles(c userconfig.Config) error {
 
 func validateTemplateFiles(c userconfig.Config) error {
 	for fn, content := range c.TemplateFiles {
+		// Reject template filenames that attempt to escape the
+		// per-tenant templates directory on disk. The Alertmanager apply
+		// path writes templates under a tenant-scoped directory using
+		// safeTemplateFilepath, but still accepts arbitrary basenames
+		// if we don't enforce this here.
+		if err := alertmanager.ValidateTemplateFilename(fn); err != nil {
+			return err
+		}
 		if _, err := template.New(fn).Funcs(template.FuncMap(amtemplate.DefaultFuncs)).Parse(content); err != nil {
 			return err
 		}
