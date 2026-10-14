@@ -321,6 +321,23 @@ func TestDistributor_IsPathSupported(t *testing.T) {
 		"/alertmanager/api/v2/other":            false,
 		"/alertmanager/other":                   false,
 		"/other":                                false,
+		// Equivalent paths (trailing slash, duplicate slashes, dot segments)
+		// must be matched the same way as their canonical form, otherwise the
+		// Distributor would silently fall back to local handling on a
+		// potentially non-owning replica.
+		"/alertmanager/api/v2/alerts/":        true,
+		"/alertmanager/api/v2/alerts//":       true,
+		"/alertmanager/api/v2/silences/":      true,
+		"/alertmanager/api/v2/silence/id/":    true,
+		"/alertmanager/api/v2/status/":        true,
+		"/alertmanager/api/v2/receivers/":     true,
+		"/alertmanager//api/v2/alerts":        true,
+		"/alertmanager/./api/v2/alerts":       true,
+		"/alertmanager/api/v2/alerts/groups/": true,
+		// Percent-encoded path separators must not be able to smuggle an
+		// equivalent path past the matcher.
+		"/alertmanager/api/v2%2Falerts": false,
+		"/alertmanager/api/v2%2falerts": false,
 	}
 
 	for path, isSupported := range supported {

@@ -68,8 +68,39 @@ func (d *Distributor) running(ctx context.Context) error {
 // IsPathSupported returns true if the given route is currently supported by the Distributor.
 func (d *Distributor) IsPathSupported(p string) bool {
 	// API can be found at https://petstore.swagger.io/?url=https://raw.githubusercontent.com/prometheus/alertmanager/master/api/v2/openapi.yaml.
-	isQuorumReadPath, _ := d.isQuorumReadPath(p)
-	return d.isQuorumWritePath(p) || d.isUnaryWritePath(p) || d.isUnaryDeletePath(p) || d.isUnaryReadPath(p) || isQuorumReadPath
+	//
+	// Normalise the path before matching so that equivalent paths (e.g. with a
+	// trailing slash, duplicate slashes or `.`/`..` segments) are routed through
+	// the Distributor instead of silently falling back to local handling by an
+	// arbitrary replica. The per-tenant Alertmanager API router already matches
+	// on a normalised path, so this keeps the routing decision and the eventual
+	// execution in sync. Paths that embed percent-encoded separators are
+	// rejected so that an attacker cannot smuggle an equivalent path past the
+	// matcher.
+	np, ok := normalizePath(p)
+	if !ok {
+		return false
+	}
+	isQuorumReadPath, _ := d.isQuorumReadPath(np)
+	return d.isQuorumWritePath(np) || d.isUnaryWritePath(np) || d.isUnaryDeletePath(np) || d.isUnaryReadPath(np) || isQuorumReadPath
+}
+
+// normalizePath returns a canonical form of the request path suitable for
+// suffix/route matching. It returns ok=false when the input contains
+// percent-encoded path separators, which would otherwise allow an attacker to
+// present an equivalent-but-non-matching path to the Distributor while still
+// being accepted by the downstream Alertmanager API router.
+func normalizePath(p string) (string, bool) {
+	if containsEncodedSeparator(p) {
+		return "", false
+	}
+	return path.Clean("/" + strings.TrimLeft(p, "/")), true
+}
+
+func containsEncodedSeparator(p string) bool {
+	// Reject percent-encoded forward and back slashes in any case form.
+	return strings.Contains(p, "%2f") || strings.Contains(p, "%2F") ||
+		strings.Contains(p, "%5c") || strings.Contains(p, "%5C")
 }
 
 func (d *Distributor) isQuorumWritePath(p string) bool {
@@ -130,28 +161,39 @@ func (d *Distributor) DistributeRequest(w http.ResponseWriter, r *http.Request) 
 
 	logger := util_log.WithContext(r.Context(), d.logger)
 
+	// Normalise the path so routing decisions here match the ones in
+	// IsPathSupported (and the downstream Alertmanager API router). Without
+	// this, equivalent paths such as "/alertmanager/api/v2/alerts/" would skip
+	// the quorum/unary branches below even though IsPathSupported now accepts
+	// them.
+	urlPath, ok := normalizePath(r.URL.Path)
+	if !ok {
+		http.Error(w, "route not supported by distributor", http.StatusNotFound)
+		return
+	}
+
 	if r.Method == http.MethodPost {
-		if d.isQuorumWritePath(r.URL.Path) {
+		if d.isQuorumWritePath(urlPath) {
 			d.doQuorum(userID, w, r, logger, merger.Noop{})
 			return
 		}
-		if d.isUnaryWritePath(r.URL.Path) {
+		if d.isUnaryWritePath(urlPath) {
 			d.doUnary(userID, w, r, logger)
 			return
 		}
 	}
 	if r.Method == http.MethodDelete {
-		if d.isUnaryDeletePath(r.URL.Path) {
+		if d.isUnaryDeletePath(urlPath) {
 			d.doUnary(userID, w, r, logger)
 			return
 		}
 	}
 	if r.Method == http.MethodGet || r.Method == http.MethodHead {
-		if ok, m := d.isQuorumReadPath(r.URL.Path); ok {
+		if ok, m := d.isQuorumReadPath(urlPath); ok {
 			d.doQuorum(userID, w, r, logger, m)
 			return
 		}
-		if d.isUnaryReadPath(r.URL.Path) {
+		if d.isUnaryReadPath(urlPath) {
 			d.doUnary(userID, w, r, logger)
 			return
 		}
@@ -255,8 +297,9 @@ func (d *Distributor) doUnary(userID string, w http.ResponseWriter, r *http.Requ
 	// Until we have a mechanism to combine the results from multiple alertmanagers,
 	// we forward the request to only only of the alertmanagers.
 
+	urlPath, _ := normalizePath(r.URL.Path)
 	var instances []ring.InstanceDesc
-	if req.GetMethod() == "GET" && d.isUnaryReadPath(r.URL.Path) {
+	if req.GetMethod() == "GET" && d.isUnaryReadPath(urlPath) {
 		instances = replicationSet.Instances
 		// Randomize the list of instances to not always query the same one.
 		rand.Shuffle(len(instances), func(i, j int) {
