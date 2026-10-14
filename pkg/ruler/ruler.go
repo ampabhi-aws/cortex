@@ -399,10 +399,20 @@ func SendAlerts(n sender, externalURL string) promRules.NotifyFunc {
 
 var sep = []byte("/")
 
-func tokenForGroup(g *rulespb.RuleGroupDesc) uint32 {
+// tokenForGroup returns the ring token used to assign a rule group to a ruler
+// replica. The optional salt is a cluster-wide shared secret: when non-empty
+// it is mixed into the FNV-32a hash so that a tenant cannot precompute, by
+// choosing namespace/group names, a token that lands on a specific replica.
+// Every ruler in the same cluster must be configured with the same salt (or
+// all with no salt) so that ownership is computed identically on each replica.
+func tokenForGroup(g *rulespb.RuleGroupDesc, salt []byte) uint32 {
 	ringHasher := fnv.New32a()
 
 	// Hasher never returns err.
+	if len(salt) > 0 {
+		_, _ = ringHasher.Write(salt)
+		_, _ = ringHasher.Write(sep)
+	}
 	_, _ = ringHasher.Write([]byte(g.User))
 	_, _ = ringHasher.Write(sep)
 	_, _ = ringHasher.Write([]byte(g.Namespace))
@@ -412,8 +422,8 @@ func tokenForGroup(g *rulespb.RuleGroupDesc) uint32 {
 	return ringHasher.Sum32()
 }
 
-func instanceOwnsRuleGroup(r ring.ReadRing, g *rulespb.RuleGroupDesc, instanceAddr string) (bool, error) {
-	hash := tokenForGroup(g)
+func instanceOwnsRuleGroup(r ring.ReadRing, g *rulespb.RuleGroupDesc, salt []byte, instanceAddr string) (bool, error) {
+	hash := tokenForGroup(g, salt)
 
 	rlrs, err := r.Get(hash, RingOp, nil, nil, nil)
 	if err != nil {
@@ -539,9 +549,10 @@ func (r *Ruler) listRulesShardingDefault(ctx context.Context) (map[string]rulesp
 		return nil, err
 	}
 
+	salt := []byte(r.cfg.Ring.TokenSalt)
 	filteredConfigs := make(map[string]rulespb.RuleGroupList)
 	for userID, groups := range configs {
-		filtered := filterRuleGroups(userID, groups, r.ring, r.lifecycler.GetInstanceAddr(), r.logger, r.ringCheckErrors)
+		filtered := filterRuleGroups(userID, groups, r.ring, salt, r.lifecycler.GetInstanceAddr(), r.logger, r.ringCheckErrors)
 		if len(filtered) > 0 {
 			filteredConfigs[userID] = filtered
 		}
@@ -584,6 +595,7 @@ func (r *Ruler) listRulesShuffleSharding(ctx context.Context) (map[string]rulesp
 
 	mu := sync.Mutex{}
 	result := map[string]rulespb.RuleGroupList{}
+	salt := []byte(r.cfg.Ring.TokenSalt)
 
 	concurrency := loadRulesConcurrency
 	if len(userRings) < concurrency {
@@ -599,7 +611,7 @@ func (r *Ruler) listRulesShuffleSharding(ctx context.Context) (map[string]rulesp
 					return errors.Wrapf(err, "failed to fetch rule groups for user %s", userID)
 				}
 
-				filtered := filterRuleGroups(userID, groups, userRings[userID], r.lifecycler.GetInstanceAddr(), r.logger, r.ringCheckErrors)
+				filtered := filterRuleGroups(userID, groups, userRings[userID], salt, r.lifecycler.GetInstanceAddr(), r.logger, r.ringCheckErrors)
 				if len(filtered) == 0 {
 					continue
 				}
@@ -619,13 +631,17 @@ func (r *Ruler) listRulesShuffleSharding(ctx context.Context) (map[string]rulesp
 // filterRuleGroups returns map of rule groups that given instance "owns" based on supplied ring.
 // This function only uses User, Namespace, and Name fields of individual RuleGroups.
 //
+// The salt is mixed into the ring token (see tokenForGroup) so that a tenant
+// cannot precompute a token that lands on a specific replica. When salt is
+// empty, placement is backwards compatible with earlier versions.
+//
 // Reason why this function is not a method on Ruler is to make sure we don't accidentally use r.ring,
 // but only ring passed as parameter.
-func filterRuleGroups(userID string, ruleGroups []*rulespb.RuleGroupDesc, ring ring.ReadRing, instanceAddr string, log log.Logger, ringCheckErrors prometheus.Counter) []*rulespb.RuleGroupDesc {
+func filterRuleGroups(userID string, ruleGroups []*rulespb.RuleGroupDesc, ring ring.ReadRing, salt []byte, instanceAddr string, log log.Logger, ringCheckErrors prometheus.Counter) []*rulespb.RuleGroupDesc {
 	// Prune the rule group to only contain rules that this ruler is responsible for, based on ring.
 	var result []*rulespb.RuleGroupDesc
 	for _, g := range ruleGroups {
-		owned, err := instanceOwnsRuleGroup(ring, g, instanceAddr)
+		owned, err := instanceOwnsRuleGroup(ring, g, salt, instanceAddr)
 		if err != nil {
 			ringCheckErrors.Inc()
 			level.Error(log).Log("msg", "failed to check if the ruler replica owns the rule group", "user", userID, "namespace", g.Namespace, "group", g.Name, "err", err)
