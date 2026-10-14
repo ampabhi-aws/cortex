@@ -1014,6 +1014,20 @@ func (am *MultitenantAlertmanager) serveRequest(w http.ResponseWriter, req *http
 		http.Error(w, err.Error(), http.StatusUnauthorized)
 		return
 	}
+
+	// In sharded mode, refuse to serve (or instantiate) a tenant's Alertmanager locally
+	// on a replica that does not own the tenant. Serving locally on a non-owner would
+	// (a) cause the fallback path below to overwrite the tenant's stored configuration
+	// with an empty placeholder, and (b) start a per-tenant Alertmanager outside of the
+	// ring, which then persists state as replica 0 to object storage. Paths that are not
+	// classified by the Distributor's IsPathSupported (e.g. UI root and assets) land here
+	// via the load balancer, so we must gate on ownership rather than trust path routing.
+	if am.cfg.ShardingEnabled && !am.isUserOwned(userID) {
+		level.Debug(am.logger).Log("msg", "refusing to serve request locally for a tenant not owned by this instance", "user", userID, "path", req.URL.Path)
+		http.Error(w, "the Alertmanager is not available on this instance for the given tenant", http.StatusNotFound)
+		return
+	}
+
 	am.alertmanagersMtx.Lock()
 	userAM, ok := am.alertmanagers[userID]
 	am.alertmanagersMtx.Unlock()
@@ -1040,17 +1054,33 @@ func (am *MultitenantAlertmanager) serveRequest(w http.ResponseWriter, req *http
 }
 
 func (am *MultitenantAlertmanager) alertmanagerFromFallbackConfig(userID string) (*Alertmanager, error) {
-	// Upload an empty config so that the Alertmanager is no de-activated in the next poll
-	cfgDesc := alertspb.ToProto("", nil, userID)
-	err := am.store.SetAlertConfig(context.Background(), cfgDesc)
-	if err != nil {
-		return nil, err
-	}
-
-	// Calling setConfig with an empty configuration will use the fallback config.
-	err = am.setConfig(cfgDesc)
-	if err != nil {
-		return nil, err
+	// If the tenant already has a stored configuration, preserve it: use that config to
+	// bring up the per-tenant Alertmanager instead of overwriting the store with an empty
+	// placeholder. The in-memory map being empty only means this instance has not yet
+	// loaded the tenant via the periodic sync (e.g. the request arrived in the poll
+	// window right after SetUserConfig, or just after a ring change); it does NOT mean
+	// the tenant is unconfigured.
+	ctx := context.Background()
+	existingCfg, err := am.store.GetAlertConfig(ctx, userID)
+	switch {
+	case err == nil:
+		// The tenant has a stored configuration. Apply it as-is; do not touch the store.
+		if err := am.setConfig(existingCfg); err != nil {
+			return nil, err
+		}
+	case errors.Is(err, alertspb.ErrNotFound):
+		// No stored configuration: upload an empty placeholder so that the next poll does
+		// not immediately de-activate the instance, then bring up the Alertmanager from
+		// the operator fallback config. This is the originally-intended semantics.
+		cfgDesc := alertspb.ToProto("", nil, userID)
+		if err := am.store.SetAlertConfig(ctx, cfgDesc); err != nil {
+			return nil, err
+		}
+		if err := am.setConfig(cfgDesc); err != nil {
+			return nil, err
+		}
+	default:
+		return nil, errors.Wrapf(err, "failed to read alertmanager configuration for user %s", userID)
 	}
 
 	am.alertmanagersMtx.Lock()
