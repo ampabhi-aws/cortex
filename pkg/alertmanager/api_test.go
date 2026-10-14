@@ -682,6 +682,9 @@ receivers:
 	router := mux.NewRouter()
 	router.Path("/multitenant_alertmanager/configs").Methods(http.MethodGet).HandlerFunc(am.ListAllConfigs)
 	req := httptest.NewRequest("GET", "https://localhost:8080/multitenant_alertmanager/configs", nil)
+	// The all-tenant admin dump requires a tenant/org id to be present in the
+	// request context (set by the AuthMiddleware in production).
+	req = req.WithContext(user.InjectOrgID(req.Context(), "admin"))
 	w := httptest.NewRecorder()
 	router.ServeHTTP(w, req)
 
