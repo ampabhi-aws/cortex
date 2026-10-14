@@ -1,8 +1,8 @@
 package storegateway
 
 import (
+	"html/template"
 	"net/http"
-	"text/template"
 
 	"github.com/go-kit/log/level"
 
@@ -26,6 +26,9 @@ var (
 )
 
 func writeMessage(w http.ResponseWriter, message string) {
+	w.Header().Set("Content-Type", "text/html; charset=utf-8")
+	w.Header().Set("Content-Security-Policy", "default-src 'none'; style-src 'self' 'unsafe-inline'; frame-ancestors 'none'; base-uri 'none'")
+	w.Header().Set("X-Content-Type-Options", "nosniff")
 	w.WriteHeader(http.StatusOK)
 	err := statusPageTemplate.Execute(w, struct {
 		Message string

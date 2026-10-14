@@ -1,14 +1,24 @@
 package alertmanager
 
 import (
+	"html/template"
 	"net/http"
-	"text/template"
 
 	"github.com/go-kit/log/level"
 
 	util_log "github.com/cortexproject/cortex/pkg/util/log"
 	"github.com/cortexproject/cortex/pkg/util/services"
 )
+
+// setAdminPageHeaders sets a safe Content-Type and a restrictive
+// Content-Security-Policy on admin HTML status pages so that if any
+// user-controlled value (such as a gossip-supplied member name) were ever
+// rendered unescaped, inline script execution would still be blocked.
+func setAdminPageHeaders(w http.ResponseWriter) {
+	w.Header().Set("Content-Type", "text/html; charset=utf-8")
+	w.Header().Set("Content-Security-Policy", "default-src 'none'; style-src 'self' 'unsafe-inline'; frame-ancestors 'none'; base-uri 'none'")
+	w.Header().Set("X-Content-Type-Options", "nosniff")
+}
 
 var (
 	ringStatusPageTemplate = template.Must(template.New("ringStatusPage").Parse(`
@@ -56,6 +66,7 @@ var (
 )
 
 func writeRingStatusMessage(w http.ResponseWriter, message string) {
+	setAdminPageHeaders(w)
 	w.WriteHeader(http.StatusOK)
 	err := ringStatusPageTemplate.Execute(w, struct {
 		Message string
@@ -100,6 +111,7 @@ func (s StatusHandler) ServeHTTP(w http.ResponseWriter, _ *http.Request) {
 	if s.am.peer != nil {
 		clusterInfo = s.am.peer.Info()
 	}
+	setAdminPageHeaders(w)
 	err := statusTemplate.Execute(w, struct {
 		ClusterInfo map[string]interface{}
 	}{
