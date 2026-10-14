@@ -60,14 +60,40 @@ func (api *TenantDeletionAPI) DeleteTenant(w http.ResponseWriter, r *http.Reques
 		return
 	}
 
-	level.Info(api.logger).Log("msg", "tenant deletion mark in blocks storage created", "user", userID)
+	// This endpoint only triggers deletion of blocks-storage data for the
+	// tenant. Ruler rule groups and Alertmanager configuration (which may
+	// contain third-party notification credentials) are stored separately and
+	// are NOT purged by this call. Operators must additionally invoke the
+	// dedicated admin endpoints to delete that state:
+	//   POST /ruler/delete_tenant_config
+	//   POST /multitenant_alertmanager/delete_tenant_config
+	level.Info(api.logger).Log(
+		"msg", "tenant deletion mark in blocks storage created; this endpoint does NOT delete ruler rule groups or alertmanager configuration (including notification credentials); call /ruler/delete_tenant_config and /multitenant_alertmanager/delete_tenant_config separately to purge those stores",
+		"user", userID,
+	)
 
 	w.WriteHeader(http.StatusOK)
 }
 
+// DeleteTenantStatusResponse is returned by the delete_tenant_status endpoint.
+//
+// Only the status of blocks-storage deletion is reported here. This endpoint
+// does not inspect or report on ruler or alertmanager object storage. A
+// "blocks_deleted": true response does NOT mean that the tenant's rule groups
+// or Alertmanager configuration (which may contain notification credentials)
+// have been removed; those must be deleted separately via
+// POST /ruler/delete_tenant_config and
+// POST /multitenant_alertmanager/delete_tenant_config.
 type DeleteTenantStatusResponse struct {
 	TenantID      string `json:"tenant_id"`
 	BlocksDeleted bool   `json:"blocks_deleted"`
+	// Scope is a human-readable description of what this status covers. It is
+	// included to prevent callers from mistaking a "blocks_deleted: true"
+	// response for complete tenant data erasure.
+	Scope string `json:"scope"`
+	// AdditionalCleanupRequired lists other admin endpoints that must be
+	// invoked to fully erase tenant data from stores not covered by this API.
+	AdditionalCleanupRequired []string `json:"additional_cleanup_required,omitempty"`
 }
 
 func (api *TenantDeletionAPI) DeleteTenantStatus(w http.ResponseWriter, r *http.Request) {
@@ -84,6 +110,11 @@ func (api *TenantDeletionAPI) DeleteTenantStatus(w http.ResponseWriter, r *http.
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
+	}
+	result.Scope = "blocks-storage only; ruler and alertmanager configuration are not inspected by this endpoint"
+	result.AdditionalCleanupRequired = []string{
+		"POST /ruler/delete_tenant_config",
+		"POST /multitenant_alertmanager/delete_tenant_config",
 	}
 
 	util.WriteJSONResponse(w, result)

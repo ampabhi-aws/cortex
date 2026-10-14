@@ -795,7 +795,18 @@ The Purger service provides APIs for requesting deletion of tenants.
 POST /purger/delete_tenant
 ```
 
-Request deletion of ALL tenant data. Only works with blocks storage. Experimental.
+Request deletion of a tenant's **blocks-storage** data. Experimental.
+
+This endpoint only writes a tenant deletion marker to the blocks bucket; the
+compactor's blocks-cleaner then asynchronously removes the tenant's blocks.
+It does **NOT** delete the tenant's ruler rule groups or Alertmanager
+configuration (which may contain third-party notification credentials). To
+fully erase a tenant's data, operators must also invoke:
+
+- `POST /ruler/delete_tenant_config` — deletes all rule groups for the tenant.
+- `POST /multitenant_alertmanager/delete_tenant_config` — deletes the
+  Alertmanager configuration and templates for the tenant (including any
+  stored notification credentials).
 
 _Requires [authentication](#authentication)._
 
@@ -805,7 +816,13 @@ _Requires [authentication](#authentication)._
 GET /purger/delete_tenant_status
 ```
 
-Returns status of tenant deletion. Output format to be defined. Experimental.
+Returns the status of a tenant's blocks-storage deletion. Experimental.
+
+The response reports only the state of blocks-storage cleanup. A
+`"blocks_deleted": true` response does **not** mean the tenant's ruler rule
+groups or Alertmanager configuration have been removed; see the
+`additional_cleanup_required` field in the response and the complementary
+endpoints listed above.
 
 _Requires [authentication](#authentication)._
 
