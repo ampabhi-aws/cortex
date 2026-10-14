@@ -45,6 +45,8 @@ var (
 	errTLSFileNotAllowed             = errors.New("setting TLS ca_file, cert_file and key_file is not allowed")
 	errSlackAPIURLFileNotAllowed     = errors.New("setting Slack api_url_file and global slack_api_url_file is not allowed")
 	errVictorOpsAPIKeyFileNotAllowed = errors.New("setting VictorOps api_key_file is not allowed")
+	errOpsGenieAPIKeyFileNotAllowed  = errors.New("setting OpsGenie api_key_file and global opsgenie_api_key_file is not allowed")
+	errFileNotAllowed                = errors.New("setting a *_file option in the Alertmanager configuration is not allowed")
 )
 
 // UserConfig is used to communicate a users alertmanager configs
@@ -304,6 +306,22 @@ func (am *MultitenantAlertmanager) ListAllConfigs(w http.ResponseWriter, r *http
 	<-done
 }
 
+// ValidateAlertmanagerConfig parses the given Alertmanager configuration YAML and
+// runs the same recursive validation that applies to tenant-supplied
+// Alertmanager configs on the /api/v1/alerts path. It is safe to call from
+// other packages (for example the legacy configs service) that ingest a
+// tenant-supplied Alertmanager config before it reaches the alert store.
+func ValidateAlertmanagerConfig(rawConfig string) error {
+	if rawConfig == "" {
+		return nil
+	}
+	amCfg, err := config.Load(rawConfig)
+	if err != nil {
+		return err
+	}
+	return validateAlertmanagerConfig(amCfg)
+}
+
 // validateAlertmanagerConfig recursively scans the input config looking for data types for which
 // we have a specific validation and, whenever encountered, it runs their validation. Returns the
 // first error or nil if validation succeeds.
@@ -349,6 +367,35 @@ func validateAlertmanagerConfig(cfg interface{}) error {
 	case reflect.TypeOf(config.VictorOpsConfig{}):
 		if err := validateVictorOpsConfig(v.Interface().(config.VictorOpsConfig)); err != nil {
 			return err
+		}
+
+	case reflect.TypeOf(config.OpsGenieConfig{}):
+		if err := validateOpsGenieConfig(v.Interface().(config.OpsGenieConfig)); err != nil {
+			return err
+		}
+	}
+
+	// Deny-by-default guard: reject any struct field whose yaml tag ends in
+	// "_file" and holds a non-empty value. This ensures future upstream
+	// Alertmanager options that read a local file cannot silently bypass the
+	// Cortex allowlist above. The specialised validators above still run first
+	// so their explicit, well-known error messages are preferred.
+	if t.Kind() == reflect.Struct {
+		for i := 0; i < t.NumField(); i++ {
+			field := t.Field(i)
+			if field.PkgPath != "" { // skip unexported fields
+				continue
+			}
+			if !isFileYAMLField(field) {
+				continue
+			}
+			fieldValue := v.FieldByIndex(field.Index)
+			if !fieldValue.IsValid() {
+				continue
+			}
+			if isNonEmptyStringLike(fieldValue) {
+				return errFileNotAllowed
+			}
 		}
 	}
 
@@ -429,7 +476,69 @@ func validateGlobalConfig(cfg config.GlobalConfig) error {
 	if cfg.SlackAPIURLFile != "" {
 		return errSlackAPIURLFileNotAllowed
 	}
+	if cfg.OpsGenieAPIKeyFile != "" {
+		return errOpsGenieAPIKeyFileNotAllowed
+	}
 	return nil
+}
+
+// validateOpsGenieConfig validates the OpsGenie config and returns an error if it contains
+// settings not allowed by Cortex.
+func validateOpsGenieConfig(cfg config.OpsGenieConfig) error {
+	if cfg.APIKeyFile != "" {
+		return errOpsGenieAPIKeyFileNotAllowed
+	}
+	return nil
+}
+
+// isFileYAMLField reports whether a struct field is tagged as a yaml "*_file"
+// option. Fields with no yaml tag, with yaml:"-", or that are not a scalar
+// string/[]byte-like value cannot name a file to be opened by the notifier and
+// are skipped. Only the first comma-separated yaml name is inspected.
+func isFileYAMLField(field reflect.StructField) bool {
+	tag, ok := field.Tag.Lookup("yaml")
+	if !ok {
+		return false
+	}
+	name := tag
+	if idx := indexByte(tag, ','); idx >= 0 {
+		name = tag[:idx]
+	}
+	if name == "" || name == "-" {
+		return false
+	}
+	return hasSuffix(name, "_file")
+}
+
+// isNonEmptyStringLike reports whether v holds a non-empty string or
+// []byte-compatible value. Named string types (e.g. config.Secret) and slices
+// of bytes are supported; everything else returns false so the deny-by-default
+// guard only blocks real path-valued fields.
+func isNonEmptyStringLike(v reflect.Value) bool {
+	switch v.Kind() {
+	case reflect.String:
+		return v.Len() > 0
+	case reflect.Slice:
+		if v.Type().Elem().Kind() == reflect.Uint8 {
+			return v.Len() > 0
+		}
+	}
+	return false
+}
+
+// indexByte / hasSuffix are tiny helpers kept local to avoid adding a strings
+// import solely for two one-line calls inside the validator.
+func indexByte(s string, c byte) int {
+	for i := 0; i < len(s); i++ {
+		if s[i] == c {
+			return i
+		}
+	}
+	return -1
+}
+
+func hasSuffix(s, suffix string) bool {
+	return len(s) >= len(suffix) && s[len(s)-len(suffix):] == suffix
 }
 
 // validateSlackConfig validates the Slack config and returns an error if it contains

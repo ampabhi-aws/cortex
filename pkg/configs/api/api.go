@@ -20,6 +20,7 @@ import (
 	amconfig "github.com/prometheus/alertmanager/config"
 	amtemplate "github.com/prometheus/alertmanager/template"
 
+	"github.com/cortexproject/cortex/pkg/alertmanager"
 	"github.com/cortexproject/cortex/pkg/configs/db"
 	"github.com/cortexproject/cortex/pkg/configs/userconfig"
 	"github.com/cortexproject/cortex/pkg/tenant"
@@ -237,6 +238,16 @@ func validateAlertmanagerConfig(cfg string, noCfg NotificationsConfig) error {
 		if noCfg.DisableWebHook && len(recv.WebhookConfigs) > 0 {
 			return ErrWebhookNotificationsAreDisabled
 		}
+	}
+
+	// Apply the same deny-list used for configs ingested through the tenant
+	// Alertmanager API so a tenant cannot smuggle *_file options (OpsGenie
+	// api_key_file, Slack api_url_file, VictorOps api_key_file, HTTP
+	// password_file / bearer_token_file / credentials_file / client_secret_file,
+	// TLS ca_file / cert_file / key_file, ...) through the legacy configs
+	// service when -alertmanager.storage.type=configdb.
+	if err := alertmanager.ValidateAlertmanagerConfig(cfg); err != nil {
+		return err
 	}
 
 	return nil
