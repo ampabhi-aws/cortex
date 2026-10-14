@@ -6,6 +6,7 @@ import (
 	"io"
 	"net/http"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/go-kit/log"
@@ -47,6 +48,12 @@ type Scheduler struct {
 	connectedFrontendsMu sync.Mutex
 	connectedFrontends   map[string]*connectedFrontend
 
+	// nextConnID generates a unique identifier for each FrontendLoop stream.
+	// Keying pendingRequests/CANCEL on this authenticated per-connection value
+	// prevents one FrontendLoop peer from affecting another peer's requests by
+	// forging the self-declared FrontendAddress.
+	nextConnID uint64
+
 	requestQueue *queue.RequestQueue
 	activeUsers  *util.ActiveUsersCleanupService
 
@@ -65,9 +72,13 @@ type Scheduler struct {
 	queueDuration            prometheus.Histogram
 }
 
+// requestKey identifies a pending request. connID is the server-assigned,
+// per-FrontendLoop-stream identifier, so cancellation of a pending request
+// is scoped to the frontend connection that enqueued it rather than to the
+// self-declared frontend address.
 type requestKey struct {
-	frontendAddr string
-	queryID      uint64
+	connID  uint64
+	queryID uint64
 }
 
 type connectedFrontend struct {
@@ -82,12 +93,14 @@ type connectedFrontend struct {
 type Config struct {
 	MaxOutstandingPerTenant int               `yaml:"max_outstanding_requests_per_tenant"`
 	QuerierForgetDelay      time.Duration     `yaml:"querier_forget_delay"`
+	MaxTenantsPerConnection int               `yaml:"max_tenants_per_connection"`
 	GRPCClientConfig        grpcclient.Config `yaml:"grpc_client_config" doc:"description=This configures the gRPC client used to report errors back to the query-frontend."`
 }
 
 func (cfg *Config) RegisterFlags(f *flag.FlagSet) {
 	f.IntVar(&cfg.MaxOutstandingPerTenant, "query-scheduler.max-outstanding-requests-per-tenant", 100, "Maximum number of outstanding requests per tenant per query-scheduler. In-flight requests above this limit will fail with HTTP response status code 429.")
 	f.DurationVar(&cfg.QuerierForgetDelay, "query-scheduler.querier-forget-delay", 0, "If a querier disconnects without sending notification about graceful shutdown, the query-scheduler will keep the querier in the tenant's shard until the forget delay has passed. This feature is useful to reduce the blast radius when shuffle-sharding is enabled.")
+	f.IntVar(&cfg.MaxTenantsPerConnection, "query-scheduler.max-tenants-per-connection", 10000, "Maximum number of distinct tenant IDs that a single FrontendLoop connection may enqueue requests for. Caps per-tenant queue and metric label growth driven by a single peer. 0 disables the limit.")
 	cfg.GRPCClientConfig.RegisterFlagsWithPrefix("query-scheduler.grpc-client-config", f)
 }
 
@@ -147,10 +160,14 @@ type Limits interface {
 
 type schedulerRequest struct {
 	frontendAddress string
-	userID          string
-	queryID         uint64
-	request         *httpgrpc.HTTPRequest
-	statsEnabled    bool
+	// connID is the per-FrontendLoop-stream identifier assigned by the
+	// scheduler when the connection was accepted. Together with queryID it
+	// identifies the entry in pendingRequests.
+	connID       uint64
+	userID       string
+	queryID      uint64
+	request      *httpgrpc.HTTPRequest
+	statsEnabled bool
 
 	enqueueTime time.Time
 
@@ -164,11 +181,22 @@ type schedulerRequest struct {
 
 // FrontendLoop handles connection from frontend.
 func (s *Scheduler) FrontendLoop(frontend schedulerpb.SchedulerForFrontend_FrontendLoopServer) error {
+	// Assign a server-generated identifier to this stream. All pendingRequests
+	// entries that this stream enqueues are keyed on connID, so CANCEL messages
+	// from this stream can only affect its own in-flight requests even if the
+	// peer forges another frontend's self-declared address.
+	connID := atomic.AddUint64(&s.nextConnID, 1)
 	frontendAddress, frontendCtx, err := s.frontendConnected(frontend)
 	if err != nil {
 		return err
 	}
 	defer s.frontendDisconnected(frontendAddress)
+	defer s.cleanupPendingRequestsForConn(connID)
+
+	// Per-connection tenant tracker caps the number of distinct tenant IDs a
+	// single FrontendLoop peer can create queues and per-tenant metric labels
+	// for.
+	connTenants := map[string]struct{}{}
 
 	// Response to INIT. If scheduler is not running, we skip for-loop, send SHUTTING_DOWN and exit this method.
 	if s.State() == services.Running {
@@ -197,7 +225,7 @@ func (s *Scheduler) FrontendLoop(frontend schedulerpb.SchedulerForFrontend_Front
 
 		switch msg.GetType() {
 		case schedulerpb.ENQUEUE:
-			err = s.enqueueRequest(frontendCtx, frontendAddress, msg)
+			err = s.enqueueRequest(frontendCtx, frontendAddress, connID, connTenants, msg)
 			switch {
 			case err == nil:
 				resp = &schedulerpb.SchedulerToFrontend{Status: schedulerpb.OK}
@@ -208,7 +236,7 @@ func (s *Scheduler) FrontendLoop(frontend schedulerpb.SchedulerForFrontend_Front
 			}
 
 		case schedulerpb.CANCEL:
-			s.cancelRequestAndRemoveFromPending(frontendAddress, msg.QueryID)
+			s.cancelRequestAndRemoveFromPending(connID, msg.QueryID)
 			resp = &schedulerpb.SchedulerToFrontend{Status: schedulerpb.OK}
 
 		default:
@@ -264,7 +292,7 @@ func (s *Scheduler) frontendDisconnected(frontendAddress string) {
 	}
 }
 
-func (s *Scheduler) enqueueRequest(frontendContext context.Context, frontendAddr string, msg *schedulerpb.FrontendToScheduler) error {
+func (s *Scheduler) enqueueRequest(frontendContext context.Context, frontendAddr string, connID uint64, connTenants map[string]struct{}, msg *schedulerpb.FrontendToScheduler) error {
 	// Create new context for this request, to support cancellation.
 	ctx, cancel := context.WithCancel(frontendContext)
 	shouldCancel := true
@@ -284,8 +312,28 @@ func (s *Scheduler) enqueueRequest(frontendContext context.Context, frontendAddr
 
 	userID := msg.GetUserID()
 
+	// Validate tenant ID format up front so we also apply the per-connection
+	// tenant cap only to well-formed tenant IDs.
+	tenantIDs, err := tenant.TenantIDsFromOrgID(userID)
+	if err != nil {
+		return err
+	}
+
+	// Enforce a per-connection cap on the number of distinct tenant IDs. This
+	// prevents a single FrontendLoop peer from creating an unbounded number of
+	// per-tenant queues and per-tenant Prometheus label series by iterating
+	// forged tenant IDs. Already-seen tenants on this connection are always
+	// allowed through.
+	if _, seen := connTenants[userID]; !seen {
+		if s.cfg.MaxTenantsPerConnection > 0 && len(connTenants) >= s.cfg.MaxTenantsPerConnection {
+			return errors.Errorf("too many distinct tenants on this connection (limit: %d)", s.cfg.MaxTenantsPerConnection)
+		}
+		connTenants[userID] = struct{}{}
+	}
+
 	req := &schedulerRequest{
 		frontendAddress: frontendAddr,
+		connID:          connID,
 		userID:          msg.UserID,
 		queryID:         msg.QueryID,
 		request:         msg.HttpRequest,
@@ -299,11 +347,6 @@ func (s *Scheduler) enqueueRequest(frontendContext context.Context, frontendAddr
 	req.enqueueTime = now
 	req.ctxCancel = cancel
 
-	// aggregate the max queriers limit in the case of a multi tenant query
-	tenantIDs, err := tenant.TenantIDsFromOrgID(userID)
-	if err != nil {
-		return err
-	}
 	maxQueriers := validation.SmallestPositiveNonZeroIntPerTenant(tenantIDs, s.limits.MaxQueriersPerUser)
 
 	s.activeUsers.UpdateUserTimestamp(userID, now)
@@ -312,21 +355,38 @@ func (s *Scheduler) enqueueRequest(frontendContext context.Context, frontendAddr
 
 		s.pendingRequestsMu.Lock()
 		defer s.pendingRequestsMu.Unlock()
-		s.pendingRequests[requestKey{frontendAddr: frontendAddr, queryID: msg.QueryID}] = req
+		s.pendingRequests[requestKey{connID: connID, queryID: msg.QueryID}] = req
 	})
 }
 
 // This method doesn't do removal from the queue.
-func (s *Scheduler) cancelRequestAndRemoveFromPending(frontendAddr string, queryID uint64) {
+func (s *Scheduler) cancelRequestAndRemoveFromPending(connID uint64, queryID uint64) {
 	s.pendingRequestsMu.Lock()
 	defer s.pendingRequestsMu.Unlock()
 
-	key := requestKey{frontendAddr: frontendAddr, queryID: queryID}
+	key := requestKey{connID: connID, queryID: queryID}
 	req := s.pendingRequests[key]
 	if req != nil {
 		req.ctxCancel()
 	}
 	delete(s.pendingRequests, key)
+}
+
+// cleanupPendingRequestsForConn cancels and removes every pending request that
+// was enqueued on the given FrontendLoop connection. It is invoked when the
+// stream terminates so that stale pendingRequests entries do not accumulate.
+func (s *Scheduler) cleanupPendingRequestsForConn(connID uint64) {
+	s.pendingRequestsMu.Lock()
+	defer s.pendingRequestsMu.Unlock()
+
+	for key, req := range s.pendingRequests {
+		if key.connID == connID {
+			if req != nil {
+				req.ctxCancel()
+			}
+			delete(s.pendingRequests, key)
+		}
+	}
 }
 
 // QuerierLoop is started by querier to receive queries from scheduler.
@@ -378,7 +438,7 @@ func (s *Scheduler) QuerierLoop(querier schedulerpb.SchedulerForQuerier_QuerierL
 
 		if r.ctx.Err() != nil {
 			// Remove from pending requests.
-			s.cancelRequestAndRemoveFromPending(r.frontendAddress, r.queryID)
+			s.cancelRequestAndRemoveFromPending(r.connID, r.queryID)
 
 			lastUserIndex = lastUserIndex.ReuseLastUser()
 			continue
@@ -401,7 +461,7 @@ func (s *Scheduler) NotifyQuerierShutdown(_ context.Context, req *schedulerpb.No
 
 func (s *Scheduler) forwardRequestToQuerier(querier schedulerpb.SchedulerForQuerier_QuerierLoopServer, req *schedulerRequest) error {
 	// Make sure to cancel request at the end to cleanup resources.
-	defer s.cancelRequestAndRemoveFromPending(req.frontendAddress, req.queryID)
+	defer s.cancelRequestAndRemoveFromPending(req.connID, req.queryID)
 
 	// Handle the stream sending & receiving on a goroutine so we can
 	// monitoring the contexts in a select and cancel things appropriately.
