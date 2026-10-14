@@ -4,10 +4,13 @@ import (
 	"context"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
+	"net/url"
 	"os"
 	"path/filepath"
 	"reflect"
+	"strings"
 
 	"github.com/go-kit/log"
 	"github.com/go-kit/log/level"
@@ -45,6 +48,7 @@ var (
 	errTLSFileNotAllowed             = errors.New("setting TLS ca_file, cert_file and key_file is not allowed")
 	errSlackAPIURLFileNotAllowed     = errors.New("setting Slack api_url_file and global slack_api_url_file is not allowed")
 	errVictorOpsAPIKeyFileNotAllowed = errors.New("setting VictorOps api_key_file is not allowed")
+	errReceiverURLNotAllowed         = errors.New("receiver URL host resolves to a reserved, loopback, unspecified, multicast, broadcast or otherwise non-routable address")
 )
 
 // UserConfig is used to communicate a users alertmanager configs
@@ -350,6 +354,16 @@ func validateAlertmanagerConfig(cfg interface{}) error {
 		if err := validateVictorOpsConfig(v.Interface().(config.VictorOpsConfig)); err != nil {
 			return err
 		}
+
+	case reflect.TypeOf(config.URL{}):
+		if err := validateReceiverURL(v.Interface().(config.URL).URL); err != nil {
+			return err
+		}
+
+	case reflect.TypeOf(config.SecretURL{}):
+		if err := validateReceiverURL(v.Interface().(config.SecretURL).URL); err != nil {
+			return err
+		}
 	}
 
 	// If the input config is a struct, recursively iterate on all fields.
@@ -448,4 +462,97 @@ func validateVictorOpsConfig(cfg config.VictorOpsConfig) error {
 		return errVictorOpsAPIKeyFileNotAllowed
 	}
 	return nil
+}
+
+// validateReceiverURL rejects URLs whose host component is an obvious
+// non-routable literal (unspecified / loopback / link-local / multicast /
+// broadcast / reserved range). This is a configuration-ingest safeguard that
+// complements the runtime FirewallDialer: it catches `0.0.0.0`, `::`, etc.
+// before the config is persisted, even when the operator has not enabled the
+// opt-in receivers firewall. Hostnames (anything that is not an IP literal)
+// are left to the runtime dialer which checks the post-resolution IP.
+func validateReceiverURL(u *url.URL) error {
+	if u == nil {
+		return nil
+	}
+	host := u.Hostname()
+	if host == "" {
+		return nil
+	}
+	// Only inspect literal IPs here. Hostnames are enforced at dial time by
+	// FirewallDialer against the resolved address, which is the only sound
+	// way to handle DNS (names can rebind).
+	ip := net.ParseIP(host)
+	if ip == nil {
+		// Reject the literal "localhost" even though it is not an IP, since
+		// it is unambiguously a loopback alias and operators expect it to be
+		// blocked by the firewall. Any other hostname is deferred to the
+		// dialer.
+		if strings.EqualFold(host, "localhost") {
+			return errReceiverURLNotAllowed
+		}
+		return nil
+	}
+	if ip.IsUnspecified() ||
+		ip.IsLoopback() ||
+		ip.IsLinkLocalUnicast() ||
+		ip.IsLinkLocalMulticast() ||
+		ip.IsInterfaceLocalMulticast() ||
+		ip.IsMulticast() ||
+		isBroadcastV4(ip) ||
+		isReservedLiteral(ip) {
+		return errReceiverURLNotAllowed
+	}
+	return nil
+}
+
+func isBroadcastV4(ip net.IP) bool {
+	ip4 := ip.To4()
+	if ip4 == nil {
+		return false
+	}
+	return ip4[0] == 0xff && ip4[1] == 0xff && ip4[2] == 0xff && ip4[3] == 0xff
+}
+
+// receiverReservedCIDRs mirrors the FirewallDialer reserved list for the
+// configuration-ingest safeguard. Kept local to avoid pulling the util/net
+// package into the alertmanager API package (which already imports the
+// prometheus alertmanager and would otherwise create a wider dependency
+// surface for a small static table).
+var receiverReservedCIDRs = func() []*net.IPNet {
+	cidrs := []string{
+		"0.0.0.0/8",
+		"100.64.0.0/10",
+		"169.254.0.0/16",
+		"192.0.0.0/24",
+		"192.0.2.0/24",
+		"198.18.0.0/15",
+		"198.51.100.0/24",
+		"203.0.113.0/24",
+		"240.0.0.0/4",
+		"::/128",
+		"::1/128",
+		"64:ff9b::/96",
+		"64:ff9b:1::/48",
+		"100::/64",
+		"2001::/32",
+		"2001:db8::/32",
+		"fec0::/10",
+	}
+	out := make([]*net.IPNet, 0, len(cidrs))
+	for _, c := range cidrs {
+		if _, n, err := net.ParseCIDR(c); err == nil {
+			out = append(out, n)
+		}
+	}
+	return out
+}()
+
+func isReservedLiteral(ip net.IP) bool {
+	for _, n := range receiverReservedCIDRs {
+		if n.Contains(ip) {
+			return true
+		}
+	}
+	return false
 }
