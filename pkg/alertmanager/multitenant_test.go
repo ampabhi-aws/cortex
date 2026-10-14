@@ -1968,6 +1968,11 @@ func TestSafeTemplateFilepath(t *testing.T) {
 			template:    "../test.tmpl",
 			expectedErr: errors.New(`invalid template name "../test.tmpl": the template filepath is escaping the per-tenant local directory`),
 		},
+		"should fail if the resolved path is a sibling directory sharing the prefix of the container dir": {
+			dir:         "/data/tenant/templates",
+			template:    "../templatesX/evil.tmpl",
+			expectedErr: errors.New(`invalid template name "../templatesX/evil.tmpl": the template filepath is escaping the per-tenant local directory`),
+		},
 	}
 
 	for testName, testData := range tests {
