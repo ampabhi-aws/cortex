@@ -248,17 +248,25 @@ func (f *Frontend) QueryResult(ctx context.Context, qrReq *frontendv2pb.QueryRes
 	}
 	userID := tenant.JoinTenantIDs(tenantIDs)
 
-	req := f.requests.get(qrReq.QueryID)
-	// It is possible that some old response belonging to different user was received, if frontend has restarted.
-	// To avoid leaking query results between users, we verify the user here.
-	// To avoid mixing results from different queries, we randomize queryID counter on start.
-	if req != nil && req.userID == userID {
-		select {
-		case req.response <- qrReq:
-			// Should always be possible, unless QueryResult is called multiple times with the same queryID.
-		default:
-			level.Warn(f.log).Log("msg", "failed to write query result to the response channel", "queryID", qrReq.QueryID, "user", userID)
-		}
+	// Atomically take the in-flight request for this queryID so that only the
+	// first caller claiming the right tenant may deliver a response. Subsequent
+	// callers (including an attacker that learned userID+queryID from a
+	// legitimate response or by racing) see no in-flight request and are
+	// ignored. This complements transport-layer peer authentication (mTLS)
+	// recommended for the querier<->frontend channel.
+	req := f.requests.takeIfOwner(qrReq.QueryID, userID)
+	if req == nil {
+		// Either the request is unknown, belongs to another tenant, or has
+		// already been answered. In all cases we silently drop the result to
+		// avoid leaking information to the caller.
+		return &frontendv2pb.QueryResultResponse{}, nil
+	}
+
+	select {
+	case req.response <- qrReq:
+		// Should always be possible, unless QueryResult is called multiple times with the same queryID.
+	default:
+		level.Warn(f.log).Log("msg", "failed to write query result to the response channel", "queryID", qrReq.QueryID, "user", userID)
 	}
 
 	return &frontendv2pb.QueryResultResponse{}, nil
@@ -316,4 +324,25 @@ func (r *requestsInProgress) get(queryID uint64) *frontendRequest {
 	defer r.mu.Unlock()
 
 	return r.requests[queryID]
+}
+
+// takeIfOwner atomically removes and returns the in-flight request for
+// queryID, but only when its userID matches the given expectedUserID. If no
+// such request exists (or the tenant does not match), it returns nil and the
+// map is left untouched. This makes the response path one-shot: once a
+// response has been accepted, further responses for the same queryID -- even
+// from a peer that forged the right tenant and queryID -- are ignored.
+func (r *requestsInProgress) takeIfOwner(queryID uint64, expectedUserID string) *frontendRequest {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+
+	req, ok := r.requests[queryID]
+	if !ok || req == nil {
+		return nil
+	}
+	if req.userID != expectedUserID {
+		return nil
+	}
+	delete(r.requests, queryID)
+	return req
 }
