@@ -15,6 +15,7 @@ import (
 	"github.com/prometheus/alertmanager/config"
 	"github.com/prometheus/client_golang/prometheus"
 	commoncfg "github.com/prometheus/common/config"
+	"github.com/prometheus/common/sigv4"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	"github.com/thanos-io/objstore"
@@ -784,6 +785,72 @@ func TestValidateAlertmanagerConfig(t *testing.T) {
 				}},
 			},
 			expected: errTLSFileNotAllowed,
+		},
+		"SNSConfig with empty sigv4 credentials falls back to ambient AWS creds": {
+			input: config.SNSConfig{
+				Sigv4: sigv4.SigV4Config{Region: "us-east-1"},
+				PhoneNumber: "+15555550123",
+			},
+			expected: errSNSMissingSigV4Credentials,
+		},
+		"SNSConfig with sigv4 role_arn is rejected": {
+			input: config.SNSConfig{
+				Sigv4: sigv4.SigV4Config{
+					Region:    "us-east-1",
+					AccessKey: "AKIA",
+					SecretKey: "secret",
+					RoleARN:   "arn:aws:iam::123456789012:role/other",
+				},
+				PhoneNumber: "+15555550123",
+			},
+			expected: errSNSSigV4RoleARNNotAllowed,
+		},
+		"SNSConfig with sigv4 profile is rejected": {
+			input: config.SNSConfig{
+				Sigv4: sigv4.SigV4Config{
+					Region:    "us-east-1",
+					AccessKey: "AKIA",
+					SecretKey: "secret",
+					Profile:   "default",
+				},
+				PhoneNumber: "+15555550123",
+			},
+			expected: errSNSSigV4ProfileNotAllowed,
+		},
+		"SNSConfig with tenant api_url is rejected": {
+			input: config.SNSConfig{
+				Sigv4: sigv4.SigV4Config{
+					Region:    "us-east-1",
+					AccessKey: "AKIA",
+					SecretKey: "secret",
+				},
+				APIUrl:      "http://attacker.example/",
+				PhoneNumber: "+15555550123",
+			},
+			expected: errSNSAPIUrlNotAllowed,
+		},
+		"SNSConfig nested in Receivers with missing sigv4 credentials is rejected": {
+			input: config.Config{
+				Receivers: []*config.Receiver{{
+					Name: "test",
+					SNSConfigs: []*config.SNSConfig{{
+						Sigv4:       sigv4.SigV4Config{Region: "us-east-1"},
+						PhoneNumber: "+15555550123",
+					}},
+				}},
+			},
+			expected: errSNSMissingSigV4Credentials,
+		},
+		"SNSConfig with static sigv4 credentials is accepted": {
+			input: config.SNSConfig{
+				Sigv4: sigv4.SigV4Config{
+					Region:    "us-east-1",
+					AccessKey: "AKIA",
+					SecretKey: "secret",
+				},
+				PhoneNumber: "+15555550123",
+			},
+			expected: nil,
 		},
 	}
 
