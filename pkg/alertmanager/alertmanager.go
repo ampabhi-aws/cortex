@@ -317,7 +317,13 @@ func (am *Alertmanager) ApplyConfig(userID string, conf *config.Config, rawCfg s
 			return err
 		}
 
-		templateFiles[i] = templateFilepath
+		// template.FromGlobs expands each path with filepath.Glob, so any
+		// glob metacharacter in the path (including those originating from
+		// the tenant id, which is interpolated into TenantDataDir) could
+		// escape the per-tenant directory and match files belonging to
+		// other tenants. Quote metacharacters so the path is matched
+		// literally.
+		templateFiles[i] = globQuoteMeta(templateFilepath)
 	}
 
 	tmpl, err := template.FromGlobs(templateFiles...)

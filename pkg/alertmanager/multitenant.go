@@ -1333,6 +1333,26 @@ func safeTemplateFilepath(dir, templateName string) (string, error) {
 	return actualPath, nil
 }
 
+// globQuoteMeta returns a string that escapes all filepath.Match / filepath.Glob
+// metacharacters within s so the string matches itself literally when passed
+// to filepath.Glob. The metacharacters escaped are those recognised by
+// filepath.Match: '*', '?', '[', and ']'. The escape character ('\\') is
+// also escaped. On Windows filepath.Match does not recognise '\\' as an
+// escape, but Cortex runs on Unix hosts where it does; the Alertmanager
+// multitenant storage layout and tests assume POSIX path semantics.
+func globQuoteMeta(s string) string {
+	var b strings.Builder
+	b.Grow(len(s))
+	for _, r := range s {
+		switch r {
+		case '*', '?', '[', ']', '\\':
+			b.WriteByte('\\')
+		}
+		b.WriteRune(r)
+	}
+	return b.String()
+}
+
 // storeTemplateFile stores template file at the given templateFilepath.
 // Returns true, if file content has changed (new or updated file), false if file with the same name
 // and content was already stored locally.
