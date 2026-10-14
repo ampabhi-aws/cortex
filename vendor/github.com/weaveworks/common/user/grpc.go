@@ -18,6 +18,14 @@ func ExtractFromGRPCRequest(ctx context.Context) (string, context.Context, error
 		return "", ctx, ErrNoOrgID
 	}
 
+	// Reject a present-but-empty x-scope-orgid value, matching the HTTP
+	// variant ExtractOrgIDFromHTTPRequest. An empty org ID would otherwise
+	// collapse per-tenant filesystem paths and bucket prefixes onto the
+	// shared root in downstream services.
+	if orgIDs[0] == "" {
+		return "", ctx, ErrNoOrgID
+	}
+
 	return orgIDs[0], InjectOrgID(ctx, orgIDs[0]), nil
 }
 

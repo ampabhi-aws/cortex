@@ -1804,7 +1804,10 @@ func (i *Ingester) getOrCreateTSDB(userID string, force bool) (*userTSDB, error)
 // createTSDB creates a TSDB for a given userID, and returns the created db.
 func (i *Ingester) createTSDB(userID string) (*userTSDB, error) {
 	tsdbPromReg := prometheus.NewRegistry()
-	udir := i.cfg.BlocksStorageConfig.TSDB.BlocksDir(userID)
+	udir, err := i.cfg.BlocksStorageConfig.TSDB.BlocksDir(userID)
+	if err != nil {
+		return nil, errors.Wrap(err, "invalid tenant ID for TSDB directory")
+	}
 	userLogger := logutil.WithUserID(userID, i.logger)
 
 	blockRanges := i.cfg.BlocksStorageConfig.TSDB.BlockRanges.ToMilliseconds()
@@ -2304,6 +2307,15 @@ func (i *Ingester) closeAndDeleteUserTSDBIfIdle(userID string) tsdbCloseCheckRes
 
 	dir := userDB.db.Dir()
 
+	// Defense in depth: refuse to os.RemoveAll a directory that is not strictly
+	// below the configured -blocks-storage.tsdb.dir. A tenant ID that is empty
+	// or otherwise collapses the per-tenant path onto the shared data directory
+	// (see TSDBConfig.BlocksDir) would otherwise wipe every tenant's local TSDB.
+	if !isStrictSubpath(i.cfg.BlocksStorageConfig.TSDB.Dir, dir) {
+		level.Error(i.logger).Log("msg", "refusing to delete idle TSDB because its directory is not strictly below the configured blocks-storage tsdb directory", "user", userID, "dir", dir, "tsdb_dir", i.cfg.BlocksStorageConfig.TSDB.Dir)
+		return tsdbDataRemovalFailed
+	}
+
 	if err := userDB.Close(); err != nil {
 		level.Error(i.logger).Log("msg", "failed to close idle TSDB", "user", userID, "err", err)
 		return tsdbCloseFailed
@@ -2624,4 +2636,34 @@ func (i *Ingester) stopIncomingRequests() {
 	i.stoppedMtx.Lock()
 	defer i.stoppedMtx.Unlock()
 	i.stopped = true
+}
+
+// isStrictSubpath returns true if child is a filesystem path that lives
+// strictly inside parent (i.e. not equal to parent and not escaping it).
+// Both paths are cleaned/absolute-ised before the comparison. This is used
+// as a defence in depth check before os.RemoveAll of a per-tenant TSDB
+// directory to make sure an unvalidated tenant ID cannot cause the shared
+// data directory itself to be deleted.
+func isStrictSubpath(parent, child string) bool {
+	if parent == "" || child == "" {
+		return false
+	}
+	parentAbs, err := filepath.Abs(parent)
+	if err != nil {
+		return false
+	}
+	childAbs, err := filepath.Abs(child)
+	if err != nil {
+		return false
+	}
+	parentAbs = filepath.Clean(parentAbs)
+	childAbs = filepath.Clean(childAbs)
+	if parentAbs == childAbs {
+		return false
+	}
+	prefix := parentAbs
+	if !strings.HasSuffix(prefix, string(filepath.Separator)) {
+		prefix += string(filepath.Separator)
+	}
+	return strings.HasPrefix(childAbs, prefix)
 }
