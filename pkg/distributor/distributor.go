@@ -489,6 +489,14 @@ func (d *Distributor) checkSample(ctx context.Context, userID, cluster, replica 
 		return false, nil
 	}
 
+	// If cluster label is too long or contains characters unsuitable for a KV key, don't use
+	// it. We accept the sample here, but it will fail validation later anyway. This prevents
+	// an attacker-controlled label value from being written into the HA-tracker KV store
+	// (where it becomes a key) or into distributor metric label values.
+	if len(cluster) > d.limits.MaxLabelValueLength(userID) || strings.ContainsAny(cluster, "/\x00") {
+		return false, nil
+	}
+
 	// At this point we know we have both HA labels, we should lookup
 	// the cluster/instance here to see if we want to accept this sample.
 	err := d.HATracker.checkReplica(ctx, userID, cluster, replica, time.Now())
