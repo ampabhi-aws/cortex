@@ -8,6 +8,7 @@ import (
 	"net/url"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"sync"
 	"time"
@@ -1293,8 +1294,14 @@ func (am *MultitenantAlertmanager) ReadState(ctx context.Context, req *alertmana
 
 // validateTemplateFilename validated the template filename and returns error if it's not valid.
 // The validation done in this function is a first fence to avoid having a tenant submitting
-// a config which may escape the per-tenant data directory on disk.
+// a config which may escape the per-tenant data directory on disk or be interpreted as a
+// filesystem glob pattern (which would allow a tenant to read other tenants' template files
+// when the name is passed to loaders that call filepath.Glob).
 func validateTemplateFilename(filename string) error {
+	if filename == "" {
+		return fmt.Errorf("invalid template name %q: the template name cannot be empty", filename)
+	}
+
 	if filepath.Base(filename) != filename {
 		return fmt.Errorf("invalid template name %q: the template name cannot contain any path", filename)
 	}
@@ -1304,7 +1311,51 @@ func validateTemplateFilename(filename string) error {
 		return fmt.Errorf("invalid template name %q: the template name cannot contain any path", filename)
 	}
 
+	// Reject filesystem glob metacharacters. The template loader passes the resulting
+	// path to filepath.Glob/ParseGlob, so any metacharacter in the template name would
+	// be expanded against the filesystem and could match files outside of what the
+	// tenant has uploaded (e.g. a template name of "*" would match every template file
+	// under the per-tenant templates directory).
+	if strings.ContainsAny(filename, globMetaChars) {
+		return fmt.Errorf("invalid template name %q: the template name cannot contain any of the glob metacharacters %q", filename, globMetaChars)
+	}
+
 	return nil
+}
+
+// globMetaChars enumerates filesystem glob metacharacters that must not appear in
+// path components fed to filepath.Glob/ParseGlob. The backslash is included because
+// on non-Windows platforms filepath.Glob treats it as an escape character.
+const globMetaChars = "*?[]\\"
+
+// containsGlobMeta reports whether s contains any filesystem glob metacharacter.
+func containsGlobMeta(s string) bool {
+	return strings.ContainsAny(s, globMetaChars)
+}
+
+// globEscapePath returns a filesystem path transformed so that it is treated as a
+// literal pattern by filepath.Glob/ParseGlob. On non-Windows platforms this is
+// achieved by prefixing each glob metacharacter with a backslash. On Windows,
+// filepath.Glob does not support escaping (backslashes are path separators), so
+// if the path contains any glob metacharacter we refuse to proceed rather than
+// risk expanding the path against unrelated files on disk.
+func globEscapePath(path string) (string, error) {
+	if !containsGlobMeta(path) {
+		return path, nil
+	}
+	if runtime.GOOS == "windows" {
+		return "", fmt.Errorf("path %q contains filesystem glob metacharacters %q which are not supported", path, globMetaChars)
+	}
+	var b strings.Builder
+	b.Grow(len(path) + 4)
+	for _, r := range path {
+		switch r {
+		case '*', '?', '[', ']', '\\':
+			b.WriteByte('\\')
+		}
+		b.WriteRune(r)
+	}
+	return b.String(), nil
 }
 
 // safeTemplateFilepath builds and return the template filepath within the provided dir.

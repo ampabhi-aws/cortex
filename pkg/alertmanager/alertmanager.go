@@ -311,13 +311,33 @@ func clusterWait(position func() int, timeout time.Duration) func() time.Duratio
 // ApplyConfig applies a new configuration to an Alertmanager.
 func (am *Alertmanager) ApplyConfig(userID string, conf *config.Config, rawCfg string) error {
 	templateFiles := make([]string, len(conf.Templates))
+	templatesContainerDir := filepath.Join(am.cfg.TenantDataDir, templatesDir)
 	for i, t := range conf.Templates {
-		templateFilepath, err := safeTemplateFilepath(filepath.Join(am.cfg.TenantDataDir, templatesDir), t)
+		// validateTemplateFilename (invoked when the config is accepted) already
+		// rejects glob metacharacters in the template name, but we re-check here
+		// because ApplyConfig is also reachable with locally-reloaded state.
+		if err := validateTemplateFilename(t); err != nil {
+			return err
+		}
+		templateFilepath, err := safeTemplateFilepath(templatesContainerDir, t)
 		if err != nil {
 			return err
 		}
 
-		templateFiles[i] = templateFilepath
+		// The resolved absolute path is handed to template.FromGlobs, which calls
+		// filepath.Glob/ParseGlob on it. If any component of the path (notably the
+		// per-tenant directory, which is <data-dir>/<tenant-id>) contains a glob
+		// metacharacter it would be expanded against the filesystem and could
+		// match other tenants' files, so convert the path to a glob-literal form
+		// before passing it on. On platforms where glob escaping is unavailable
+		// (Windows treats '\\' as the path separator rather than an escape), we
+		// refuse to proceed if any metacharacter is present.
+		literalPath, err := globEscapePath(templateFilepath)
+		if err != nil {
+			return err
+		}
+
+		templateFiles[i] = literalPath
 	}
 
 	tmpl, err := template.FromGlobs(templateFiles...)
