@@ -82,10 +82,10 @@ func TestSingleResolver(t *testing.T) {
 	r := NewSingleResolver()
 	for _, tc := range append(commonResolverTestCases, []resolverTestCase{
 		{
-			name:        "multi-tenant",
-			headerValue: strptr("tenant-a|tenant-b"),
-			tenantID:    "tenant-a|tenant-b",
-			tenantIDs:   []string{"tenant-a|tenant-b"},
+			name:         "multi-tenant",
+			headerValue:  strptr("tenant-a|tenant-b"),
+			errTenantID:  &errTenantIDUnsupportedCharacter{pos: 8, tenantID: "tenant-a|tenant-b"},
+			errTenantIDs: &errTenantIDUnsupportedCharacter{pos: 8, tenantID: "tenant-a|tenant-b"},
 		},
 		{
 			name:         "containing-forward-slash",
@@ -98,6 +98,12 @@ func TestSingleResolver(t *testing.T) {
 			headerValue:  strptr(`backward\slash`),
 			errTenantID:  errInvalidTenantID,
 			errTenantIDs: errInvalidTenantID,
+		},
+		{
+			name:         "containing-colon",
+			headerValue:  strptr("v:foo"),
+			errTenantID:  &errTenantIDUnsupportedCharacter{pos: 1, tenantID: "v:foo"},
+			errTenantIDs: &errTenantIDUnsupportedCharacter{pos: 1, tenantID: "v:foo"},
 		},
 	}...) {
 		t.Run(tc.name, tc.test(r))
