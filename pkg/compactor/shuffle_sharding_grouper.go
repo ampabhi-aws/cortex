@@ -229,7 +229,30 @@ mainLoop:
 			CompactorID: g.ringLifecyclerID,
 			Version:     VisitMarkerVersion1,
 		}
-		markBlocksVisited(g.ctx, g.bkt, g.logger, group.blocks, blockVisitMarker, g.blockVisitMarkerWriteFailed)
+		if err := markBlocksVisited(g.ctx, g.bkt, g.logger, group.blocks, blockVisitMarker, g.blockVisitMarkerWriteFailed); err != nil {
+			level.Warn(g.logger).Log("msg", "failed to write visit marker for all blocks in group; skipping group to avoid duplicate compaction", "group_hash", groupHash, "err", err, "group", group.String())
+			remainingCompactions--
+			continue
+		}
+		// Re-read every block visit marker to confirm this compactor still owns the
+		// lock. Because UpdateBlockVisitMarker is an unconditional overwrite, a
+		// concurrent compactor in the same shuffle shard may have written its own
+		// marker between our isGroupVisited check and markBlocksVisited call. The
+		// read-back narrows the TOCTOU window: if the marker no longer has our
+		// CompactorID and VisitTime for any block in the group, drop the group so
+		// only one compactor proceeds. This does not fully eliminate the race on
+		// object stores without read-after-write consistency for overwrites, but it
+		// is sufficient on S3/GCS/Azure overwrite semantics and matches the
+		// ShuffleShardingPlanner.Plan read-back.
+		if owned, err := g.verifyGroupOwnership(group.blocks, blockVisitMarker); err != nil {
+			level.Warn(g.logger).Log("msg", "unable to verify visit marker ownership after write; skipping group", "group_hash", groupHash, "err", err, "group", group.String())
+			remainingCompactions--
+			continue
+		} else if !owned {
+			level.Info(g.logger).Log("msg", "visit marker ownership lost after write; another compactor won the race; skipping group", "group_hash", groupHash, "group", group.String())
+			remainingCompactions--
+			continue
+		}
 
 		// All the blocks within the same group have the same downsample
 		// resolution and external labels.
@@ -295,6 +318,25 @@ func (g *ShuffleShardingGrouper) isGroupVisited(blocks []*metadata.Meta, compact
 		}
 	}
 	return false, nil
+}
+
+// verifyGroupOwnership re-reads the visit marker for every block in the group
+// and returns true only if each marker still matches the expected CompactorID
+// AND the expected VisitTime that was just written. This provides a
+// read-after-write check that detects a concurrent compactor overwriting the
+// marker between isGroupVisited and markBlocksVisited.
+func (g *ShuffleShardingGrouper) verifyGroupOwnership(blocks []*metadata.Meta, expected BlockVisitMarker) (bool, error) {
+	for _, block := range blocks {
+		blockID := block.ULID.String()
+		blockVisitMarker, err := ReadBlockVisitMarker(g.ctx, g.bkt, g.logger, blockID, g.blockVisitMarkerReadFailed)
+		if err != nil {
+			return false, errors.Wrapf(err, "read-back visit marker for block %s", blockID)
+		}
+		if blockVisitMarker.CompactorID != expected.CompactorID || blockVisitMarker.VisitTime != expected.VisitTime {
+			return false, nil
+		}
+	}
+	return true, nil
 }
 
 // Check whether this compactor exists on the subring based on user ID
