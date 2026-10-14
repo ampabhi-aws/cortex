@@ -2,7 +2,7 @@ package ruler
 
 import (
 	"crypto/md5"
-	"net/url"
+	"encoding/base64"
 	"path/filepath"
 	"sort"
 
@@ -75,15 +75,18 @@ func (m *mapper) MapRules(user string, ruleConfigs map[string][]rulefmt.RuleGrou
 
 	// user rule files will be stored as `/<path>/<userid>/<encoded filename>`
 	path := filepath.Join(m.Path, user)
-	err := m.FS.MkdirAll(path, 0777)
+	err := m.FS.MkdirAll(path, 0700)
 	if err != nil {
 		return false, nil, err
 	}
 
 	// write all rule configs to disk
 	for filename, groups := range ruleConfigs {
-		// Store the encoded file name to better handle `/` characters
-		encodedFileName := url.PathEscape(filename)
+		// Store a base64-encoded file name. Unlike url.PathEscape, which leaves
+		// bare "." and ".." segments untouched, base64 of the namespace cannot
+		// produce a traversal segment and matches how the bucket-backed store
+		// treats namespaces.
+		encodedFileName := base64.URLEncoding.EncodeToString([]byte(filename))
 		fullFileName := filepath.Join(path, encodedFileName)
 
 		fileUpdated, err := m.writeRuleGroupsIfNewer(groups, fullFileName)
@@ -103,8 +106,8 @@ func (m *mapper) MapRules(user string, ruleConfigs map[string][]rulefmt.RuleGrou
 	for _, existingFile := range existingFiles {
 		fullFileName := filepath.Join(path, existingFile.Name())
 
-		// Ensure the namespace is decoded from a url path encoding to see if it is still required
-		decodedNamespace, err := url.PathUnescape(existingFile.Name())
+		// Decode the base64 file name to see if it is still required.
+		decodedNamespace, err := base64.URLEncoding.DecodeString(existingFile.Name())
 		if err != nil {
 			level.Warn(m.logger).Log("msg", "unable to remove rule file on disk", "file", fullFileName, "err", err)
 			continue
@@ -152,7 +155,7 @@ func (m *mapper) writeRuleGroupsIfNewer(groups []rulefmt.RuleGroup, filename str
 	}
 
 	level.Info(m.logger).Log("msg", "updating rule file", "file", filename)
-	err = afero.WriteFile(m.FS, filename, d, 0777)
+	err = afero.WriteFile(m.FS, filename, d, 0600)
 	if err != nil {
 		return false, err
 	}
