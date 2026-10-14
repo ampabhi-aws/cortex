@@ -45,6 +45,10 @@ var (
 	errTLSFileNotAllowed             = errors.New("setting TLS ca_file, cert_file and key_file is not allowed")
 	errSlackAPIURLFileNotAllowed     = errors.New("setting Slack api_url_file and global slack_api_url_file is not allowed")
 	errVictorOpsAPIKeyFileNotAllowed = errors.New("setting VictorOps api_key_file is not allowed")
+	errSNSMissingSigV4Credentials    = errors.New("setting SNS sigv4 access_key and secret_key is required (ambient AWS credentials are not allowed for tenant SNS receivers)")
+	errSNSSigV4RoleARNNotAllowed     = errors.New("setting SNS sigv4 role_arn is not allowed")
+	errSNSSigV4ProfileNotAllowed     = errors.New("setting SNS sigv4 profile is not allowed")
+	errSNSAPIUrlNotAllowed           = errors.New("setting SNS api_url is not allowed")
 )
 
 // UserConfig is used to communicate a users alertmanager configs
@@ -350,6 +354,11 @@ func validateAlertmanagerConfig(cfg interface{}) error {
 		if err := validateVictorOpsConfig(v.Interface().(config.VictorOpsConfig)); err != nil {
 			return err
 		}
+
+	case reflect.TypeOf(config.SNSConfig{}):
+		if err := validateSNSConfig(v.Interface().(config.SNSConfig)); err != nil {
+			return err
+		}
 	}
 
 	// If the input config is a struct, recursively iterate on all fields.
@@ -446,6 +455,29 @@ func validateSlackConfig(cfg config.SlackConfig) error {
 func validateVictorOpsConfig(cfg config.VictorOpsConfig) error {
 	if cfg.APIKeyFile != "" {
 		return errVictorOpsAPIKeyFileNotAllowed
+	}
+	return nil
+}
+
+// validateSNSConfig validates the SNS config and returns an error if it contains
+// settings not allowed by Cortex. Specifically, we reject tenant configs that
+// would cause the SNS notifier to resolve the Cortex process's ambient AWS
+// credentials (via the AWS default credential chain), assume a tenant-chosen
+// IAM role (confused deputy), or send SigV4-signed requests to a
+// tenant-controlled api_url. Tenants must supply explicit static SigV4
+// credentials for their own AWS identity.
+func validateSNSConfig(cfg config.SNSConfig) error {
+	if cfg.Sigv4.RoleARN != "" {
+		return errSNSSigV4RoleARNNotAllowed
+	}
+	if cfg.Sigv4.Profile != "" {
+		return errSNSSigV4ProfileNotAllowed
+	}
+	if cfg.APIUrl != "" {
+		return errSNSAPIUrlNotAllowed
+	}
+	if cfg.Sigv4.AccessKey == "" || string(cfg.Sigv4.SecretKey) == "" {
+		return errSNSMissingSigV4Credentials
 	}
 	return nil
 }
