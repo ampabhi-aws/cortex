@@ -225,6 +225,34 @@ func newExemplarLabelLengthError(seriesLabels []cortexpb.LabelAdapter, exemplarL
 	}
 }
 
+// exemplarInvalidLabelError is a ValidationError for exemplar entries whose
+// label name fails Prometheus label-name syntax validation.
+type exemplarInvalidLabelError struct {
+	seriesLabels   []cortexpb.LabelAdapter
+	exemplarLabels []cortexpb.LabelAdapter
+	labelName      string
+	timestamp      int64
+}
+
+func (e *exemplarInvalidLabelError) Error() string {
+	return fmt.Sprintf(
+		"exemplar invalid label name: %.200q, timestamp: %d series: %s labels: %s",
+		e.labelName,
+		e.timestamp,
+		cortexpb.FromLabelAdaptersToLabels(e.seriesLabels).String(),
+		cortexpb.FromLabelAdaptersToLabels(e.exemplarLabels).String(),
+	)
+}
+
+func newExemplarInvalidLabelError(seriesLabels []cortexpb.LabelAdapter, exemplarLabels []cortexpb.LabelAdapter, labelName string, timestamp int64) ValidationError {
+	return &exemplarInvalidLabelError{
+		seriesLabels:   seriesLabels,
+		exemplarLabels: exemplarLabels,
+		labelName:      labelName,
+		timestamp:      timestamp,
+	}
+}
+
 // formatLabelSet formats label adapters as a metric name with labels, while preserving
 // label order, and keeping duplicates. If there are multiple "__name__" labels, only
 // first one is used as metric name, other ones will be included as regular labels.

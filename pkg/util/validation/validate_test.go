@@ -180,6 +180,11 @@ func TestValidateExemplars(t *testing.T) {
 			Labels:      []cortexpb.LabelAdapter{{Name: "foo", Value: strings.Repeat("0", 126)}},
 			TimestampMs: 1000,
 		},
+		{
+			// Invalid label name (contains a space)
+			Labels:      []cortexpb.LabelAdapter{{Name: "bad label", Value: "bar"}},
+			TimestampMs: 1000,
+		},
 	}
 
 	for _, ie := range invalidExemplars {
@@ -194,6 +199,7 @@ func TestValidateExemplars(t *testing.T) {
 			# TYPE cortex_discarded_exemplars_total counter
 			cortex_discarded_exemplars_total{reason="exemplar_labels_missing",user="testUser"} 1
 			cortex_discarded_exemplars_total{reason="exemplar_labels_too_long",user="testUser"} 1
+			cortex_discarded_exemplars_total{reason="exemplar_labels_blank",user="testUser"} 1
 			cortex_discarded_exemplars_total{reason="exemplar_timestamp_invalid",user="testUser"} 1
 
 			cortex_discarded_exemplars_total{reason="random reason",user="different user"} 1
