@@ -159,6 +159,29 @@ func (i *InstanceDesc) IsReady(now time.Time, heartbeatTimeout time.Duration) er
 	return nil
 }
 
+// MaxTokensPerInstance is the upper bound on the number of tokens accepted on
+// a single InstanceDesc when a Desc is received over gossip. Realistic rings
+// use ~128 to a few thousand tokens per instance; anything above this bound is
+// treated as a malformed/malicious packed-tokens field (which gogo-protobuf
+// pre-sizes at 4 bytes of []uint32 per decompressed wire byte).
+const MaxTokensPerInstance = 1_000_000
+
+// Validate performs cheap, defensive checks on a Desc that has just been
+// deserialised from an untrusted peer. It is intentionally conservative: it
+// only rejects values that cannot plausibly be legitimate, so a hostile peer
+// cannot force this process into pathological allocation or compute paths.
+func (d *Desc) Validate() error {
+	if d == nil {
+		return nil
+	}
+	for id, ing := range d.Ingesters {
+		if len(ing.Tokens) > MaxTokensPerInstance {
+			return fmt.Errorf("instance %q has %d tokens, exceeds maximum %d", id, len(ing.Tokens), MaxTokensPerInstance)
+		}
+	}
+	return nil
+}
+
 // Merge merges other ring into this one. Returns sub-ring that represents the change,
 // and can be sent out to other clients.
 //
