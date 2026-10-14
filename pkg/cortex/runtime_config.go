@@ -2,6 +2,7 @@ package cortex
 
 import (
 	"errors"
+	"fmt"
 	"io"
 	"net/http"
 
@@ -59,6 +60,19 @@ func (l *runtimeConfigTenantLimits) AllByUserID() map[string]*validation.Limits 
 }
 
 func loadRuntimeConfig(r io.Reader) (interface{}, error) {
+	// Default to shardByAllLabels=true so that MaxGlobalSeriesPerUser overrides
+	// are not rejected by the generic entry point used in tests. Production
+	// callers go through runtimeConfigLoader with the actual distributor flag.
+	return runtimeConfigLoader{shardByAllLabels: true}.load(r)
+}
+
+// runtimeConfigLoader wraps loadRuntimeConfig with the extra context required
+// to validate per-tenant limits at reload time.
+type runtimeConfigLoader struct {
+	shardByAllLabels bool
+}
+
+func (l runtimeConfigLoader) load(r io.Reader) (interface{}, error) {
 	var overrides = &runtimeConfigValues{}
 
 	decoder := yaml.NewDecoder(r)
@@ -72,6 +86,19 @@ func loadRuntimeConfig(r io.Reader) (interface{}, error) {
 	// Ensure the provided YAML config is not composed of multiple documents,
 	if err := decoder.Decode(&runtimeConfigValues{}); !errors.Is(err, io.EOF) {
 		return nil, errMultipleDocuments
+	}
+
+	// Validate per-tenant limit overrides at reload time, so that misconfigured
+	// values (e.g. an unsupported S3 SSE type, a malformed KMS encryption
+	// context, or an SSE-KMS override with an empty KMS key id) are rejected up
+	// front instead of silently breaking every Upload for that tenant.
+	for userID, limits := range overrides.TenantLimits {
+		if limits == nil {
+			continue
+		}
+		if err := limits.Validate(l.shardByAllLabels); err != nil {
+			return nil, fmt.Errorf("invalid override for tenant %q: %w", userID, err)
+		}
 	}
 
 	return overrides, nil
