@@ -747,8 +747,10 @@ instance_limits:
 
   # Max users that this ingester can hold. Requests from additional users will
   # be rejected. This limit only works when using blocks engine. 0 = unlimited.
+  # A non-zero default bounds the number of per-tenant TSDBs that may be
+  # allocated by requests carrying attacker-chosen X-Scope-OrgID headers.
   # CLI flag: -ingester.instance-limits.max-tenants
-  [max_tenants: <int> | default = 0]
+  [max_tenants: <int> | default = 100000]
 
   # Max series that this ingester can hold (across all tenants). Requests to
   # create additional series will be rejected. This limit only works when using
