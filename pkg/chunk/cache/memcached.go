@@ -2,9 +2,9 @@ package cache
 
 import (
 	"context"
+	"crypto/sha256"
 	"encoding/hex"
 	"flag"
-	"hash/fnv"
 	"sync"
 	"time"
 
@@ -265,10 +265,17 @@ func (c *Memcached) Stop() {
 }
 
 // HashKey hashes key into something you can store in memcached.
+//
+// SHA-256 is used (instead of a 64-bit non-cryptographic digest such as
+// FNV-1a) so that cache entries for mutually untrusted tenants cannot be
+// forced to collide by crafting attacker-controlled key material (e.g. the
+// PromQL `query` URL parameter in the results cache). The full 256-bit
+// digest is encoded as hex and fits comfortably within memcached's 250-byte
+// key limit. Callers that embed the full logical key inside the stored
+// value (e.g. CachedResponse.Key) retain that check as defence in depth.
 func HashKey(key string) string {
-	hasher := fnv.New64a()
-	_, _ = hasher.Write([]byte(key)) // This'll never error.
+	sum := sha256.Sum256([]byte(key))
 
-	// Hex because memcache errors for the bytes produced by the hash.
-	return hex.EncodeToString(hasher.Sum(nil))
+	// Hex because memcache errors for the raw bytes produced by the hash.
+	return hex.EncodeToString(sum[:])
 }
