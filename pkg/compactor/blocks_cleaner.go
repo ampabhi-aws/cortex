@@ -3,6 +3,7 @@ package compactor
 import (
 	"context"
 	"fmt"
+	"path"
 	"time"
 
 	"github.com/go-kit/log"
@@ -394,6 +395,34 @@ func (c *BlocksCleaner) cleanUserPartialBlocks(ctx context.Context, partials map
 		// We can safely delete only partial blocks with a deletion mark.
 		err := metadata.ReadMarker(ctx, userLogger, userBucket, blockID.String(), &metadata.DeletionMark{})
 		if errors.Is(err, metadata.ErrorMarkerNotFound) {
+			// A partial-block prefix that contains only visit-mark.json (and nothing else)
+			// is reclaimable garbage: it has no meta.json, no deletion mark, and no block
+			// data. This can happen when the per-job visit-marker heartbeat has written
+			// visit-mark.json after block.Delete removed everything else (notably with
+			// -compactor.deletion-delay=0). Without this reclaim path, such a prefix would
+			// be classified as a partial block forever and inflate
+			// cortex_bucket_blocks_partials_count indefinitely.
+			if onlyVisitMarker, checkErr := isPartialBlockOnlyVisitMarker(ctx, userBucket, blockID); checkErr != nil {
+				level.Warn(userLogger).Log("msg", "error inspecting partial block contents", "block", blockID, "err", checkErr)
+				continue
+			} else if !onlyVisitMarker {
+				continue
+			}
+
+			// The prefix contains only visit-mark.json. Delete the stale marker directly
+			// (block.Delete would short-circuit because there is no meta.json).
+			if err := userBucket.Delete(ctx, path.Join(blockID.String(), BlockVisitMarkerFile)); err != nil {
+				if !userBucket.IsObjNotFoundErr(err) {
+					c.blocksFailedTotal.Inc()
+					level.Warn(userLogger).Log("msg", "error deleting stale visit marker for partial block", "block", blockID, "err", err)
+					continue
+				}
+			}
+
+			idx.RemoveBlock(blockID)
+			delete(partials, blockID)
+			c.blocksCleanedTotal.Inc()
+			level.Info(userLogger).Log("msg", "deleted stale visit-marker-only partial block", "block", blockID)
 			continue
 		}
 		if err != nil {
@@ -460,3 +489,32 @@ func listBlocksOutsideRetentionPeriod(idx *bucketindex.Index, threshold time.Tim
 
 	return
 }
+
+// isPartialBlockOnlyVisitMarker reports whether the given block prefix in the
+// user bucket contains only the compactor's visit-mark.json file (and nothing
+// else). Such a prefix is created when the per-job visit-marker heartbeat
+// writes visit-mark.json after block.Delete has already removed the real block
+// contents (which can happen under -compactor.deletion-delay=0 if the heartbeat
+// outlives the compaction job). The caller uses this to safely reclaim the
+// stale marker; a return of (false, nil) means the prefix has other objects
+// and must not be touched.
+func isPartialBlockOnlyVisitMarker(ctx context.Context, userBucket objstore.InstrumentedBucket, blockID ulid.ULID) (bool, error) {
+	seenVisitMarker := false
+	seenOther := false
+	err := userBucket.Iter(ctx, blockID.String(), func(name string) error {
+		if path.Base(name) == BlockVisitMarkerFile {
+			seenVisitMarker = true
+			return nil
+		}
+		seenOther = true
+		// We can stop iterating as soon as we see any non-visit-marker object.
+		return errStopIter
+	})
+	if err != nil && !errors.Is(err, errStopIter) {
+		return false, err
+	}
+	return seenVisitMarker && !seenOther, nil
+}
+
+// errStopIter is a sentinel used to short-circuit bucket Iter callbacks.
+var errStopIter = errors.New("stop iter")
