@@ -1,6 +1,7 @@
 package api
 
 import (
+	"crypto/subtle"
 	"database/sql"
 	"encoding/json"
 	"errors"
@@ -24,6 +25,7 @@ import (
 	"github.com/cortexproject/cortex/pkg/configs/userconfig"
 	"github.com/cortexproject/cortex/pkg/tenant"
 	"github.com/cortexproject/cortex/pkg/util"
+	"github.com/cortexproject/cortex/pkg/util/flagext"
 	util_log "github.com/cortexproject/cortex/pkg/util/log"
 )
 
@@ -35,6 +37,7 @@ var (
 // Config configures Configs API
 type Config struct {
 	Notifications NotificationsConfig `yaml:"notifications"`
+	PrivateAPI    PrivateAPIConfig    `yaml:"private_api"`
 }
 
 // NotificationsConfig configures Alertmanager notifications method.
@@ -43,10 +46,37 @@ type NotificationsConfig struct {
 	DisableWebHook bool `yaml:"disable_webhook"`
 }
 
+// PrivateAPIConfig configures authentication for the internal, all-tenant
+// `/private/api/prom/configs/*` endpoints. These endpoints return every
+// tenant's rule files and Alertmanager configuration (including notification
+// credentials embedded in the Alertmanager YAML) and are intended only for the
+// internal ruler/alertmanager configdb client. By default they require a
+// shared-secret bearer token so that an untrusted party able to reach the
+// Cortex HTTP port cannot dump all tenants' configurations.
+type PrivateAPIConfig struct {
+	// AuthToken is a shared secret that must be presented in the
+	// `Authorization: Bearer <token>` header on every request to
+	// `/private/api/prom/configs/*`. Requests without a matching token are
+	// rejected with 401 Unauthorized. The matching value must be configured
+	// on the ruler/alertmanager configdb client via
+	// `-<prefix>configs.private-api.auth-token`.
+	AuthToken flagext.Secret `yaml:"auth_token"`
+
+	// AllowUnauthenticated disables the bearer-token check on the
+	// `/private/...` endpoints. This restores the legacy, pre-fix behavior
+	// where any reachable party could dump all tenants' configurations and
+	// must only be enabled when the operator terminates authentication at a
+	// trusted reverse proxy or binds the configs HTTP listener to a
+	// network-restricted interface. The default (false) is fail-closed.
+	AllowUnauthenticated bool `yaml:"allow_unauthenticated"`
+}
+
 // RegisterFlags adds the flags required to configure this to the given FlagSet.
 func (cfg *Config) RegisterFlags(f *flag.FlagSet) {
 	f.BoolVar(&cfg.Notifications.DisableEmail, "configs.notifications.disable-email", false, "Disable Email notifications for Alertmanager.")
 	f.BoolVar(&cfg.Notifications.DisableWebHook, "configs.notifications.disable-webhook", false, "Disable WebHook notifications for Alertmanager.")
+	f.Var(&cfg.PrivateAPI.AuthToken, "configs.private-api.auth-token", "Shared-secret bearer token required on the internal /private/api/prom/configs/* endpoints that return every tenant's rules and Alertmanager configuration. The ruler/alertmanager configdb client must be configured with the same value.")
+	f.BoolVar(&cfg.PrivateAPI.AllowUnauthenticated, "configs.private-api.allow-unauthenticated", false, "Allow unauthenticated access to the internal /private/api/prom/configs/* endpoints. These endpoints expose every tenant's rules and Alertmanager configuration (including embedded notification secrets); enable only when the operator terminates authentication at a trusted reverse proxy or binds the configs HTTP listener to a network-restricted interface.")
 }
 
 // API implements the configs api.
@@ -83,6 +113,7 @@ func (a *API) admin(w http.ResponseWriter, r *http.Request) {
 
 // RegisterRoutes registers the configs API HTTP routes with the provided Router.
 func (a *API) RegisterRoutes(r *mux.Router) {
+	privateGetConfigs := a.requirePrivateAuth(a.getConfigs)
 	for _, route := range []struct {
 		name, method, path string
 		handler            http.HandlerFunc
@@ -99,11 +130,55 @@ func (a *API) RegisterRoutes(r *mux.Router) {
 		{"validate_alertmanager_config", "POST", "/api/prom/configs/alertmanager/validate", a.validateAlertmanagerConfig},
 		{"deactivate_config", "DELETE", "/api/prom/configs/deactivate", a.deactivateConfig},
 		{"restore_config", "POST", "/api/prom/configs/restore", a.restoreConfig},
-		// Internal APIs.
-		{"private_get_rules", "GET", "/private/api/prom/configs/rules", a.getConfigs},
-		{"private_get_alertmanager_config", "GET", "/private/api/prom/configs/alertmanager", a.getConfigs},
+		// Internal APIs. These return every tenant's configuration and are
+		// gated by requirePrivateAuth (shared-secret bearer token) so that an
+		// untrusted party able to reach the Cortex HTTP port cannot dump all
+		// tenants' rules and Alertmanager YAML. Operators that terminate
+		// authentication at a trusted reverse proxy or bind the configs HTTP
+		// listener to a network-restricted interface can opt out via
+		// -configs.private-api.allow-unauthenticated=true. The /private/*
+		// prefix should additionally be blocked at any tenant-facing gateway.
+		{"private_get_rules", "GET", "/private/api/prom/configs/rules", privateGetConfigs},
+		{"private_get_alertmanager_config", "GET", "/private/api/prom/configs/alertmanager", privateGetConfigs},
 	} {
 		r.Handle(route.path, route.handler).Methods(route.method).Name(route.name)
+	}
+}
+
+// requirePrivateAuth wraps a handler for the internal all-tenant /private/*
+// endpoints and enforces that the request carries the configured shared-secret
+// bearer token. The comparison is constant-time to avoid timing side channels.
+// When no token is configured and AllowUnauthenticated is false (the default),
+// the endpoint is disabled and returns 503 so that a misconfigured deployment
+// cannot silently leak every tenant's configuration.
+func (a *API) requirePrivateAuth(next http.HandlerFunc) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		logger := util_log.WithContext(r.Context(), util_log.Logger)
+		w.Header().Set("Cache-Control", "no-store")
+		expected := a.cfg.PrivateAPI.AuthToken.Value
+		if expected == "" {
+			if a.cfg.PrivateAPI.AllowUnauthenticated {
+				next(w, r)
+				return
+			}
+			level.Warn(logger).Log("msg", "rejecting request to internal all-tenant configs endpoint: no auth token configured", "path", r.URL.Path)
+			http.Error(w, "internal configs API disabled: set -configs.private-api.auth-token or -configs.private-api.allow-unauthenticated=true", http.StatusServiceUnavailable)
+			return
+		}
+		const bearerPrefix = "Bearer "
+		authz := r.Header.Get("Authorization")
+		if !strings.HasPrefix(authz, bearerPrefix) {
+			w.Header().Set("WWW-Authenticate", `Bearer realm="cortex-configs-private"`)
+			http.Error(w, "missing bearer token", http.StatusUnauthorized)
+			return
+		}
+		provided := strings.TrimPrefix(authz, bearerPrefix)
+		if subtle.ConstantTimeCompare([]byte(provided), []byte(expected)) != 1 {
+			w.Header().Set("WWW-Authenticate", `Bearer realm="cortex-configs-private" error="invalid_token"`)
+			http.Error(w, "invalid bearer token", http.StatusUnauthorized)
+			return
+		}
+		next(w, r)
 	}
 }
 
