@@ -378,7 +378,7 @@ func (c *haTracker) checkReplica(ctx context.Context, userID, cluster, replica s
 
 	c.electedLock.RLock()
 	entry, ok := c.elected[key]
-	clusters := len(c.clusters[userID])
+	_, clusterKnown := c.clusters[userID][cluster]
 	c.electedLock.RUnlock()
 
 	if ok && now.Sub(timestamp.Time(entry.ReceivedAt)) < c.cfg.UpdateTimeout+c.updateTimeoutJitter {
@@ -388,16 +388,46 @@ func (c *haTracker) checkReplica(ctx context.Context, userID, cluster, replica s
 		return nil
 	}
 
-	if !ok {
-		// If we don't know about this cluster yet and we have reached the limit for number of clusters, we error out now.
-		if limit := c.limits.MaxHAClusters(userID); limit > 0 && clusters+1 > limit {
-			return tooManyClustersError{limit: limit}
+	// If we don't know about this cluster yet, reserve a slot in the local tracker before
+	// talking to the KV store. The reservation is done under electedLock so that concurrent
+	// pushes with distinct new cluster values cannot all observe the same stale count and
+	// collectively bypass MaxHAClusters. c.clusters is otherwise only populated by the
+	// asynchronous WatchPrefix callback, which is why the previous check (against a local
+	// count read under RLock) could be bypassed by bursts.
+	reservedCluster := false
+	if !clusterKnown {
+		c.electedLock.Lock()
+		if _, alreadyThere := c.clusters[userID][cluster]; !alreadyThere {
+			if limit := c.limits.MaxHAClusters(userID); limit > 0 && len(c.clusters[userID])+1 > limit {
+				c.electedLock.Unlock()
+				return tooManyClustersError{limit: limit}
+			}
+			if c.clusters[userID] == nil {
+				c.clusters[userID] = map[string]struct{}{}
+			}
+			c.clusters[userID][cluster] = struct{}{}
+			reservedCluster = true
 		}
+		c.electedLock.Unlock()
 	}
 
 	err := c.checkKVStore(ctx, key, replica, now)
 	c.kvCASCalls.WithLabelValues(userID, cluster).Inc()
 	if err != nil {
+		// If we reserved a slot above but failed to write to the KV store, release the
+		// reservation unless the WatchPrefix callback has already observed and (re)written it.
+		if reservedCluster {
+			c.electedLock.Lock()
+			if _, elected := c.elected[key]; !elected {
+				if userClusters, exists := c.clusters[userID]; exists {
+					delete(userClusters, cluster)
+					if len(userClusters) == 0 {
+						delete(c.clusters, userID)
+					}
+				}
+			}
+			c.electedLock.Unlock()
+		}
 		// The callback within checkKVStore will return a replicasNotMatchError if the sample is being deduped,
 		// otherwise there may have been an actual error CAS'ing that we should log.
 		if !errors.Is(err, replicasNotMatchError{}) {
