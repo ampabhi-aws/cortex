@@ -18,6 +18,7 @@ import (
 	"github.com/cortexproject/cortex/pkg/alertmanager"
 	"github.com/cortexproject/cortex/pkg/alertmanager/alertmanagerpb"
 	"github.com/cortexproject/cortex/pkg/compactor"
+	configsapi "github.com/cortexproject/cortex/pkg/configs/api"
 	"github.com/cortexproject/cortex/pkg/cortexpb"
 	"github.com/cortexproject/cortex/pkg/distributor"
 	"github.com/cortexproject/cortex/pkg/distributor/distributorpb"
@@ -417,4 +418,15 @@ func (a *API) RegisterServiceMapHandler(handler http.Handler) {
 func (a *API) RegisterMemberlistKV(handler http.Handler) {
 	a.indexPage.AddLink(SectionAdminEndpoints, "/memberlist", "Memberlist Status")
 	a.RegisterRoute("/memberlist", handler, false, "GET")
+}
+
+// RegisterConfigAPI registers the routes exposed by the deprecated configs
+// service through the standard API router. Routing through RegisterRoute
+// ensures the configured HTTP middleware stack (authentication, response
+// compression, header logging) is applied uniformly, instead of attaching
+// the configs handlers directly to the shared mux.
+func (a *API) RegisterConfigAPI(c *configsapi.API) {
+	for _, route := range c.Routes() {
+		a.RegisterRoute(route.Path, route.Handler, route.Auth, route.Method)
+	}
 }
