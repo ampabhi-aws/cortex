@@ -249,6 +249,13 @@ func validateRulesFiles(c userconfig.Config) error {
 
 func validateTemplateFiles(c userconfig.Config) error {
 	for fn, content := range c.TemplateFiles {
+		// Reject filenames that contain any path component. Downstream the
+		// Alertmanager stores these files inside a per-tenant templates
+		// directory, so filenames with directory separators (including
+		// "..") could be used to attempt to escape that directory.
+		if strings.ContainsAny(fn, `/\`) || fn == "." || fn == ".." {
+			return fmt.Errorf("invalid template name %q: the template name cannot contain any path", fn)
+		}
 		if _, err := template.New(fn).Funcs(template.FuncMap(amtemplate.DefaultFuncs)).Parse(content); err != nil {
 			return err
 		}

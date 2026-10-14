@@ -814,6 +814,19 @@ func (am *MultitenantAlertmanager) setConfig(cfg alertspb.AlertConfigDesc) error
 	var userTemplateDir = filepath.Join(am.getTenantDirectory(cfg.User), templatesDir)
 	var pathsToRemove = make(map[string]struct{})
 
+	// Enforce Cortex-specific restrictions on configs sourced from any AlertStore
+	// backend. Historically these were only enforced in the SetUserConfig HTTP
+	// handler, so configs loaded from the configdb/local backends bypassed the
+	// *_file denylist and the template-filename check. Running the validation
+	// here closes that gap for every store backend. Empty configs are allowed:
+	// the fallback config is applied further down.
+	if cfg.RawConfig != "" {
+		if err := validateStoreAlertmanagerConfig(cfg); err != nil {
+			level.Warn(am.logger).Log("msg", "rejecting tenant Alertmanager config loaded from store: fails Cortex restrictions", "user", cfg.User, "err", err)
+			return fmt.Errorf("invalid Cortex Alertmanager configuration for %v: %v", cfg.User, err)
+		}
+	}
+
 	// List existing files to keep track the ones to be removed
 	if oldTemplateFiles, err := os.ReadDir(userTemplateDir); err == nil {
 		for _, file := range oldTemplateFiles {
@@ -1325,12 +1338,52 @@ func safeTemplateFilepath(dir, templateName string) (string, error) {
 
 	// Ensure the actual path of the template is within the expected directory.
 	// This check is a counter-measure to make sure the tenant is not trying to
-	// escape its own directory on disk.
-	if !strings.HasPrefix(actualPath, containerDir) {
+	// escape its own directory on disk. Compare against containerDir with a
+	// trailing path separator so a sibling directory sharing the same string
+	// prefix (e.g. "<dir>/templatesX" vs "<dir>/templates") is rejected.
+	containerDirWithSep := containerDir + string(os.PathSeparator)
+	if actualPath != containerDir && !strings.HasPrefix(actualPath, containerDirWithSep) {
 		return "", fmt.Errorf("invalid template name %q: the template filepath is escaping the per-tenant local directory", templateName)
 	}
 
 	return actualPath, nil
+}
+
+// validateStoreAlertmanagerConfig applies the Cortex-specific restrictions
+// (the *_file denylist implemented by validateAlertmanagerConfig and the
+// template-name check implemented by validateTemplateFilename) to a config
+// loaded from an AlertStore. This mirrors the checks the HTTP handler runs
+// through validateUserConfig, so that configs sourced from backends which do
+// not round-trip through the Cortex Alertmanager HTTP API (notably the
+// configdb and local backends) cannot bypass these controls.
+func validateStoreAlertmanagerConfig(cfg alertspb.AlertConfigDesc) error {
+	amCfg, err := amconfig.Load(cfg.RawConfig)
+	if err != nil {
+		return err
+	}
+
+	// Scan the loaded config recursively for disallowed *_file settings.
+	if err := validateAlertmanagerConfig(amCfg); err != nil {
+		return err
+	}
+
+	// Reject template names referenced inside the Alertmanager config that
+	// contain any path component.
+	for _, name := range amCfg.Templates {
+		if err := validateTemplateFilename(name); err != nil {
+			return err
+		}
+	}
+
+	// Reject template filenames carried in the store descriptor that contain
+	// any path component.
+	for _, tmpl := range cfg.Templates {
+		if err := validateTemplateFilename(tmpl.Filename); err != nil {
+			return err
+		}
+	}
+
+	return nil
 }
 
 // storeTemplateFile stores template file at the given templateFilepath.
