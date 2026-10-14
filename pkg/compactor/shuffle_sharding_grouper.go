@@ -229,7 +229,16 @@ mainLoop:
 			CompactorID: g.ringLifecyclerID,
 			Version:     VisitMarkerVersion1,
 		}
-		markBlocksVisited(g.ctx, g.bkt, g.logger, group.blocks, blockVisitMarker, g.blockVisitMarkerWriteFailed)
+		if !markBlocksVisited(g.ctx, g.bkt, g.bkt, g.logger, group.blocks, blockVisitMarker, g.blockVisitMarkerTimeout, g.blockVisitMarkerReadFailed, g.blockVisitMarkerWriteFailed) {
+			// Another compactor in the tenant sub-ring has already claimed (or
+			// is actively holding) a visit marker for one or more blocks in
+			// this group, or the claim write failed. Skip the group this cycle
+			// rather than compacting source blocks that are being compacted by
+			// someone else. This closes the read-then-blind-write TOCTOU window
+			// between isGroupVisited and markBlocksVisited.
+			level.Info(g.logger).Log("msg", "skipping group because block visit marker claim was refused by another compactor", "group_hash", groupHash, "group", group.String())
+			continue
+		}
 
 		// All the blocks within the same group have the same downsample
 		// resolution and external labels.

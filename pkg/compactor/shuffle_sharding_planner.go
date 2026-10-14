@@ -89,7 +89,24 @@ func (p *ShuffleShardingPlanner) Plan(_ context.Context, metasByMinTime []*metad
 		return nil, nil
 	}
 
-	go markBlocksVisitedHeartBeat(p.ctx, p.bkt, p.logger, resultMetas, p.ringLifecyclerID, p.blockVisitMarkerFileUpdateInterval, p.blockVisitMarkerWriteFailed)
+	// Re-verify ownership immediately before returning so that compaction (and
+	// the eventual compacted-block upload driven by Thanos' BucketCompactor)
+	// only proceeds if we still own the visit marker on every block. This
+	// narrows the TOCTOU window left open by the per-block read/write loop
+	// above: another compactor may have refreshed/overwritten the marker
+	// between the first ReadBlockVisitMarker call and now.
+	for _, b := range resultMetas {
+		blockID := b.ULID.String()
+		blockVisitMarker, err := ReadBlockVisitMarker(p.ctx, p.bkt, p.logger, blockID, p.blockVisitMarkerReadFailed)
+		if err != nil {
+			return nil, fmt.Errorf("unable to re-verify visit marker file for block %s: %s", blockID, err.Error())
+		}
+		if !blockVisitMarker.isVisitedByCompactor(p.blockVisitMarkerTimeout, p.ringLifecyclerID) {
+			return nil, fmt.Errorf("block %s is no longer visited by current compactor %s (owner is now %s)", blockID, p.ringLifecyclerID, blockVisitMarker.CompactorID)
+		}
+	}
+
+	go markBlocksVisitedHeartBeat(p.ctx, p.bkt, p.bkt, p.logger, resultMetas, p.ringLifecyclerID, p.blockVisitMarkerFileUpdateInterval, p.blockVisitMarkerTimeout, p.blockVisitMarkerReadFailed, p.blockVisitMarkerWriteFailed)
 
 	return resultMetas, nil
 }
