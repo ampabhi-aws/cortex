@@ -41,7 +41,7 @@ func newS3Config(cfg Config) (s3.Config, error) {
 		Bucket:    cfg.BucketName,
 		Endpoint:  cfg.Endpoint,
 		Region:    cfg.Region,
-		AccessKey: cfg.AccessKeyID,
+		AccessKey: cfg.AccessKeyID.Value,
 		SecretKey: cfg.SecretAccessKey.Value,
 		Insecure:  cfg.Insecure,
 		SSEConfig: sseCfg,
@@ -59,6 +59,6 @@ func newS3Config(cfg Config) (s3.Config, error) {
 		// Enforce signature version 2 if CLI flag is set
 		SignatureV2:      cfg.SignatureVersion == SignatureVersionV2,
 		BucketLookupType: bucketLookupType,
-		AWSSDKAuth:       cfg.AccessKeyID == "",
+		AWSSDKAuth:       cfg.AccessKeyID.Value == "",
 	}, nil
 }
