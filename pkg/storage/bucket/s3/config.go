@@ -41,6 +41,7 @@ var (
 	errUnsupportedSSEType          = errors.New("unsupported S3 SSE type")
 	errInvalidSSEContext           = errors.New("invalid S3 SSE encryption context")
 	errInvalidBucketLookupType     = errors.New("invalid bucket lookup type")
+	errEmptyKMSKeyID               = errors.New("KMS key id is required when S3 SSE type is SSE-KMS")
 )
 
 // HTTPConfig stores the http.Transport configuration for the s3 minio client.
@@ -143,6 +144,13 @@ func (cfg *SSEConfig) Validate() error {
 		return errUnsupportedSSEType
 	}
 
+	// A SSE-KMS override without an explicit KMS key id would otherwise fall back
+	// to the bucket/account default KMS key, defeating the purpose of configuring
+	// a per-tenant key. Reject it as a configuration error so it fails closed.
+	if cfg.Type == SSEKMS && cfg.KMSKeyID == "" {
+		return errEmptyKMSKeyID
+	}
+
 	if _, err := parseKMSEncryptionContext(cfg.KMSEncryptionContext); err != nil {
 		return errInvalidSSEContext
 	}
@@ -181,6 +189,15 @@ func (cfg *SSEConfig) BuildMinioConfig() (encrypt.ServerSide, error) {
 	case "":
 		return nil, nil
 	case SSEKMS:
+		// Guard against falling back to the bucket default KMS key when the per-tenant
+		// key id is empty: minio-go accepts the empty key id and simply omits the
+		// x-amz-server-side-encryption-aws-kms-key-id header, which causes S3 to
+		// encrypt with the bucket/account default KMS key instead of the intended
+		// per-tenant CMK. Fail closed instead.
+		if cfg.KMSKeyID == "" {
+			return nil, errEmptyKMSKeyID
+		}
+
 		encryptionCtx, err := parseKMSEncryptionContext(cfg.KMSEncryptionContext)
 		if err != nil {
 			return nil, err

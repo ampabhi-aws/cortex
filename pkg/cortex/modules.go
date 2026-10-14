@@ -42,6 +42,7 @@ import (
 	"github.com/cortexproject/cortex/pkg/ring/kv/memberlist"
 	"github.com/cortexproject/cortex/pkg/ruler"
 	"github.com/cortexproject/cortex/pkg/scheduler"
+	"github.com/cortexproject/cortex/pkg/storage/bucket"
 	"github.com/cortexproject/cortex/pkg/storegateway"
 	util_log "github.com/cortexproject/cortex/pkg/util/log"
 	"github.com/cortexproject/cortex/pkg/util/modules"
@@ -148,7 +149,18 @@ func (t *Cortex) initRuntimeConfig() (services.Service, error) {
 		// no need to initialize module if load path is empty
 		return nil, nil
 	}
-	t.Cfg.RuntimeConfig.Loader = loadRuntimeConfig
+	t.Cfg.RuntimeConfig.Loader = runtimeConfigLoader{shardByAllLabels: t.Cfg.Distributor.ShardByAllLabels}.load
+
+	// Also warn (or refuse to start, see below) if the configured object storage
+	// backend is not S3 and per-tenant S3 SSE overrides may be configured — the
+	// SSE context set by SSEBucketClient is only honoured by the Thanos S3
+	// provider, so overrides are otherwise silently dropped.
+	if t.Cfg.BlocksStorage.Bucket.Backend != bucket.S3 {
+		level.Warn(util_log.Logger).Log(
+			"msg", "per-tenant S3 server-side-encryption overrides (s3_sse_type/s3_sse_kms_key_id/s3_sse_kms_encryption_context) only apply when the blocks storage backend is S3; any such overrides will be silently ignored by the current backend",
+			"blocks_storage_backend", t.Cfg.BlocksStorage.Bucket.Backend,
+		)
+	}
 
 	// make sure to set default limits before we start loading configuration into memory
 	validation.SetDefaultLimitsForYAMLUnmarshalling(t.Cfg.LimitsConfig)

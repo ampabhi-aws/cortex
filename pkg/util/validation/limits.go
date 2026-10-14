@@ -13,6 +13,7 @@ import (
 	"github.com/prometheus/prometheus/model/relabel"
 	"golang.org/x/time/rate"
 
+	"github.com/cortexproject/cortex/pkg/storage/bucket/s3"
 	"github.com/cortexproject/cortex/pkg/util/flagext"
 )
 
@@ -197,6 +198,18 @@ func (l *Limits) Validate(shardByAllLabels bool) error {
 	// if shard-by-all-labels is disabled
 	if l.MaxGlobalSeriesPerUser > 0 && !shardByAllLabels {
 		return errMaxGlobalSeriesPerUserValidation
+	}
+
+	// Validate the per-tenant S3 SSE override. This is a no-op when no SSE type
+	// override is configured; it rejects unsupported SSE types, invalid KMS
+	// encryption contexts, and SSE-KMS overrides with an empty KMS key id
+	// (which would otherwise fall back to the bucket/account default KMS key).
+	if err := (&s3.SSEConfig{
+		Type:                 l.S3SSEType,
+		KMSKeyID:             l.S3SSEKMSKeyID,
+		KMSEncryptionContext: l.S3SSEKMSEncryptionContext,
+	}).Validate(); err != nil {
+		return err
 	}
 
 	return nil

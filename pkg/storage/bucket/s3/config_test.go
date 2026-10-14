@@ -144,15 +144,25 @@ func TestSSEConfig_Validate(t *testing.T) {
 			setup: func() *SSEConfig {
 				return &SSEConfig{
 					Type:                 SSEKMS,
+					KMSKeyID:             "test-key",
 					KMSEncryptionContext: "!{}!",
 				}
 			},
 			expected: errInvalidSSEContext,
 		},
+		"should fail on SSE-KMS with empty KMS key id": {
+			setup: func() *SSEConfig {
+				return &SSEConfig{
+					Type: SSEKMS,
+				}
+			},
+			expected: errEmptyKMSKeyID,
+		},
 		"should pass on valid SSE KMS encryption context": {
 			setup: func() *SSEConfig {
 				return &SSEConfig{
 					Type:                 SSEKMS,
+					KMSKeyID:             "test-key",
 					KMSEncryptionContext: `{"department": "10103.0"}`,
 				}
 			},
