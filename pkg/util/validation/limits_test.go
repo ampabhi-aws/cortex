@@ -47,19 +47,29 @@ func TestLimits_Validate(t *testing.T) {
 		expected         error
 	}{
 		"max-global-series-per-user disabled and shard-by-all-labels=false": {
-			limits:           Limits{MaxGlobalSeriesPerUser: 0},
+			limits:           Limits{MaxGlobalSeriesPerUser: 0, MaxQueryParallelism: 14},
 			shardByAllLabels: false,
 			expected:         nil,
 		},
 		"max-global-series-per-user enabled and shard-by-all-labels=false": {
-			limits:           Limits{MaxGlobalSeriesPerUser: 1000},
+			limits:           Limits{MaxGlobalSeriesPerUser: 1000, MaxQueryParallelism: 14},
 			shardByAllLabels: false,
 			expected:         errMaxGlobalSeriesPerUserValidation,
 		},
 		"max-global-series-per-user disabled and shard-by-all-labels=true": {
-			limits:           Limits{MaxGlobalSeriesPerUser: 1000},
+			limits:           Limits{MaxGlobalSeriesPerUser: 1000, MaxQueryParallelism: 14},
 			shardByAllLabels: true,
 			expected:         nil,
+		},
+		"max-query-parallelism set to zero": {
+			limits:           Limits{MaxQueryParallelism: 0},
+			shardByAllLabels: true,
+			expected:         errMaxQueryParallelismNonPositive,
+		},
+		"max-query-parallelism set to a negative value": {
+			limits:           Limits{MaxQueryParallelism: -1},
+			shardByAllLabels: true,
+			expected:         errMaxQueryParallelismNonPositive,
 		},
 	}
 

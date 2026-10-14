@@ -37,7 +37,12 @@ func DoRequests(ctx context.Context, downstream Handler, reqs []Request, limits 
 	}()
 
 	respChan, errChan := make(chan RequestResponse), make(chan error)
-	parallelism := validation.SmallestPositiveIntPerTenant(tenantIDs, limits.MaxQueryParallelism)
+	parallelism := validation.SmallestPositiveNonZeroIntPerTenant(tenantIDs, limits.MaxQueryParallelism)
+	// Defensive clamp: parallelism must be at least 1, otherwise no worker
+	// goroutines are started and the collection loop below would block forever.
+	if parallelism <= 0 {
+		parallelism = 1
+	}
 	if parallelism > len(reqs) {
 		parallelism = len(reqs)
 	}
@@ -65,6 +70,8 @@ func DoRequests(ctx context.Context, downstream Handler, reqs []Request, limits 
 				cancel()
 				firstErr = err
 			}
+		case <-ctx.Done():
+			return resps, ctx.Err()
 		}
 	}
 
