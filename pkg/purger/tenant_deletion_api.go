@@ -23,22 +23,28 @@ type TenantDeletionAPI struct {
 	bucketClient objstore.Bucket
 	logger       log.Logger
 	cfgProvider  bucket.TenantConfigProvider
+	// authEnabled reflects the top-level -auth.enabled flag. When false the
+	// tenant in the request context is a hard-coded placeholder, so we refuse
+	// to run the destructive deletion handler to prevent a credential-free
+	// POST from wiping blocks for the "fake" tenant.
+	authEnabled bool
 }
 
-func NewTenantDeletionAPI(storageCfg cortex_tsdb.BlocksStorageConfig, cfgProvider bucket.TenantConfigProvider, logger log.Logger, reg prometheus.Registerer) (*TenantDeletionAPI, error) {
+func NewTenantDeletionAPI(storageCfg cortex_tsdb.BlocksStorageConfig, cfgProvider bucket.TenantConfigProvider, authEnabled bool, logger log.Logger, reg prometheus.Registerer) (*TenantDeletionAPI, error) {
 	bucketClient, err := createBucketClient(storageCfg, logger, reg)
 	if err != nil {
 		return nil, err
 	}
 
-	return newTenantDeletionAPI(bucketClient, cfgProvider, logger), nil
+	return newTenantDeletionAPI(bucketClient, cfgProvider, authEnabled, logger), nil
 }
 
-func newTenantDeletionAPI(bkt objstore.Bucket, cfgProvider bucket.TenantConfigProvider, logger log.Logger) *TenantDeletionAPI {
+func newTenantDeletionAPI(bkt objstore.Bucket, cfgProvider bucket.TenantConfigProvider, authEnabled bool, logger log.Logger) *TenantDeletionAPI {
 	return &TenantDeletionAPI{
 		bucketClient: bkt,
 		cfgProvider:  cfgProvider,
 		logger:       logger,
+		authEnabled:  authEnabled,
 	}
 }
 
@@ -49,6 +55,42 @@ func (api *TenantDeletionAPI) DeleteTenant(w http.ResponseWriter, r *http.Reques
 		// When Cortex is running, it uses Auth Middleware for checking X-Scope-OrgID and injecting tenant into context.
 		// Auth Middleware sends http.StatusUnauthorized if X-Scope-OrgID is missing, so we do too here, for consistency.
 		http.Error(w, err.Error(), http.StatusUnauthorized)
+		return
+	}
+
+	// Refuse to serve the destructive endpoint when auth is disabled: in that
+	// mode the tenant resolved from the context is the hard-coded placeholder
+	// "fake" injected into every request, so any client that can reach the
+	// HTTP port could wipe stored blocks with a credential-free POST. Operators
+	// who need the admin endpoint in such setups must put it behind their own
+	// authenticating gateway and enable per-tenant auth.
+	if !api.authEnabled {
+		level.Warn(api.logger).Log("msg", "refusing POST /purger/delete_tenant because -auth.enabled=false; the endpoint only runs with per-tenant auth enabled")
+		http.Error(w, "tenant deletion endpoint is disabled when auth is disabled", http.StatusForbidden)
+		return
+	}
+
+	// Require an explicit confirmation parameter that matches the tenant in
+	// the authenticated context. This prevents a stray or CSRF-style POST from
+	// wiping data by forcing the caller to spell out which tenant they intend
+	// to destroy. The parameter may be supplied as a query argument or form
+	// value named "tenant".
+	confirm := r.URL.Query().Get("tenant")
+	if confirm == "" {
+		// Parse the form only if we did not find the parameter in the query
+		// string, so we do not consume a legitimately empty request body on
+		// endpoints that forward form data.
+		if err := r.ParseForm(); err == nil {
+			confirm = r.PostForm.Get("tenant")
+		}
+	}
+	if confirm == "" {
+		http.Error(w, "missing required confirmation parameter: tenant=<tenant-id>", http.StatusBadRequest)
+		return
+	}
+	if confirm != userID {
+		level.Warn(api.logger).Log("msg", "tenant deletion confirmation mismatch", "context_tenant", userID, "confirmation", confirm)
+		http.Error(w, "tenant confirmation parameter does not match authenticated tenant", http.StatusBadRequest)
 		return
 	}
 
