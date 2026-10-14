@@ -83,6 +83,10 @@ func (t *SingleResolver) TenantID(ctx context.Context) (string, error) {
 		return "", err
 	}
 
+	if len(id) == 0 {
+		return "", errTenantIDEmpty
+	}
+
 	if containsUnsafePathSegments(id) {
 		return "", errInvalidTenantID
 	}
@@ -131,6 +135,12 @@ func (t *MultiResolver) TenantIDs(ctx context.Context) ([]string, error) {
 
 	orgIDs := strings.Split(orgID, tenantIDsLabelSeparator)
 	for _, orgID := range orgIDs {
+		// Reject empty parts explicitly so headers like "|", "a||b" or
+		// "a|" cannot resolve to the empty tenant ID (which would collapse
+		// every per-tenant namespace onto the shared root).
+		if len(orgID) == 0 {
+			return nil, errTenantIDEmpty
+		}
 		if err := ValidTenantID(orgID); err != nil {
 			return nil, err
 		}
