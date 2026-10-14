@@ -995,7 +995,11 @@ func (i *Ingester) Push(ctx context.Context, req *cortexpb.WriteRequest) (*corte
 			// of it, so that we can return it back to the distributor, which will return a
 			// 400 error to the client. The client (Prometheus) will not retry on 400, and
 			// we actually ingested all samples which haven't failed.
-			level.Warn(logutil.WithContext(ctx, i.logger)).Log("msg", "partial failure to push", "err", err)
+			//
+			// Do NOT log per sample here: the number of iterations is attacker-controlled
+			// (one remote-write request can contain millions of samples). Soft errors are
+			// aggregated per-request below and emitted as a single WARN line after the loop
+			// so that log output is independent of the attacker-chosen sample count.
 			switch cause := errors.Cause(err); cause {
 			case storage.ErrOutOfBounds:
 				sampleOutOfBoundsCount++
@@ -1111,8 +1115,31 @@ func (i *Ingester) Push(ctx context.Context, req *cortexpb.WriteRequest) (*corte
 		validation.DiscardedSamples.WithLabelValues(perMetricSeriesLimit, userID).Add(float64(perMetricSeriesLimitCount))
 	}
 
+	// Emit at most one aggregated WARN line per Push summarising the soft-error counts
+	// and the first partial error. Logging per rejected sample is unsafe: the number of
+	// rejected samples is attacker-controlled and the process-global stderr logger is
+	// mutex-serialised, so per-sample logging lets a single remote-write request flood
+	// the shared logger and starve every other tenant on the ingester.
+	if failedSamplesCount > 0 {
+		level.Warn(logutil.WithContext(ctx, i.logger)).Log(
+			"msg", "partial failure to push",
+			"user", userID,
+			"failedSamples", failedSamplesCount,
+			"succeededSamples", succeededSamplesCount,
+			"sampleOutOfBounds", sampleOutOfBoundsCount,
+			"sampleOutOfOrder", sampleOutOfOrderCount,
+			"newValueForTimestamp", newValueForTimestampCount,
+			"perUserSeriesLimit", perUserSeriesLimitCount,
+			"perMetricSeriesLimit", perMetricSeriesLimitCount,
+			"firstErr", firstPartialErr,
+		)
+	}
+
 	// Distributor counts both samples and metadata, so for consistency ingester does the same.
-	i.ingestionRate.Add(int64(succeededSamplesCount + ingestedMetadata))
+	// Count failed samples toward the instance ingestion rate as well, so that requests made
+	// entirely of failing samples still consume the ingester-side rate budget and can be
+	// throttled by -ingester.instance-limits.max-ingestion-rate.
+	i.ingestionRate.Add(int64(succeededSamplesCount + failedSamplesCount + ingestedMetadata))
 
 	switch req.Source {
 	case cortexpb.RULE:
