@@ -265,13 +265,18 @@ func (a *API) RegisterIngester(i Ingester, pushConfig distributor.Config) {
 
 	a.indexPage.AddLink(SectionDangerous, "/ingester/flush", "Trigger a Flush of data from Ingester to storage")
 	a.indexPage.AddLink(SectionDangerous, "/ingester/shutdown", "Trigger Ingester Shutdown (Dangerous)")
-	a.RegisterRoute("/ingester/flush", http.HandlerFunc(i.FlushHandler), false, "GET", "POST")
-	a.RegisterRoute("/ingester/shutdown", http.HandlerFunc(i.ShutdownHandler), false, "GET", "POST")
+	// These are state-changing lifecycle operations. Restrict to POST only so that a
+	// cross-site GET (e.g. an attacker-controlled <img src>) cannot trigger them from
+	// any browser that happens to have network reachability to the ingester's internal
+	// HTTP listener. Authentication/authorization of the caller is still the external
+	// reverse proxy's responsibility, per the documented Cortex trust boundary.
+	a.RegisterRoute("/ingester/flush", http.HandlerFunc(i.FlushHandler), false, "POST")
+	a.RegisterRoute("/ingester/shutdown", http.HandlerFunc(i.ShutdownHandler), false, "POST")
 	a.RegisterRoute("/ingester/push", push.Handler(pushConfig.MaxRecvMsgSize, a.sourceIPs, i.Push), true, "POST") // For testing and debugging.
 
 	// Legacy Routes
-	a.RegisterRoute("/flush", http.HandlerFunc(i.FlushHandler), false, "GET", "POST")
-	a.RegisterRoute("/shutdown", http.HandlerFunc(i.ShutdownHandler), false, "GET", "POST")
+	a.RegisterRoute("/flush", http.HandlerFunc(i.FlushHandler), false, "POST")
+	a.RegisterRoute("/shutdown", http.HandlerFunc(i.ShutdownHandler), false, "POST")
 	a.RegisterRoute("/push", push.Handler(pushConfig.MaxRecvMsgSize, a.sourceIPs, i.Push), true, "POST") // For testing and debugging.
 }
 
