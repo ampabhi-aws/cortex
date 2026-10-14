@@ -102,6 +102,10 @@ func (r ruleLimits) RulerMaxRulesPerRuleGroup(_ string) int {
 	return r.maxRulesPerRuleGroup
 }
 
+func (r ruleLimits) RulerMinRuleEvaluationInterval(_ string) time.Duration {
+	return 0
+}
+
 func newEmptyQueryable() storage.Queryable {
 	return storage.QueryableFunc(func(ctx context.Context, mint, maxt int64) (storage.Querier, error) {
 		return emptyQuerier{}, nil
@@ -168,7 +172,7 @@ func testSetup(t *testing.T, querierTestConfig *querier.TestConfig) (*promql.Eng
 
 func newManager(t *testing.T, cfg Config) *DefaultMultiTenantManager {
 	engine, queryable, pusher, logger, overrides, reg := testSetup(t, nil)
-	manager, err := NewDefaultMultiTenantManager(cfg, DefaultTenantManagerFactory(cfg, pusher, queryable, engine, overrides, nil), reg, logger)
+	manager, err := NewDefaultMultiTenantManager(cfg, DefaultTenantManagerFactory(cfg, pusher, queryable, engine, overrides, nil), reg, logger, overrides)
 	require.NoError(t, err)
 
 	return manager
@@ -216,7 +220,7 @@ func buildRuler(t *testing.T, rulerConfig Config, querierTestConfig *querier.Tes
 	engine, queryable, pusher, logger, overrides, reg := testSetup(t, querierTestConfig)
 
 	managerFactory := DefaultTenantManagerFactory(rulerConfig, pusher, queryable, engine, overrides, reg)
-	manager, err := NewDefaultMultiTenantManager(rulerConfig, managerFactory, reg, log.NewNopLogger())
+	manager, err := NewDefaultMultiTenantManager(rulerConfig, managerFactory, reg, log.NewNopLogger(), overrides)
 	require.NoError(t, err)
 
 	ruler, err := newRuler(

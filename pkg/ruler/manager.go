@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"net/http"
 	"sync"
+	"time"
 
 	"github.com/go-kit/log"
 	"github.com/go-kit/log/level"
@@ -26,6 +27,7 @@ type DefaultMultiTenantManager struct {
 	cfg            Config
 	notifierCfg    *config.Config
 	managerFactory ManagerFactory
+	limits         RulesLimits
 
 	mapper *mapper
 
@@ -47,7 +49,7 @@ type DefaultMultiTenantManager struct {
 	logger                        log.Logger
 }
 
-func NewDefaultMultiTenantManager(cfg Config, managerFactory ManagerFactory, reg prometheus.Registerer, logger log.Logger) (*DefaultMultiTenantManager, error) {
+func NewDefaultMultiTenantManager(cfg Config, managerFactory ManagerFactory, reg prometheus.Registerer, logger log.Logger, limits RulesLimits) (*DefaultMultiTenantManager, error) {
 	ncfg, err := buildNotifierConfig(&cfg)
 	if err != nil {
 		return nil, err
@@ -62,6 +64,7 @@ func NewDefaultMultiTenantManager(cfg Config, managerFactory ManagerFactory, reg
 		cfg:                cfg,
 		notifierCfg:        ncfg,
 		managerFactory:     managerFactory,
+		limits:             limits,
 		notifiers:          map[string]*rulerNotifier{},
 		mapper:             newMapper(cfg.RulePath, logger),
 		userManagers:       map[string]RulesManager{},
@@ -123,6 +126,12 @@ func (r *DefaultMultiTenantManager) SyncRuleGroups(ctx context.Context, ruleGrou
 // syncRulesToManager maps the rule files to disk, detects any changes and will create/update the
 // the users Prometheus Rules Manager.
 func (r *DefaultMultiTenantManager) syncRulesToManager(ctx context.Context, user string, groups rulespb.RuleGroupList) {
+	// Enforce the per-tenant minimum evaluation interval on the load path. Groups persisted in
+	// the rule store (e.g. uploaded before the limit was configured or before this fix) cannot
+	// keep a sub-limit Interval: we clamp them up to the effective minimum before they reach
+	// Prometheus' rules.Manager, which would otherwise install a ticker at the stored value.
+	groups = r.clampGroupIntervals(user, groups)
+
 	// Map the files to disk and return the file names to be passed to the users manager if they
 	// have been updated
 	update, files, err := r.mapper.MapRules(user, groups.Formatted())
@@ -298,4 +307,61 @@ func (*DefaultMultiTenantManager) ValidateRuleGroup(g rulefmt.RuleGroup) []error
 	}
 
 	return errs
+}
+
+// minEvaluationIntervalFor returns the effective minimum evaluation interval that applies to
+// rule groups owned by user: max(per-tenant min, cfg.EvaluationInterval). When no limits
+// provider is attached (e.g. unit tests), it returns 0, meaning "no clamping".
+func (r *DefaultMultiTenantManager) minEvaluationIntervalFor(user string) time.Duration {
+	if r.limits == nil {
+		return 0
+	}
+	min := r.limits.RulerMinRuleEvaluationInterval(user)
+	if min <= 0 {
+		// Fall back to the operator-configured default evaluation interval.
+		return r.cfg.EvaluationInterval
+	}
+	if r.cfg.EvaluationInterval > min {
+		return r.cfg.EvaluationInterval
+	}
+	return min
+}
+
+// clampGroupIntervals returns a copy of groups where any Interval below the per-tenant minimum
+// is clamped up to that minimum. It also preserves the input when nothing needs clamping to
+// avoid unnecessary allocations and spurious rule-manager restarts.
+func (r *DefaultMultiTenantManager) clampGroupIntervals(user string, groups rulespb.RuleGroupList) rulespb.RuleGroupList {
+	min := r.minEvaluationIntervalFor(user)
+	if min <= 0 {
+		return groups
+	}
+
+	var out rulespb.RuleGroupList
+	for i, g := range groups {
+		if g == nil || g.Interval <= 0 || g.Interval >= min {
+			if out != nil {
+				out = append(out, g)
+			}
+			continue
+		}
+		if out == nil {
+			out = make(rulespb.RuleGroupList, 0, len(groups))
+			out = append(out, groups[:i]...)
+		}
+		clamped := *g
+		level.Warn(r.logger).Log(
+			"msg", "clamping persisted rule group evaluation interval below configured minimum",
+			"user", user,
+			"group", g.Name,
+			"namespace", g.Namespace,
+			"stored_interval", g.Interval,
+			"effective_min", min,
+		)
+		clamped.Interval = min
+		out = append(out, &clamped)
+	}
+	if out == nil {
+		return groups
+	}
+	return out
 }
