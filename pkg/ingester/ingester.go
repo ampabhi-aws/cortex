@@ -1801,8 +1801,40 @@ func (i *Ingester) getOrCreateTSDB(userID string, force bool) (*userTSDB, error)
 	return db, nil
 }
 
+// validateUserIDForTSDBDir rejects a userID that would, when joined with the
+// configured TSDB root via BlocksDir, resolve to the shared root itself or to
+// anything other than a single, direct subdirectory of that root. This guards
+// the paths in createTSDB() and closeAndDeleteUserTSDBIfIdle() so a bug or a
+// malformed tenant resolver cannot cause tsdb.Open or os.RemoveAll to operate
+// on the shared TSDB data directory.
+func validateUserIDForTSDBDir(userID, tsdbRoot string) error {
+	if userID == "" {
+		return errors.New("invalid tenant ID: empty")
+	}
+	if strings.ContainsAny(userID, `\/`) || userID == "." || userID == ".." {
+		return errors.Errorf("invalid tenant ID %q: must be a single path segment", userID)
+	}
+	cleanRoot := filepath.Clean(tsdbRoot)
+	udir := filepath.Clean(filepath.Join(tsdbRoot, userID))
+	if udir == cleanRoot || filepath.Dir(udir) != cleanRoot {
+		return errors.Errorf("invalid tenant ID %q: resolved TSDB dir %q is not a direct subdirectory of %q", userID, udir, cleanRoot)
+	}
+	return nil
+}
+
 // createTSDB creates a TSDB for a given userID, and returns the created db.
 func (i *Ingester) createTSDB(userID string) (*userTSDB, error) {
+	// Defence in depth: the tenant resolver is expected to reject these cases,
+	// but we must never let a bad tenant ID collapse the per-tenant TSDB
+	// directory onto the shared TSDB root (filepath.Join drops empty elements
+	// and treats "." / separator chars dangerously). If that happened we would
+	// create wal/, chunks_head/ and block directories in the shared root and,
+	// via closeAndDeleteUserTSDBIfIdle, os.RemoveAll the entire local TSDB of
+	// every other tenant on this ingester.
+	if err := validateUserIDForTSDBDir(userID, i.cfg.BlocksStorageConfig.TSDB.Dir); err != nil {
+		return nil, err
+	}
+
 	tsdbPromReg := prometheus.NewRegistry()
 	udir := i.cfg.BlocksStorageConfig.TSDB.BlocksDir(userID)
 	userLogger := logutil.WithUserID(userID, i.logger)
@@ -2333,7 +2365,19 @@ func (i *Ingester) closeAndDeleteUserTSDBIfIdle(userID string) tsdbCloseCheckRes
 
 	validation.DeletePerUserValidationMetrics(userID, i.logger)
 
-	// And delete local data.
+	// And delete local data. Defence in depth: refuse to os.RemoveAll anything
+	// other than a direct subdirectory of the configured TSDB root. If a
+	// previous bug ever let an empty / unsafe tenant ID create a TSDB rooted
+	// at the shared data directory, this guard prevents the idle-close code
+	// from wiping every other tenant's local WAL and unshipped blocks.
+	if err := validateUserIDForTSDBDir(userID, i.cfg.BlocksStorageConfig.TSDB.Dir); err != nil {
+		level.Error(i.logger).Log("msg", "refusing to delete local TSDB: invalid tenant ID / directory", "user", userID, "dir", dir, "err", err)
+		return tsdbDataRemovalFailed
+	}
+	if cleanRoot, cleanDir := filepath.Clean(i.cfg.BlocksStorageConfig.TSDB.Dir), filepath.Clean(dir); cleanDir == cleanRoot || filepath.Dir(cleanDir) != cleanRoot {
+		level.Error(i.logger).Log("msg", "refusing to delete local TSDB: dir is not a direct child of TSDB root", "user", userID, "dir", dir, "tsdb_root", cleanRoot)
+		return tsdbDataRemovalFailed
+	}
 	if err := os.RemoveAll(dir); err != nil {
 		level.Error(i.logger).Log("msg", "failed to delete local TSDB", "user", userID, "err", err)
 		return tsdbDataRemovalFailed
