@@ -322,8 +322,17 @@ func (m *mergeQuerier) Select(sortSeries bool, hints *storage.SelectHints, match
 		if !ok {
 			return fmt.Errorf("unexpected type %T", jobIntf)
 		}
+		// Give each per-tenant sub-querier its own copy of the hints so that
+		// concurrent per-tenant clamping (e.g. max_query_lookback) cannot be
+		// observed by sibling sub-queries and so that there is no
+		// unsynchronised read/write of the caller's shared *storage.SelectHints.
+		var jobHints *storage.SelectHints
+		if hints != nil {
+			hintsCopy := *hints
+			jobHints = &hintsCopy
+		}
 		seriesSets[job.pos] = &addLabelsSeriesSet{
-			upstream: job.querier.Select(sortSeries, hints, filteredMatchers...),
+			upstream: job.querier.Select(sortSeries, jobHints, filteredMatchers...),
 			labels: labels.Labels{
 				{
 					Name:  m.idLabelName,
