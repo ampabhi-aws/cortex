@@ -30,6 +30,7 @@ import (
 	"github.com/thanos-io/thanos/pkg/store/labelpb"
 	"github.com/thanos-io/thanos/pkg/store/storepb"
 	"github.com/weaveworks/common/logging"
+	"github.com/weaveworks/common/user"
 	"go.uber.org/atomic"
 	"google.golang.org/grpc/metadata"
 
@@ -436,9 +437,15 @@ func mockLoggingLevel() logging.Level {
 }
 
 func setUserIDToGRPCContext(ctx context.Context, userID string) context.Context {
-	// We have to store it in the incoming metadata because we have to emulate the
-	// case it's coming from a gRPC request, while here we're running everything in-memory.
-	return metadata.NewIncomingContext(ctx, metadata.Pairs(cortex_tsdb.TenantIDExternalLabel, userID))
+	// Emulate the real request path: the gRPC auth interceptor (fakeauth.SetupAuthMiddleware)
+	// extracts the x-scope-orgid metadata key and injects the resolved tenant into the context
+	// via user.InjectOrgID; the __org_id__ metadata key is kept in parallel for backwards
+	// compatibility with Thanos-style clients and must match the authenticated tenant.
+	ctx = metadata.NewIncomingContext(ctx, metadata.Pairs(
+		cortex_tsdb.TenantIDExternalLabel, userID,
+		user.OrgIDHeaderName, userID,
+	))
+	return user.InjectOrgID(ctx, userID)
 }
 
 func TestBucketStores_deleteLocalFilesForExcludedTenants(t *testing.T) {
