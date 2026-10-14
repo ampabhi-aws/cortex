@@ -1108,7 +1108,17 @@ func TestRuler_ListAllRules(t *testing.T) {
 	router := mux.NewRouter()
 	router.Path("/ruler/rule_groups").Methods(http.MethodGet).HandlerFunc(r.ListAllRules)
 
-	req := requestFor(t, http.MethodGet, "https://localhost:8080/ruler/rule_groups", nil, "")
+	// Without an authenticated tenant, the handler must reject the request.
+	unauth := httptest.NewRequest(http.MethodGet, "https://localhost:8080/ruler/rule_groups", nil)
+	unauthRec := httptest.NewRecorder()
+	router.ServeHTTP(unauthRec, unauth)
+	require.Equal(t, http.StatusUnauthorized, unauthRec.Result().StatusCode)
+
+	// With an authenticated tenant, the handler must scope the response to
+	// just that tenant's rule groups. Callers from other tenants must not be
+	// able to observe them.
+	const callerUserID = "user1"
+	req := requestFor(t, http.MethodGet, "https://localhost:8080/ruler/rule_groups", nil, callerUserID)
 	w := httptest.NewRecorder()
 	router.ServeHTTP(w, req)
 
@@ -1120,9 +1130,7 @@ func TestRuler_ListAllRules(t *testing.T) {
 	require.Equal(t, "application/yaml", resp.Header.Get("Content-Type"))
 
 	gs := make(map[string]map[string][]rulefmt.RuleGroup) // user:namespace:[]rulefmt.RuleGroup
-	for userID := range mockRules {
-		gs[userID] = mockRules[userID].Formatted()
-	}
+	gs[callerUserID] = mockRules[callerUserID].Formatted()
 
 	// check for unnecessary fields
 	unnecessaryFields := []string{"kind", "style", "tag", "value", "anchor", "alias", "content", "headcomment", "linecomment", "footcomment", "line", "column"}
@@ -1133,6 +1141,14 @@ func TestRuler_ListAllRules(t *testing.T) {
 	expectedResponse, err := yaml.Marshal(gs)
 	require.NoError(t, err)
 	require.YAMLEq(t, string(expectedResponse), string(body))
+
+	// Other tenants' data must not appear in the response.
+	for userID := range mockRules {
+		if userID == callerUserID {
+			continue
+		}
+		require.NotContains(t, string(body), userID)
+	}
 }
 
 type senderFunc func(alerts ...*notifier.Alert)

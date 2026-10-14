@@ -292,7 +292,9 @@ func (a *API) RegisterRuler(r *ruler.Ruler) {
 	a.RegisterRoute("/ruler_ring", r, false, "GET", "POST")
 
 	// List all user rule groups
-	a.RegisterRoute("/ruler/rule_groups", http.HandlerFunc(r.ListAllRules), false, "GET")
+	// Requires authentication: the handler scopes the response to the
+	// authenticated tenant to prevent cross-tenant disclosure of rule groups.
+	a.RegisterRoute("/ruler/rule_groups", http.HandlerFunc(r.ListAllRules), true, "GET")
 
 	ruler.RegisterRulerServer(a.server.GRPC, r)
 }
