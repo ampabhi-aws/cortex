@@ -188,28 +188,40 @@ func ValidateLabels(cfg LabelValidationConfig, userID string, ls []cortexpb.Labe
 		}
 	}
 
+	maxLabelNameLength := cfg.MaxLabelNameLength(userID)
+	maxLabelValueLength := cfg.MaxLabelValueLength(userID)
+	maxLabelsSizeBytes := cfg.MaxLabelsSizeBytes(userID)
+	labelsSizeBytes := 0
+
+	// Validate individual label name/value lengths (and accumulate the labels size) BEFORE
+	// checking the number of labels, so a rejected series carrying a huge label value cannot
+	// be reported via tooManyLabelsError (which would echo the full attacker-controlled set).
+	for _, l := range ls {
+		if len(l.Name) > maxLabelNameLength {
+			DiscardedSamples.WithLabelValues(labelNameTooLong, userID).Inc()
+			return newLabelNameTooLongError(ls, l.Name, maxLabelNameLength)
+		} else if len(l.Value) > maxLabelValueLength {
+			DiscardedSamples.WithLabelValues(labelValueTooLong, userID).Inc()
+			return newLabelValueTooLongError(ls, l.Name, l.Value, maxLabelValueLength)
+		}
+		labelsSizeBytes += l.Size()
+	}
+	if maxLabelsSizeBytes > 0 && labelsSizeBytes > maxLabelsSizeBytes {
+		DiscardedSamples.WithLabelValues(labelsSizeBytesExceeded, userID).Inc()
+		return labelSizeBytesExceededError(ls, labelsSizeBytes, maxLabelsSizeBytes)
+	}
+
 	numLabelNames := len(ls)
 	if numLabelNames > cfg.MaxLabelNamesPerSeries(userID) {
 		DiscardedSamples.WithLabelValues(maxLabelNamesPerSeries, userID).Inc()
 		return newTooManyLabelsError(ls, cfg.MaxLabelNamesPerSeries(userID))
 	}
 
-	maxLabelNameLength := cfg.MaxLabelNameLength(userID)
-	maxLabelValueLength := cfg.MaxLabelValueLength(userID)
 	lastLabelName := ""
-	maxLabelsSizeBytes := cfg.MaxLabelsSizeBytes(userID)
-	labelsSizeBytes := 0
-
 	for _, l := range ls {
 		if !skipLabelNameValidation && !model.LabelName(l.Name).IsValid() {
 			DiscardedSamples.WithLabelValues(invalidLabel, userID).Inc()
 			return newInvalidLabelError(ls, l.Name)
-		} else if len(l.Name) > maxLabelNameLength {
-			DiscardedSamples.WithLabelValues(labelNameTooLong, userID).Inc()
-			return newLabelNameTooLongError(ls, l.Name, maxLabelNameLength)
-		} else if len(l.Value) > maxLabelValueLength {
-			DiscardedSamples.WithLabelValues(labelValueTooLong, userID).Inc()
-			return newLabelValueTooLongError(ls, l.Name, l.Value, maxLabelValueLength)
 		} else if cmp := strings.Compare(lastLabelName, l.Name); cmp >= 0 {
 			if cmp == 0 {
 				DiscardedSamples.WithLabelValues(duplicateLabelNames, userID).Inc()
@@ -221,11 +233,6 @@ func ValidateLabels(cfg LabelValidationConfig, userID string, ls []cortexpb.Labe
 		}
 
 		lastLabelName = l.Name
-		labelsSizeBytes += l.Size()
-	}
-	if maxLabelsSizeBytes > 0 && labelsSizeBytes > maxLabelsSizeBytes {
-		DiscardedSamples.WithLabelValues(labelsSizeBytesExceeded, userID).Inc()
-		return labelSizeBytesExceededError(ls, labelsSizeBytes, maxLabelsSizeBytes)
 	}
 	return nil
 }
