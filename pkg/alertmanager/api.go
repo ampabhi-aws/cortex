@@ -261,6 +261,20 @@ func validateUserConfig(logger log.Logger, cfg alertspb.AlertConfigDesc, limits 
 
 func (am *MultitenantAlertmanager) ListAllConfigs(w http.ResponseWriter, r *http.Request) {
 	logger := util_log.WithContext(r.Context(), am.logger)
+
+	// ListAllConfigs is an operator/admin endpoint that returns every tenant's
+	// Alertmanager configuration (including inline third-party secrets stored in
+	// RawConfig and template bodies). It must never be exposed to tenant traffic.
+	// Require a tenant/OrgID to be present in the request context so that the
+	// upstream AuthMiddleware (or an operator-fronting reverse proxy) is in the
+	// request path; a missing OrgID means the route was reached without going
+	// through the authn/authz layer and the request is rejected.
+	if _, err := tenant.TenantID(r.Context()); err != nil {
+		level.Warn(logger).Log("msg", errNoOrgID, "err", err.Error())
+		http.Error(w, fmt.Sprintf("%s: %s", errNoOrgID, err.Error()), http.StatusUnauthorized)
+		return
+	}
+
 	userIDs, err := am.store.ListAllUsers(r.Context())
 	if err != nil {
 		level.Error(logger).Log("msg", "failed to list users of alertmanager", "err", err)

@@ -682,6 +682,9 @@ receivers:
 	router := mux.NewRouter()
 	router.Path("/multitenant_alertmanager/configs").Methods(http.MethodGet).HandlerFunc(am.ListAllConfigs)
 	req := httptest.NewRequest("GET", "https://localhost:8080/multitenant_alertmanager/configs", nil)
+	// ListAllConfigs now requires an OrgID in the request context (set by the
+	// AuthMiddleware when the route is reached through the authenticated path).
+	req = req.WithContext(user.InjectOrgID(req.Context(), "admin"))
 	w := httptest.NewRecorder()
 	router.ServeHTTP(w, req)
 
@@ -693,6 +696,13 @@ receivers:
 	old, err := yaml.Marshal(testCases)
 	require.NoError(t, err)
 	require.YAMLEq(t, string(old), string(body))
+
+	// A request without an OrgID (i.e. one that did not go through the
+	// AuthMiddleware) must be rejected to avoid leaking every tenant's config.
+	reqUnauth := httptest.NewRequest("GET", "https://localhost:8080/multitenant_alertmanager/configs", nil)
+	wUnauth := httptest.NewRecorder()
+	router.ServeHTTP(wUnauth, reqUnauth)
+	require.Equal(t, http.StatusUnauthorized, wUnauth.Result().StatusCode)
 }
 
 func TestValidateAlertmanagerConfig(t *testing.T) {
