@@ -2,6 +2,7 @@
 
 ## master / unreleased
 
+* [CHANGE] Alertmanager: `-alertmanager.receivers-firewall-block-private-addresses` now defaults to `true` so that private, loopback, link-local and RFC 4193 addresses are blocked for tenant-authored receiver integrations by default. This closes a server-side request forgery (SSRF) gateway when the Alertmanager tenant config API is enabled. Operators of trusted single-tenant installs where receivers must reach internal addresses need to explicitly set this flag (or the per-tenant override `alertmanager_receivers_firewall_block_private_addresses`) to `false`.
   **This release removes support for chunks storage. See below for more.**
 * [CHANGE] Remove support for chunks storage entirely. If you are using chunks storage on a previous version, you must [migrate your data](https://github.com/cortexproject/cortex/blob/v1.11.1/docs/blocks-storage/migrate-from-chunks-to-blocks.md) on version 1.12 or earlier. Before upgrading to this release, you should also remove any deprecated chunks-related configuration, as this release will no longer accept that. The following flags are gone:
   - `-dynamodb.*`
