@@ -553,6 +553,12 @@ func (d *Distributor) Push(ctx context.Context, req *cortexpb.WriteRequest) (*co
 	if err != nil {
 		return nil, err
 	}
+	// Defence in depth: reject an empty tenant ID. The tenant resolver already
+	// rejects empty tenant IDs; this guard mirrors the ones in
+	// pkg/storegateway/bucket_stores.go and pkg/ruler/api.go.
+	if userID == "" {
+		return nil, httpgrpc.Errorf(http.StatusBadRequest, "empty tenant ID")
+	}
 
 	// We will report *this* request in the error too.
 	inflight := d.inflightPushRequests.Inc()
