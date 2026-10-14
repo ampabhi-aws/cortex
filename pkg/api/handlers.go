@@ -4,6 +4,7 @@ import (
 	"context"
 	"html/template"
 	"net/http"
+	"net/url"
 	"path"
 	"sync"
 
@@ -142,13 +143,89 @@ func DefaultConfigHandler(actualCfg interface{}, defaultCfg interface{}) http.Ha
 			output = diff
 
 		case "defaults":
-			output = defaultCfg
+			defaultCfgObj, err := util.YAMLMarshalUnmarshal(defaultCfg)
+			if err != nil {
+				http.Error(w, err.Error(), http.StatusInternalServerError)
+				return
+			}
+			output = defaultCfgObj
 		default:
-			output = actualCfg
+			actualCfgObj, err := util.YAMLMarshalUnmarshal(actualCfg)
+			if err != nil {
+				http.Error(w, err.Error(), http.StatusInternalServerError)
+				return
+			}
+			output = actualCfgObj
+		}
+
+		// Scrub any secrets that are not already handled by the type-based
+		// flagext.Secret redaction (e.g. URL-shaped options that can embed
+		// userinfo credentials) before serving the response.
+		if m, ok := output.(map[interface{}]interface{}); ok {
+			redactConfigURLs(m)
 		}
 
 		util.WriteYAMLResponse(w, output)
 	}
+}
+
+// urlFieldsToRedact is an allowlist of YAML field names whose string values
+// may contain a URL with embedded userinfo credentials (user:password@host).
+// Any such userinfo is stripped before the /config endpoint serializes the
+// value so that credentials pasted into these fields are not leaked.
+var urlFieldsToRedact = map[string]struct{}{
+	"uri":              {}, // configs.database.uri
+	"alertmanager_url": {}, // ruler.alertmanager_url
+}
+
+// redactConfigURLs walks the YAML-unmarshalled config tree and strips any
+// embedded userinfo from values whose keys are in urlFieldsToRedact.
+func redactConfigURLs(node map[interface{}]interface{}) {
+	for k, v := range node {
+		switch value := v.(type) {
+		case map[interface{}]interface{}:
+			redactConfigURLs(value)
+		case []interface{}:
+			for _, item := range value {
+				if child, ok := item.(map[interface{}]interface{}); ok {
+					redactConfigURLs(child)
+				}
+			}
+		case string:
+			keyStr, ok := k.(string)
+			if !ok {
+				continue
+			}
+			if _, redact := urlFieldsToRedact[keyStr]; !redact {
+				continue
+			}
+			node[k] = stripURLUserinfo(value)
+		}
+	}
+}
+
+// stripURLUserinfo removes any userinfo (user:password) from a URL string.
+// If the input is empty, is not a parseable URL, or has no userinfo, it is
+// returned unchanged (with the password masked if one was present but the
+// URL could not be re-serialized).
+func stripURLUserinfo(raw string) string {
+	if raw == "" {
+		return raw
+	}
+	u, err := url.Parse(raw)
+	if err != nil || u.User == nil {
+		return raw
+	}
+	if _, hasPassword := u.User.Password(); !hasPassword && u.User.Username() == "" {
+		return raw
+	}
+	// Preserve the username (not sensitive on its own) but drop the password.
+	if username := u.User.Username(); username != "" {
+		u.User = url.User(username)
+	} else {
+		u.User = nil
+	}
+	return u.String()
 }
 
 // NewQuerierHandler returns a HTTP handler that can be used by the querier service to
