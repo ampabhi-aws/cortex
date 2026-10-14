@@ -132,6 +132,14 @@ func TestConfig_Validate(t *testing.T) {
 			initLimits: func(_ *validation.Limits) {},
 			expected:   errInvalidTenantShardSize.Error(),
 		},
+		"should fail with shuffle sharding strategy but sharding disabled": {
+			setup: func(cfg *Config) {
+				cfg.ShardingStrategy = util.ShardingStrategyShuffle
+				cfg.ShardingEnabled = false
+			},
+			initLimits: func(_ *validation.Limits) {},
+			expected:   errShuffleShardingRequiresShard.Error(),
+		},
 	}
 
 	for testName, testData := range tests {
