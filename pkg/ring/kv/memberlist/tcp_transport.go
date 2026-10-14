@@ -235,6 +235,14 @@ func (t *TCPTransport) debugLog() log.Logger {
 	return noopLogger
 }
 
+// maxPacketSize is a hard upper bound (in bytes) on the amount of data the
+// TCP transport will accept from a single inbound "packet"-type connection
+// before handing it to memberlist. It must be large enough for the biggest
+// legitimate gossip packet (which is bounded by UDPBufferSize elsewhere in
+// this package) and small enough that an attacker on the gossip port cannot
+// force an unbounded io.ReadAll allocation.
+const maxPacketSize = 10 * 1024 * 1024
+
 func (t *TCPTransport) handleConnection(conn net.Conn) {
 	t.debugLog().Log("msg", "New connection", "addr", conn.RemoteAddr())
 
@@ -280,11 +288,19 @@ func (t *TCPTransport) handleConnection(conn net.Conn) {
 			return
 		}
 
-		// read the rest to buffer -- this is the "packet" itself
-		buf, err := io.ReadAll(conn)
+		// read the rest to buffer -- this is the "packet" itself.
+		// Cap the amount of data we are willing to read into memory to prevent
+		// an attacker from forcing the process to allocate an arbitrary amount
+		// of RAM via a single very large (or unbounded) connection.
+		buf, err := io.ReadAll(io.LimitReader(conn, int64(maxPacketSize)+1))
 		if err != nil {
 			t.receivedPacketsErrors.Inc()
 			level.Warn(t.logger).Log("msg", "error while reading packet data", "err", err, "remote", conn.RemoteAddr())
+			return
+		}
+		if len(buf) > maxPacketSize {
+			t.receivedPacketsErrors.Inc()
+			level.Warn(t.logger).Log("msg", "received packet exceeds maximum allowed size; dropping", "size", len(buf), "max", maxPacketSize, "remote", conn.RemoteAddr())
 			return
 		}
 

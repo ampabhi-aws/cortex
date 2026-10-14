@@ -949,6 +949,15 @@ func (m *KV) broadcastNewValue(key string, change Mergeable, version uint, codec
 	m.queueBroadcast(key, change.MergeContent(), version, pairData)
 }
 
+// maxMessageSize is a defensive upper bound (in bytes) applied to raw inbound
+// gossip messages (NotifyMsg) and raw inbound push/pull KV pair values
+// (MergeRemoteState) before they are handed to a codec. Messages larger than
+// this are rejected without decoding, which protects codecs such as Proto/snappy
+// from decompression-bomb inputs supplied by unauthenticated peers. The value
+// matches the memberlist UDPBufferSize configured in buildMemberlistConfig,
+// which caps legitimate per-packet sizes anyway.
+const maxMessageSize = 10 * 1024 * 1024
+
 // NodeMeta is method from Memberlist Delegate interface
 func (m *KV) NodeMeta(limit int) []byte {
 	// we can send local state from here (512 bytes only)
@@ -963,6 +972,12 @@ func (m *KV) NotifyMsg(msg []byte) {
 
 	m.numberOfReceivedMessages.Inc()
 	m.totalSizeOfReceivedMessages.Add(float64(len(msg)))
+
+	if len(msg) > maxMessageSize {
+		level.Warn(m.logger).Log("msg", "received gossip message exceeds maximum allowed size; dropping", "size", len(msg), "max", maxMessageSize)
+		m.numberOfInvalidReceivedMessages.Inc()
+		return
+	}
 
 	kvPair := KeyValuePair{}
 	err := kvPair.Unmarshal(msg)
@@ -1122,6 +1137,11 @@ func (m *KV) MergeRemoteState(data []byte, join bool) {
 	m.numberOfPushes.Inc()
 	m.totalSizeOfPushes.Add(float64(len(data)))
 
+	if len(data) > maxMessageSize {
+		level.Warn(m.logger).Log("msg", "received push/pull state exceeds maximum allowed size; dropping", "size", len(data), "max", maxMessageSize)
+		return
+	}
+
 	kvPair := KeyValuePair{}
 
 	var err error
@@ -1187,6 +1207,9 @@ func (m *KV) MergeRemoteState(data []byte, join bool) {
 }
 
 func (m *KV) mergeBytesValueForKey(key string, incomingData []byte, codec codec.Codec) (Mergeable, uint, error) {
+	if len(incomingData) > maxMessageSize {
+		return nil, 0, fmt.Errorf("KV pair value size %d exceeds maximum allowed size %d", len(incomingData), maxMessageSize)
+	}
 	decodedValue, err := codec.Decode(incomingData)
 	if err != nil {
 		return nil, 0, fmt.Errorf("failed to decode value: %v", err)
