@@ -31,7 +31,33 @@ const (
 	// StatusClientClosedRequest is the status code for when a client request cancellation of an http request
 	StatusClientClosedRequest = 499
 	ServiceTimingHeaderName   = "Server-Timing"
+
+	// maxBodySizeForQueryStringParsing bounds how much of a buffered request
+	// body parseRequestQueryString will hand to r.ParseForm(). Beyond this
+	// size the body is skipped so that a large but still -frontend.max-body-size
+	// compliant request cannot force the frontend to materialise a huge
+	// url.Values map purely for logging.
+	maxBodySizeForQueryStringParsing = 64 * 1024
+
+	// maxLoggedQueryStringValueLength bounds the length of a single parameter
+	// value included in the stats/slow-query log line. Longer values are
+	// truncated and a `param_<name>_truncated=true` field is emitted.
+	maxLoggedQueryStringValueLength = 1024
 )
+
+// loggedQueryStringParams is the allow-list of request parameters whose names
+// and (truncated) values are safe and useful to include in the stats /
+// slow-query log record. Everything outside the allow-list is counted but not
+// echoed back into the operator log stream.
+var loggedQueryStringParams = map[string]struct{}{
+	"query":   {},
+	"start":   {},
+	"end":     {},
+	"step":    {},
+	"time":    {},
+	"timeout": {},
+	"match[]": {},
+}
 
 var (
 	errCanceled              = httpgrpc.Errorf(StatusClientClosedRequest, context.Canceled.Error())
@@ -219,6 +245,22 @@ func (f *Handler) reportQueryStats(r *http.Request, queryString url.Values, quer
 }
 
 func (f *Handler) parseRequestQueryString(r *http.Request, bodyBuf bytes.Buffer) url.Values {
+	// Skip parsing of large buffered bodies: ParseForm would otherwise
+	// materialise a url.Values map proportional to the body size (and the
+	// number of parameters it contains) purely to produce one log line, which
+	// an authenticated tenant could abuse to amplify a single request into
+	// hundreds of MB of transient heap on the shared query-frontend. The URL
+	// query string is still parsed below via r.URL.Query() so GET parameters
+	// (query, start, end, ...) are preserved for logging.
+	if int64(bodyBuf.Len()) > maxBodySizeForQueryStringParsing {
+		level.Info(util_log.WithContext(r.Context(), f.log)).Log(
+			"msg", "request body too large to parse for query stats logging; logging URL query parameters only",
+			"body_size", bodyBuf.Len(),
+			"max_body_size_for_logging", maxBodySizeForQueryStringParsing,
+		)
+		return r.URL.Query()
+	}
+
 	// Use previously buffered body.
 	r.Body = io.NopCloser(&bodyBuf)
 
@@ -232,10 +274,32 @@ func (f *Handler) parseRequestQueryString(r *http.Request, bodyBuf bytes.Buffer)
 	return r.Form
 }
 
+// formatQueryString turns a url.Values set into a bounded set of log fields.
+// Only parameters on the allow-list are echoed verbatim (with each value
+// truncated to maxLoggedQueryStringValueLength); every parameter is still
+// counted via param_count so operators can see when a client is sending
+// unexpectedly large/odd requests without the log record itself growing
+// unboundedly with attacker-controlled content.
 func formatQueryString(queryString url.Values) (fields []interface{}) {
-	for k, v := range queryString {
-		fields = append(fields, fmt.Sprintf("param_%s", k), strings.Join(v, ","))
+	if len(queryString) == 0 {
+		return nil
 	}
+	for k, v := range queryString {
+		if _, ok := loggedQueryStringParams[k]; !ok {
+			continue
+		}
+		joined := strings.Join(v, ",")
+		truncated := false
+		if len(joined) > maxLoggedQueryStringValueLength {
+			joined = joined[:maxLoggedQueryStringValueLength]
+			truncated = true
+		}
+		fields = append(fields, fmt.Sprintf("param_%s", k), joined)
+		if truncated {
+			fields = append(fields, fmt.Sprintf("param_%s_truncated", k), true)
+		}
+	}
+	fields = append(fields, "param_count", len(queryString))
 	return fields
 }
 
