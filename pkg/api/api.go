@@ -8,7 +8,6 @@ import (
 	"strings"
 
 	"github.com/NYTimes/gziphandler"
-	"github.com/felixge/fgprof"
 	"github.com/go-kit/log"
 	"github.com/go-kit/log/level"
 	"github.com/prometheus/prometheus/storage"
@@ -219,7 +218,13 @@ func (a *API) RegisterAPI(httpPathPrefix string, actualCfg interface{}, defaultC
 
 	a.RegisterRoute("/config", a.cfg.configHandler(actualCfg, defaultCfg), false, "GET")
 	a.RegisterRoute("/", indexHandler(httpPathPrefix, a.indexPage), false, "GET")
-	a.RegisterRoute("/debug/fgprof", fgprof.Handler(), false, "GET")
+	// /debug/fgprof runs a 99 Hz stop-the-world runtime.GoroutineProfile
+	// sampler for the caller-supplied duration. Register it behind the auth
+	// middleware (auth=true) so it is not reachable without the tenant
+	// identification required for every other authenticated route, and wrap
+	// it in fgprofHandler which clamps the `seconds` parameter, serializes
+	// concurrent profiles, and enforces an http.TimeoutHandler deadline.
+	a.RegisterRoute("/debug/fgprof", fgprofHandler(), true, "GET")
 }
 
 // RegisterRuntimeConfig registers the endpoints associates with the runtime configuration
