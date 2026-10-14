@@ -44,21 +44,35 @@ func (s *UsersScanner) ScanUsers(ctx context.Context) (users, markedForDeletion 
 
 	// Check users for being owned by instance, and split users into non-deleted and deleted.
 	// We do these checks after listing all users, to improve cacheability of Iter (result is only cached at the end of Iter call).
+	//
+	// Both the ownership check and the tenant-deletion-mark check fail closed: if the check
+	// returns an error we drop the user from the returned lists for this scan. This matches
+	// the behaviour of the compaction path (see compactor.compactUsers) and prevents the
+	// blocks cleaner from concurrently mutating shared per-tenant state (bucket index,
+	// deletion markers) on every replica while e.g. the compactor ring/KV store is unstable.
 	for ix := 0; ix < len(users); {
 		userID := users[ix]
 
-		// Check if it's owned by this instance.
+		// Check if it's owned by this instance. Treat a check error as "not owned" so we
+		// never process a tenant whose ownership we could not verify.
 		owned, err := s.isOwned(userID)
 		if err != nil {
-			level.Warn(s.logger).Log("msg", "unable to check if user is owned by this shard", "user", userID, "err", err)
+			level.Warn(s.logger).Log("msg", "unable to check if user is owned by this shard, skipping", "user", userID, "err", err)
+			users = append(users[:ix], users[ix+1:]...)
+			continue
 		} else if !owned {
 			users = append(users[:ix], users[ix+1:]...)
 			continue
 		}
 
+		// Check if the tenant is marked for deletion. Treat a check error as "unknown state"
+		// and skip the tenant so we never silently clean a tenant whose deletion state we
+		// could not determine.
 		deletionMarkExists, err := TenantDeletionMarkExists(ctx, s.bucketClient, userID)
 		if err != nil {
-			level.Warn(s.logger).Log("msg", "unable to check if user is marked for deletion", "user", userID, "err", err)
+			level.Warn(s.logger).Log("msg", "unable to check if user is marked for deletion, skipping", "user", userID, "err", err)
+			users = append(users[:ix], users[ix+1:]...)
+			continue
 		} else if deletionMarkExists {
 			users = append(users[:ix], users[ix+1:]...)
 			markedForDeletion = append(markedForDeletion, userID)
