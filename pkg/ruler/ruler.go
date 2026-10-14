@@ -141,6 +141,37 @@ func (cfg *Config) Validate(limits validation.Limits, log log.Logger) error {
 	return nil
 }
 
+// MarshalYAML implements yaml.Marshaler so that credentials embedded in
+// AlertmanagerURL (as userinfo) are redacted when the running config is
+// serialised (for example by the /config endpoint).
+func (cfg Config) MarshalYAML() (interface{}, error) {
+	type plain Config
+	out := plain(cfg)
+	out.AlertmanagerURL = redactAlertmanagerURLCredentials(cfg.AlertmanagerURL)
+	return out, nil
+}
+
+// redactAlertmanagerURLCredentials masks the password component of every URL
+// in a comma-separated AlertmanagerURL list, preserving everything else so
+// that the YAML output remains parseable and informative.
+func redactAlertmanagerURLCredentials(raw string) string {
+	if raw == "" {
+		return raw
+	}
+	parts := strings.Split(raw, ",")
+	for i, p := range parts {
+		u, err := url.Parse(p)
+		if err != nil || u.User == nil {
+			continue
+		}
+		if _, hasPassword := u.User.Password(); hasPassword {
+			u.User = url.UserPassword(u.User.Username(), "********")
+			parts[i] = u.String()
+		}
+	}
+	return strings.Join(parts, ",")
+}
+
 // RegisterFlags adds the flags required to config this to the given FlagSet
 func (cfg *Config) RegisterFlags(f *flag.FlagSet) {
 	cfg.ClientTLSConfig.RegisterFlagsWithPrefix("ruler.client", f)
