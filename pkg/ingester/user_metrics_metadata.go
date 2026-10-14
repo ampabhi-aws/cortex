@@ -85,10 +85,15 @@ func (mm *userMetricsMetadata) purge(deadline time.Time) {
 func (mm *userMetricsMetadata) toClientMetadata() []*cortexpb.MetricMetadata {
 	mm.mtx.RLock()
 	defer mm.mtx.RUnlock()
-	r := make([]*cortexpb.MetricMetadata, 0, len(mm.metricToMetadata))
+	totalEntries := 0
+	for _, set := range mm.metricToMetadata {
+		totalEntries += len(set)
+	}
+	r := make([]*cortexpb.MetricMetadata, 0, totalEntries)
 	for _, set := range mm.metricToMetadata {
 		for m := range set {
-			r = append(r, &m)
+			md := m
+			r = append(r, &md)
 		}
 	}
 	return r
