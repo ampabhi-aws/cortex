@@ -264,21 +264,30 @@ type ConfigsView struct {
 }
 
 func (a *API) getConfigs(w http.ResponseWriter, r *http.Request) {
+	userID, _, err := tenant.ExtractTenantIDFromHTTPRequest(r)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusUnauthorized)
+		return
+	}
 	var cfgs map[string]userconfig.View
 	var cfgErr error
 	logger := util_log.WithContext(r.Context(), util_log.Logger)
+	var since userconfig.ID
 	rawSince := r.FormValue("since")
-	if rawSince == "" {
-		cfgs, cfgErr = a.db.GetAllConfigs(r.Context())
-	} else {
-		since, err := strconv.ParseUint(rawSince, 10, 0)
+	if rawSince != "" {
+		parsed, err := strconv.ParseUint(rawSince, 10, 0)
 		if err != nil {
 			level.Info(logger).Log("msg", "invalid config ID", "err", err)
 			http.Error(w, err.Error(), http.StatusBadRequest)
 			return
 		}
-		cfgs, cfgErr = a.db.GetConfigs(r.Context(), userconfig.ID(since))
+		since = userconfig.ID(parsed)
 	}
+	// Scope the query to the authenticated tenant. The DB method includes
+	// an owner_id predicate, so this request can only ever observe its own
+	// configuration — never another tenant's rules, templates, or
+	// Alertmanager YAML (which embeds notification credentials).
+	cfgs, cfgErr = a.db.GetConfigsForUser(r.Context(), userID, since)
 
 	if cfgErr != nil {
 		// XXX: Untested

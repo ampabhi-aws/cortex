@@ -16,6 +16,7 @@ import (
 	"github.com/prometheus/client_golang/prometheus/promauto"
 	"github.com/prometheus/common/version"
 	"github.com/weaveworks/common/instrument"
+	"github.com/weaveworks/common/user"
 
 	"github.com/cortexproject/cortex/pkg/configs/userconfig"
 	"github.com/cortexproject/cortex/pkg/util/flagext"
@@ -98,7 +99,7 @@ func (c ConfigDBClient) GetRules(ctx context.Context, since userconfig.ID) (map[
 	var response *ConfigsResponse
 	err := instrument.CollectedRequest(ctx, "GetRules", configsRequestDuration, instrument.ErrorCode, func(ctx context.Context) error {
 		var err error
-		response, err = doRequest(endpoint, c.Timeout, c.TLSConfig, since)
+		response, err = doRequest(ctx, endpoint, c.Timeout, c.TLSConfig, since)
 		return err
 	})
 	if err != nil {
@@ -124,13 +125,13 @@ func (c ConfigDBClient) GetAlerts(ctx context.Context, since userconfig.ID) (*Co
 	var response *ConfigsResponse
 	err := instrument.CollectedRequest(ctx, "GetAlerts", configsRequestDuration, instrument.ErrorCode, func(ctx context.Context) error {
 		var err error
-		response, err = doRequest(endpoint, c.Timeout, c.TLSConfig, since)
+		response, err = doRequest(ctx, endpoint, c.Timeout, c.TLSConfig, since)
 		return err
 	})
 	return response, err
 }
 
-func doRequest(endpoint string, timeout time.Duration, tlsConfig *tls.Config, since userconfig.ID) (*ConfigsResponse, error) {
+func doRequest(ctx context.Context, endpoint string, timeout time.Duration, tlsConfig *tls.Config, since userconfig.ID) (*ConfigsResponse, error) {
 	req, err := http.NewRequest("GET", endpoint, nil)
 	if err != nil {
 		return nil, err
@@ -142,6 +143,14 @@ func doRequest(endpoint string, timeout time.Duration, tlsConfig *tls.Config, si
 	}
 
 	req.Header.Set("User-Agent", fmt.Sprintf("Cortex/%s", version.Version))
+
+	// Propagate the tenant ID from the caller's context onto the HTTP
+	// request so the configs service can scope the response to a single
+	// tenant. The /private endpoints now require this header; without it
+	// the server returns 401 instead of leaking cross-tenant data.
+	if err := user.InjectOrgIDIntoHTTPRequest(ctx, req); err != nil {
+		return nil, err
+	}
 
 	resp, err := client.Do(req)
 	if err != nil {

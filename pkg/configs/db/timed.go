@@ -65,6 +65,17 @@ func (t timed) GetConfigs(ctx context.Context, since userconfig.ID) (map[string]
 	return cfgs, err
 }
 
+func (t timed) GetConfigsForUser(ctx context.Context, userID string, since userconfig.ID) (map[string]userconfig.View, error) {
+	var cfgs map[string]userconfig.View
+	err := instrument.CollectedRequest(ctx, "DB.GetConfigsForUser", databaseRequestDuration, instrument.ErrorCode, func(ctx context.Context) error {
+		var err error
+		cfgs, err = t.d.GetConfigsForUser(ctx, userID, since)
+		return err
+	})
+
+	return cfgs, err
+}
+
 func (t timed) DeactivateConfig(ctx context.Context, userID string) error {
 	return instrument.CollectedRequest(ctx, "DB.DeactivateConfig", databaseRequestDuration, instrument.ErrorCode, func(ctx context.Context) error {
 		return t.d.DeactivateConfig(ctx, userID)

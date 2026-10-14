@@ -58,6 +58,18 @@ func (d *DB) GetConfigs(ctx context.Context, since userconfig.ID) (map[string]us
 	return cfgs, nil
 }
 
+// GetConfigsForUser gets the latest config for the given userID that has
+// changed since the provided config ID. The returned map contains at most
+// one entry (keyed by userID); it never returns configs belonging to other
+// users.
+func (d *DB) GetConfigsForUser(ctx context.Context, userID string, since userconfig.ID) (map[string]userconfig.View, error) {
+	cfgs := map[string]userconfig.View{}
+	if c, ok := d.cfgs[userID]; ok && c.ID > since {
+		cfgs[userID] = c
+	}
+	return cfgs, nil
+}
+
 // SetDeletedAtConfig sets a deletedAt for configuration
 // by adding a single new row with deleted_at set
 // the same as SetConfig is actually insert
