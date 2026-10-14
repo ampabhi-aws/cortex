@@ -2,6 +2,7 @@ package push
 
 import (
 	"context"
+	"fmt"
 	"net/http"
 
 	"github.com/go-kit/log/level"
@@ -48,9 +49,34 @@ func Handler(maxRecvMsgSize int, sourceIPs *middleware.SourceIPExtractor, push F
 				return
 			}
 			if resp.GetCode() != 202 {
-				level.Error(logger).Log("msg", "push error", "err", err)
+				// Error bodies on this path include attacker-controlled validation
+				// messages (e.g. rendered label sets). Truncate what we log so a
+				// single malformed push can't write ~100 MiB per request into the
+				// operator's logging pipeline.
+				level.Error(logger).Log("msg", "push error", "err", truncateErrorForLog(err))
 			}
 			http.Error(w, string(resp.Body), int(resp.Code))
 		}
 	})
+}
+
+// maxErrorLogBodyLen bounds the number of bytes of an attacker-influenced error
+// message that we are willing to copy into the process log. 1 KiB is more than
+// enough to retain the diagnostic prefix (status code, validation reason,
+// bounded label set) that validation errors emit.
+const maxErrorLogBodyLen = 1024
+
+// truncateErrorForLog returns an error whose Error() string is capped at
+// maxErrorLogBodyLen bytes, suitable for logging without copying a large
+// attacker-controlled message into log storage. The original error is left
+// intact for the HTTP response and the gRPC status.
+func truncateErrorForLog(err error) error {
+	if err == nil {
+		return nil
+	}
+	msg := err.Error()
+	if len(msg) <= maxErrorLogBodyLen {
+		return err
+	}
+	return fmt.Errorf("%s... (truncated, original length: %d)", msg[:maxErrorLogBodyLen], len(msg))
 }
