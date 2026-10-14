@@ -53,8 +53,13 @@ type Resolver interface {
 }
 
 // NewSingleResolver creates a tenant resolver, which restricts all requests to
-// be using a single tenant only. This allows a wider set of characters to be
-// used within the tenant ID and should not impose a breaking change.
+// be using a single tenant only. The accepted tenant ID is validated against
+// the documented tenant-ID naming contract (see
+// https://cortexmetrics.io/docs/guides/limitations/#tenant-id-naming): a
+// 150-byte charset-restricted identifier that forbids path-traversal segments
+// and the empty string. The same validation routine is also applied to each
+// ID produced by MultiResolver so that downstream code only ever observes a
+// well-formed tenant ID.
 func NewSingleResolver() *SingleResolver {
 	return &SingleResolver{}
 }
@@ -74,7 +79,29 @@ func containsUnsafePathSegments(id string) bool {
 	return strings.ContainsAny(id, "\\/")
 }
 
-var errInvalidTenantID = errors.New("invalid tenant ID")
+var (
+	errInvalidTenantID = errors.New("invalid tenant ID")
+	errEmptyTenantID   = errors.New("empty tenant ID")
+)
+
+// checkTenantID validates a single tenant ID against the documented tenant-ID
+// contract (charset allowlist + 150-byte length limit) and additionally
+// rejects path-traversal segments and the empty string. It is the single
+// validation routine used by both SingleResolver and MultiResolver so that
+// every tenant ID that reaches the rest of Cortex is known to conform to the
+// documented naming rules at https://cortexmetrics.io/docs/guides/limitations/#tenant-id-naming
+func checkTenantID(id string) error {
+	if id == "" {
+		return errEmptyTenantID
+	}
+	if err := ValidTenantID(id); err != nil {
+		return err
+	}
+	if containsUnsafePathSegments(id) {
+		return errInvalidTenantID
+	}
+	return nil
+}
 
 func (t *SingleResolver) TenantID(ctx context.Context) (string, error) {
 	//lint:ignore faillint wrapper around upstream method
@@ -83,8 +110,8 @@ func (t *SingleResolver) TenantID(ctx context.Context) (string, error) {
 		return "", err
 	}
 
-	if containsUnsafePathSegments(id) {
-		return "", errInvalidTenantID
+	if err := checkTenantID(id); err != nil {
+		return "", err
 	}
 
 	return id, nil
@@ -131,11 +158,8 @@ func (t *MultiResolver) TenantIDs(ctx context.Context) ([]string, error) {
 
 	orgIDs := strings.Split(orgID, tenantIDsLabelSeparator)
 	for _, orgID := range orgIDs {
-		if err := ValidTenantID(orgID); err != nil {
+		if err := checkTenantID(orgID); err != nil {
 			return nil, err
-		}
-		if containsUnsafePathSegments(orgID) {
-			return nil, errInvalidTenantID
 		}
 	}
 
