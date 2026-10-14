@@ -37,6 +37,14 @@ const (
 	errTemplateTooBig        = "template %s is too big: %d bytes (limit: %d bytes)"
 
 	fetchConcurrency = 16
+
+	// defaultMaxConfigSizeBytes is the hard ceiling applied to the uploaded
+	// Alertmanager configuration body when no per-tenant override is set.
+	// It mirrors the house pattern of pkg/alertmanager/distributor.go and
+	// pkg/frontend/transport/handler.go which bound untrusted bodies
+	// unconditionally. Per-tenant AlertmanagerMaxConfigSize can lower or
+	// raise this ceiling via the limits override.
+	defaultMaxConfigSizeBytes = 16 * 1024 * 1024 // 16 MiB
 )
 
 var (
@@ -100,24 +108,34 @@ func (am *MultitenantAlertmanager) SetUserConfig(w http.ResponseWriter, r *http.
 		return
 	}
 
-	var input io.Reader
+	// Always bound the request body to prevent a single tenant from forcing
+	// unbounded heap allocation (and OOMing the shared multi-tenant process).
+	// The per-tenant AlertmanagerMaxConfigSize override, when set to a
+	// positive value, lowers or raises the ceiling; otherwise the built-in
+	// defaultMaxConfigSizeBytes applies.
 	maxConfigSize := am.limits.AlertmanagerMaxConfigSize(userID)
-	if maxConfigSize > 0 {
-		// LimitReader will return EOF after reading specified number of bytes. To check if
-		// we have read too many bytes, allow one extra byte.
-		input = io.LimitReader(r.Body, int64(maxConfigSize)+1)
-	} else {
-		input = r.Body
+	if maxConfigSize <= 0 {
+		maxConfigSize = defaultMaxConfigSizeBytes
 	}
+	// Allow one extra byte so we can detect that the body exceeded the limit
+	// and return a clean application-level error message, consistent with
+	// the previous behavior for the per-tenant override.
+	input := http.MaxBytesReader(w, r.Body, int64(maxConfigSize)+1)
 
 	payload, err := io.ReadAll(input)
 	if err != nil {
+		if util.IsRequestBodyTooLarge(err) {
+			msg := fmt.Sprintf(errConfigurationTooBig, maxConfigSize)
+			level.Warn(logger).Log("msg", msg)
+			http.Error(w, msg, http.StatusBadRequest)
+			return
+		}
 		level.Error(logger).Log("msg", errReadingConfiguration, "err", err.Error())
 		http.Error(w, fmt.Sprintf("%s: %s", errReadingConfiguration, err.Error()), http.StatusBadRequest)
 		return
 	}
 
-	if maxConfigSize > 0 && len(payload) > maxConfigSize {
+	if len(payload) > maxConfigSize {
 		msg := fmt.Sprintf(errConfigurationTooBig, maxConfigSize)
 		level.Warn(logger).Log("msg", msg)
 		http.Error(w, msg, http.StatusBadRequest)
