@@ -822,6 +822,13 @@ func (am *MultitenantAlertmanager) setConfig(cfg alertspb.AlertConfigDesc) error
 	}
 
 	for _, tmpl := range cfg.Templates {
+		// Validate template filename at point of use: this is the second
+		// fence against writers (e.g. the deprecated configs API) that may
+		// not run validateTemplateFilename themselves.
+		if err := validateTemplateFilename(tmpl.Filename); err != nil {
+			return err
+		}
+
 		templateFilePath, err := safeTemplateFilepath(userTemplateDir, tmpl.Filename)
 		if err != nil {
 			return err
@@ -870,6 +877,19 @@ func (am *MultitenantAlertmanager) setConfig(cfg alertspb.AlertConfigDesc) error
 			// This means that if a user has a working config and
 			// they submit a broken one, the Manager will keep running the last known
 			// working configuration.
+			return fmt.Errorf("invalid Cortex configuration for %v: %v", cfg.User, err)
+		}
+	}
+
+	// Re-run the Cortex-specific validation here, at the point of use, so a
+	// config loaded from the alert store (e.g. written through the deprecated
+	// configs API, which does not enforce the `*_file` deny-list) cannot
+	// bypass the restrictions enforced by the Alertmanager /api/v1/alerts
+	// handler. If validation fails we refuse to apply the new config and keep
+	// the previous working one, mirroring the behaviour on amconfig.Load
+	// errors above.
+	if userAmConfig != nil {
+		if err := validateAlertmanagerConfig(userAmConfig); err != nil {
 			return fmt.Errorf("invalid Cortex configuration for %v: %v", cfg.User, err)
 		}
 	}
@@ -1325,8 +1345,11 @@ func safeTemplateFilepath(dir, templateName string) (string, error) {
 
 	// Ensure the actual path of the template is within the expected directory.
 	// This check is a counter-measure to make sure the tenant is not trying to
-	// escape its own directory on disk.
-	if !strings.HasPrefix(actualPath, containerDir) {
+	// escape its own directory on disk. We use filepath.Rel instead of a string
+	// prefix test so that a sibling directory sharing a prefix (e.g.
+	// "<dir>_evil") is not accepted.
+	rel, err := filepath.Rel(containerDir, actualPath)
+	if err != nil || rel == ".." || strings.HasPrefix(rel, ".."+string(os.PathSeparator)) {
 		return "", fmt.Errorf("invalid template name %q: the template filepath is escaping the per-tenant local directory", templateName)
 	}
 

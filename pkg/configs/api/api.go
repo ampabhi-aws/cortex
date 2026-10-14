@@ -20,6 +20,7 @@ import (
 	amconfig "github.com/prometheus/alertmanager/config"
 	amtemplate "github.com/prometheus/alertmanager/template"
 
+	"github.com/cortexproject/cortex/pkg/alertmanager"
 	"github.com/cortexproject/cortex/pkg/configs/db"
 	"github.com/cortexproject/cortex/pkg/configs/userconfig"
 	"github.com/cortexproject/cortex/pkg/tenant"
@@ -225,6 +226,17 @@ func (a *API) validateAlertmanagerConfig(w http.ResponseWriter, r *http.Request)
 }
 
 func validateAlertmanagerConfig(cfg string, noCfg NotificationsConfig) error {
+	// Reuse the Alertmanager package's validation so the `*_file` deny-list
+	// (password_file, bearer_token_file, credentials_file, oauth2 client_secret_file,
+	// TLS ca_file/cert_file/key_file, slack api_url_file, victorops api_key_file)
+	// and template filename fence enforced on the main /api/v1/alerts handler
+	// are also enforced on this (deprecated) write path. Without this, a tenant
+	// could bypass those restrictions by writing through POST
+	// /api/prom/configs/alertmanager when -alertmanager-storage.backend=configdb.
+	if err := alertmanager.ValidateAlertmanagerConfigYAML(cfg); err != nil {
+		return err
+	}
+
 	amCfg, err := amconfig.Load(cfg)
 	if err != nil {
 		return err
@@ -249,6 +261,12 @@ func validateRulesFiles(c userconfig.Config) error {
 
 func validateTemplateFiles(c userconfig.Config) error {
 	for fn, content := range c.TemplateFiles {
+		// Validate the map key as a template filename to ensure it is a bare
+		// basename with no path separators (prevents a tenant from writing
+		// outside the per-tenant templates directory via safeTemplateFilepath).
+		if err := alertmanager.ValidateTemplateFilename(fn); err != nil {
+			return err
+		}
 		if _, err := template.New(fn).Funcs(template.FuncMap(amtemplate.DefaultFuncs)).Parse(content); err != nil {
 			return err
 		}
