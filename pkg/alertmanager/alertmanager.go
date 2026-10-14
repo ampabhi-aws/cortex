@@ -312,6 +312,14 @@ func clusterWait(position func() int, timeout time.Duration) func() time.Duratio
 func (am *Alertmanager) ApplyConfig(userID string, conf *config.Config, rawCfg string) error {
 	templateFiles := make([]string, len(conf.Templates))
 	for i, t := range conf.Templates {
+		// Defence in depth: reject template names containing filesystem-glob
+		// metacharacters before building the on-disk path. Downstream
+		// template.FromGlobs expands its arguments with filepath.Glob /
+		// ParseGlob, so an unescaped `*`/`?`/`[`/`]` could expand into other
+		// tenants' template directories.
+		if err := validateTemplateFilename(t); err != nil {
+			return err
+		}
 		templateFilepath, err := safeTemplateFilepath(filepath.Join(am.cfg.TenantDataDir, templatesDir), t)
 		if err != nil {
 			return err
