@@ -193,6 +193,14 @@ func decompressRequest(reader io.Reader, expectedSize, maxSize int, compression 
 	return
 }
 
+// maxPreallocatedBuffer bounds the amount of memory the request parser will
+// preallocate based on the client-supplied Content-Length (expectedSize).
+// Content-Length is attacker-controlled and is not cross-checked against the
+// bytes actually delivered, so we must not use it to size an immediate heap
+// allocation. We cap the preallocation at a small constant and let
+// bytes.Buffer grow as real data is received.
+const maxPreallocatedBuffer = 64 * 1024
+
 func decompressFromReader(reader io.Reader, expectedSize, maxSize int, compression CompressionType, sp opentracing.Span) ([]byte, error) {
 	var (
 		buf  bytes.Buffer
@@ -200,7 +208,13 @@ func decompressFromReader(reader io.Reader, expectedSize, maxSize int, compressi
 		err  error
 	)
 	if expectedSize > 0 {
-		buf.Grow(expectedSize + bytes.MinRead) // extra space guarantees no reallocation
+		// Cap the preallocation to avoid attacker-controlled large heap
+		// allocations driven solely by the Content-Length header.
+		preallocate := expectedSize + bytes.MinRead
+		if preallocate > maxPreallocatedBuffer {
+			preallocate = maxPreallocatedBuffer
+		}
+		buf.Grow(preallocate)
 	}
 	// Read from LimitReader with limit max+1. So if the underlying
 	// reader is over limit, the result will be bigger than max.
