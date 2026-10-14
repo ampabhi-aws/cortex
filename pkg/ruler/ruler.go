@@ -863,6 +863,18 @@ func (r *Ruler) DeleteTenantConfiguration(w http.ResponseWriter, req *http.Reque
 func (r *Ruler) ListAllRules(w http.ResponseWriter, req *http.Request) {
 	logger := util_log.WithContext(req.Context(), r.logger)
 
+	// Require an authenticated caller for this cross-tenant dump. The route is
+	// also registered behind the auth middleware (see pkg/api/api.go), which
+	// rejects requests that do not carry an X-Scope-OrgID header. This check
+	// defends in depth: a request that reaches the handler without a tenant ID
+	// in context (e.g. if the middleware is bypassed by an operator-supplied
+	// override) is refused rather than being allowed to enumerate every
+	// tenant's rule configuration.
+	if _, err := tenant.TenantID(req.Context()); err != nil {
+		http.Error(w, err.Error(), http.StatusUnauthorized)
+		return
+	}
+
 	userIDs, err := r.store.ListAllUsers(req.Context())
 	if err != nil {
 		level.Error(logger).Log("msg", errListAllUser, "err", err)
