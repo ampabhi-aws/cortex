@@ -52,7 +52,7 @@ func TestSSEBucketClient_Upload_ShouldInjectCustomSSEConfig(t *testing.T) {
 				Region:           "test",
 				BucketName:       "test-bucket",
 				SecretAccessKey:  flagext.Secret{Value: "test"},
-				AccessKeyID:      "test",
+				AccessKeyID:      flagext.Secret{Value: "test"},
 				Insecure:         true,
 				BucketLookupType: s3.BucketPathLookup,
 			}

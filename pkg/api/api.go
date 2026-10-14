@@ -63,6 +63,13 @@ type Config struct {
 	// DefaultConfigHandler.
 	CustomConfigHandler ConfigHandler `yaml:"-"`
 
+	// When true, the /config HTTP endpoint is wrapped by the HTTP auth
+	// middleware. The default is false to preserve backwards compatibility
+	// with existing deployments. The /config handler also masks every
+	// credential-bearing field so cleartext secrets are not disclosed even
+	// when this flag is left disabled.
+	ConfigEndpointAuth bool `yaml:"config_endpoint_auth_enabled"`
+
 	// Allows and is used to configure the addition of HTTP Header fields to logs
 	HTTPRequestHeadersToLog flagext.StringSlice `yaml:"http_request_headers_to_log"`
 }
@@ -71,6 +78,7 @@ type Config struct {
 func (cfg *Config) RegisterFlags(f *flag.FlagSet) {
 	f.BoolVar(&cfg.ResponseCompression, "api.response-compression-enabled", false, "Use GZIP compression for API responses. Some endpoints serve large YAML or JSON blobs which can benefit from compression.")
 	f.Var(&cfg.HTTPRequestHeadersToLog, "api.http-request-headers-to-log", "Which HTTP Request headers to add to logs")
+	f.BoolVar(&cfg.ConfigEndpointAuth, "api.config-endpoint-auth-enabled", false, "When true, the /config HTTP endpoint is wrapped by the HTTP auth middleware. Operators should enable this if the Cortex HTTP port is reachable by untrusted clients. The handler always masks credential-bearing fields regardless of this setting.")
 	cfg.RegisterFlagsWithPrefix("", f)
 }
 
@@ -217,7 +225,7 @@ func (a *API) RegisterAPI(httpPathPrefix string, actualCfg interface{}, defaultC
 	a.indexPage.AddLink(SectionAdminEndpoints, "/config", "Current Config (including the default values)")
 	a.indexPage.AddLink(SectionAdminEndpoints, "/config?mode=diff", "Current Config (show only values that differ from the defaults)")
 
-	a.RegisterRoute("/config", a.cfg.configHandler(actualCfg, defaultCfg), false, "GET")
+	a.RegisterRoute("/config", a.cfg.configHandler(actualCfg, defaultCfg), a.cfg.ConfigEndpointAuth, "GET")
 	a.RegisterRoute("/", indexHandler(httpPathPrefix, a.indexPage), false, "GET")
 	a.RegisterRoute("/debug/fgprof", fgprof.Handler(), false, "GET")
 }
