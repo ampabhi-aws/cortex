@@ -33,8 +33,12 @@ func GetParentSpanForRequest(tracer opentracing.Tracer, req *httpgrpc.HTTPReques
 
 	carrier := (*HttpgrpcHeadersCarrier)(req)
 	extracted, err := tracer.Extract(opentracing.HTTPHeaders, carrier)
-	if err == opentracing.ErrSpanContextNotFound {
-		err = nil
+	if err != nil {
+		// Treat any extraction failure (missing context, malformed/corrupt tracing
+		// headers, etc.) as "no parent span" rather than propagating the error.
+		// A tenant-controlled header such as a malformed Uber-Trace-Id must not
+		// be able to turn a benign request into a scheduler-side error.
+		return nil, nil
 	}
-	return extracted, err
+	return extracted, nil
 }

@@ -184,6 +184,13 @@ func (w *frontendSchedulerWorker) start() {
 		w.wg.Add(1)
 		go func() {
 			defer w.wg.Done()
+			defer func() {
+				// Recover from any panic in the worker goroutine so a single malformed
+				// scheduler response cannot terminate the query-frontend process.
+				if r := recover(); r != nil {
+					level.Error(w.log).Log("msg", "recovered from panic in scheduler worker goroutine", "panic", r, "addr", w.schedulerAddr)
+				}
+			}()
 			w.runOne(w.ctx, client)
 		}()
 	}
@@ -291,7 +298,7 @@ func (w *frontendSchedulerWorker) schedulerLoop(loop schedulerpb.SchedulerForFro
 				req.response <- &frontendv2pb.QueryResultRequest{
 					HttpResponse: &httpgrpc.HTTPResponse{
 						Code: http.StatusInternalServerError,
-						Body: []byte(err.Error()),
+						Body: []byte(resp.Error),
 					},
 				}
 
