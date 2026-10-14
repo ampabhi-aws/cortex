@@ -682,6 +682,14 @@ receivers:
 	router := mux.NewRouter()
 	router.Path("/multitenant_alertmanager/configs").Methods(http.MethodGet).HandlerFunc(am.ListAllConfigs)
 	req := httptest.NewRequest("GET", "https://localhost:8080/multitenant_alertmanager/configs", nil)
+	// Unauthenticated callers must be rejected: this endpoint streams every tenant's
+	// Alertmanager configuration (including inline notification secrets).
+	{
+		unauthRec := httptest.NewRecorder()
+		router.ServeHTTP(unauthRec, req)
+		require.Equal(t, http.StatusUnauthorized, unauthRec.Result().StatusCode)
+	}
+	req = req.WithContext(user.InjectOrgID(req.Context(), "test_admin"))
 	w := httptest.NewRecorder()
 	router.ServeHTTP(w, req)
 
