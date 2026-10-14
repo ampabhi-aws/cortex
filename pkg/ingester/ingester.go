@@ -516,6 +516,12 @@ type TSDBState struct {
 	forceCompactTrigger chan requestWithUsersAndCallback
 	shipTrigger         chan requestWithUsersAndCallback
 
+	// pendingAsyncFlushes bounds the number of in-flight async forced
+	// compactions queued via flushHandler so an unauthenticated caller cannot
+	// accumulate unbounded goroutines on the single-consumer
+	// forceCompactTrigger channel.
+	pendingAsyncFlushes atomic.Int32
+
 	// Timeout chosen for idle compactions.
 	compactionIdleTimeout time.Duration
 
@@ -2549,7 +2555,18 @@ func (i *Ingester) flushHandler(w http.ResponseWriter, r *http.Request) {
 		// Run synchronously. This simplifies and speeds up tests.
 		run()
 	} else {
-		go run()
+		// Refuse to queue a new forced compaction while one is already pending.
+		// This bounds the number of goroutines blocked on the single-consumer
+		// forceCompactTrigger channel.
+		if !i.TSDBState.pendingAsyncFlushes.CAS(0, 1) {
+			level.Warn(logutil.WithContext(r.Context(), i.logger)).Log("msg", "flush request rejected: an async forced compaction is already pending")
+			http.Error(w, "an async forced compaction is already pending", http.StatusTooManyRequests)
+			return
+		}
+		go func() {
+			defer i.TSDBState.pendingAsyncFlushes.Store(0)
+			run()
+		}()
 	}
 
 	w.WriteHeader(http.StatusNoContent)
