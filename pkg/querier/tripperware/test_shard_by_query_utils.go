@@ -344,6 +344,7 @@ http_requests_total`,
 type mockLimits struct {
 	maxQueryLookback  time.Duration
 	maxQueryLength    time.Duration
+	maxQueryBytesSize int
 	maxCacheFreshness time.Duration
 	shardSize         int
 }
@@ -354,6 +355,10 @@ func (m mockLimits) MaxQueryLookback(string) time.Duration {
 
 func (m mockLimits) MaxQueryLength(string) time.Duration {
 	return m.maxQueryLength
+}
+
+func (m mockLimits) MaxQueryBytesSize(string) int {
+	return m.maxQueryBytesSize
 }
 
 func (mockLimits) MaxQueryParallelism(string) int {

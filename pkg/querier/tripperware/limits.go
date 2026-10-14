@@ -11,6 +11,10 @@ type Limits interface {
 	// MaxQueryLength returns the limit of the length (in time) of a query.
 	MaxQueryLength(string) time.Duration
 
+	// MaxQueryBytesSize returns the maximum raw PromQL query text size (in bytes)
+	// accepted by the query-frontend for the given tenant. 0 means no limit.
+	MaxQueryBytesSize(string) int
+
 	// MaxQueryParallelism returns the limit to the number of split queries the
 	// frontend will process in parallel.
 	MaxQueryParallelism(string) int
