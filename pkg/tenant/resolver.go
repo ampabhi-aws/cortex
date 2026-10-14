@@ -83,6 +83,14 @@ func (t *SingleResolver) TenantID(ctx context.Context) (string, error) {
 		return "", err
 	}
 
+	// reject empty tenant IDs explicitly: when the ID is supplied via a
+	// context (e.g. gRPC metadata or InjectOrgID), the upstream HTTP
+	// extractor's empty-header check does not apply, but an empty tenant
+	// still resolves to a shared filesystem path downstream.
+	if len(id) == 0 {
+		return "", errTenantIDEmpty
+	}
+
 	if containsUnsafePathSegments(id) {
 		return "", errInvalidTenantID
 	}

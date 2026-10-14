@@ -393,6 +393,9 @@ func isEmptyBucketStore(bs *store.BucketStore) bool {
 }
 
 func (u *BucketStores) syncDirForUser(userID string) string {
+	if userID == "" {
+		return ""
+	}
 	return filepath.Join(u.cfg.BucketStore.SyncDir, userID)
 }
 
