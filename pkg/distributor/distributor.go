@@ -695,7 +695,9 @@ func (d *Distributor) Push(ctx context.Context, req *cortexpb.WriteRequest) (*co
 		if validationErr != nil && firstPartialErr == nil {
 			// The series labels may be retained by validationErr but that's not a problem for this
 			// use case because we format it calling Error() and then we discard it.
-			firstPartialErr = httpgrpc.Errorf(http.StatusBadRequest, validationErr.Error())
+			// Pass the message as an argument (%s), not as the format string, so attacker-controlled
+			// label values that happen to contain fmt verbs (e.g. %s) are not re-interpreted.
+			firstPartialErr = httpgrpc.Errorf(http.StatusBadRequest, "%s", validationErr.Error())
 		}
 
 		// validateSeries would have returned an emptyPreallocSeries if there were no valid samples.

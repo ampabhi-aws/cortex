@@ -13,6 +13,22 @@ import (
 	"github.com/cortexproject/cortex/pkg/util/log"
 )
 
+// maxErrMsgLen caps the size of error strings taken from attacker-controlled input
+// (e.g. the body of an httpgrpc error produced from a validation failure) before they
+// are echoed back to the client or written to the shared log pipeline. Without this cap
+// a single rejected remote-write request can be amplified into a very large HTTP response
+// and single log line (see pkg/util/validation errors).
+const maxErrMsgLen = 1024
+
+// truncateErrMsg truncates an error message intended for logs and the HTTP response body
+// so attacker-controlled data cannot be amplified into unbounded output.
+func truncateErrMsg(s string) string {
+	if len(s) <= maxErrMsgLen {
+		return s
+	}
+	return s[:maxErrMsgLen] + "... (truncated)"
+}
+
 // Func defines the type of the push. It is similar to http.HandlerFunc.
 type Func func(context.Context, *cortexpb.WriteRequest) (*cortexpb.WriteResponse, error)
 
@@ -44,13 +60,14 @@ func Handler(maxRecvMsgSize int, sourceIPs *middleware.SourceIPExtractor, push F
 		if _, err := push(ctx, &req.WriteRequest); err != nil {
 			resp, ok := httpgrpc.HTTPResponseFromError(err)
 			if !ok {
-				http.Error(w, err.Error(), http.StatusInternalServerError)
+				http.Error(w, truncateErrMsg(err.Error()), http.StatusInternalServerError)
 				return
 			}
+			body := truncateErrMsg(string(resp.Body))
 			if resp.GetCode() != 202 {
-				level.Error(logger).Log("msg", "push error", "err", err)
+				level.Error(logger).Log("msg", "push error", "err", body)
 			}
-			http.Error(w, string(resp.Body), int(resp.Code))
+			http.Error(w, body, int(resp.Code))
 		}
 	})
 }

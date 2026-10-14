@@ -128,9 +128,12 @@ func newTooManyLabelsError(series []cortexpb.LabelAdapter, limit int) Validation
 }
 
 func (e *tooManyLabelsError) Error() string {
+	// Format the attacker-controlled series with %.200q (same truncation pattern used by
+	// every other label-bearing error in this file) so a request carrying very large label
+	// values cannot amplify the resulting error message to the full configured max body size.
 	return fmt.Sprintf(
-		"series has too many labels (actual: %d, limit: %d) series: '%s'",
-		len(e.series), e.limit, cortexpb.FromLabelAdaptersToMetric(e.series).String())
+		"series has too many labels (actual: %d, limit: %d) series: %.200q",
+		len(e.series), e.limit, formatLabelSet(e.series))
 }
 
 type noMetricNameError struct{}
@@ -193,12 +196,15 @@ type exemplarValidationError struct {
 }
 
 func (e *exemplarValidationError) Error() string {
+	// Truncate the attacker-controlled series and exemplar labels with %.200q (same pattern
+	// as other label-bearing errors in this file) to avoid amplifying a large label set
+	// into an equally large error message.
 	return fmt.Sprintf(e.message, e.timestamp, cortexpb.FromLabelAdaptersToLabels(e.seriesLabels).String(), cortexpb.FromLabelAdaptersToLabels(e.exemplarLabels).String())
 }
 
 func newExemplarEmtpyLabelsError(seriesLabels []cortexpb.LabelAdapter, exemplarLabels []cortexpb.LabelAdapter, timestamp int64) ValidationError {
 	return &exemplarValidationError{
-		message:        "exemplar missing labels, timestamp: %d series: %s labels: %s",
+		message:        "exemplar missing labels, timestamp: %d series: %.200q labels: %.200q",
 		seriesLabels:   seriesLabels,
 		exemplarLabels: exemplarLabels,
 		timestamp:      timestamp,
@@ -207,14 +213,14 @@ func newExemplarEmtpyLabelsError(seriesLabels []cortexpb.LabelAdapter, exemplarL
 
 func newExemplarMissingTimestampError(seriesLabels []cortexpb.LabelAdapter, exemplarLabels []cortexpb.LabelAdapter, timestamp int64) ValidationError {
 	return &exemplarValidationError{
-		message:        "exemplar missing timestamp, timestamp: %d series: %s labels: %s",
+		message:        "exemplar missing timestamp, timestamp: %d series: %.200q labels: %.200q",
 		seriesLabels:   seriesLabels,
 		exemplarLabels: exemplarLabels,
 		timestamp:      timestamp,
 	}
 }
 
-var labelLenMsg = "exemplar combined labelset exceeds " + strconv.Itoa(ExemplarMaxLabelSetLength) + " characters, timestamp: %d series: %s labels: %s"
+var labelLenMsg = "exemplar combined labelset exceeds " + strconv.Itoa(ExemplarMaxLabelSetLength) + " characters, timestamp: %d series: %.200q labels: %.200q"
 
 func newExemplarLabelLengthError(seriesLabels []cortexpb.LabelAdapter, exemplarLabels []cortexpb.LabelAdapter, timestamp int64) ValidationError {
 	return &exemplarValidationError{
