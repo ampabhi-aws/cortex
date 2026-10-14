@@ -143,6 +143,13 @@ tenant_federation:
   # CLI flag: -tenant-federation.enabled
   [enabled: <boolean> | default = false]
 
+  # The maximum number of tenants allowed in a single federated query (the
+  # number of IDs in a `|`-separated X-Scope-OrgID header). Requests exceeding
+  # this limit are rejected with HTTP 400 before any per-tenant work is
+  # scheduled. 0 to disable the limit (not recommended on public endpoints).
+  # CLI flag: -tenant-federation.max-tenants
+  [max_tenants: <int> | default = 0]
+
 # The ruler_config configures the Cortex ruler.
 [ruler: <ruler_config>]
 
