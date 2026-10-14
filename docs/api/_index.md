@@ -112,6 +112,8 @@ GET /config
 
 Displays the configuration currently applied to Cortex (in YAML format), including default values and settings via CLI flags. Sensitive data is masked. Please be aware that the exported configuration **doesn't include the per-tenant overrides**.
 
+This endpoint is an operator-only administrative endpoint. It is **not** registered by default; set `-api.admin-endpoints-enabled=true` (or `api.admin_endpoints_enabled: true` in YAML) to expose it. When registered the endpoint requires an authenticated request (`X-Scope-OrgID` header or an upstream auth proxy), and operators are expected to additionally restrict access to the HTTP listener to trusted operator tenants.
+
 #### Different modes
 
 ```
@@ -133,6 +135,8 @@ GET /runtime_config
 ```
 
 Displays the runtime configuration currently applied to Cortex (in YAML format), including default values. Please be aware that the endpoint will be only available if Cortex is configured with the `-runtime-config.file` option.
+
+Like `/config`, this endpoint is an operator-only administrative endpoint that is **not** registered by default; set `-api.admin-endpoints-enabled=true` to expose it. The endpoint requires an authenticated request and the per-tenant overrides map is scoped to the caller's tenant.
 
 #### Different modes
 

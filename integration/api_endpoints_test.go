@@ -47,7 +47,14 @@ func TestConfigAPIEndpoint(t *testing.T) {
 	// Start Cortex in single binary mode, reading the config from file.
 	require.NoError(t, copyFileToSharedDir(s, "docs/configuration/single-process-config-blocks-local.yaml", cortexConfigFile))
 
-	cortex1 := e2ecortex.NewSingleBinaryWithConfigFile("cortex-1", cortexConfigFile, nil, "", 9009, 9095)
+	// /config is an operator-only endpoint; it is only registered when
+	// explicitly opted-in via -api.admin-endpoints-enabled, and then only
+	// when the caller is authenticated.
+	flags := map[string]string{
+		"-api.admin-endpoints-enabled": "true",
+		"-auth.enabled":                "false",
+	}
+	cortex1 := e2ecortex.NewSingleBinaryWithConfigFile("cortex-1", cortexConfigFile, flags, "", 9009, 9095)
 	require.NoError(t, s.StartAndWaitReady(cortex1))
 
 	// Get config from /config API endpoint.
@@ -62,6 +69,6 @@ func TestConfigAPIEndpoint(t *testing.T) {
 	// Start again Cortex in single binary with the exported config
 	// and ensure it starts (pass the readiness probe).
 	require.NoError(t, writeFileToSharedDir(s, cortexConfigFile, body))
-	cortex2 := e2ecortex.NewSingleBinaryWithConfigFile("cortex-2", cortexConfigFile, nil, "", 9009, 9095)
+	cortex2 := e2ecortex.NewSingleBinaryWithConfigFile("cortex-2", cortexConfigFile, flags, "", 9009, 9095)
 	require.NoError(t, s.StartAndWaitReady(cortex2))
 }
