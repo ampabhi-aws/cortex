@@ -449,3 +449,37 @@ func validateVictorOpsConfig(cfg config.VictorOpsConfig) error {
 	}
 	return nil
 }
+
+// ValidateAlertmanagerConfigYAML parses the given raw Alertmanager YAML and
+// runs Cortex's deny-list validation on the resulting config. It is intended
+// to be reused by alternative write paths (such as the deprecated configs
+// API) so the "tenants may not reference operator files" policy enforced on
+// the main /api/v1/alerts endpoint is applied consistently.
+//
+// An empty cfg is accepted so callers can check it against their own
+// "configuration must not be empty" rule.
+func ValidateAlertmanagerConfigYAML(cfg string) error {
+	if cfg == "" {
+		return nil
+	}
+	amCfg, err := config.Load(cfg)
+	if err != nil {
+		return err
+	}
+	if err := validateAlertmanagerConfig(amCfg); err != nil {
+		return err
+	}
+	for _, name := range amCfg.Templates {
+		if err := validateTemplateFilename(name); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// ValidateTemplateFilename validates a tenant-supplied template filename and
+// returns an error when it contains a path separator or any other construct
+// that could allow the tenant to escape the per-tenant templates directory.
+func ValidateTemplateFilename(filename string) error {
+	return validateTemplateFilename(filename)
+}
