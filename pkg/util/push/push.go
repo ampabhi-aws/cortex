@@ -29,9 +29,22 @@ func Handler(maxRecvMsgSize int, sourceIPs *middleware.SourceIPExtractor, push F
 			}
 		}
 		var req cortexpb.PreallocWriteRequest
+		// Wrap the request body with MaxBytesReader so that an attacker-controlled
+		// Content-Length cannot drive heap allocation beyond maxRecvMsgSize: the
+		// reader short-circuits with an error once more than maxRecvMsgSize bytes
+		// are read, independently of what the Content-Length header claims. This
+		// mirrors the pattern used in pkg/alertmanager/distributor.go and
+		// pkg/frontend/transport/handler.go.
+		if r.Body != nil {
+			r.Body = http.MaxBytesReader(w, r.Body, int64(maxRecvMsgSize))
+		}
 		err := util.ParseProtoReader(ctx, r.Body, int(r.ContentLength), maxRecvMsgSize, &req, util.RawSnappy)
 		if err != nil {
 			level.Error(logger).Log("err", err.Error())
+			if util.IsRequestBodyTooLarge(err) {
+				http.Error(w, err.Error(), http.StatusRequestEntityTooLarge)
+				return
+			}
 			http.Error(w, err.Error(), http.StatusBadRequest)
 			return
 		}
