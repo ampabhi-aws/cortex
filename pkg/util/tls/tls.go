@@ -73,6 +73,46 @@ func (cfg *ClientConfig) GetTLSConfig() (*tls.Config, error) {
 	return config, nil
 }
 
+// GetServerTLSConfig initialises a *server-side* tls.Config from config options.
+// Unlike GetTLSConfig (which is intended for use by TLS *clients*), this
+// returns a config suitable to be passed to tls.Listen / http.Server: it
+// loads the server certificate from CertPath/KeyPath and, if CAPath is set,
+// requires and verifies a client certificate signed by that CA
+// (mutual TLS). This is the configuration needed to safely accept
+// connections on a listener using this type's TLS paths.
+func (cfg *ClientConfig) GetServerTLSConfig() (*tls.Config, error) {
+	if cfg.CertPath == "" || cfg.KeyPath == "" {
+		return nil, errors.New("server TLS requires both certificate and key paths to be configured")
+	}
+
+	serverCert, err := tls.LoadX509KeyPair(cfg.CertPath, cfg.KeyPath)
+	if err != nil {
+		return nil, errors.Wrapf(err, "failed to load server TLS certificate %s,%s", cfg.CertPath, cfg.KeyPath)
+	}
+
+	config := &tls.Config{
+		Certificates: []tls.Certificate{serverCert},
+	}
+
+	// If a CA is configured, require and verify client certificates
+	// signed by that CA (mutual TLS). This is what prevents
+	// unauthenticated peers from completing the memberlist handshake.
+	if cfg.CAPath != "" {
+		caCert, err := os.ReadFile(cfg.CAPath)
+		if err != nil {
+			return nil, errors.Wrapf(err, "error loading ca cert: %s", cfg.CAPath)
+		}
+		caCertPool := x509.NewCertPool()
+		if !caCertPool.AppendCertsFromPEM(caCert) {
+			return nil, errors.Errorf("failed to parse any CA certificates from %s", cfg.CAPath)
+		}
+		config.ClientCAs = caCertPool
+		config.ClientAuth = tls.RequireAndVerifyClientCert
+	}
+
+	return config, nil
+}
+
 // GetGRPCDialOptions creates GRPC DialOptions for TLS
 func (cfg *ClientConfig) GetGRPCDialOptions(enabled bool) ([]grpc.DialOption, error) {
 	if !enabled {
