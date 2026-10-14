@@ -672,8 +672,19 @@ func (t *Cortex) initMemberlistKV() (services.Service, error) {
 }
 
 func (t *Cortex) initTenantDeletionAPI() (services.Service, error) {
+	// The destructive /purger/delete_tenant endpoint is an admin API and is
+	// default-off. Operators must explicitly opt in via
+	// -purger.enable-tenant-deletion-api and ensure the endpoint is only
+	// reachable from a trusted admin path (never from tenant data-plane
+	// traffic). When the flag is false the handler is not constructed and
+	// the routes are not registered, so requests return 404.
+	if !t.Cfg.Purger.EnableTenantDeletionAPI {
+		level.Info(util_log.Logger).Log("msg", "tenant deletion API disabled; set -purger.enable-tenant-deletion-api=true on an admin-only listener to enable it")
+		return nil, nil
+	}
+
 	// t.RulerStorage can be nil when running in single-binary mode, and rule storage is not configured.
-	tenantDeletionAPI, err := purger.NewTenantDeletionAPI(t.Cfg.BlocksStorage, t.Overrides, util_log.Logger, prometheus.DefaultRegisterer)
+	tenantDeletionAPI, err := purger.NewTenantDeletionAPI(t.Cfg.BlocksStorage, t.Overrides, t.Cfg.AuthEnabled, util_log.Logger, prometheus.DefaultRegisterer)
 	if err != nil {
 		return nil, err
 	}

@@ -5,6 +5,7 @@ import (
 	"context"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
 	"path"
 	"testing"
 
@@ -18,19 +19,47 @@ import (
 
 func TestDeleteTenant(t *testing.T) {
 	bkt := objstore.NewInMemBucket()
-	api := newTenantDeletionAPI(bkt, nil, log.NewNopLogger())
+	api := newTenantDeletionAPI(bkt, nil, true, log.NewNopLogger())
 
+	// Missing X-Scope-OrgID -> 401.
 	{
 		resp := httptest.NewRecorder()
-		api.DeleteTenant(resp, &http.Request{})
+		api.DeleteTenant(resp, &http.Request{URL: &url.URL{}})
 		require.Equal(t, http.StatusUnauthorized, resp.Code)
 	}
 
+	// Missing confirmation parameter -> 400 and no deletion mark written.
 	{
 		ctx := context.Background()
 		ctx = user.InjectOrgID(ctx, "fake")
 
-		req := &http.Request{}
+		req := &http.Request{URL: &url.URL{}}
+		resp := httptest.NewRecorder()
+		api.DeleteTenant(resp, req.WithContext(ctx))
+
+		require.Equal(t, http.StatusBadRequest, resp.Code)
+		require.Nil(t, bkt.Objects()[path.Join("fake", tsdb.TenantDeletionMarkPath)])
+	}
+
+	// Confirmation parameter present but does not match context tenant -> 400.
+	{
+		ctx := context.Background()
+		ctx = user.InjectOrgID(ctx, "fake")
+
+		req := &http.Request{URL: &url.URL{RawQuery: "tenant=other"}}
+		resp := httptest.NewRecorder()
+		api.DeleteTenant(resp, req.WithContext(ctx))
+
+		require.Equal(t, http.StatusBadRequest, resp.Code)
+		require.Nil(t, bkt.Objects()[path.Join("fake", tsdb.TenantDeletionMarkPath)])
+	}
+
+	// Matching confirmation parameter -> 200, mark written.
+	{
+		ctx := context.Background()
+		ctx = user.InjectOrgID(ctx, "fake")
+
+		req := &http.Request{URL: &url.URL{RawQuery: "tenant=fake"}}
 		resp := httptest.NewRecorder()
 		api.DeleteTenant(resp, req.WithContext(ctx))
 
@@ -38,6 +67,21 @@ func TestDeleteTenant(t *testing.T) {
 		objs := bkt.Objects()
 		require.NotNil(t, objs[path.Join("fake", tsdb.TenantDeletionMarkPath)])
 	}
+}
+
+func TestDeleteTenantAuthDisabledRefused(t *testing.T) {
+	bkt := objstore.NewInMemBucket()
+	api := newTenantDeletionAPI(bkt, nil, false, log.NewNopLogger())
+
+	ctx := context.Background()
+	ctx = user.InjectOrgID(ctx, "fake")
+
+	req := &http.Request{URL: &url.URL{RawQuery: "tenant=fake"}}
+	resp := httptest.NewRecorder()
+	api.DeleteTenant(resp, req.WithContext(ctx))
+
+	require.Equal(t, http.StatusForbidden, resp.Code)
+	require.Nil(t, bkt.Objects()[path.Join("fake", tsdb.TenantDeletionMarkPath)])
 }
 
 func TestDeleteTenantStatus(t *testing.T) {
@@ -80,7 +124,7 @@ func TestDeleteTenantStatus(t *testing.T) {
 				require.NoError(t, bkt.Upload(context.Background(), objName, bytes.NewReader(data)))
 			}
 
-			api := newTenantDeletionAPI(bkt, nil, log.NewNopLogger())
+			api := newTenantDeletionAPI(bkt, nil, true, log.NewNopLogger())
 
 			res, err := api.isBlocksForUserDeleted(context.Background(), username)
 			require.NoError(t, err)
