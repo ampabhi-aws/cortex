@@ -1,6 +1,7 @@
 package api
 
 import (
+	"crypto/subtle"
 	"database/sql"
 	"encoding/json"
 	"errors"
@@ -35,6 +36,15 @@ var (
 // Config configures Configs API
 type Config struct {
 	Notifications NotificationsConfig `yaml:"notifications"`
+
+	// PrivateAPIAuthToken, when non-empty, is a shared secret that callers of the
+	// internal (`/private/api/prom/configs/*`) all-tenant endpoints must present
+	// in the `Authorization: Bearer <token>` header. This provides an
+	// in-process operator-capability check for a cross-tenant bulk read that is
+	// otherwise mounted on the shared HTTP mux. When empty, the legacy
+	// behaviour is preserved and the endpoints rely on the operator's reverse
+	// proxy / network controls for access restriction.
+	PrivateAPIAuthToken string `yaml:"private_api_auth_token"`
 }
 
 // NotificationsConfig configures Alertmanager notifications method.
@@ -47,6 +57,7 @@ type NotificationsConfig struct {
 func (cfg *Config) RegisterFlags(f *flag.FlagSet) {
 	f.BoolVar(&cfg.Notifications.DisableEmail, "configs.notifications.disable-email", false, "Disable Email notifications for Alertmanager.")
 	f.BoolVar(&cfg.Notifications.DisableWebHook, "configs.notifications.disable-webhook", false, "Disable WebHook notifications for Alertmanager.")
+	f.StringVar(&cfg.PrivateAPIAuthToken, "configs.api.private-auth-token", "", "Optional shared-secret bearer token required to access the internal all-tenant endpoints under /private/api/prom/configs/*. When set, requests to those endpoints must present an 'Authorization: Bearer <token>' header matching this value. When empty, the endpoints are not authenticated in-process and must be protected by the operator's reverse proxy / network controls.")
 }
 
 // API implements the configs api.
@@ -263,7 +274,36 @@ type ConfigsView struct {
 	Configs map[string]userconfig.View `json:"configs"`
 }
 
+// authorizePrivateRequest enforces the optional operator-capability check for
+// the internal all-tenant endpoints. When no token is configured, access is
+// delegated to the operator's reverse proxy / network controls (the legacy
+// behaviour). When a token is configured, callers must present it in the
+// `Authorization: Bearer <token>` header.
+func (a *API) authorizePrivateRequest(w http.ResponseWriter, r *http.Request) bool {
+	expected := a.cfg.PrivateAPIAuthToken
+	if expected == "" {
+		return true
+	}
+	const prefix = "Bearer "
+	authHeader := r.Header.Get("Authorization")
+	if !strings.HasPrefix(authHeader, prefix) {
+		w.Header().Set("WWW-Authenticate", `Bearer realm="configs"`)
+		http.Error(w, "unauthorized", http.StatusUnauthorized)
+		return false
+	}
+	provided := authHeader[len(prefix):]
+	if subtle.ConstantTimeCompare([]byte(provided), []byte(expected)) != 1 {
+		w.Header().Set("WWW-Authenticate", `Bearer realm="configs"`)
+		http.Error(w, "unauthorized", http.StatusUnauthorized)
+		return false
+	}
+	return true
+}
+
 func (a *API) getConfigs(w http.ResponseWriter, r *http.Request) {
+	if !a.authorizePrivateRequest(w, r) {
+		return
+	}
 	var cfgs map[string]userconfig.View
 	var cfgErr error
 	logger := util_log.WithContext(r.Context(), util_log.Logger)
