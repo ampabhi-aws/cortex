@@ -275,9 +275,18 @@ func (a *API) RegisterIngester(i Ingester, pushConfig distributor.Config) {
 	a.RegisterRoute("/push", push.Handler(pushConfig.MaxRecvMsgSize, a.sourceIPs, i.Push), true, "POST") // For testing and debugging.
 }
 
-func (a *API) RegisterTenantDeletion(api *purger.TenantDeletionAPI) {
+func (a *API) RegisterTenantDeletion(api *purger.TenantDeletionAPI, cfg purger.Config) {
+	if !cfg.EnableTenantDeletionAPI {
+		level.Info(a.logger).Log("msg", "tenant deletion API is disabled; set -purger.enable-tenant-deletion-api to opt in on an operator-only listener")
+		return
+	}
+
+	a.indexPage.AddLink(SectionAdminEndpoints, "/purger/delete_tenant", "Mark Tenant For Deletion (Dangerous)")
+	a.indexPage.AddLink(SectionAdminEndpoints, "/purger/delete_tenant_status", "Tenant Deletion Status")
+	a.indexPage.AddLink(SectionAdminEndpoints, "/purger/undelete_tenant", "Cancel Tenant Deletion")
 	a.RegisterRoute("/purger/delete_tenant", http.HandlerFunc(api.DeleteTenant), true, "POST")
 	a.RegisterRoute("/purger/delete_tenant_status", http.HandlerFunc(api.DeleteTenantStatus), true, "GET")
+	a.RegisterRoute("/purger/undelete_tenant", http.HandlerFunc(api.UndeleteTenant), true, "POST")
 }
 
 // RegisterRuler registers routes associated with the Ruler service.

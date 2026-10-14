@@ -61,6 +61,7 @@ For the sake of clarity, in this document we have grouped API endpoints by servi
 | [Delete Alertmanager configuration](#delete-alertmanager-configuration) | Alertmanager | `DELETE /api/v1/alerts` |
 | [Tenant delete request](#tenant-delete-request) | Purger | `POST /purger/delete_tenant` |
 | [Tenant delete status](#tenant-delete-status) | Purger | `GET /purger/delete_tenant_status` |
+| [Tenant undelete request](#tenant-undelete-request) | Purger | `POST /purger/undelete_tenant` |
 | [Store-gateway ring status](#store-gateway-ring-status) | Store-gateway | `GET /store-gateway/ring` |
 | [Compactor ring status](#compactor-ring-status) | Compactor | `GET /compactor/ring` |
 | [Get rule files](#get-rule-files) | Configs API (deprecated) | `GET /api/prom/configs/rules` |
@@ -789,6 +790,16 @@ _Requires [authentication](#authentication)._
 
 The Purger service provides APIs for requesting deletion of tenants.
 
+All Purger endpoints are **admin endpoints**. The `delete_tenant` operation
+is irreversible once the compactor's blocks cleaner has started removing
+blocks for the tenant. The Purger endpoints are disabled by default and
+must be opted in with the `-purger.enable-tenant-deletion-api` CLI flag (or
+the equivalent `purger.enable_tenant_deletion_api` YAML option). Even when
+enabled, operators are responsible for blocking `/purger/*` at their
+authenticating reverse proxy so that it is reachable only from an
+operator-controlled surface -- not from the regular tenant data plane that
+serves `/api/v1/push` and the query endpoints.
+
 ### Tenant Delete Request
 
 ```
@@ -797,7 +808,21 @@ POST /purger/delete_tenant
 
 Request deletion of ALL tenant data. Only works with blocks storage. Experimental.
 
+To guard against a blind POST issued from a stolen or mis-scoped tenant
+data-plane credential, the caller MUST supply an explicit confirmation that
+matches the tenant resolved from the request context. The confirmation may
+be supplied either as the `tenant` form value (query string or
+`application/x-www-form-urlencoded` body) or as the
+`X-Cortex-Delete-Tenant-Confirm` header. Requests without a matching
+confirmation receive HTTP `400 Bad Request` and no deletion mark is
+written.
+
 _Requires [authentication](#authentication)._
+
+_This endpoint is disabled by default and must be enabled via the
+`-purger.enable-tenant-deletion-api` CLI flag (or its respective YAML
+config option). Operators must additionally restrict `/purger/*` at their
+reverse proxy._
 
 ### Tenant Delete Status
 
@@ -808,6 +833,30 @@ GET /purger/delete_tenant_status
 Returns status of tenant deletion. Output format to be defined. Experimental.
 
 _Requires [authentication](#authentication)._
+
+_This endpoint is disabled by default and must be enabled via the
+`-purger.enable-tenant-deletion-api` CLI flag (or its respective YAML
+config option)._
+
+### Tenant Undelete Request
+
+```
+POST /purger/undelete_tenant
+```
+
+Cancels a tenant deletion by removing the tenant deletion mark object. This
+is useful as a cancellation window when a `delete_tenant` call was issued
+by mistake. It only removes the deletion mark; any blocks the compactor's
+blocks cleaner has already hard-deleted remain gone. Like
+`delete_tenant`, this endpoint requires a `tenant` form value or
+`X-Cortex-Delete-Tenant-Confirm` header that matches the resolved tenant.
+
+_Requires [authentication](#authentication)._
+
+_This endpoint is disabled by default and must be enabled via the
+`-purger.enable-tenant-deletion-api` CLI flag (or its respective YAML
+config option). Operators must additionally restrict `/purger/*` at their
+reverse proxy._
 
 ## Store-gateway
 
