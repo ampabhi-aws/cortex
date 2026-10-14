@@ -7,9 +7,12 @@ import (
 	"net/url"
 	"os"
 
+	"github.com/go-kit/log/level"
+
 	"github.com/cortexproject/cortex/pkg/configs/db/memory"
 	"github.com/cortexproject/cortex/pkg/configs/db/postgres"
 	"github.com/cortexproject/cortex/pkg/configs/userconfig"
+	util_log "github.com/cortexproject/cortex/pkg/util/log"
 )
 
 // Config configures the database.
@@ -24,7 +27,7 @@ type Config struct {
 
 // RegisterFlags adds the flags required to configure this to the given FlagSet.
 func (cfg *Config) RegisterFlags(f *flag.FlagSet) {
-	f.StringVar(&cfg.URI, "configs.database.uri", "postgres://postgres@configs-db.weave.local/configs?sslmode=disable", "URI where the database can be found (for dev you can use memory://)")
+	f.StringVar(&cfg.URI, "configs.database.uri", "postgres://postgres@configs-db.weave.local/configs?sslmode=require", "URI where the database can be found (for dev you can use memory://)")
 	f.StringVar(&cfg.MigrationsDir, "configs.database.migrations-dir", "", "Path where the database migration files can be found")
 	f.StringVar(&cfg.PasswordFile, "configs.database.password-file", "", "File containing password (username goes in URI)")
 }
@@ -78,6 +81,20 @@ func New(cfg Config) (DB, error) {
 			return nil, fmt.Errorf("Could not read database password file: %v", err)
 		}
 		u.User = url.UserPassword(u.User.Username(), string(passwordBytes))
+	}
+
+	// Warn (or refuse, if a DB password is being sent) when the operator-supplied
+	// DSN disables or weakens TLS. For lib/pq, sslmode values of "disable",
+	// "allow" and "prefer" do not guarantee an encrypted connection, so tenant
+	// Alertmanager configs (including notification secrets) and the database
+	// password would be transmitted in cleartext.
+	if u.Scheme == "postgres" {
+		if sslmode := u.Query().Get("sslmode"); sslmode == "disable" || sslmode == "allow" || sslmode == "prefer" {
+			if len(cfg.PasswordFile) != 0 {
+				return nil, fmt.Errorf("refusing to send database password over a connection that does not guarantee TLS: configs.database.uri has sslmode=%q; use sslmode=require, verify-ca or verify-full", sslmode)
+			}
+			level.Warn(util_log.Logger).Log("msg", "configs.database.uri does not guarantee a TLS-encrypted connection to Postgres; tenant Alertmanager configurations and credentials may be transmitted in cleartext", "sslmode", sslmode)
+		}
 	}
 
 	var d DB
