@@ -4,9 +4,14 @@ import (
 	"context"
 	"errors"
 
+	"github.com/go-kit/log/level"
+	amconfig "github.com/prometheus/alertmanager/config"
+
+	"github.com/cortexproject/cortex/pkg/alertmanager/alertcfg"
 	"github.com/cortexproject/cortex/pkg/alertmanager/alertspb"
 	"github.com/cortexproject/cortex/pkg/configs/client"
 	"github.com/cortexproject/cortex/pkg/configs/userconfig"
+	util_log "github.com/cortexproject/cortex/pkg/util/log"
 )
 
 const (
@@ -125,6 +130,19 @@ func (c *Store) reloadConfigs(ctx context.Context) (map[string]alertspb.AlertCon
 			continue
 		}
 
+		// Defense in depth: the write path through the configs service API is
+		// supposed to apply the `*_file` denylist, but older/concurrent writers
+		// may have persisted a tenant YAML before the hardened validator was in
+		// place. Re-apply the shared validator here so we never surface a
+		// config that would let a tenant read arbitrary host files and exfil
+		// them through a notifier (CVE-2021-31232 / CVE-2021-36157). On error,
+		// drop the config for this tenant rather than loading an unsafe one.
+		if err := validateRawAlertmanagerConfig(cfg.Config.AlertmanagerConfig); err != nil {
+			level.Warn(util_log.Logger).Log("msg", "configdb: dropping tenant Alertmanager config that failed validation", "user", user, "err", err)
+			delete(c.alertConfigs, user)
+			continue
+		}
+
 		var templates []*alertspb.TemplateDesc
 		for fn, template := range cfg.Config.TemplateFiles {
 			templates = append(templates, &alertspb.TemplateDesc{
@@ -143,4 +161,26 @@ func (c *Store) reloadConfigs(ctx context.Context) (map[string]alertspb.AlertCon
 	c.since = configs.GetLatestConfigID()
 
 	return c.alertConfigs, nil
+}
+
+// validateRawAlertmanagerConfig applies the hardened Alertmanager validator to
+// a tenant-supplied YAML. Empty configs are allowed (they translate to the
+// fallback config). Returns nil if the config is safe to load.
+func validateRawAlertmanagerConfig(raw string) error {
+	if raw == "" {
+		return nil
+	}
+	amCfg, err := amconfig.Load(raw)
+	if err != nil {
+		return err
+	}
+	if err := alertcfg.Validate(amCfg); err != nil {
+		return err
+	}
+	for _, name := range amCfg.Templates {
+		if err := alertcfg.ValidateTemplateFilename(name); err != nil {
+			return err
+		}
+	}
+	return nil
 }

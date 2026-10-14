@@ -20,6 +20,7 @@ import (
 	amconfig "github.com/prometheus/alertmanager/config"
 	amtemplate "github.com/prometheus/alertmanager/template"
 
+	"github.com/cortexproject/cortex/pkg/alertmanager/alertcfg"
 	"github.com/cortexproject/cortex/pkg/configs/db"
 	"github.com/cortexproject/cortex/pkg/configs/userconfig"
 	"github.com/cortexproject/cortex/pkg/tenant"
@@ -236,6 +237,25 @@ func validateAlertmanagerConfig(cfg string, noCfg NotificationsConfig) error {
 		}
 		if noCfg.DisableWebHook && len(recv.WebhookConfigs) > 0 {
 			return ErrWebhookNotificationsAreDisabled
+		}
+	}
+
+	// Apply the hardened `*_file` denylist shared with the Alertmanager HTTP
+	// API. Without this check a tenant could set bearer_token_file /
+	// password_file / credentials_file / OAuth2 client_secret_file / TLS
+	// ca_file,cert_file,key_file / Slack api_url_file / VictorOps
+	// api_key_file and make the Alertmanager read arbitrary host-readable
+	// files and exfiltrate their content via a tenant-controlled receiver
+	// (CVE-2021-31232 / CVE-2021-36157).
+	if err := alertcfg.Validate(amCfg); err != nil {
+		return err
+	}
+
+	// Reject templates referenced by filename that try to escape the
+	// per-tenant data directory on disk.
+	for _, name := range amCfg.Templates {
+		if err := alertcfg.ValidateTemplateFilename(name); err != nil {
+			return err
 		}
 	}
 
