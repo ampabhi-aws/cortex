@@ -130,7 +130,12 @@ func (f *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	// Buffer the body for later use to track slow queries.
 	var buf bytes.Buffer
 	r.Body = http.MaxBytesReader(w, r.Body, f.cfg.MaxBodySize)
-	r.Body = io.NopCloser(io.TeeReader(r.Body, &buf))
+	// Only tee the request body when something will actually consume the buffered
+	// copy, otherwise we retain up to MaxBodySize bytes per in-flight request for
+	// no reason.
+	if f.cfg.QueryStatsEnabled || f.cfg.LogQueriesLongerThan != 0 {
+		r.Body = io.NopCloser(io.TeeReader(r.Body, &buf))
+	}
 
 	startTime := time.Now()
 	resp, err := f.roundTripper.RoundTrip(r)
@@ -140,6 +145,14 @@ func (f *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		writeError(w, err)
 		return
 	}
+	// Ensure the downstream response body is drained and closed so the pooled
+	// upstream connection is released even when io.Copy below aborts (e.g. the
+	// client disconnected and we got EPIPE). Mirrors the pattern used in
+	// pkg/querier/tripperware/roundtrip.go.
+	defer func() {
+		_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, 1024))
+		_ = resp.Body.Close()
+	}()
 
 	hs := w.Header()
 	for h, vs := range resp.Header {
