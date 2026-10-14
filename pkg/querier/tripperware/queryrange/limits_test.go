@@ -201,6 +201,10 @@ func (m mockLimits) MaxQueryLength(string) time.Duration {
 	return m.maxQueryLength
 }
 
+func (mockLimits) MaxQueryExpressionSizeBytes(string) int {
+	return 0
+}
+
 func (mockLimits) MaxQueryParallelism(string) int {
 	return 14 // Flag default.
 }

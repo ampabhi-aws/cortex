@@ -80,7 +80,7 @@ func Middlewares(
 	// Metric used to keep track of each middleware execution duration.
 	metrics := tripperware.NewInstrumentMiddlewareMetrics(registerer)
 
-	queryRangeMiddleware := []tripperware.Middleware{NewLimitsMiddleware(limits)}
+	queryRangeMiddleware := []tripperware.Middleware{tripperware.QueryExpressionSizeLimitMiddleware(limits), NewLimitsMiddleware(limits)}
 	if cfg.AlignQueriesWithStep {
 		queryRangeMiddleware = append(queryRangeMiddleware, tripperware.InstrumentMiddleware("step_align", metrics), StepAlignMiddleware)
 	}

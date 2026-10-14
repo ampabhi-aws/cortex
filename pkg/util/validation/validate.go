@@ -34,6 +34,10 @@ const (
 	// ErrQueryTooLong is used in chunk store, querier and query frontend.
 	ErrQueryTooLong = "the query time range exceeds the limit (query length: %s, limit: %s)"
 
+	// ErrQueryExpressionTooLarge is returned when the raw PromQL expression
+	// exceeds the configured maximum size in bytes.
+	ErrQueryExpressionTooLarge = "the query expression size exceeds the limit (query size: %d bytes, limit: %d bytes)"
+
 	missingMetricName       = "missing_metric_name"
 	invalidMetricName       = "metric_name_invalid"
 	greaterThanMaxSampleAge = "greater_than_max_sample_age"

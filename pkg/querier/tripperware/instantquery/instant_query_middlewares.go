@@ -12,6 +12,7 @@ func Middlewares(
 ) ([]tripperware.Middleware, error) {
 	var m []tripperware.Middleware
 
+	m = append(m, tripperware.QueryExpressionSizeLimitMiddleware(limits))
 	m = append(m, tripperware.ShardByMiddleware(log, limits, InstantQueryCodec))
 	return m, nil
 }
