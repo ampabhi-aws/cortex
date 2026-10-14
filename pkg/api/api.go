@@ -275,8 +275,15 @@ func (a *API) RegisterIngester(i Ingester, pushConfig distributor.Config) {
 	a.RegisterRoute("/push", push.Handler(pushConfig.MaxRecvMsgSize, a.sourceIPs, i.Push), true, "POST") // For testing and debugging.
 }
 
-func (a *API) RegisterTenantDeletion(api *purger.TenantDeletionAPI) {
-	a.RegisterRoute("/purger/delete_tenant", http.HandlerFunc(api.DeleteTenant), true, "POST")
+func (a *API) RegisterTenantDeletion(api *purger.TenantDeletionAPI, enableDestructiveAPI bool) {
+	if enableDestructiveAPI {
+		a.indexPage.AddLink(SectionDangerous, "/purger/delete_tenant", "Delete Tenant (Dangerous)")
+		api.WithSourceIPExtractor(a.sourceIPs)
+		a.RegisterRoute("/purger/delete_tenant", http.HandlerFunc(api.DeleteTenant), true, "POST")
+		a.RegisterRoute("/purger/cancel_delete_tenant", http.HandlerFunc(api.CancelTenantDeletion), true, "POST")
+	}
+	// Status is non-destructive and always exposed so operators can observe
+	// cleanup progress even when the destructive API is disabled.
 	a.RegisterRoute("/purger/delete_tenant_status", http.HandlerFunc(api.DeleteTenantStatus), true, "GET")
 }
 
