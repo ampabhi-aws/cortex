@@ -100,18 +100,36 @@ func (am *MultitenantAlertmanager) SetUserConfig(w http.ResponseWriter, r *http.
 		return
 	}
 
-	var input io.Reader
+	// Always bound the request body to the configured global maximum HTTP
+	// request body size to prevent a single tenant from exhausting memory in
+	// the shared multi-tenant alertmanager process. http.MaxBytesReader will
+	// cause io.ReadAll to return an error (and the ResponseWriter to send 413)
+	// if the body exceeds the limit.
+	var body io.ReadCloser = r.Body
+	if am.cfg != nil && am.cfg.MaxRecvMsgSize > 0 {
+		body = http.MaxBytesReader(w, r.Body, am.cfg.MaxRecvMsgSize)
+	}
+
+	// The per-tenant limit is kept as an optional tighter cap on top of the
+	// global MaxRecvMsgSize bound above.
+	var input io.Reader = body
 	maxConfigSize := am.limits.AlertmanagerMaxConfigSize(userID)
 	if maxConfigSize > 0 {
 		// LimitReader will return EOF after reading specified number of bytes. To check if
 		// we have read too many bytes, allow one extra byte.
-		input = io.LimitReader(r.Body, int64(maxConfigSize)+1)
-	} else {
-		input = r.Body
+		input = io.LimitReader(body, int64(maxConfigSize)+1)
 	}
 
 	payload, err := io.ReadAll(input)
 	if err != nil {
+		// http.MaxBytesReader returns an error with message "http: request body too large"
+		// once the global bound is exceeded; surface that as 413 Payload Too Large.
+		if am.cfg != nil && am.cfg.MaxRecvMsgSize > 0 && err.Error() == "http: request body too large" {
+			msg := fmt.Sprintf(errConfigurationTooBig, am.cfg.MaxRecvMsgSize)
+			level.Warn(logger).Log("msg", msg)
+			http.Error(w, msg, http.StatusRequestEntityTooLarge)
+			return
+		}
 		level.Error(logger).Log("msg", errReadingConfiguration, "err", err.Error())
 		http.Error(w, fmt.Sprintf("%s: %s", errReadingConfiguration, err.Error()), http.StatusBadRequest)
 		return
