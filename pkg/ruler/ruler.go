@@ -863,10 +863,13 @@ func (r *Ruler) DeleteTenantConfiguration(w http.ResponseWriter, req *http.Reque
 func (r *Ruler) ListAllRules(w http.ResponseWriter, req *http.Request) {
 	logger := util_log.WithContext(req.Context(), r.logger)
 
-	userIDs, err := r.store.ListAllUsers(req.Context())
+	// Scope the response to the caller's tenant to prevent cross-tenant disclosure
+	// of alerting/recording rule groups.
+	userID, err := tenant.TenantID(req.Context())
 	if err != nil {
-		level.Error(logger).Log("msg", errListAllUser, "err", err)
-		http.Error(w, fmt.Sprintf("%s: %s", errListAllUser, err.Error()), http.StatusInternalServerError)
+		// When Cortex is running, it uses Auth Middleware for checking X-Scope-OrgID and injecting tenant into context.
+		// Auth Middleware sends http.StatusUnauthorized if X-Scope-OrgID is missing, so we do too here, for consistency.
+		http.Error(w, err.Error(), http.StatusUnauthorized)
 		return
 	}
 
@@ -878,13 +881,13 @@ func (r *Ruler) ListAllRules(w http.ResponseWriter, req *http.Request) {
 		close(done)
 	}()
 
-	err = concurrency.ForEachUser(req.Context(), userIDs, fetchRulesConcurrency, func(ctx context.Context, userID string) error {
-		rg, err := r.store.ListRuleGroupsForUserAndNamespace(ctx, userID, "")
+	fetchErr := func() error {
+		rg, err := r.store.ListRuleGroupsForUserAndNamespace(req.Context(), userID, "")
 		if err != nil {
 			return errors.Wrapf(err, "failed to fetch ruler config for user %s", userID)
 		}
 		userRules := map[string]rulespb.RuleGroupList{userID: rg}
-		if err := r.store.LoadRuleGroups(ctx, userRules); err != nil {
+		if err := r.store.LoadRuleGroups(req.Context(), userRules); err != nil {
 			return errors.Wrapf(err, "failed to load ruler config for user %s", userID)
 		}
 		data := map[string]map[string][]rulefmt.RuleGroup{userID: userRules[userID].Formatted()}
@@ -895,9 +898,9 @@ func (r *Ruler) ListAllRules(w http.ResponseWriter, req *http.Request) {
 		}
 
 		return nil
-	})
-	if err != nil {
-		level.Error(logger).Log("msg", "failed to list all ruler configs", "err", err)
+	}()
+	if fetchErr != nil {
+		level.Error(logger).Log("msg", "failed to list ruler config", "err", fetchErr, "user", userID)
 	}
 	close(iter)
 	<-done

@@ -1108,31 +1108,40 @@ func TestRuler_ListAllRules(t *testing.T) {
 	router := mux.NewRouter()
 	router.Path("/ruler/rule_groups").Methods(http.MethodGet).HandlerFunc(r.ListAllRules)
 
-	req := requestFor(t, http.MethodGet, "https://localhost:8080/ruler/rule_groups", nil, "")
-	w := httptest.NewRecorder()
-	router.ServeHTTP(w, req)
-
-	resp := w.Result()
-	body, _ := io.ReadAll(resp.Body)
-
-	// Check status code and header
-	require.Equal(t, http.StatusOK, resp.StatusCode)
-	require.Equal(t, "application/yaml", resp.Header.Get("Content-Type"))
-
-	gs := make(map[string]map[string][]rulefmt.RuleGroup) // user:namespace:[]rulefmt.RuleGroup
-	for userID := range mockRules {
-		gs[userID] = mockRules[userID].Formatted()
+	// Unauthenticated requests (no X-Scope-OrgID / tenant in context) must be rejected,
+	// since this endpoint now scopes its response to the caller's tenant.
+	{
+		req := httptest.NewRequest(http.MethodGet, "https://localhost:8080/ruler/rule_groups", nil)
+		w := httptest.NewRecorder()
+		router.ServeHTTP(w, req)
+		require.Equal(t, http.StatusUnauthorized, w.Result().StatusCode)
 	}
 
 	// check for unnecessary fields
 	unnecessaryFields := []string{"kind", "style", "tag", "value", "anchor", "alias", "content", "headcomment", "linecomment", "footcomment", "line", "column"}
-	for _, word := range unnecessaryFields {
-		require.NotContains(t, string(body), word)
-	}
 
-	expectedResponse, err := yaml.Marshal(gs)
-	require.NoError(t, err)
-	require.YAMLEq(t, string(expectedResponse), string(body))
+	for userID := range mockRules {
+		req := requestFor(t, http.MethodGet, "https://localhost:8080/ruler/rule_groups", nil, userID)
+		w := httptest.NewRecorder()
+		router.ServeHTTP(w, req)
+
+		resp := w.Result()
+		body, _ := io.ReadAll(resp.Body)
+
+		// Check status code and header
+		require.Equal(t, http.StatusOK, resp.StatusCode)
+		require.Equal(t, "application/yaml", resp.Header.Get("Content-Type"))
+
+		for _, word := range unnecessaryFields {
+			require.NotContains(t, string(body), word)
+		}
+
+		expectedResponse, err := yaml.Marshal(map[string]map[string][]rulefmt.RuleGroup{
+			userID: mockRules[userID].Formatted(),
+		})
+		require.NoError(t, err)
+		require.YAMLEq(t, string(expectedResponse), string(body))
+	}
 }
 
 type senderFunc func(alerts ...*notifier.Alert)

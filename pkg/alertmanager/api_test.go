@@ -681,18 +681,32 @@ receivers:
 
 	router := mux.NewRouter()
 	router.Path("/multitenant_alertmanager/configs").Methods(http.MethodGet).HandlerFunc(am.ListAllConfigs)
-	req := httptest.NewRequest("GET", "https://localhost:8080/multitenant_alertmanager/configs", nil)
-	w := httptest.NewRecorder()
-	router.ServeHTTP(w, req)
 
-	resp := w.Result()
-	require.Equal(t, http.StatusOK, resp.StatusCode)
-	require.Equal(t, "application/yaml", resp.Header.Get("Content-Type"))
-	body, err := io.ReadAll(resp.Body)
-	require.NoError(t, err)
-	old, err := yaml.Marshal(testCases)
-	require.NoError(t, err)
-	require.YAMLEq(t, string(old), string(body))
+	// Unauthenticated requests (no X-Scope-OrgID / tenant in context) must be rejected,
+	// since this endpoint now scopes its response to the caller's tenant.
+	{
+		req := httptest.NewRequest("GET", "https://localhost:8080/multitenant_alertmanager/configs", nil)
+		w := httptest.NewRecorder()
+		router.ServeHTTP(w, req)
+		require.Equal(t, http.StatusUnauthorized, w.Result().StatusCode)
+	}
+
+	// With a tenant in the context, the handler returns only that tenant's config.
+	for userID, expected := range testCases {
+		req := httptest.NewRequest("GET", "https://localhost:8080/multitenant_alertmanager/configs", nil)
+		req = req.WithContext(user.InjectOrgID(req.Context(), userID))
+		w := httptest.NewRecorder()
+		router.ServeHTTP(w, req)
+
+		resp := w.Result()
+		require.Equal(t, http.StatusOK, resp.StatusCode)
+		require.Equal(t, "application/yaml", resp.Header.Get("Content-Type"))
+		body, err := io.ReadAll(resp.Body)
+		require.NoError(t, err)
+		old, err := yaml.Marshal(map[string]*UserConfig{userID: expected})
+		require.NoError(t, err)
+		require.YAMLEq(t, string(old), string(body))
+	}
 }
 
 func TestValidateAlertmanagerConfig(t *testing.T) {
