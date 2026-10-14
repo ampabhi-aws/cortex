@@ -99,6 +99,30 @@ func TestSingleResolver(t *testing.T) {
 			errTenantID:  errInvalidTenantID,
 			errTenantIDs: errInvalidTenantID,
 		},
+		{
+			name:         "containing-glob-asterisk",
+			headerValue:  strptr("tenant-a*"),
+			errTenantID:  errInvalidTenantID,
+			errTenantIDs: errInvalidTenantID,
+		},
+		{
+			name:         "containing-glob-question",
+			headerValue:  strptr("tenant?a"),
+			errTenantID:  errInvalidTenantID,
+			errTenantIDs: errInvalidTenantID,
+		},
+		{
+			name:         "containing-glob-bracket-open",
+			headerValue:  strptr("tenant-[a"),
+			errTenantID:  errInvalidTenantID,
+			errTenantIDs: errInvalidTenantID,
+		},
+		{
+			name:         "containing-glob-bracket-close",
+			headerValue:  strptr("tenant]a"),
+			errTenantID:  errInvalidTenantID,
+			errTenantIDs: errInvalidTenantID,
+		},
 	}...) {
 		t.Run(tc.name, tc.test(r))
 	}
@@ -142,6 +166,12 @@ func TestMultiResolver(t *testing.T) {
 			headerValue:  strptr(`backward\slash`),
 			errTenantID:  &errTenantIDUnsupportedCharacter{pos: 8, tenantID: "backward\\slash"},
 			errTenantIDs: &errTenantIDUnsupportedCharacter{pos: 8, tenantID: "backward\\slash"},
+		},
+		{
+			name:         "containing-glob-asterisk",
+			headerValue:  strptr("tenant-a*"),
+			errTenantID:  errInvalidTenantID,
+			errTenantIDs: errInvalidTenantID,
 		},
 	}...) {
 		t.Run(tc.name, tc.test(r))

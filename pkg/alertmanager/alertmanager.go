@@ -310,19 +310,56 @@ func clusterWait(position func() int, timeout time.Duration) func() time.Duratio
 
 // ApplyConfig applies a new configuration to an Alertmanager.
 func (am *Alertmanager) ApplyConfig(userID string, conf *config.Config, rawCfg string) error {
+	// Escape any filepath.Glob metacharacters in the per-tenant container
+	// directory so that only the final template-name component (which is
+	// also validated by validateTemplateFilename) can be expanded as a glob
+	// pattern. Without this, a tenant whose ID contained a glob
+	// metacharacter (e.g. '*') would turn its own on-disk directory segment
+	// into a wildcard, letting filepath.Glob — called by
+	// template.FromGlobs — match sibling tenants' template directories and
+	// so load another tenant's templates into this tenant's bundle.
+	tenantTemplatesDir := filepath.Join(am.cfg.TenantDataDir, templatesDir)
+	tenantTemplatesDirAbs, err := filepath.Abs(tenantTemplatesDir)
+	if err != nil {
+		return err
+	}
+	globBaseDir := escapeGlobBaseDir(tenantTemplatesDir)
+
 	templateFiles := make([]string, len(conf.Templates))
 	for i, t := range conf.Templates {
-		templateFilepath, err := safeTemplateFilepath(filepath.Join(am.cfg.TenantDataDir, templatesDir), t)
-		if err != nil {
+		// Validate the template filename / lexical containment against the
+		// un-escaped per-tenant directory so error messages remain
+		// meaningful.
+		if _, err := safeTemplateFilepath(tenantTemplatesDir, t); err != nil {
 			return err
 		}
 
-		templateFiles[i] = templateFilepath
+		templateFiles[i] = filepath.Join(globBaseDir, t)
 	}
 
 	tmpl, err := template.FromGlobs(templateFiles...)
 	if err != nil {
 		return err
+	}
+
+	// Defence in depth: after glob expansion, confirm every match actually
+	// lives inside the per-tenant templates directory. If the base-dir
+	// escaping above ever fails to escape a new metacharacter, this check
+	// still prevents cross-tenant reads.
+	for _, pattern := range templateFiles {
+		matches, err := filepath.Glob(pattern)
+		if err != nil {
+			return err
+		}
+		for _, m := range matches {
+			absMatch, err := filepath.Abs(m)
+			if err != nil {
+				return err
+			}
+			if !isPathWithinDir(absMatch, tenantTemplatesDirAbs) {
+				return fmt.Errorf("template glob %q matched a file outside of the per-tenant templates directory: %q", pattern, m)
+			}
+		}
 	}
 	tmpl.ExternalURL = am.cfg.ExternalURL
 
