@@ -67,9 +67,102 @@ type PreallocTimeseries struct {
 }
 
 // Unmarshal implements proto.Message.
+//
+// To avoid the ~930 byte per-entry heap amplification caused by handing out a
+// fully pre-allocated pooled *TimeSeries for every (possibly tiny or empty)
+// repeated TimeSeries entry on the wire, we first inspect the encoded content
+// to see whether it contains at least one label, sample or exemplar. For
+// completely empty entries we allocate a bare *TimeSeries with nil slices;
+// for populated entries we take from the pool as before so hot-path reuse is
+// preserved. The entry's own slices still grow via append inside TimeSeries
+// .Unmarshal, so legitimate requests observe no behavioural change.
 func (p *PreallocTimeseries) Unmarshal(dAtA []byte) error {
-	p.TimeSeries = TimeseriesFromPool()
+	if timeseriesEntryIsEmpty(dAtA) {
+		p.TimeSeries = &TimeSeries{}
+	} else {
+		p.TimeSeries = TimeseriesFromPool()
+	}
 	return p.TimeSeries.Unmarshal(dAtA)
+}
+
+// timeseriesEntryIsEmpty returns true when the encoded TimeSeries message in
+// dAtA has no Labels, Samples or Exemplars fields. The scan is a bounded
+// single pass over the wire bytes and is cheap compared to the full Unmarshal
+// of a populated entry. It is intentionally conservative: any parse ambiguity
+// returns false so we fall back to the pre-allocated pooled object.
+func timeseriesEntryIsEmpty(dAtA []byte) bool {
+	l := len(dAtA)
+	if l == 0 {
+		return true
+	}
+	i := 0
+	for i < l {
+		// Decode varint tag.
+		var wire uint64
+		for shift := uint(0); ; shift += 7 {
+			if shift >= 64 || i >= l {
+				return false
+			}
+			b := dAtA[i]
+			i++
+			wire |= uint64(b&0x7F) << shift
+			if b < 0x80 {
+				break
+			}
+		}
+		fieldNum := int32(wire >> 3)
+		wireType := int(wire & 0x7)
+		// Fields 1 (Labels), 2 (Samples) and 3 (Exemplars) all use length-
+		// delimited wire type 2. Any occurrence means the entry is non-empty
+		// and we fall back to the pooled path.
+		if (fieldNum == 1 || fieldNum == 2 || fieldNum == 3) && wireType == 2 {
+			return false
+		}
+		// Skip the current field's payload based on wire type.
+		switch wireType {
+		case 0: // varint
+			for shift := uint(0); ; shift += 7 {
+				if shift >= 64 || i >= l {
+					return false
+				}
+				b := dAtA[i]
+				i++
+				if b < 0x80 {
+					break
+				}
+			}
+		case 1: // 64-bit
+			if i+8 > l {
+				return false
+			}
+			i += 8
+		case 2: // length-delimited (other field numbers only; 1/2/3 handled above)
+			var msglen int
+			for shift := uint(0); ; shift += 7 {
+				if shift >= 64 || i >= l {
+					return false
+				}
+				b := dAtA[i]
+				i++
+				msglen |= int(b&0x7F) << shift
+				if b < 0x80 {
+					break
+				}
+			}
+			if msglen < 0 || i+msglen > l {
+				return false
+			}
+			i += msglen
+		case 5: // 32-bit
+			if i+4 > l {
+				return false
+			}
+			i += 4
+		default:
+			return false
+		}
+	}
+	return true
 }
 
 // LabelAdapter is a labels.Label that can be marshalled to/from protos.
@@ -305,5 +398,13 @@ func ReuseTimeseries(ts *TimeSeries) {
 		}
 	}
 	ts.Exemplars = ts.Exemplars[:0]
+	// Avoid polluting the pool with bare TimeSeries that were created outside
+	// the pool for empty wire entries (see PreallocTimeseries.Unmarshal): they
+	// have zero-cap slices and would defeat the pool's pre-allocation benefit
+	// for subsequent consumers. Keep only objects whose slices still carry the
+	// pool's original backing arrays.
+	if cap(ts.Labels) == 0 && cap(ts.Samples) == 0 && cap(ts.Exemplars) == 0 {
+		return
+	}
 	timeSeriesPool.Put(ts)
 }
