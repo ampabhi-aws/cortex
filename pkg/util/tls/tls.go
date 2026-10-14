@@ -73,6 +73,51 @@ func (cfg *ClientConfig) GetTLSConfig() (*tls.Config, error) {
 	return config, nil
 }
 
+// GetServerTLSConfig initialises a server-side tls.Config from the same
+// ClientConfig fields. Unlike GetTLSConfig, it uses CAPath to populate
+// ClientCAs (not RootCAs) and requires peers to present a certificate signed
+// by that CA (ClientAuth = tls.RequireAndVerifyClientCert). It is intended for
+// listeners such as the memberlist gossip port where mutual authentication is
+// required so that unauthenticated peers cannot inject state.
+//
+// A server certificate (CertPath/KeyPath) is required. When CAPath is set,
+// peers must present a certificate signed by that CA; when CAPath is empty,
+// the config falls back to ClientAuth = tls.NoClientCert (the Go default),
+// which preserves the previous permissive behaviour for operators that only
+// configured a server cert.
+func (cfg *ClientConfig) GetServerTLSConfig() (*tls.Config, error) {
+	if cfg.CertPath == "" || cfg.KeyPath == "" {
+		return nil, errors.New("server TLS requires both a certificate and a key to be configured")
+	}
+
+	serverCert, err := tls.LoadX509KeyPair(cfg.CertPath, cfg.KeyPath)
+	if err != nil {
+		return nil, errors.Wrapf(err, "failed to load TLS certificate %s,%s", cfg.CertPath, cfg.KeyPath)
+	}
+
+	config := &tls.Config{
+		Certificates: []tls.Certificate{serverCert},
+	}
+
+	if cfg.CAPath != "" {
+		caCert, err := os.ReadFile(cfg.CAPath)
+		if err != nil {
+			return nil, errors.Wrapf(err, "error loading ca cert: %s", cfg.CAPath)
+		}
+		caCertPool := x509.NewCertPool()
+		if !caCertPool.AppendCertsFromPEM(caCert) {
+			return nil, errors.Errorf("failed to parse any CA certificate from %s", cfg.CAPath)
+		}
+		config.ClientCAs = caCertPool
+		// Require peers to present a certificate signed by the configured CA.
+		// Without this, Go defaults to tls.NoClientCert and the listener accepts
+		// any peer, which allows unauthenticated gossip injection.
+		config.ClientAuth = tls.RequireAndVerifyClientCert
+	}
+
+	return config, nil
+}
+
 // GetGRPCDialOptions creates GRPC DialOptions for TLS
 func (cfg *ClientConfig) GetGRPCDialOptions(enabled bool) ([]grpc.DialOption, error) {
 	if !enabled {

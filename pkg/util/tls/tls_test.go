@@ -1,6 +1,7 @@
 package tls
 
 import (
+	"crypto/tls"
 	"fmt"
 	"os"
 	"testing"
@@ -183,4 +184,36 @@ func TestGetTLSConfig_ServerName(t *testing.T) {
 	tlsConfig, err := c.GetTLSConfig()
 	assert.NoError(t, err)
 	assert.Equal(t, "myserver.com", tlsConfig.ServerName)
+}
+
+func TestGetServerTLSConfig(t *testing.T) {
+	// requires both cert and key
+	c := &ClientConfig{}
+	_, err := c.GetServerTLSConfig()
+	assert.Error(t, err)
+
+	paths := newTestX509Files(t, []byte(certPEM), []byte(keyPEM), nil)
+
+	// without a CA path, falls back to NoClientCert (preserves prior permissive behaviour)
+	c = &ClientConfig{CertPath: paths.cert, KeyPath: paths.key}
+	tlsConfig, err := c.GetServerTLSConfig()
+	require.NoError(t, err)
+	assert.Equal(t, 1, len(tlsConfig.Certificates), "expected server certificate to be set")
+	assert.Equal(t, tls.NoClientCert, tlsConfig.ClientAuth)
+	assert.Nil(t, tlsConfig.ClientCAs)
+
+	// with CAPath set, requires peers to present a certificate signed by the CA
+	paths = newTestX509Files(t, []byte(certPEM), []byte(keyPEM), []byte(caPEM))
+	c = &ClientConfig{CertPath: paths.cert, KeyPath: paths.key, CAPath: paths.ca}
+	tlsConfig, err = c.GetServerTLSConfig()
+	require.NoError(t, err)
+	assert.Equal(t, tls.RequireAndVerifyClientCert, tlsConfig.ClientAuth, "client cert must be required and verified when a CA is configured")
+	require.NotNil(t, tlsConfig.ClientCAs)
+	// nolint:staticcheck
+	assert.Equal(t, 1, len(tlsConfig.ClientCAs.Subjects()))
+
+	// unreadable CA path returns an error
+	c = &ClientConfig{CertPath: paths.cert, KeyPath: paths.key, CAPath: paths.ca + "-missing"}
+	_, err = c.GetServerTLSConfig()
+	assert.Error(t, err)
 }
