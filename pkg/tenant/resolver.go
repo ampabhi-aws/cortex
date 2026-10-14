@@ -83,6 +83,10 @@ func (t *SingleResolver) TenantID(ctx context.Context) (string, error) {
 		return "", err
 	}
 
+	if id == "" {
+		return "", errEmptyTenantID
+	}
+
 	if containsUnsafePathSegments(id) {
 		return "", errInvalidTenantID
 	}
@@ -131,6 +135,10 @@ func (t *MultiResolver) TenantIDs(ctx context.Context) ([]string, error) {
 
 	orgIDs := strings.Split(orgID, tenantIDsLabelSeparator)
 	for _, orgID := range orgIDs {
+		// Reject empty segments (e.g. leading/trailing/duplicated '|' separators
+		// such as "|", "team-a|", "|team-a", "team-a||team-b"). An empty tenant
+		// ID would otherwise collapse per-tenant storage namespaces onto the
+		// shared TSDB root directory and bucket root.
 		if err := ValidTenantID(orgID); err != nil {
 			return nil, err
 		}

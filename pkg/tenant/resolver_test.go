@@ -54,9 +54,10 @@ var commonResolverTestCases = []resolverTestCase{
 		errTenantIDs: user.ErrNoOrgID,
 	},
 	{
-		name:        "empty",
-		headerValue: strptr(""),
-		tenantIDs:   []string{""},
+		name:         "empty",
+		headerValue:  strptr(""),
+		errTenantID:  errEmptyTenantID,
+		errTenantIDs: errEmptyTenantID,
 	},
 	{
 		name:        "single-tenant",
@@ -130,6 +131,30 @@ func TestMultiResolver(t *testing.T) {
 			headerValue:  strptr("tenant-a|tenant-b|.."),
 			errTenantID:  errInvalidTenantID,
 			errTenantIDs: errInvalidTenantID,
+		},
+		{
+			name:         "only-separator",
+			headerValue:  strptr("|"),
+			errTenantID:  errEmptyTenantID,
+			errTenantIDs: errEmptyTenantID,
+		},
+		{
+			name:         "trailing-separator",
+			headerValue:  strptr("tenant-a|"),
+			errTenantID:  errEmptyTenantID,
+			errTenantIDs: errEmptyTenantID,
+		},
+		{
+			name:         "leading-separator",
+			headerValue:  strptr("|tenant-a"),
+			errTenantID:  errEmptyTenantID,
+			errTenantIDs: errEmptyTenantID,
+		},
+		{
+			name:         "duplicated-separator",
+			headerValue:  strptr("tenant-a||tenant-b"),
+			errTenantID:  errEmptyTenantID,
+			errTenantIDs: errEmptyTenantID,
 		},
 		{
 			name:         "containing-forward-slash",
