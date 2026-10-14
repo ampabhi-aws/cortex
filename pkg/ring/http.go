@@ -25,7 +25,6 @@ const pageContent = `
 		<h1>Ring Status</h1>
 		<p>Current time: {{ .Now }}</p>
 		<form action="" method="POST">
-			<input type="hidden" name="csrf_token" value="$__CSRF_TOKEN_PLACEHOLDER__">
 			<table width="100%" border="1">
 				<thead>
 					<tr>
@@ -123,6 +122,17 @@ type httpResponse struct {
 
 func (r *Ring) ServeHTTP(w http.ResponseWriter, req *http.Request) {
 	if req.Method == http.MethodPost {
+		// "forget" permanently removes an instance (and its tokens) from the
+		// cluster-wide KV ring. Cortex itself does not authenticate HTTP
+		// requests - that is delegated to an external reverse proxy - so this
+		// destructive mutation is disabled by default and must be explicitly
+		// opted into via the ring.enable-http-forget flag.
+		if !r.cfg.EnableHTTPForget {
+			level.Warn(r.logger).Log("msg", "rejected ring forget POST because ring.enable-http-forget is disabled")
+			http.Error(w, "forget is disabled; enable ring.enable-http-forget to allow unregistering instances via HTTP", http.StatusForbidden)
+			return
+		}
+
 		ingesterID := req.FormValue("forget")
 		if err := r.forget(req.Context(), ingesterID); err != nil {
 			level.Error(r.logger).Log("msg", "error forgetting instance", "err", err)
