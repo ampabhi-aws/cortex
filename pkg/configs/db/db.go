@@ -10,6 +10,7 @@ import (
 	"github.com/cortexproject/cortex/pkg/configs/db/memory"
 	"github.com/cortexproject/cortex/pkg/configs/db/postgres"
 	"github.com/cortexproject/cortex/pkg/configs/userconfig"
+	"github.com/cortexproject/cortex/pkg/util"
 )
 
 // Config configures the database.
@@ -20,6 +21,16 @@ type Config struct {
 
 	// Allow injection of mock DBs for unit testing.
 	Mock DB `yaml:"-"`
+}
+
+// MarshalYAML implements yaml.Marshaler. It redacts any credentials embedded in
+// the URI (userinfo component) before marshalling so that /config and
+// /runtime_config do not leak the Postgres password.
+func (cfg Config) MarshalYAML() (interface{}, error) {
+	type plain Config
+	redacted := plain(cfg)
+	redacted.URI = util.RedactURLCredentials(cfg.URI)
+	return redacted, nil
 }
 
 // RegisterFlags adds the flags required to configure this to the given FlagSet.
