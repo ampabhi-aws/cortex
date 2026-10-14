@@ -5,6 +5,7 @@ import (
 	"crypto/tls"
 	"flag"
 	"fmt"
+	"strings"
 	"time"
 
 	"github.com/go-kit/log"
@@ -18,6 +19,11 @@ import (
 	"github.com/cortexproject/cortex/pkg/util/flagext"
 	cortextls "github.com/cortexproject/cortex/pkg/util/tls"
 )
+
+// errEtcdCredentialsWithoutTLS is returned by Config.Validate when etcd
+// credentials are configured but TLS is disabled, which would transmit the
+// credentials and auth token in cleartext.
+var errEtcdCredentialsWithoutTLS = errors.New("etcd username/password are configured but TLS is disabled; refusing to transmit credentials in cleartext. Set -<prefix>etcd.tls-enabled=true or use an https:// endpoint")
 
 // Config for a new etcd.Client.
 type Config struct {
@@ -62,9 +68,47 @@ func (cfg *Config) RegisterFlagsWithPrefix(f *flag.FlagSet, prefix string) {
 	cfg.TLS.RegisterFlagsWithPrefix(prefix+"etcd", f)
 }
 
+// hasHTTPSEndpoint reports whether any configured endpoint uses an
+// https:// or unixs:// scheme, in which case the etcd client will negotiate
+// TLS at the transport layer regardless of the TLS field on the client config.
+func (cfg *Config) hasHTTPSEndpoint() bool {
+	for _, ep := range cfg.Endpoints {
+		e := strings.ToLower(strings.TrimSpace(ep))
+		if strings.HasPrefix(e, "https://") || strings.HasPrefix(e, "unixs://") {
+			return true
+		}
+	}
+	return false
+}
+
+// Validate checks that the etcd Config is coherent. In particular, it
+// refuses configurations where credentials (username/password) are set but
+// transport security is not, because that would transmit the credentials and
+// the subsequently issued auth token over an unencrypted connection.
+// If a logger is provided a warning is also emitted so operators get an
+// explicit signal in logs. A nil logger is accepted.
+func (cfg *Config) Validate(logger log.Logger) error {
+	if cfg.UserName == "" && cfg.Password == "" {
+		return nil
+	}
+	// Credentials are set; require TLS either via the explicit flag or via
+	// an https:// (or unixs://) endpoint scheme which forces TLS transport
+	// credentials in the etcd v3 client.
+	if cfg.EnableTLS || cfg.hasHTTPSEndpoint() {
+		return nil
+	}
+	if logger != nil {
+		level.Error(logger).Log("msg", "etcd credentials are configured but TLS is disabled; this would transmit the username/password and auth token in cleartext. Enable TLS or use an https:// endpoint.")
+	}
+	return errEtcdCredentialsWithoutTLS
+}
+
 // GetTLS sets the TLS config field with certs
 func (cfg *Config) GetTLS() (*tls.Config, error) {
-	if !cfg.EnableTLS {
+	// If an https:// (or unixs://) endpoint is configured, the etcd v3
+	// client will negotiate TLS at the transport layer even when EnableTLS
+	// is false, so honor the configured TLS parameters in that case too.
+	if !cfg.EnableTLS && !cfg.hasHTTPSEndpoint() {
 		return nil, nil
 	}
 	tlsInfo := &transport.TLSInfo{
@@ -79,6 +123,9 @@ func (cfg *Config) GetTLS() (*tls.Config, error) {
 
 // New makes a new Client.
 func New(cfg Config, codec codec.Codec, logger log.Logger) (*Client, error) {
+	if err := cfg.Validate(logger); err != nil {
+		return nil, err
+	}
 	tlsConfig, err := cfg.GetTLS()
 	if err != nil {
 		return nil, errors.Wrapf(err, "unable to initialise TLS configuration for etcd")
