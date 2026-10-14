@@ -6,6 +6,7 @@ import (
 	"github.com/go-kit/log"
 	"github.com/go-kit/log/level"
 	"github.com/prometheus/prometheus/storage"
+	"golang.org/x/sync/errgroup"
 
 	"github.com/cortexproject/cortex/pkg/cortexpb"
 	"github.com/cortexproject/cortex/pkg/ingester/client"
@@ -15,6 +16,20 @@ import (
 
 // Queries are a set of matchers with time ranges - should not get into megabytes
 const maxRemoteReadQuerySize = 1024 * 1024
+
+// maxRemoteReadQueries bounds the number of sub-queries a single remote read
+// request may contain. The Prometheus remote read API itself only ever sends a
+// handful of sub-queries per request (one per Querier call), so this limit is
+// deliberately small. It exists to prevent a single ~tens-of-KB snappy-encoded
+// request from fanning out to tens of thousands of concurrent storage queries
+// (CWE-770).
+const maxRemoteReadQueries = 100
+
+// maxRemoteReadQueryConcurrency bounds the number of sub-queries from a single
+// remote read request that may execute concurrently against the underlying
+// Queryable. Together with maxRemoteReadQueries this caps per-request fan-out
+// to the ingesters and store-gateways.
+const maxRemoteReadQueryConcurrency = 10
 
 // RemoteReadHandler handles Prometheus remote read requests.
 func RemoteReadHandler(q storage.Queryable, logger log.Logger) http.Handler {
@@ -28,23 +43,38 @@ func RemoteReadHandler(q storage.Queryable, logger log.Logger) http.Handler {
 			return
 		}
 
-		// Fetch samples for all queries in parallel.
+		// Reject requests whose sub-query count exceeds a small constant. A
+		// bounded-size body may still legally contain tens of thousands of
+		// tiny QueryRequest entries, which otherwise fan out to as many
+		// concurrent storage queries.
+		if len(req.Queries) > maxRemoteReadQueries {
+			err := "too many queries in remote read request"
+			level.Error(logger).Log("msg", err, "queries", len(req.Queries), "limit", maxRemoteReadQueries)
+			http.Error(w, err, http.StatusBadRequest)
+			return
+		}
+
+		// Fetch samples for all queries in parallel, through a bounded worker
+		// pool. errgroup.Group.SetLimit caps the number of concurrently
+		// running goroutines; errgroup.WithContext cancels the shared context
+		// as soon as any sub-query returns an error so the remaining
+		// sub-queries stop accumulating results.
 		resp := client.ReadResponse{
 			Results: make([]*client.QueryResponse, len(req.Queries)),
 		}
-		errors := make(chan error)
+		g, gCtx := errgroup.WithContext(ctx)
+		g.SetLimit(maxRemoteReadQueryConcurrency)
 		for i, qr := range req.Queries {
-			go func(i int, qr *client.QueryRequest) {
+			i, qr := i, qr
+			g.Go(func() error {
 				from, to, matchers, err := client.FromQueryRequest(qr)
 				if err != nil {
-					errors <- err
-					return
+					return err
 				}
 
-				querier, err := q.Querier(ctx, int64(from), int64(to))
+				querier, err := q.Querier(gCtx, int64(from), int64(to))
 				if err != nil {
-					errors <- err
-					return
+					return err
 				}
 
 				params := &storage.SelectHints{
@@ -52,20 +82,17 @@ func RemoteReadHandler(q storage.Queryable, logger log.Logger) http.Handler {
 					End:   int64(to),
 				}
 				seriesSet := querier.Select(false, params, matchers...)
-				resp.Results[i], err = seriesSetToQueryResponse(seriesSet)
-				errors <- err
-			}(i, qr)
+				result, err := seriesSetToQueryResponse(seriesSet)
+				if err != nil {
+					return err
+				}
+				resp.Results[i] = result
+				return nil
+			})
 		}
 
-		var lastErr error
-		for range req.Queries {
-			err := <-errors
-			if err != nil {
-				lastErr = err
-			}
-		}
-		if lastErr != nil {
-			http.Error(w, lastErr.Error(), http.StatusBadRequest)
+		if err := g.Wait(); err != nil {
+			http.Error(w, err.Error(), http.StatusBadRequest)
 			return
 		}
 		w.Header().Add("Content-Type", "application/x-protobuf")
