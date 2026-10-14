@@ -211,6 +211,24 @@ type QueryableWithFilter interface {
 	UseQueryable(now time.Time, queryMinT, queryMaxT int64) bool
 }
 
+// ensureQueryLimiter attaches a per-query QueryLimiter to the context if one
+// is not already present. When a QueryLimiter is already installed (for
+// example, by the tenant-federation layer which installs one shared limiter
+// aggregated across the federated tenants), it is reused as-is so that the
+// per-query series/chunk/byte budget is not multiplied by the number of
+// tenants.
+func ensureQueryLimiter(ctx context.Context, userID string, limits *validation.Overrides) context.Context {
+	if _, ok := limiter.QueryLimiterFromContext(ctx); ok {
+		return ctx
+	}
+	return limiter.AddQueryLimiterToContext(ctx, limiter.NewQueryLimiter(
+		limits.MaxFetchedSeriesPerQuery(userID),
+		limits.MaxFetchedChunkBytesPerQuery(userID),
+		limits.MaxChunksPerQuery(userID),
+		limits.MaxFetchedDataBytesPerQuery(userID),
+	))
+}
+
 // NewQueryable creates a new Queryable for cortex.
 func NewQueryable(distributor QueryableWithFilter, stores []QueryableWithFilter, chunkIterFn chunkIteratorFunc, cfg Config, limits *validation.Overrides, tombstonesLoader purger.TombstonesLoader) storage.Queryable {
 	return storage.QueryableFunc(func(ctx context.Context, mint, maxt int64) (storage.Querier, error) {
@@ -221,7 +239,7 @@ func NewQueryable(distributor QueryableWithFilter, stores []QueryableWithFilter,
 			return nil, err
 		}
 
-		ctx = limiter.AddQueryLimiterToContext(ctx, limiter.NewQueryLimiter(limits.MaxFetchedSeriesPerQuery(userID), limits.MaxFetchedChunkBytesPerQuery(userID), limits.MaxChunksPerQuery(userID), limits.MaxFetchedDataBytesPerQuery(userID)))
+		ctx = ensureQueryLimiter(ctx, userID, limits)
 
 		mint, maxt, err = validateQueryTimeRange(ctx, userID, mint, maxt, limits, cfg.MaxQueryIntoFuture)
 		if err == errEmptyTimeRange {

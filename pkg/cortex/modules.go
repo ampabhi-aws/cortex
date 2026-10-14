@@ -43,6 +43,7 @@ import (
 	"github.com/cortexproject/cortex/pkg/ruler"
 	"github.com/cortexproject/cortex/pkg/scheduler"
 	"github.com/cortexproject/cortex/pkg/storegateway"
+	"github.com/cortexproject/cortex/pkg/util/limiter"
 	util_log "github.com/cortexproject/cortex/pkg/util/log"
 	"github.com/cortexproject/cortex/pkg/util/modules"
 	"github.com/cortexproject/cortex/pkg/util/runtimeconfig"
@@ -233,7 +234,21 @@ func (t *Cortex) initTenantFederation() (serv services.Service, err error) {
 		// single tenant. This allows for a less impactful enabling of tenant
 		// federation.
 		byPassForSingleQuerier := true
-		t.QuerierQueryable = querier.NewSampleAndChunkQueryable(tenantfederation.NewQueryable(t.QuerierQueryable, byPassForSingleQuerier))
+		limits := t.Overrides
+		// Aggregate the per-query resource limiter across the federated
+		// tenants, so a federated query cannot multiply the per-query
+		// series/chunk/byte budget by the number of tenants.
+		limiterCallback := func(ctx context.Context, tenantIDs []string) context.Context {
+			if limits == nil {
+				return ctx
+			}
+			maxSeries := validation.SmallestPositiveNonZeroIntPerTenant(tenantIDs, limits.MaxFetchedSeriesPerQuery)
+			maxChunkBytes := validation.SmallestPositiveNonZeroIntPerTenant(tenantIDs, limits.MaxFetchedChunkBytesPerQuery)
+			maxChunks := validation.SmallestPositiveNonZeroIntPerTenant(tenantIDs, limits.MaxChunksPerQuery)
+			maxDataBytes := validation.SmallestPositiveNonZeroIntPerTenant(tenantIDs, limits.MaxFetchedDataBytesPerQuery)
+			return limiter.AddQueryLimiterToContext(ctx, limiter.NewQueryLimiter(maxSeries, maxChunkBytes, maxChunks, maxDataBytes))
+		}
+		t.QuerierQueryable = querier.NewSampleAndChunkQueryable(tenantfederation.NewQueryable(t.QuerierQueryable, t.Cfg.TenantFederation.MaxTenants, byPassForSingleQuerier, limiterCallback))
 	}
 	return nil, nil
 }
