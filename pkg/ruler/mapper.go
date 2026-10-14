@@ -5,6 +5,7 @@ import (
 	"net/url"
 	"path/filepath"
 	"sort"
+	"strings"
 
 	"github.com/go-kit/log"
 	"github.com/go-kit/log/level"
@@ -82,9 +83,26 @@ func (m *mapper) MapRules(user string, ruleConfigs map[string][]rulefmt.RuleGrou
 
 	// write all rule configs to disk
 	for filename, groups := range ruleConfigs {
+		// Reject namespaces that would resolve outside the per-tenant directory.
+		// url.PathEscape escapes '/' but leaves '.' and '..' intact, so without
+		// this guard a rule group stored under namespace "." or ".." would be
+		// written to the shared rules root or to a sibling tenant's directory
+		// (CWE-22). Empty namespaces are rejected for the same reason.
+		if filename == "" || filename == "." || filename == ".." {
+			level.Warn(m.logger).Log("msg", "skipping rule group with unsafe namespace", "user", user, "namespace", filename)
+			continue
+		}
 		// Store the encoded file name to better handle `/` characters
 		encodedFileName := url.PathEscape(filename)
 		fullFileName := filepath.Join(path, encodedFileName)
+
+		// Defence in depth: ensure the resolved file remains inside the
+		// per-tenant directory after joining. This protects against any
+		// future encoder change or namespace value that could still escape.
+		if !strings.HasPrefix(fullFileName, path+string(filepath.Separator)) {
+			level.Warn(m.logger).Log("msg", "skipping rule group that would escape user directory", "user", user, "namespace", filename)
+			continue
+		}
 
 		fileUpdated, err := m.writeRuleGroupsIfNewer(groups, fullFileName)
 		if err != nil {

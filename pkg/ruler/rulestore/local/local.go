@@ -5,6 +5,7 @@ import (
 	"flag"
 	"os"
 	"path/filepath"
+	"strings"
 
 	"github.com/pkg/errors"
 	promRules "github.com/prometheus/prometheus/rules"
@@ -168,11 +169,38 @@ func (l *Client) loadAllRulesGroupsForUser(ctx context.Context, userID string) (
 }
 
 func (l *Client) loadAllRulesGroupsForUserAndNamespace(_ context.Context, userID string, namespace string) (rulespb.RuleGroupList, error) {
-	filename := filepath.Join(l.cfg.Directory, userID, namespace)
+	// Compute an absolute, canonical form of the per-tenant rules directory and
+	// the target filename, then verify that the requested file is actually
+	// contained inside the per-tenant directory. This defends against path
+	// traversal via the namespace path variable (CWE-22): without this check
+	// `filepath.Join` would collapse `..` segments and allow the caller to
+	// escape the tenant's directory and read sibling tenants' rule files or
+	// arbitrary files on disk.
+	userDir := filepath.Join(l.cfg.Directory, userID)
+	filename := filepath.Join(userDir, namespace)
+
+	absUserDir, err := filepath.Abs(userDir)
+	if err != nil {
+		return nil, errors.New("invalid rules directory")
+	}
+	absFilename, err := filepath.Abs(filename)
+	if err != nil {
+		return nil, errors.New("invalid namespace")
+	}
+
+	// Require that the resolved file sits directly under <directory>/<userID>/.
+	// Using filepath.Separator for a trailing boundary avoids matching sibling
+	// directories whose name shares a prefix with the tenant id.
+	if absFilename == absUserDir || !strings.HasPrefix(absFilename, absUserDir+string(filepath.Separator)) {
+		return nil, errors.New("invalid namespace")
+	}
 
 	rulegroups, allErrors := l.loader.Load(filename)
 	if len(allErrors) > 0 {
-		return nil, errors.Wrapf(allErrors[0], "error parsing %s", filename)
+		// Do not propagate the resolved filesystem path or the underlying
+		// parse/OS error to callers: it would leak host paths and act as a
+		// file-existence oracle. The caller logs the detail server-side.
+		return nil, errors.New("error parsing rules")
 	}
 
 	var list rulespb.RuleGroupList
