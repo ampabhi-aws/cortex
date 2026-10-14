@@ -39,6 +39,36 @@ you won't see any data. As of now, you can't see series from other tenants.
 
 For more information regarding the tenant ID limits, refer to: [Tenant ID limitations](./limitations.md#tenant-id-naming)
 
+### Admin (cross-tenant) HTTP endpoints
+
+A small number of Cortex HTTP endpoints return or mutate data that spans
+every tenant (the full list of tenants, each tenant's raw Alertmanager
+configuration -- which may embed receiver credentials -- every tenant's
+rule groups, per-tenant limit overrides, HA tracker state, and the raw
+gossiped memberlist KV). These are operator-only endpoints and **must not
+be exposed to end users**:
+
+* `/multitenant_alertmanager/configs`
+* `/ruler/rule_groups`
+* `/distributor/all_user_stats` (and the legacy `/all_user_stats` alias)
+* `/distributor/ha_tracker` (and the legacy `/ha-tracker` alias)
+* `/runtime_config`
+* `/memberlist`
+
+Cortex registers these endpoints through `API.RegisterAdminRoute`, which
+wraps the handler with `Config.HTTPAdminMiddleware`. When no admin
+middleware is configured, the API falls back to the tenant auth middleware
+so the endpoints at least require a valid `X-Scope-OrgID` header rather
+than being reachable with no identity at all. Operators are strongly
+encouraged to:
+
+1. Inject a stricter middleware into `Config.HTTPAdminMiddleware` -- for
+   example one that validates a shared operator bearer token or a source-IP
+   allowlist -- so that only operators can reach these paths; and/or
+2. Front Cortex with a reverse proxy that denies the paths above by default
+   and only allows them through the operator plane (a separate hostname,
+   port or network).
+
 ### Cortex-Tenant
 
 One way to add `X-Scope-OrgID` to Prometheus requests is to use a [cortex-tenant](https://github.com/blind-oracle/cortex-tenant)
