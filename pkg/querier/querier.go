@@ -336,9 +336,17 @@ func (q querier) Select(sortSeries bool, sp *storage.SelectHints, matchers ...*l
 	// Validate query time range. This validation should be done only for instant / range queries and
 	// NOT for metadata queries (series, labels) because the query-frontend doesn't support splitting
 	// of such queries.
-	if maxQueryLength := q.limits.MaxQueryLength(userID); maxQueryLength > 0 && endTime.Sub(startTime) > maxQueryLength {
-		limitErr := validation.LimitError(fmt.Sprintf(validation.ErrQueryTooLong, endTime.Sub(startTime), maxQueryLength))
-		return storage.ErrSeriesSet(limitErr)
+	// Compare the range in milliseconds to avoid the silent int64 overflow that
+	// happens when model.Time.Sub multiplies (end-start) ms by 1e6 to produce a
+	// time.Duration (in nanoseconds). For ranges wider than ~292 years that
+	// multiplication wraps and the limit can be bypassed. Using endTime.Time().Sub(startTime.Time())
+	// is saturating in time.Time arithmetic and therefore overflow-safe.
+	if maxQueryLength := q.limits.MaxQueryLength(userID); maxQueryLength > 0 {
+		queryLen := endTime.Time().Sub(startTime.Time())
+		if queryLen > maxQueryLength {
+			limitErr := validation.LimitError(fmt.Sprintf(validation.ErrQueryTooLong, queryLen, maxQueryLength))
+			return storage.ErrSeriesSet(limitErr)
+		}
 	}
 
 	tombstones, err := q.tombstonesLoader.GetPendingTombstonesForInterval(userID, startTime, endTime)
