@@ -863,11 +863,23 @@ func (r *Ruler) DeleteTenantConfiguration(w http.ResponseWriter, req *http.Reque
 func (r *Ruler) ListAllRules(w http.ResponseWriter, req *http.Request) {
 	logger := util_log.WithContext(req.Context(), r.logger)
 
-	userIDs, err := r.store.ListAllUsers(req.Context())
-	if err != nil {
-		level.Error(logger).Log("msg", errListAllUser, "err", err)
-		http.Error(w, fmt.Sprintf("%s: %s", errListAllUser, err.Error()), http.StatusInternalServerError)
-		return
+	// Resolve the tenant from the request context. When a tenant is present
+	// (i.e. the request was authenticated through the tenant auth middleware),
+	// restrict the response to that tenant's rule groups only so this handler
+	// cannot be used to disclose other tenants' configuration. When no tenant
+	// is present (operator usage on a non-tenant-facing listener), fall back
+	// to the original cross-tenant listing behaviour.
+	var userIDs []string
+	if tenantID, tenantErr := tenant.TenantID(req.Context()); tenantErr == nil && tenantID != "" {
+		userIDs = []string{tenantID}
+	} else {
+		var err error
+		userIDs, err = r.store.ListAllUsers(req.Context())
+		if err != nil {
+			level.Error(logger).Log("msg", errListAllUser, "err", err)
+			http.Error(w, fmt.Sprintf("%s: %s", errListAllUser, err.Error()), http.StatusInternalServerError)
+			return
+		}
 	}
 
 	done := make(chan struct{})
@@ -878,7 +890,7 @@ func (r *Ruler) ListAllRules(w http.ResponseWriter, req *http.Request) {
 		close(done)
 	}()
 
-	err = concurrency.ForEachUser(req.Context(), userIDs, fetchRulesConcurrency, func(ctx context.Context, userID string) error {
+	err := concurrency.ForEachUser(req.Context(), userIDs, fetchRulesConcurrency, func(ctx context.Context, userID string) error {
 		rg, err := r.store.ListRuleGroupsForUserAndNamespace(ctx, userID, "")
 		if err != nil {
 			return errors.Wrapf(err, "failed to fetch ruler config for user %s", userID)
