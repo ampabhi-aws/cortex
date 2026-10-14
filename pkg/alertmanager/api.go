@@ -283,10 +283,21 @@ func (am *MultitenantAlertmanager) ListAllConfigs(w http.ResponseWriter, r *http
 		} else if err != nil {
 			return errors.Wrapf(err, "failed to fetch alertmanager config for user %s", userID)
 		}
+		// This endpoint is a cluster-wide dump that returns another tenant's
+		// Alertmanager configuration. Tenant configs embed third-party
+		// notification credentials (Slack api_url, PagerDuty/OpsGenie keys,
+		// SMTP passwords, http_config basic_auth / bearer_token). Redact them
+		// before emitting the config so that an operator export cannot be used
+		// to harvest live third-party credentials.
+		rawCfg, rerr := redactAlertmanagerRawConfig(cfg.RawConfig)
+		if rerr != nil {
+			level.Warn(logger).Log("msg", "failed to redact alertmanager config secrets; omitting raw config", "user", userID, "err", rerr)
+			rawCfg = ""
+		}
 		data := map[string]*UserConfig{
 			userID: {
 				TemplateFiles:      alertspb.ParseTemplates(cfg),
-				AlertmanagerConfig: cfg.RawConfig,
+				AlertmanagerConfig: rawCfg,
 			},
 		}
 
@@ -302,6 +313,25 @@ func (am *MultitenantAlertmanager) ListAllConfigs(w http.ResponseWriter, r *http
 	}
 	close(iter)
 	<-done
+}
+
+// redactAlertmanagerRawConfig parses a tenant's raw Alertmanager configuration
+// and re-marshals it so that secret-bearing fields (Slack api_url, PagerDuty/
+// OpsGenie/VictorOps/WeChat/Pushover/SNS keys, smtp_auth_password, http_config
+// basic_auth.password/bearer_token, etc.) are replaced with the `<secret>`
+// placeholder emitted by the upstream Alertmanager Secret/SecretURL types.
+// If the raw config is empty it is returned unchanged; parse errors are
+// surfaced to the caller which must then choose a safe fallback (never return
+// the verbatim raw config).
+func redactAlertmanagerRawConfig(raw string) (string, error) {
+	if raw == "" {
+		return raw, nil
+	}
+	parsed, err := config.Load(raw)
+	if err != nil {
+		return "", err
+	}
+	return parsed.String(), nil
 }
 
 // validateAlertmanagerConfig recursively scans the input config looking for data types for which

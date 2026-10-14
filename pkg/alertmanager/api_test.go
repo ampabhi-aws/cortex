@@ -690,9 +690,24 @@ receivers:
 	require.Equal(t, "application/yaml", resp.Header.Get("Content-Type"))
 	body, err := io.ReadAll(resp.Body)
 	require.NoError(t, err)
-	old, err := yaml.Marshal(testCases)
-	require.NoError(t, err)
-	require.YAMLEq(t, string(old), string(body))
+
+	// The handler re-marshals each tenant's RawConfig through the upstream
+	// Alertmanager config types so that secret-bearing fields are replaced
+	// with the `<secret>` placeholder before being emitted to another
+	// tenant/operator. Compare the parsed structure rather than the raw
+	// bytes, after re-parsing each entry's RawConfig.
+	got := map[string]*UserConfig{}
+	require.NoError(t, yaml.Unmarshal(body, &got))
+	require.Len(t, got, len(testCases))
+	for user, want := range testCases {
+		have, ok := got[user]
+		require.Truef(t, ok, "missing user %q in response", user)
+		wantCfg, err := config.Load(want.AlertmanagerConfig)
+		require.NoError(t, err)
+		haveCfg, err := config.Load(have.AlertmanagerConfig)
+		require.NoError(t, err)
+		require.Equal(t, wantCfg.String(), haveCfg.String())
+	}
 }
 
 func TestValidateAlertmanagerConfig(t *testing.T) {
@@ -793,4 +808,69 @@ func TestValidateAlertmanagerConfig(t *testing.T) {
 			assert.ErrorIs(t, err, testData.expected)
 		})
 	}
+}
+
+func TestRedactAlertmanagerRawConfig(t *testing.T) {
+	// Config carrying every category of secret the mitigation requires us
+	// to redact before emitting another tenant's RawConfig.
+	in := `
+global:
+  resolve_timeout: 5m
+  slack_api_url: https://hooks.slack.com/services/T000/B000/XXXXXXXXXXXXXXXX
+  smtp_auth_password: 'super-secret-smtp-password'
+route:
+  receiver: fallback
+receivers:
+- name: fallback
+  slack_configs:
+  - api_url: https://hooks.slack.com/services/T000/B000/YYYYYYYYYYYYYYYY
+    channel: '#alerts'
+  pagerduty_configs:
+  - service_key: pd-service-key-should-be-redacted
+    routing_key: pd-routing-key-should-be-redacted
+  opsgenie_configs:
+  - api_key: og-api-key-should-be-redacted
+  victorops_configs:
+  - api_key: vo-api-key-should-be-redacted
+    routing_key: vo-routing-should-be-redacted
+  webhook_configs:
+  - url: https://example.com/webhook
+    http_config:
+      basic_auth:
+        username: user
+        password: webhook-basic-auth-password
+      authorization:
+        type: Bearer
+        credentials: webhook-bearer-token
+`
+	out, err := redactAlertmanagerRawConfig(in)
+	require.NoError(t, err)
+	// None of the plaintext secrets must appear in the redacted output.
+	forbidden := []string{
+		"T000/B000/XXXXXXXXXXXXXXXX",
+		"T000/B000/YYYYYYYYYYYYYYYY",
+		"super-secret-smtp-password",
+		"pd-service-key-should-be-redacted",
+		"pd-routing-key-should-be-redacted",
+		"og-api-key-should-be-redacted",
+		"vo-api-key-should-be-redacted",
+		"vo-routing-should-be-redacted",
+		"webhook-basic-auth-password",
+		"webhook-bearer-token",
+	}
+	for _, s := range forbidden {
+		assert.NotContains(t, out, s, "redacted config leaked secret %q", s)
+	}
+	// The redacted output must still parse as a valid Alertmanager config.
+	_, err = config.Load(out)
+	require.NoError(t, err)
+
+	// Empty input is passed through unchanged.
+	empty, err := redactAlertmanagerRawConfig("")
+	require.NoError(t, err)
+	require.Equal(t, "", empty)
+
+	// Invalid YAML is reported, never silently returned verbatim.
+	_, err = redactAlertmanagerRawConfig("not: valid: alertmanager: config: at: all: ::")
+	require.Error(t, err)
 }
