@@ -49,5 +49,26 @@ func (c *Compactor) RingHandler(w http.ResponseWriter, req *http.Request) {
 		return
 	}
 
+	// The underlying ring HTTP handler treats any POST as an administrative
+	// "forget" of a ring instance, which mutates shared KV state and can be
+	// used to steer compactor ownership. This endpoint is registered with
+	// auth=false (see pkg/api/api.go), so without an external operator
+	// authentication layer we must not expose that mutating action here.
+	// Reject any non-GET method and log the attempt for auditing. Operators
+	// that need to forget a compactor instance should do so via a separate
+	// authenticated admin endpoint or by using an external auth proxy.
+	if req.Method != http.MethodGet {
+		level.Warn(util_log.Logger).Log(
+			"msg", "rejected non-GET request to compactor ring endpoint",
+			"method", req.Method,
+			"remote_addr", req.RemoteAddr,
+			"forget", req.FormValue("forget"),
+			"user_agent", req.UserAgent(),
+		)
+		w.Header().Set("Allow", http.MethodGet)
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
 	c.ring.ServeHTTP(w, req)
 }

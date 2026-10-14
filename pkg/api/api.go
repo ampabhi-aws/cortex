@@ -344,7 +344,12 @@ func (a *API) RegisterStoreGateway(s *storegateway.StoreGateway) {
 // RegisterCompactor registers the ring UI page associated with the compactor.
 func (a *API) RegisterCompactor(c *compactor.Compactor) {
 	a.indexPage.AddLink(SectionAdminEndpoints, "/compactor/ring", "Compactor Ring Status")
-	a.RegisterRoute("/compactor/ring", http.HandlerFunc(c.RingHandler), false, "GET", "POST")
+	// The compactor ring page is read-only here: the mutating "forget" action
+	// exposed by the shared ring handler on POST has no authentication on this
+	// route (auth=false) and would let any unauthenticated caller rewrite
+	// compactor ring membership. Restrict the method set to GET; the handler
+	// itself also rejects non-GET methods as a defense in depth.
+	a.RegisterRoute("/compactor/ring", http.HandlerFunc(c.RingHandler), false, "GET")
 }
 
 type Distributor interface {
