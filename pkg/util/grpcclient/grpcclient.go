@@ -5,6 +5,7 @@ import (
 	"time"
 
 	"github.com/go-kit/log"
+	"github.com/go-kit/log/level"
 	middleware "github.com/grpc-ecosystem/go-grpc-middleware"
 	"github.com/pkg/errors"
 	"google.golang.org/grpc"
@@ -51,12 +52,29 @@ func (cfg *Config) RegisterFlagsWithPrefix(prefix string, f *flag.FlagSet) {
 	cfg.TLS.RegisterFlagsWithPrefix(prefix, f)
 }
 
-func (cfg *Config) Validate(log log.Logger) error {
+func (cfg *Config) Validate(logger log.Logger) error {
 	switch cfg.GRPCCompression {
 	case gzip.Name, snappy.Name, "":
 		// valid
 	default:
 		return errors.Errorf("unsupported compression type: %s", cfg.GRPCCompression)
+	}
+
+	// Warn when the embedded TLS client config is populated but tls_enabled is
+	// false: in that case GetGRPCDialOptions silently returns insecure
+	// credentials and every configured TLS field (cert/key/CA/server name/skip
+	// verify) is discarded. Flag this inconsistency so operators notice at
+	// startup instead of unknowingly running inter-component gRPC in cleartext.
+	if !cfg.TLSEnabled {
+		if cfg.TLS.CertPath != "" || cfg.TLS.KeyPath != "" || cfg.TLS.CAPath != "" || cfg.TLS.ServerName != "" || cfg.TLS.InsecureSkipVerify {
+			level.Warn(logger).Log("msg", "ignoring configured gRPC client TLS settings because tls_enabled is false; the connection will be established in cleartext. Set tls_enabled=true (or clear the TLS fields) to resolve this inconsistency.",
+				"tls_cert_path", cfg.TLS.CertPath,
+				"tls_key_path", cfg.TLS.KeyPath,
+				"tls_ca_path", cfg.TLS.CAPath,
+				"tls_server_name", cfg.TLS.ServerName,
+				"tls_insecure_skip_verify", cfg.TLS.InsecureSkipVerify,
+			)
+		}
 	}
 	return nil
 }
