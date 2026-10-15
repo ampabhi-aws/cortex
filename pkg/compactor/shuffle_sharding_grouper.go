@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"hash/fnv"
+	"math"
 	"sort"
 	"strings"
 	"time"
@@ -138,6 +139,16 @@ func (g *ShuffleShardingGrouper) Groups(blocks map[ulid.ULID]*metadata.Meta) (re
 	// grouping (based on downsample resolution + external labels).
 	mainGroups := map[string][]*metadata.Meta{}
 	for _, b := range blocks {
+		if !isValidBlockMetaTimeRange(b) {
+			level.Warn(g.logger).Log(
+				"msg", "skipping block with invalid min/max time in meta.json; it will not be considered for compaction",
+				"block", b.ULID.String(),
+				"min_time", b.MinTime,
+				"max_time", b.MaxTime,
+				"user", g.userID,
+			)
+			continue
+		}
 		key := b.Thanos.GroupKey()
 		mainGroups[key] = append(mainGroups[key], b)
 	}
@@ -475,6 +486,13 @@ func groupBlocksByRange(blocks []*metadata.Meta, tr int64) []blocksGroup {
 		)
 
 		group.rangeStart = getRangeStart(m, tr)
+		// Guard against int64 overflow when computing rangeEnd. If rangeStart+tr
+		// would overflow, we cannot build a well-defined range: skip this block
+		// instead of looping forever on bogus arithmetic.
+		if tr <= 0 || group.rangeStart > math.MaxInt64-tr {
+			i++
+			continue
+		}
 		group.rangeEnd = group.rangeStart + tr
 
 		// Skip blocks that don't fall into the range. This can happen via mis-alignment or
@@ -483,6 +501,10 @@ func groupBlocksByRange(blocks []*metadata.Meta, tr int64) []blocksGroup {
 			i++
 			continue
 		}
+
+		// Remember where the inner loop started so we can detect lack of progress
+		// and still move forward structurally if nothing was added to the group.
+		start := i
 
 		// Add all blocks to the current group that are within [t0, t0+tr].
 		for ; i < len(blocks); i++ {
@@ -504,9 +526,46 @@ func groupBlocksByRange(blocks []*metadata.Meta, tr int64) []blocksGroup {
 		if len(group.blocks) > 0 {
 			ret = append(ret, group)
 		}
+
+		// Guarantee forward progress: if the inner loop did not consume any block
+		// (e.g. because arithmetic edge cases made every entry fall outside the
+		// computed range), always advance `i` so the outer loop cannot stall.
+		if i == start {
+			i++
+		}
 	}
 
 	return ret
+}
+
+// isValidBlockMetaTimeRange reports whether a block's meta.json timestamps are
+// internally consistent and inside a sane window. Blocks that fail this check
+// are produced only by direct writes to the blocks object-storage bucket
+// (TSDB-produced blocks always have MaxTime >= MinTime and realistic bounds)
+// and would otherwise feed overflow-prone arithmetic in the compaction grouper.
+func isValidBlockMetaTimeRange(m *metadata.Meta) bool {
+	if m == nil {
+		return false
+	}
+	if m.MaxTime < m.MinTime {
+		return false
+	}
+	// Reject timestamps outside a sane range. The compactor's smallest range is
+	// a few hours (ms since epoch), so values close to the int64 extremes can
+	// only come from a corrupt or crafted meta.json. maxSaneBlockTimeMillis is
+	// well past any realistic clock value and still leaves ample headroom for
+	// the largest compaction range plus overflow checks.
+	const (
+		minSaneBlockTimeMillis int64 = 0
+		maxSaneBlockTimeMillis int64 = math.MaxInt64 / 4
+	)
+	if m.MinTime < minSaneBlockTimeMillis || m.MaxTime < minSaneBlockTimeMillis {
+		return false
+	}
+	if m.MinTime > maxSaneBlockTimeMillis || m.MaxTime > maxSaneBlockTimeMillis {
+		return false
+	}
+	return true
 }
 
 func getRangeStart(m *metadata.Meta, tr int64) int64 {
