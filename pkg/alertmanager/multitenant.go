@@ -524,8 +524,11 @@ func (am *MultitenantAlertmanager) migrateStateFilesToPerTenantDirectories() err
 	}
 
 	for userID, files := range st {
-		tenantDir := am.getTenantDirectory(userID)
-		err := os.MkdirAll(tenantDir, 0777)
+		tenantDir, err := am.getTenantDirectory(userID)
+		if err != nil {
+			return errors.Wrap(err, "failed to resolve tenant directory")
+		}
+		err = os.MkdirAll(tenantDir, 0777)
 		if err != nil {
 			return errors.Wrapf(err, "failed to create per-tenant directory %v", tenantDir)
 		}
@@ -809,9 +812,12 @@ func (am *MultitenantAlertmanager) syncConfigs(cfgs map[string]alertspb.AlertCon
 // creating an alertmanager if it doesn't already exist.
 func (am *MultitenantAlertmanager) setConfig(cfg alertspb.AlertConfigDesc) error {
 	var userAmConfig *amconfig.Config
-	var err error
 	var hasTemplateChanges bool
-	var userTemplateDir = filepath.Join(am.getTenantDirectory(cfg.User), templatesDir)
+	tenantDir, err := am.getTenantDirectory(cfg.User)
+	if err != nil {
+		return errors.Wrap(err, "failed to resolve tenant directory")
+	}
+	var userTemplateDir = filepath.Join(tenantDir, templatesDir)
 	var pathsToRemove = make(map[string]struct{})
 
 	// List existing files to keep track the ones to be removed
@@ -919,15 +925,21 @@ func (am *MultitenantAlertmanager) setConfig(cfg alertspb.AlertConfigDesc) error
 	return nil
 }
 
-func (am *MultitenantAlertmanager) getTenantDirectory(userID string) string {
-	return filepath.Join(am.cfg.DataDir, userID)
+func (am *MultitenantAlertmanager) getTenantDirectory(userID string) (string, error) {
+	if userID == "" {
+		return "", errors.New("tenant ID is empty: refusing to build Alertmanager tenant directory that would collapse onto the shared data root")
+	}
+	return filepath.Join(am.cfg.DataDir, userID), nil
 }
 
 func (am *MultitenantAlertmanager) newAlertmanager(userID string, amConfig *amconfig.Config, rawCfg string) (*Alertmanager, error) {
 	reg := prometheus.NewRegistry()
 
-	tenantDir := am.getTenantDirectory(userID)
-	err := os.MkdirAll(tenantDir, 0777)
+	tenantDir, err := am.getTenantDirectory(userID)
+	if err != nil {
+		return nil, errors.Wrap(err, "failed to resolve tenant directory")
+	}
+	err = os.MkdirAll(tenantDir, 0777)
 	if err != nil {
 		return nil, errors.Wrapf(err, "failed to create per-tenant directory %v", tenantDir)
 	}
