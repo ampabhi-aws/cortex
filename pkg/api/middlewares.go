@@ -35,15 +35,16 @@ type HTTPHeaderMiddleware struct {
 	TargetHeaders []string
 }
 
-// InjectTargetHeadersIntoHTTPRequest injects specified HTTPHeaders into the request context
+// InjectTargetHeadersIntoHTTPRequest injects specified HTTPHeaders into the request context.
+//
+// The map is always re-derived from the operator-configured TargetHeaders
+// allowlist. In particular, we deliberately do NOT trust a header map that is
+// already present on the context: when a request is dispatched via
+// httpgrpc.HTTP/Handle the context carries whatever map a gRPC caller
+// supplied, and honouring it here would let that caller bypass the HTTP
+// allowlist and inject arbitrary log fields.
 func (h HTTPHeaderMiddleware) InjectTargetHeadersIntoHTTPRequest(r *http.Request) context.Context {
 	headerMap := make(map[string]string)
-
-	// Check to make sure that Headers have not already been injected
-	checkMapInContext := util_log.HeaderMapFromContext(r.Context())
-	if checkMapInContext != nil {
-		return r.Context()
-	}
 
 	for _, target := range h.TargetHeaders {
 		contents := r.Header.Get(target)

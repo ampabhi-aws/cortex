@@ -45,20 +45,21 @@ func TestHeaderInjection(t *testing.T) {
 	}
 }
 
-func TestExistingHeaderInContextIsNotOverridden(t *testing.T) {
+func TestExistingHeaderInContextIsOverriddenByAllowlist(t *testing.T) {
 	ctx := context.Background()
 
 	h := http.Header{}
-	contentsMap := make(map[string]string)
-	contentsMap["TestHeader1"] = "RequestID"
-	contentsMap["TestHeader2"] = "ContentsOfTestHeader2"
-	contentsMap["Test3"] = "SomeInformation"
+	preexisting := map[string]string{
+		"TestHeader1": "ShouldBeDroppedBecauseGRPCProvided",
+		"InjectedKey": "ShouldBeDropped",
+		"org_id":      "spoofed",
+	}
 
-	h.Add("TestHeader1", "Fail1")
-	h.Add("TestHeader2", "Fail2")
-	h.Add("Test3", "Fail3")
+	h.Add("TestHeader1", "FromHTTP1")
+	h.Add("TestHeader2", "FromHTTP2")
+	h.Add("Test3", "FromHTTP3")
 
-	ctx = util_log.ContextWithHeaderMap(ctx, contentsMap)
+	ctx = util_log.ContextWithHeaderMap(ctx, preexisting)
 	req := &http.Request{
 		Method:     "GET",
 		RequestURI: "/HTTPHeaderTest",
@@ -69,6 +70,14 @@ func TestExistingHeaderInContextIsNotOverridden(t *testing.T) {
 	req = req.WithContext(ctx)
 	ctx = HTTPTestMiddleware.InjectTargetHeadersIntoHTTPRequest(req)
 
-	require.Equal(t, contentsMap, util_log.HeaderMapFromContext(ctx))
-
+	headerMap := util_log.HeaderMapFromContext(ctx)
+	require.NotNil(t, headerMap)
+	// The map must be fully re-derived from the allowlist and the actual
+	// HTTP request headers; the previously-injected (potentially
+	// gRPC-supplied) map must not survive.
+	require.Equal(t, map[string]string{
+		"TestHeader1": "FromHTTP1",
+		"TestHeader2": "FromHTTP2",
+		"Test3":       "FromHTTP3",
+	}, headerMap)
 }

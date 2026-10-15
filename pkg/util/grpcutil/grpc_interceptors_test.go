@@ -68,7 +68,7 @@ func TestGRPCHeaderInjectionForHTTPPropagationServerInterceptor(t *testing.T) {
 
 	md, ok := metadata.FromOutgoingContext(ctx)
 	require.True(t, ok)
-	ctx = util_log.ContextWithHeaderMapFromMetadata(ctx, md)
+	ctx = util_log.ContextWithHeaderMapFromMetadata(ctx, md, []string{"Test1", "TestHeader2"})
 
 	headersMap := util_log.HeaderMapFromContext(ctx)
 
@@ -86,7 +86,22 @@ func TestGRPCHeaderDifferentLengthsForHTTPPropagationServerInterceptor(t *testin
 	ctx = metadata.AppendToOutgoingContext(ctx, util_log.HeaderPropagationStringForRequestLogging, "Results")
 	ctx = metadata.AppendToOutgoingContext(ctx, util_log.HeaderPropagationStringForRequestLogging, "Results2")
 
-	ctx = extractForwardedHeadersFromMetadata(ctx)
+	ctx = extractForwardedHeadersFromMetadata(ctx, []string{"Test123"})
 
 	assert.Nil(t, util_log.HeaderMapFromContext(ctx))
+}
+
+func TestGRPCHeaderPropagationServerInterceptorIgnoresNonAllowlistedKeys(t *testing.T) {
+	ctx := metadata.NewIncomingContext(context.Background(), metadata.New(nil))
+	md, _ := metadata.FromIncomingContext(ctx)
+	md[util_log.HeaderPropagationStringForRequestLogging] = []string{
+		"Allowed", "ok",
+		"org_id", "spoofed",
+		" ", "empty",
+	}
+	ctx = metadata.NewIncomingContext(context.Background(), md)
+
+	ctx = extractForwardedHeadersFromMetadata(ctx, []string{"Allowed"})
+	headerMap := util_log.HeaderMapFromContext(ctx)
+	require.Equal(t, map[string]string{"Allowed": "ok"}, headerMap)
 }
