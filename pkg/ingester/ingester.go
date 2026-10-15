@@ -1803,6 +1803,13 @@ func (i *Ingester) getOrCreateTSDB(userID string, force bool) (*userTSDB, error)
 
 // createTSDB creates a TSDB for a given userID, and returns the created db.
 func (i *Ingester) createTSDB(userID string) (*userTSDB, error) {
+	if userID == "" {
+		// Defensive: an empty user ID would make BlocksDir return the
+		// shared TSDB root (filepath.Join(cfg.Dir, "") == cfg.Dir), which
+		// holds every tenant's TSDB. Reject it rather than opening the
+		// shared directory as if it were a tenant's TSDB.
+		return nil, errors.New("ingester: tenant ID must not be empty")
+	}
 	tsdbPromReg := prometheus.NewRegistry()
 	udir := i.cfg.BlocksStorageConfig.TSDB.BlocksDir(userID)
 	userLogger := logutil.WithUserID(userID, i.logger)
