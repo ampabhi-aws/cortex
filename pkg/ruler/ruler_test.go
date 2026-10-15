@@ -50,6 +50,7 @@ import (
 	"github.com/cortexproject/cortex/pkg/ruler/rulestore"
 	"github.com/cortexproject/cortex/pkg/tenant"
 	"github.com/cortexproject/cortex/pkg/util"
+	"github.com/cortexproject/cortex/pkg/util/adminauth"
 	"github.com/cortexproject/cortex/pkg/util/flagext"
 	"github.com/cortexproject/cortex/pkg/util/services"
 	"github.com/cortexproject/cortex/pkg/util/validation"
@@ -1109,6 +1110,10 @@ func TestRuler_ListAllRules(t *testing.T) {
 	router.Path("/ruler/rule_groups").Methods(http.MethodGet).HandlerFunc(r.ListAllRules)
 
 	req := requestFor(t, http.MethodGet, "https://localhost:8080/ruler/rule_groups", nil, "")
+	// Simulate the admin-authorization middleware marking the request as
+	// operator-authorized, so the ListAllRules defence-in-depth check
+	// (which refuses to run without operator authorization) is satisfied.
+	req = req.WithContext(adminauth.With(req.Context()))
 	w := httptest.NewRecorder()
 	router.ServeHTTP(w, req)
 

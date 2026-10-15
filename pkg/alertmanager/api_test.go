@@ -23,6 +23,7 @@ import (
 
 	"github.com/cortexproject/cortex/pkg/alertmanager/alertspb"
 	"github.com/cortexproject/cortex/pkg/alertmanager/alertstore/bucketclient"
+	"github.com/cortexproject/cortex/pkg/util/adminauth"
 	"github.com/cortexproject/cortex/pkg/util/flagext"
 	util_log "github.com/cortexproject/cortex/pkg/util/log"
 	"github.com/cortexproject/cortex/pkg/util/services"
@@ -682,6 +683,10 @@ receivers:
 	router := mux.NewRouter()
 	router.Path("/multitenant_alertmanager/configs").Methods(http.MethodGet).HandlerFunc(am.ListAllConfigs)
 	req := httptest.NewRequest("GET", "https://localhost:8080/multitenant_alertmanager/configs", nil)
+	// Simulate the admin-authorization middleware marking the request as
+	// operator-authorized, so the ListAllConfigs defence-in-depth check
+	// (which refuses to run without operator authorization) is satisfied.
+	req = req.WithContext(adminauth.With(req.Context()))
 	w := httptest.NewRecorder()
 	router.ServeHTTP(w, req)
 
@@ -690,7 +695,17 @@ receivers:
 	require.Equal(t, "application/yaml", resp.Header.Get("Content-Type"))
 	body, err := io.ReadAll(resp.Body)
 	require.NoError(t, err)
-	old, err := yaml.Marshal(testCases)
+	// The aggregate endpoint redacts secret-bearing fields before streaming,
+	// so compute the expected YAML by passing each tenant's raw config
+	// through the same redactor.
+	expected := map[string]*UserConfig{}
+	for u, cfg := range testCases {
+		expected[u] = &UserConfig{
+			TemplateFiles:      cfg.TemplateFiles,
+			AlertmanagerConfig: redactAlertmanagerConfigYAML(cfg.AlertmanagerConfig),
+		}
+	}
+	old, err := yaml.Marshal(expected)
 	require.NoError(t, err)
 	require.YAMLEq(t, string(old), string(body))
 }
