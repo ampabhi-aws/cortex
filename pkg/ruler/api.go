@@ -2,6 +2,7 @@ package ruler
 
 import (
 	"encoding/json"
+	"fmt"
 	io "io"
 	"net/http"
 	"net/url"
@@ -447,14 +448,31 @@ func (a *API) CreateRuleGroup(w http.ResponseWriter, req *http.Request) {
 		return
 	}
 
-	payload, err := io.ReadAll(req.Body)
+	// Bound the request body before reading it into memory to protect the ruler
+	// from OOM caused by an oversized rule-group upload (mirrors the Alertmanager
+	// config upload path in pkg/alertmanager/api.go).
+	var body io.Reader = req.Body
+	maxRuleGroupSize := a.ruler.limits.RulerMaxRuleGroupSizeBytes(userID)
+	if maxRuleGroupSize > 0 {
+		// Read one extra byte so we can detect when the limit is exceeded.
+		body = io.LimitReader(req.Body, int64(maxRuleGroupSize)+1)
+	}
+
+	payload, err := io.ReadAll(body)
 	if err != nil {
 		level.Error(logger).Log("msg", "unable to read rule group payload", "err", err.Error())
 		http.Error(w, err.Error(), http.StatusBadRequest)
 		return
 	}
 
-	level.Debug(logger).Log("msg", "attempting to unmarshal rulegroup", "userID", userID, "group", string(payload))
+	if maxRuleGroupSize > 0 && len(payload) > maxRuleGroupSize {
+		msg := fmt.Sprintf("rule group too big: the rule group has size greater than the limit of %d bytes", maxRuleGroupSize)
+		level.Warn(logger).Log("msg", msg, "user", userID)
+		http.Error(w, msg, http.StatusBadRequest)
+		return
+	}
+
+	level.Debug(logger).Log("msg", "attempting to unmarshal rulegroup", "userID", userID, "payload_bytes", len(payload))
 
 	rg := rulefmt.RuleGroup{}
 	err = yaml.Unmarshal(payload, &rg)
@@ -497,7 +515,7 @@ func (a *API) CreateRuleGroup(w http.ResponseWriter, req *http.Request) {
 
 	rgProto := rulespb.ToProto(userID, namespace, rg)
 
-	level.Debug(logger).Log("msg", "attempting to store rulegroup", "userID", userID, "group", rgProto.String())
+	level.Debug(logger).Log("msg", "attempting to store rulegroup", "userID", userID, "group_name", rgProto.Name, "namespace", namespace, "rules", len(rgProto.Rules))
 	err = a.store.SetRuleGroup(req.Context(), userID, namespace, rgProto)
 	if err != nil {
 		level.Error(logger).Log("msg", "unable to store rule group", "err", err.Error())
