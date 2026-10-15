@@ -20,6 +20,17 @@ which identify them and confirm they are authorised. When configuring the
 auth, or Bearer token, can be used to convey the tenant ID and/or credentials.
 See the [Cortex-Tenant](#cortex-tenant) section below for one way to solve this.
 
+> **Important** — admin endpoints exposed on the same HTTP listener as the
+> tenant API (notably `/config`, `/runtime_config`, `/services`, `/ring`,
+> `/memberlist` and the `/debug/*` family) serialize process-wide state.
+> Although `/config` and `/runtime_config` now require the tenant
+> authentication middleware, that middleware only enforces the presence of
+> an `X-Scope-OrgID` header; it is not real authentication. Operators are
+> expected to configure the fronting reverse proxy to deny all paths that
+> are not under `/api/` or `/prometheus/` (and any other tenant-facing
+> prefixes you expose). Do not expose the Cortex HTTP port directly to
+> untrusted networks.
+
 In trusted environments, Prometheus can send the `X-Scope-OrgID` header itself
 by configuring the `headers` field in its [`remote_write` configuration](https://prometheus.io/docs/prometheus/latest/configuration/configuration/#remote_write):
 ```
