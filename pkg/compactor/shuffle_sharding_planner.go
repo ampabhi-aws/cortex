@@ -51,7 +51,7 @@ func NewShuffleShardingPlanner(
 	}
 }
 
-func (p *ShuffleShardingPlanner) Plan(_ context.Context, metasByMinTime []*metadata.Meta) ([]*metadata.Meta, error) {
+func (p *ShuffleShardingPlanner) Plan(ctx context.Context, metasByMinTime []*metadata.Meta) ([]*metadata.Meta, error) {
 	// Ensure all blocks fits within the largest range. This is a double check
 	// to ensure there's no bug in the previous blocks grouping, given this Plan()
 	// is just a pass-through.
@@ -72,7 +72,7 @@ func (p *ShuffleShardingPlanner) Plan(_ context.Context, metasByMinTime []*metad
 			return nil, fmt.Errorf("block %s with time range %d:%d is outside the largest expected range %d:%d", blockID, b.MinTime, b.MaxTime, rangeStart, rangeEnd)
 		}
 
-		blockVisitMarker, err := ReadBlockVisitMarker(p.ctx, p.bkt, p.logger, blockID, p.blockVisitMarkerReadFailed)
+		blockVisitMarker, err := ReadBlockVisitMarker(ctx, p.bkt, p.logger, blockID, p.blockVisitMarkerReadFailed)
 		if err != nil {
 			// shuffle_sharding_grouper should put visit marker file for blocks ready for
 			// compaction. So error should be returned if visit marker file does not exist.
@@ -89,7 +89,12 @@ func (p *ShuffleShardingPlanner) Plan(_ context.Context, metasByMinTime []*metad
 		return nil, nil
 	}
 
-	go markBlocksVisitedHeartBeat(p.ctx, p.bkt, p.logger, resultMetas, p.ringLifecyclerID, p.blockVisitMarkerFileUpdateInterval, p.blockVisitMarkerWriteFailed)
+	// Bind the heartbeat to the per-job context passed by Thanos so the goroutine
+	// terminates as soon as the planned compaction job completes or fails, instead
+	// of being tied to the long-lived per-tenant run context (which would leak one
+	// goroutine and keep issuing visit-marker writes per Plan call until the whole
+	// run returns).
+	go markBlocksVisitedHeartBeat(ctx, p.bkt, p.logger, resultMetas, p.ringLifecyclerID, p.blockVisitMarkerFileUpdateInterval, p.blockVisitMarkerWriteFailed)
 
 	return resultMetas, nil
 }
