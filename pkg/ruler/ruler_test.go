@@ -259,7 +259,7 @@ func TestNotifierSendsUserIDHeader(t *testing.T) {
 
 	cfg := defaultRulerConfig(t)
 
-	cfg.AlertmanagerURL = ts.URL
+	cfg.AlertmanagerURL = flagext.URLString(ts.URL)
 	cfg.AlertmanagerDiscovery = false
 
 	manager := newManager(t, cfg)
