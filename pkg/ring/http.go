@@ -2,6 +2,9 @@ package ring
 
 import (
 	"context"
+	"crypto/rand"
+	"crypto/subtle"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"html/template"
@@ -14,6 +17,10 @@ import (
 	"github.com/go-kit/log/level"
 )
 
+// csrfCookieName is the name of the cookie used to implement the
+// double-submit cookie CSRF protection for the ring admin page.
+const csrfCookieName = "cortex_ring_csrf"
+
 const pageContent = `
 <!DOCTYPE html>
 <html>
@@ -25,7 +32,7 @@ const pageContent = `
 		<h1>Ring Status</h1>
 		<p>Current time: {{ .Now }}</p>
 		<form action="" method="POST">
-			<input type="hidden" name="csrf_token" value="$__CSRF_TOKEN_PLACEHOLDER__">
+			<input type="hidden" name="csrf_token" value="{{ .CSRFToken }}">
 			<table width="100%" border="1">
 				<thead>
 					<tr>
@@ -90,6 +97,82 @@ func init() {
 	pageTemplate = template.Must(t.Parse(pageContent))
 }
 
+// generateCSRFToken returns a cryptographically random, hex-encoded token
+// suitable for use as a CSRF double-submit value.
+func generateCSRFToken() (string, error) {
+	b := make([]byte, 32)
+	if _, err := rand.Read(b); err != nil {
+		return "", err
+	}
+	return hex.EncodeToString(b), nil
+}
+
+// isValidCSRFToken returns true if s looks like a token issued by
+// generateCSRFToken (64 lowercase hex characters). This guards against
+// an attacker injecting an arbitrary cookie value that would then be
+// trivially replayed in the form field.
+func isValidCSRFToken(s string) bool {
+	if len(s) != 64 {
+		return false
+	}
+	_, err := hex.DecodeString(s)
+	return err == nil
+}
+
+// ensureCSRFCookie returns the CSRF token bound to the caller via a cookie,
+// generating and setting one if the request does not already carry a valid
+// token cookie. The returned token is also the value that must be echoed
+// back in the csrf_token form field on subsequent POSTs.
+func ensureCSRFCookie(w http.ResponseWriter, req *http.Request) (string, error) {
+	if c, err := req.Cookie(csrfCookieName); err == nil && isValidCSRFToken(c.Value) {
+		return c.Value, nil
+	}
+	tok, err := generateCSRFToken()
+	if err != nil {
+		return "", err
+	}
+	http.SetCookie(w, &http.Cookie{
+		Name:     csrfCookieName,
+		Value:    tok,
+		Path:     "/",
+		HttpOnly: true,
+		SameSite: http.SameSiteStrictMode,
+		Secure:   req.TLS != nil,
+	})
+	return tok, nil
+}
+
+// verifyCSRF performs double-submit cookie CSRF validation on the request.
+// It requires that the csrf_token form value be a non-empty, well-formed
+// token that matches the value of the csrfCookieName cookie in constant
+// time. Any mismatch is treated as a CSRF failure.
+func verifyCSRF(req *http.Request) error {
+	formTok := req.FormValue("csrf_token")
+	if !isValidCSRFToken(formTok) {
+		return fmt.Errorf("missing or malformed csrf_token form value")
+	}
+	cookie, err := req.Cookie(csrfCookieName)
+	if err != nil || !isValidCSRFToken(cookie.Value) {
+		return fmt.Errorf("missing or malformed csrf cookie")
+	}
+	if subtle.ConstantTimeCompare([]byte(formTok), []byte(cookie.Value)) != 1 {
+		return fmt.Errorf("csrf token mismatch")
+	}
+	return nil
+}
+
+// hasInstance reports whether the given instance ID is currently registered
+// in the ring descriptor.
+func (r *Ring) hasInstance(id string) bool {
+	r.mtx.RLock()
+	defer r.mtx.RUnlock()
+	if r.ringDesc == nil {
+		return false
+	}
+	_, ok := r.ringDesc.Ingesters[id]
+	return ok
+}
+
 func (r *Ring) forget(ctx context.Context, id string) error {
 	unregister := func(in interface{}) (out interface{}, retry bool, err error) {
 		if in == nil {
@@ -119,16 +202,57 @@ type httpResponse struct {
 	Ingesters  []ingesterDesc `json:"shards"`
 	Now        time.Time      `json:"now"`
 	ShowTokens bool           `json:"-"`
+	CSRFToken  string         `json:"-"`
 }
 
 func (r *Ring) ServeHTTP(w http.ResponseWriter, req *http.Request) {
 	if req.Method == http.MethodPost {
-		ingesterID := req.FormValue("forget")
-		if err := r.forget(req.Context(), ingesterID); err != nil {
-			level.Error(r.logger).Log("msg", "error forgetting instance", "err", err)
+		// CSRF protection: the ring routes are mounted without authentication
+		// (see pkg/api/api.go), so any client - including a cross-site form
+		// in an operator's browser - can reach this handler. Implement the
+		// double-submit cookie pattern: a random token is set as an HttpOnly,
+		// SameSite=Strict cookie on GET and we require that the POST body
+		// carry the same token in the csrf_token form field.
+		if err := verifyCSRF(req); err != nil {
+			level.Warn(r.logger).Log(
+				"msg", "rejected ring forget request: CSRF validation failed",
+				"err", err,
+				"remote", req.RemoteAddr,
+				"user_agent", req.UserAgent(),
+			)
+			http.Error(w, "forbidden: CSRF validation failed", http.StatusForbidden)
+			return
 		}
 
-		// Implement PRG pattern to prevent double-POST and work with CSRF middleware.
+		ingesterID := req.FormValue("forget")
+		if ingesterID == "" {
+			http.Error(w, "missing forget instance ID", http.StatusBadRequest)
+			return
+		}
+		if !r.hasInstance(ingesterID) {
+			level.Warn(r.logger).Log(
+				"msg", "rejected ring forget request: unknown instance",
+				"instance", ingesterID,
+				"remote", req.RemoteAddr,
+				"user_agent", req.UserAgent(),
+			)
+			http.Error(w, "unknown instance", http.StatusNotFound)
+			return
+		}
+
+		level.Info(r.logger).Log(
+			"msg", "forgetting ring instance",
+			"instance", ingesterID,
+			"remote", req.RemoteAddr,
+			"user_agent", req.UserAgent(),
+		)
+		if err := r.forget(req.Context(), ingesterID); err != nil {
+			level.Error(r.logger).Log("msg", "error forgetting instance", "err", err, "instance", ingesterID)
+			http.Error(w, "failed to forget instance", http.StatusInternalServerError)
+			return
+		}
+
+		// Implement PRG pattern to prevent double-POST.
 		// https://en.wikipedia.org/wiki/Post/Redirect/Get
 
 		// http.Redirect() would convert our relative URL to absolute, which is not what we want.
@@ -137,6 +261,15 @@ func (r *Ring) ServeHTTP(w http.ResponseWriter, req *http.Request) {
 		w.Header().Set("Location", "#")
 		w.WriteHeader(http.StatusFound)
 
+		return
+	}
+
+	// Issue (or re-use) the CSRF cookie so the rendered form carries a
+	// token that is bound to this caller.
+	csrfToken, err := ensureCSRFCookie(w, req)
+	if err != nil {
+		level.Error(r.logger).Log("msg", "failed to issue CSRF cookie", "err", err)
+		http.Error(w, "internal error", http.StatusInternalServerError)
 		return
 	}
 
@@ -185,6 +318,7 @@ func (r *Ring) ServeHTTP(w http.ResponseWriter, req *http.Request) {
 		Ingesters:  ingesters,
 		Now:        now,
 		ShowTokens: tokensParam == "true",
+		CSRFToken:  csrfToken,
 	}, pageTemplate, req)
 }
 
