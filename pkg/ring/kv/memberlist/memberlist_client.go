@@ -28,6 +28,15 @@ import (
 const (
 	maxCasRetries              = 10          // max retries in CAS operation
 	noChangeDetectedRetrySleep = time.Second // how long to sleep after no change was detected in CAS
+
+	// Defaults for resource caps enforced on gossip inputs. These are intentionally generous
+	// so legitimate traffic (large rings, big push/pull snapshots) is not disturbed, while
+	// still bounding what a hostile peer can allocate before being rejected.
+	defaultMaxReceivedMessageSize = 10 * 1024 * 1024  // per NotifyMsg user message
+	defaultMaxRemoteStateSize     = 128 * 1024 * 1024 // total MergeRemoteState payload size
+	defaultMaxLocalStateSize      = 128 * 1024 * 1024 // bound on bytes emitted by LocalState
+	defaultMaxStoreKeys           = 1024              // bound on distinct keys kept in local store
+	defaultMaxBroadcastQueueItems = 16 * 1024         // bound on in-flight broadcasts (prune threshold)
 )
 
 // Client implements kv.Client interface, by using memberlist.KV
@@ -165,6 +174,34 @@ type KVConfig struct {
 
 	// Codecs to register. Codecs need to be registered before joining other members.
 	Codecs []codec.Codec `yaml:"-"`
+
+	// AcceptedKeys optionally restricts which gossip KV keys this process will accept
+	// from remote peers (NotifyMsg / MergeRemoteState). If empty, keys are also accepted
+	// implicitly when a local caller references them (Get/CAS/WatchKey/List/WatchPrefix).
+	// Setting an explicit list hardens the KV against hostile peers that attempt to grow
+	// the local store with attacker-chosen keys.
+	AcceptedKeys []string `yaml:"accepted_keys"`
+
+	// MaxReceivedMessageSize bounds a single user-level gossip message (NotifyMsg).
+	// 0 selects defaultMaxReceivedMessageSize. Messages larger than the cap are dropped.
+	MaxReceivedMessageSize int `yaml:"max_received_message_size"`
+
+	// MaxRemoteStateSize bounds the total size accepted from a single push/pull sync
+	// (MergeRemoteState). 0 selects defaultMaxRemoteStateSize.
+	MaxRemoteStateSize int `yaml:"max_remote_state_size"`
+
+	// MaxLocalStateSize bounds the number of bytes emitted by LocalState in a single
+	// push/pull cycle. 0 selects defaultMaxLocalStateSize.
+	MaxLocalStateSize int `yaml:"max_local_state_size"`
+
+	// MaxStoreKeys bounds the number of distinct keys kept in the local store. New keys
+	// received from gossip beyond this cap are rejected. 0 selects defaultMaxStoreKeys.
+	MaxStoreKeys int `yaml:"max_store_keys"`
+
+	// MaxBroadcastQueueItems caps the number of pending broadcasts in the memberlist
+	// TransmitLimitedQueue. When exceeded, the oldest entries are pruned. 0 selects
+	// defaultMaxBroadcastQueueItems.
+	MaxBroadcastQueueItems int `yaml:"max_broadcast_queue_items"`
 }
 
 // RegisterFlagsWithPrefix registers flags.
@@ -193,6 +230,11 @@ func (cfg *KVConfig) RegisterFlagsWithPrefix(f *flag.FlagSet, prefix string) {
 	f.BoolVar(&cfg.EnableCompression, prefix+"memberlist.compression-enabled", mlDefaults.EnableCompression, "Enable message compression. This can be used to reduce bandwidth usage at the cost of slightly more CPU utilization.")
 	f.StringVar(&cfg.AdvertiseAddr, prefix+"memberlist.advertise-addr", mlDefaults.AdvertiseAddr, "Gossip address to advertise to other members in the cluster. Used for NAT traversal.")
 	f.IntVar(&cfg.AdvertisePort, prefix+"memberlist.advertise-port", mlDefaults.AdvertisePort, "Gossip port to advertise to other members in the cluster. Used for NAT traversal.")
+	f.IntVar(&cfg.MaxReceivedMessageSize, prefix+"memberlist.max-received-message-size", defaultMaxReceivedMessageSize, "Maximum size of a single user message accepted via gossip NotifyMsg. Messages larger than this are dropped.")
+	f.IntVar(&cfg.MaxRemoteStateSize, prefix+"memberlist.max-remote-state-size", defaultMaxRemoteStateSize, "Maximum size of a remote push/pull state accepted via gossip MergeRemoteState. Larger payloads are truncated.")
+	f.IntVar(&cfg.MaxLocalStateSize, prefix+"memberlist.max-local-state-size", defaultMaxLocalStateSize, "Maximum size of the local state emitted during a push/pull sync. Oldest keys are skipped once this cap is reached.")
+	f.IntVar(&cfg.MaxStoreKeys, prefix+"memberlist.max-store-keys", defaultMaxStoreKeys, "Maximum number of distinct keys kept in the local gossip KV store. New keys received via gossip beyond this cap are dropped.")
+	f.IntVar(&cfg.MaxBroadcastQueueItems, prefix+"memberlist.max-broadcast-queue-items", defaultMaxBroadcastQueueItems, "Maximum number of pending broadcast messages. Oldest entries are pruned when this cap is exceeded.")
 
 	cfg.TCPTransport.RegisterFlagsWithPrefix(f, prefix)
 }
@@ -237,6 +279,17 @@ type KV struct {
 
 	// Codec registry
 	codecs map[string]codec.Codec
+
+	// Key allowlist. Keys/prefixes populated here are accepted when seen via gossip
+	// (NotifyMsg/MergeRemoteState). Entries are added from KVConfig.AcceptedKeys at
+	// startup, and lazily when a local caller references a key (Get/CAS/WatchKey/List/WatchPrefix).
+	// If both maps are empty, the KV runs in permissive mode and will register a key the first
+	// time it is observed; this preserves backward-compatible behaviour for callers that have
+	// not opted into an explicit allowlist.
+	registeredMu       sync.Mutex
+	registeredKeys     map[string]struct{}
+	registeredPrefixes map[string]struct{}
+	strictAllowlist    bool
 
 	// Key watchers
 	watchersMu     sync.Mutex
@@ -350,6 +403,14 @@ func NewKV(cfg KVConfig, logger log.Logger, dnsProvider DNSProvider, registerer 
 		prefixWatchers: make(map[string][]chan string),
 		shutdown:       make(chan struct{}),
 		maxCasRetries:  maxCasRetries,
+
+		registeredKeys:     make(map[string]struct{}),
+		registeredPrefixes: make(map[string]struct{}),
+		strictAllowlist:    len(cfg.AcceptedKeys) > 0,
+	}
+
+	for _, k := range cfg.AcceptedKeys {
+		mlkv.registeredKeys[k] = struct{}{}
 	}
 
 	mlkv.createAndRegisterMetrics()
@@ -510,6 +571,95 @@ func (m *KV) GetCodec(codecID string) codec.Codec {
 	return m.codecs[codecID]
 }
 
+// registerKey records that this process has local interest in key, so that gossip
+// messages carrying it are accepted. Safe to call under any lock ordering.
+func (m *KV) registerKey(key string) {
+	if key == "" {
+		return
+	}
+	m.registeredMu.Lock()
+	m.registeredKeys[key] = struct{}{}
+	m.registeredMu.Unlock()
+}
+
+// registerPrefix records a watched prefix so that gossip messages for any key with
+// that prefix are accepted.
+func (m *KV) registerPrefix(prefix string) {
+	m.registeredMu.Lock()
+	m.registeredPrefixes[prefix] = struct{}{}
+	m.registeredMu.Unlock()
+}
+
+// isKeyAllowed reports whether a key received over gossip should be accepted.
+// In strict mode (an explicit AcceptedKeys list was configured) the key must be
+// present in the allowlist or match a registered prefix. Otherwise, the first
+// sighting registers the key, preserving backward compatibility for deployments
+// that have not opted into strict filtering, while still ensuring we have a
+// record of every stored key for pruning and telemetry.
+func (m *KV) isKeyAllowed(key string) bool {
+	if key == "" {
+		return false
+	}
+	m.registeredMu.Lock()
+	defer m.registeredMu.Unlock()
+
+	if _, ok := m.registeredKeys[key]; ok {
+		return true
+	}
+	for p := range m.registeredPrefixes {
+		if strings.HasPrefix(key, p) {
+			return true
+		}
+	}
+	if m.strictAllowlist {
+		return false
+	}
+	// Permissive mode: remember the key so subsequent gossip (and local
+	// bookkeeping like max-store-keys) treats it as known.
+	m.registeredKeys[key] = struct{}{}
+	return true
+}
+
+// maxReceivedMessageSize returns the configured per-message cap for NotifyMsg.
+func (m *KV) maxReceivedMessageSize() int {
+	if m.cfg.MaxReceivedMessageSize > 0 {
+		return m.cfg.MaxReceivedMessageSize
+	}
+	return defaultMaxReceivedMessageSize
+}
+
+// maxRemoteStateSize returns the configured push/pull payload cap.
+func (m *KV) maxRemoteStateSize() int {
+	if m.cfg.MaxRemoteStateSize > 0 {
+		return m.cfg.MaxRemoteStateSize
+	}
+	return defaultMaxRemoteStateSize
+}
+
+// maxLocalStateSize returns the cap on bytes emitted by LocalState.
+func (m *KV) maxLocalStateSize() int {
+	if m.cfg.MaxLocalStateSize > 0 {
+		return m.cfg.MaxLocalStateSize
+	}
+	return defaultMaxLocalStateSize
+}
+
+// maxStoreKeys returns the cap on the number of distinct keys retained locally.
+func (m *KV) maxStoreKeys() int {
+	if m.cfg.MaxStoreKeys > 0 {
+		return m.cfg.MaxStoreKeys
+	}
+	return defaultMaxStoreKeys
+}
+
+// maxBroadcastQueueItems returns the retransmit queue cap.
+func (m *KV) maxBroadcastQueueItems() int {
+	if m.cfg.MaxBroadcastQueueItems > 0 {
+		return m.cfg.MaxBroadcastQueueItems
+	}
+	return defaultMaxBroadcastQueueItems
+}
+
 // GetListeningPort returns port used for listening for memberlist communication. Useful when BindPort is set to 0.
 // This call is only valid after KV service has been started.
 func (m *KV) GetListeningPort() int {
@@ -640,6 +790,8 @@ func (m *KV) stopping(_ error) error {
 // List returns all known keys under a given prefix.
 // No communication with other nodes in the cluster is done here.
 func (m *KV) List(prefix string) []string {
+	m.registerPrefix(prefix)
+
 	m.storeMu.Lock()
 	defer m.storeMu.Unlock()
 
@@ -661,6 +813,8 @@ func (m *KV) Get(key string, codec codec.Codec) (interface{}, error) {
 
 // Returns current value with removed tombstones.
 func (m *KV) get(key string, codec codec.Codec) (out interface{}, version uint, err error) {
+	m.registerKey(key)
+
 	m.storeMu.Lock()
 	v := m.store[key].Clone()
 	m.storeMu.Unlock()
@@ -679,6 +833,8 @@ func (m *KV) get(key string, codec codec.Codec) (out interface{}, version uint, 
 //
 // Watching ends when 'f' returns false, context is done, or this client is shut down.
 func (m *KV) WatchKey(ctx context.Context, key string, codec codec.Codec, f func(interface{}) bool) {
+	m.registerKey(key)
+
 	// keep one extra notification, to avoid missing notification if we're busy running the function
 	w := make(chan string, 1)
 
@@ -726,6 +882,8 @@ func (m *KV) WatchKey(ctx context.Context, key string, codec codec.Codec, f func
 //
 // Watching ends when 'f' returns false, context is done, or this client is shut down.
 func (m *KV) WatchPrefix(ctx context.Context, prefix string, codec codec.Codec, f func(string, interface{}) bool) {
+	m.registerPrefix(prefix)
+
 	// we use bigger buffer here, since keys are interesting and we don't want to lose them.
 	w := make(chan string, 16)
 
@@ -825,6 +983,8 @@ func (m *KV) notifyWatchers(key string) {
 // detect removals. If Merge doesn't result in any change (returns nil), then operation fails and is retried again.
 // After too many failed retries, this method returns error.
 func (m *KV) CAS(ctx context.Context, key string, codec codec.Codec, f func(in interface{}) (out interface{}, retry bool, err error)) error {
+	m.registerKey(key)
+
 	var lastError error
 
 outer:
@@ -964,6 +1124,14 @@ func (m *KV) NotifyMsg(msg []byte) {
 	m.numberOfReceivedMessages.Inc()
 	m.totalSizeOfReceivedMessages.Add(float64(len(msg)))
 
+	// Reject oversized messages up front so a hostile peer cannot force unbounded
+	// allocations in the protobuf decoder or the merge path.
+	if max := m.maxReceivedMessageSize(); len(msg) > max {
+		level.Warn(m.logger).Log("msg", "dropping oversized gossip message", "size", len(msg), "max", max)
+		m.numberOfInvalidReceivedMessages.Inc()
+		return
+	}
+
 	kvPair := KeyValuePair{}
 	err := kvPair.Unmarshal(msg)
 	if err != nil {
@@ -982,6 +1150,22 @@ func (m *KV) NotifyMsg(msg []byte) {
 	if codec == nil {
 		m.numberOfInvalidReceivedMessages.Inc()
 		level.Error(m.logger).Log("msg", "failed to decode received value, unknown codec", "codec", kvPair.GetCodec())
+		return
+	}
+
+	// Only accept keys this process has a legitimate interest in. This stops an
+	// unauthenticated peer from forcing new entries into m.store under
+	// attacker-chosen keys that are never evicted and are re-broadcast cluster-wide.
+	if !m.isKeyAllowed(kvPair.Key) {
+		m.numberOfInvalidReceivedMessages.Inc()
+		level.Warn(m.logger).Log("msg", "rejecting gossip message for unregistered key", "key", kvPair.Key)
+		return
+	}
+
+	// Cap distinct keys stored to prevent unbounded growth even in permissive mode.
+	if !m.canAcceptNewKey(kvPair.Key) {
+		m.numberOfInvalidReceivedMessages.Inc()
+		level.Warn(m.logger).Log("msg", "rejecting gossip message, local KV store at max-store-keys cap", "key", kvPair.Key, "max", m.maxStoreKeys())
 		return
 	}
 
@@ -1027,6 +1211,27 @@ func (m *KV) queueBroadcast(key string, content []string, version uint, message 
 
 	m.totalSizeOfBroadcastMessagesInQueue.Add(float64(l))
 	m.broadcasts.QueueBroadcast(b)
+
+	// Bound the retransmit queue so a flood of unique broadcasts can't grow memory
+	// without limit. Prune keeps the newest entries and drops the oldest.
+	if max := m.maxBroadcastQueueItems(); max > 0 && m.broadcasts.NumQueued() > max {
+		m.broadcasts.Prune(max)
+	}
+}
+
+// canAcceptNewKey reports whether the KV can still accept a new key under the
+// MaxStoreKeys cap. Existing keys are always allowed.
+func (m *KV) canAcceptNewKey(key string) bool {
+	max := m.maxStoreKeys()
+	if max <= 0 {
+		return true
+	}
+	m.storeMu.Lock()
+	defer m.storeMu.Unlock()
+	if _, exists := m.store[key]; exists {
+		return true
+	}
+	return len(m.store) < max
 }
 
 // GetBroadcasts is method from Memberlist Delegate interface
@@ -1040,8 +1245,8 @@ func (m *KV) GetBroadcasts(overhead, limit int) [][]byte {
 // LocalState is method from Memberlist Delegate interface
 //
 // This is "pull" part of push/pull sync (either periodic, or when new node joins the cluster).
-// Here we dump our entire state -- all keys and their values. There is no limit on message size here,
-// as Memberlist uses 'stream' operations for transferring this state.
+// Here we dump our state. The emitted payload is bounded by MaxLocalStateSize so a bloated
+// local store cannot be amplified back onto the network in a single push/pull.
 func (m *KV) LocalState(join bool) []byte {
 	m.initWG.Wait()
 
@@ -1055,6 +1260,7 @@ func (m *KV) LocalState(join bool) []byte {
 
 	buf := bytes.Buffer{}
 	sent := time.Now()
+	maxSize := m.maxLocalStateSize()
 
 	kvPair := KeyValuePair{}
 	for key, val := range m.store {
@@ -1090,6 +1296,13 @@ func (m *KV) LocalState(join bool) []byte {
 			continue
 		}
 
+		// Enforce the push/pull payload cap. Keys that would push us past the limit
+		// are skipped for this cycle; subsequent cycles may pick them up.
+		if maxSize > 0 && buf.Len()+4+len(ser) > maxSize {
+			level.Warn(m.logger).Log("msg", "skipping key in LocalState: exceeds max-local-state-size", "key", key, "max", maxSize)
+			continue
+		}
+
 		err = binary.Write(&buf, binary.BigEndian, uint32(len(ser)))
 		if err != nil {
 			level.Error(m.logger).Log("msg", "failed to write uint32 to buffer?", "err", err)
@@ -1121,6 +1334,14 @@ func (m *KV) MergeRemoteState(data []byte, join bool) {
 
 	m.numberOfPushes.Inc()
 	m.totalSizeOfPushes.Add(float64(len(data)))
+
+	// Reject oversized push/pull payloads so a hostile peer cannot force unbounded
+	// allocations in the decode loop.
+	if max := m.maxRemoteStateSize(); max > 0 && len(data) > max {
+		level.Warn(m.logger).Log("msg", "dropping oversized gossip remote state", "size", len(data), "max", max)
+		m.numberOfInvalidReceivedMessages.Inc()
+		return
+	}
 
 	kvPair := KeyValuePair{}
 
@@ -1154,6 +1375,19 @@ func (m *KV) MergeRemoteState(data []byte, join bool) {
 		codec := m.GetCodec(kvPair.GetCodec())
 		if codec == nil {
 			level.Error(m.logger).Log("msg", "failed to parse remote state: unknown codec for key", "codec", kvPair.GetCodec(), "key", kvPair.GetKey())
+			continue
+		}
+
+		// Enforce the key allowlist and the max-store-keys cap on each decoded pair
+		// so a hostile push cannot grow m.store without bound.
+		if len(kvPair.Key) == 0 || !m.isKeyAllowed(kvPair.Key) {
+			m.numberOfInvalidReceivedMessages.Inc()
+			level.Warn(m.logger).Log("msg", "rejecting remote state entry for unregistered key", "key", kvPair.GetKey())
+			continue
+		}
+		if !m.canAcceptNewKey(kvPair.Key) {
+			m.numberOfInvalidReceivedMessages.Inc()
+			level.Warn(m.logger).Log("msg", "rejecting remote state entry, local KV store at max-store-keys cap", "key", kvPair.GetKey(), "max", m.maxStoreKeys())
 			continue
 		}
 
@@ -1211,11 +1445,20 @@ func (m *KV) mergeValueForKey(key string, incomingValue Mergeable, casVersion ui
 	// Note that we do not take a deep copy of curr.value here, it is modified in-place.
 	// This is safe because the entire function runs under the store lock; we do not return
 	// the full state anywhere as is done elsewhere (i.e. Get/WatchKey/CAS).
-	curr := m.store[key]
+	curr, exists := m.store[key]
 	// if casVersion is 0, then there was no previous value, so we will just do normal merge, without localCAS flag set.
 	if casVersion > 0 && curr.version != casVersion {
 		return nil, 0, errVersionMismatch
 	}
+
+	// Final enforcement of max-store-keys inside the store lock to avoid TOCTOU races
+	// against concurrent gossip pushes that pass the earlier admission check.
+	if !exists {
+		if max := m.maxStoreKeys(); max > 0 && len(m.store) >= max {
+			return nil, 0, fmt.Errorf("local KV store at max-store-keys cap (%d), refusing new key %q", max, key)
+		}
+	}
+
 	result, change, err := computeNewValue(incomingValue, curr.value, casVersion > 0)
 	if err != nil {
 		return nil, 0, err
