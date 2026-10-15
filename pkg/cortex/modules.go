@@ -591,7 +591,18 @@ func (t *Cortex) initConfig() (serv services.Service, err error) {
 	}
 
 	t.ConfigAPI = configAPI.New(t.ConfigDB, t.Cfg.Configs.API)
-	t.ConfigAPI.RegisterRoutes(t.Server.HTTP)
+	// Register the tenant-facing configs routes on the raw server mux. The
+	// internal /private/* fan-out routes are registered through the main
+	// Cortex API (pkg/api.(*API).RegisterRoute) so they flow through the
+	// central API registration — matching the way other admin / internal
+	// endpoints (e.g. /multitenant_alertmanager/configs, /ruler/rule_groups)
+	// are registered — rather than being attached to the bare server router
+	// with no middleware. The handler additionally rejects requests that
+	// carry a tenant identity so a tenant cannot use these endpoints to
+	// dump every other tenant's Alertmanager configuration.
+	t.ConfigAPI.RegisterTenantRoutes(t.Server.HTTP)
+	t.API.RegisterRoute("/private/api/prom/configs/rules", t.ConfigAPI.GetConfigsHandler(), false, "GET")
+	t.API.RegisterRoute("/private/api/prom/configs/alertmanager", t.ConfigAPI.GetConfigsHandler(), false, "GET")
 	return services.NewIdleService(nil, func(_ error) error {
 		t.ConfigDB.Close()
 		return nil
