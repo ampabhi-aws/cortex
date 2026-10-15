@@ -302,15 +302,17 @@ func normalizeIngestersMap(inputRing *Desc) {
 		}
 
 		// tokens are sorted now, we can easily remove duplicates.
-		prev := ing.Tokens[0]
-		for ix := 1; ix < len(ing.Tokens); {
-			if ing.Tokens[ix] == prev {
-				ing.Tokens = append(ing.Tokens[:ix], ing.Tokens[ix+1:]...)
-			} else {
-				prev = ing.Tokens[ix]
-				ix++
+		// Deduplicate in-place in O(n) using a write index, rather than
+		// repeatedly shifting the tail of the slice (which would be O(n^2)
+		// and lets an attacker-controlled gossip peer freeze the ring KV
+		// store with a few-megabyte Desc containing ~1e6 identical tokens).
+		out := ing.Tokens[:1]
+		for _, t := range ing.Tokens[1:] {
+			if t != out[len(out)-1] {
+				out = append(out, t)
 			}
 		}
+		ing.Tokens = out
 
 		// write updated value back to map
 		inputRing.Ingesters[n] = ing
