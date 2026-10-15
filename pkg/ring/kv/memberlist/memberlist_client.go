@@ -4,12 +4,14 @@ import (
 	"bytes"
 	"context"
 	"crypto/rand"
+	"crypto/sha256"
 	"encoding/binary"
 	"errors"
 	"flag"
 	"fmt"
 	"math"
 	mathrand "math/rand"
+	"os"
 	"strings"
 	"sync"
 	"time"
@@ -159,6 +161,18 @@ type KVConfig struct {
 
 	TCPTransport TCPTransportConfig `yaml:",inline"`
 
+	// ClusterSecret, if set, is used to derive memberlist's own symmetric
+	// SecretKey (AES-256). This authenticates and encrypts every gossip
+	// message independently of TLS, so even if a peer bypasses TLS client
+	// auth it still cannot inject merge updates without the shared secret.
+	// Mutually exclusive with ClusterSecretPath.
+	ClusterSecret string `yaml:"cluster_secret" doc:"hidden"`
+
+	// ClusterSecretPath, if set, is a path to a file whose contents are used
+	// in place of ClusterSecret. Preferred for production so the secret does
+	// not need to appear in process args or config files.
+	ClusterSecretPath string `yaml:"cluster_secret_path"`
+
 	// Where to put custom metrics. Metrics are not registered, if this is nil.
 	MetricsRegisterer prometheus.Registerer `yaml:"-"`
 	MetricsNamespace  string                `yaml:"-"`
@@ -193,12 +207,39 @@ func (cfg *KVConfig) RegisterFlagsWithPrefix(f *flag.FlagSet, prefix string) {
 	f.BoolVar(&cfg.EnableCompression, prefix+"memberlist.compression-enabled", mlDefaults.EnableCompression, "Enable message compression. This can be used to reduce bandwidth usage at the cost of slightly more CPU utilization.")
 	f.StringVar(&cfg.AdvertiseAddr, prefix+"memberlist.advertise-addr", mlDefaults.AdvertiseAddr, "Gossip address to advertise to other members in the cluster. Used for NAT traversal.")
 	f.IntVar(&cfg.AdvertisePort, prefix+"memberlist.advertise-port", mlDefaults.AdvertisePort, "Gossip port to advertise to other members in the cluster. Used for NAT traversal.")
+	f.StringVar(&cfg.ClusterSecret, prefix+"memberlist.cluster-secret", "", "Shared secret used to authenticate and encrypt gossip messages via memberlist's own keyring. When set, only peers that know the same secret can inject or read ring state. Prefer -memberlist.cluster-secret-path for production. Mutually exclusive with -memberlist.cluster-secret-path.")
+	f.StringVar(&cfg.ClusterSecretPath, prefix+"memberlist.cluster-secret-path", "", "Path to a file containing the shared gossip secret (see -memberlist.cluster-secret). Trailing whitespace is trimmed.")
 
 	cfg.TCPTransport.RegisterFlagsWithPrefix(f, prefix)
 }
 
 func (cfg *KVConfig) RegisterFlags(f *flag.FlagSet) {
 	cfg.RegisterFlagsWithPrefix(f, "")
+}
+
+// resolveClusterSecret returns the operator-provided shared gossip secret, if
+// any, from the inline value or the configured file. The two options are
+// mutually exclusive; a configured path that is empty is treated as an error
+// to avoid silently running without the expected authentication.
+func (cfg *KVConfig) resolveClusterSecret() ([]byte, error) {
+	if cfg.ClusterSecret != "" && cfg.ClusterSecretPath != "" {
+		return nil, errors.New("-memberlist.cluster-secret and -memberlist.cluster-secret-path are mutually exclusive")
+	}
+	if cfg.ClusterSecret != "" {
+		return []byte(cfg.ClusterSecret), nil
+	}
+	if cfg.ClusterSecretPath != "" {
+		data, err := os.ReadFile(cfg.ClusterSecretPath)
+		if err != nil {
+			return nil, fmt.Errorf("failed to read memberlist cluster secret file %q: %w", cfg.ClusterSecretPath, err)
+		}
+		data = bytes.TrimRight(data, " \t\r\n")
+		if len(data) == 0 {
+			return nil, fmt.Errorf("memberlist cluster secret file %q is empty", cfg.ClusterSecretPath)
+		}
+		return data, nil
+	}
+	return nil, nil
 }
 
 func generateRandomSuffix(logger log.Logger) string {
@@ -397,6 +438,31 @@ func (m *KV) buildMemberlistConfig() (*memberlist.Config, error) {
 
 	mlCfg.LogOutput = newMemberlistLoggerAdapter(m.logger, false)
 	mlCfg.Transport = tr
+
+	// If an operator-provided shared secret is configured, enable memberlist's
+	// own per-message authentication/encryption. This is defence in depth on
+	// top of (or in place of) TLS client auth on the TCP transport: without
+	// it, any host that reaches the gossip port -- even over TLS, which does
+	// not request a peer certificate when built from a client tls.Config --
+	// could inject ring/KV state that every receiver would merge and
+	// re-broadcast. See the finding behind this change.
+	secret, err := m.cfg.resolveClusterSecret()
+	if err != nil {
+		return nil, err
+	}
+	if len(secret) > 0 {
+		// memberlist's SecretKey must be 16, 24 or 32 bytes (AES-128/192/256).
+		// Derive a fixed-length key from the user secret with SHA-256 so any
+		// passphrase length works and the raw secret is never used directly.
+		key := sha256.Sum256(secret)
+		mlCfg.SecretKey = key[:]
+		mlCfg.GossipVerifyIncoming = true
+		mlCfg.GossipVerifyOutgoing = true
+	}
+
+	if !m.cfg.TCPTransport.TLSEnabled && m.cfg.TCPTransport.TLSClientCAPath == "" && len(secret) == 0 {
+		level.Warn(m.logger).Log("msg", "memberlist gossip is running without TLS client authentication and without a shared cluster secret; any host that can reach the gossip port can inject ring state. Configure -memberlist.tls-enabled with -memberlist.tls-client-ca-path, or -memberlist.cluster-secret[-path], and ensure the gossip port is not reachable from untrusted networks.")
+	}
 
 	// Memberlist uses UDPBufferSize to figure out how many messages it can put into single "packet".
 	// As we don't use UDP for sending packets, we can use higher value here.
