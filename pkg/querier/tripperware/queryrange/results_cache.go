@@ -5,6 +5,7 @@ import (
 	"flag"
 	"fmt"
 	"net/http"
+	"net/url"
 	"sort"
 	"strings"
 	"time"
@@ -141,9 +142,16 @@ type CacheSplitter interface {
 type constSplitter time.Duration
 
 // GenerateCacheKey generates a cache key based on the userID, Request and interval.
+//
+// The userID is percent-escaped so that delimiter bytes (`:` and `|`) that may
+// legally appear in tenant IDs after `JoinTenantIDs` (and that historically
+// could pass the default `SingleResolver`) cannot be confused with the `:`
+// field separators. This prevents cross-tenant cache-key collisions in which,
+// for example, tenant `a` querying `b:up` would otherwise generate the same
+// key as tenant `a:b` querying `up`.
 func (t constSplitter) GenerateCacheKey(userID string, r tripperware.Request) string {
 	currentInterval := r.GetStart() / int64(time.Duration(t)/time.Millisecond)
-	return fmt.Sprintf("%s:%s:%d:%d", userID, r.GetQuery(), r.GetStep(), currentInterval)
+	return fmt.Sprintf("%s:%s:%d:%d", url.QueryEscape(userID), r.GetQuery(), r.GetStep(), currentInterval)
 }
 
 // ShouldCacheFn checks whether the current request should go to cache
