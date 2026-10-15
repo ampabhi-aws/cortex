@@ -4,10 +4,12 @@ import (
 	"bytes"
 	"crypto/md5"
 	"crypto/tls"
+	"crypto/x509"
 	"flag"
 	"fmt"
 	"io"
 	"net"
+	"os"
 	"strings"
 	"sync"
 	"time"
@@ -59,6 +61,14 @@ type TCPTransportConfig struct {
 
 	TLSEnabled bool                   `yaml:"tls_enabled"`
 	TLS        cortextls.ClientConfig `yaml:",inline"`
+
+	// Server-side TLS options for the gossip listener. The listener needs a
+	// *server* TLS configuration (ClientAuth / ClientCAs) rather than reusing
+	// the client config, otherwise tls.Listen silently accepts any peer. The
+	// server certificate / private key presented to peers reuse TLS.CertPath
+	// and TLS.KeyPath above (the same key material a peer uses to dial out).
+	TLSClientCAPath string `yaml:"tls_client_ca_path"`
+	TLSClientAuth   string `yaml:"tls_client_auth"`
 }
 
 func (cfg *TCPTransportConfig) RegisterFlags(f *flag.FlagSet) {
@@ -76,6 +86,65 @@ func (cfg *TCPTransportConfig) RegisterFlagsWithPrefix(f *flag.FlagSet, prefix s
 
 	f.BoolVar(&cfg.TLSEnabled, prefix+"memberlist.tls-enabled", false, "Enable TLS on the memberlist transport layer.")
 	cfg.TLS.RegisterFlagsWithPrefix(prefix+"memberlist", f)
+
+	// Server-side TLS flags for the gossip listener. tls-client-ca-path and
+	// tls-client-auth control verification of peer (client) certificates on
+	// the listener. Default (empty) remains backwards compatible, but
+	// operators are strongly encouraged to set tls-client-auth to
+	// RequireAndVerifyClientCert so that any host reaching the gossip port
+	// must present a certificate issued by the cluster CA.
+	f.StringVar(&cfg.TLSClientCAPath, prefix+"memberlist.tls-client-ca-path", "", "Path to the CA certificates used by the memberlist listener to verify client (peer) certificates. Required when tls-client-auth requires client certificates.")
+	f.StringVar(&cfg.TLSClientAuth, prefix+"memberlist.tls-client-auth", "", "Policy for peer certificate authentication on the memberlist listener. One of NoClientCert, RequestClientCert, RequireAnyClientCert, VerifyClientCertIfGiven, RequireAndVerifyClientCert. Defaults to NoClientCert, which does not authenticate peers.")
+}
+
+// buildListenerTLSConfig builds a *tls.Config suitable for use with tls.Listen
+// on the memberlist port. It intentionally does NOT reuse cfg.TLS
+// (cortextls.ClientConfig), which only populates fields relevant to a client:
+// using a client config on a server leaves ClientAuth as tls.NoClientCert, so
+// the listener accepts any client, with or without a certificate.
+//
+// Here we populate the server certificate from cfg.TLS.CertPath / KeyPath
+// (the same key material used when dialing peers) and the client-cert
+// verification policy from the dedicated server-side fields.
+func (cfg *TCPTransportConfig) buildListenerTLSConfig() (*tls.Config, error) {
+	clientAuth, err := cortextls.ParseClientAuthType(cfg.TLSClientAuth)
+	if err != nil {
+		return nil, err
+	}
+
+	tlsCfg := &tls.Config{
+		ClientAuth: clientAuth,
+	}
+
+	if cfg.TLS.CertPath != "" || cfg.TLS.KeyPath != "" {
+		if cfg.TLS.CertPath == "" {
+			return nil, errors.New("memberlist TLS enabled: tls-key-path given but no tls-cert-path configured")
+		}
+		if cfg.TLS.KeyPath == "" {
+			return nil, errors.New("memberlist TLS enabled: tls-cert-path given but no tls-key-path configured")
+		}
+		cert, err := tls.LoadX509KeyPair(cfg.TLS.CertPath, cfg.TLS.KeyPath)
+		if err != nil {
+			return nil, errors.Wrapf(err, "failed to load memberlist TLS certificate %s,%s", cfg.TLS.CertPath, cfg.TLS.KeyPath)
+		}
+		tlsCfg.Certificates = []tls.Certificate{cert}
+	}
+
+	if cfg.TLSClientCAPath != "" {
+		caCert, err := os.ReadFile(cfg.TLSClientCAPath)
+		if err != nil {
+			return nil, errors.Wrapf(err, "error loading memberlist client CA cert: %s", cfg.TLSClientCAPath)
+		}
+		pool := x509.NewCertPool()
+		if !pool.AppendCertsFromPEM(caCert) {
+			return nil, fmt.Errorf("failed to parse memberlist client CA cert: %s", cfg.TLSClientCAPath)
+		}
+		tlsCfg.ClientCAs = pool
+	} else if clientAuth == tls.VerifyClientCertIfGiven || clientAuth == tls.RequireAndVerifyClientCert {
+		return nil, fmt.Errorf("memberlist tls-client-auth %q requires memberlist.tls-client-ca-path to be set", cfg.TLSClientAuth)
+	}
+
+	return tlsCfg, nil
 }
 
 // TCPTransport is a memberlist.Transport implementation that uses TCP for both packet and stream
@@ -88,7 +157,13 @@ type TCPTransport struct {
 	connCh       chan net.Conn
 	wg           sync.WaitGroup
 	tcpListeners []net.Listener
-	tlsConfig    *tls.Config
+	// tlsConfig is the *client* TLS config used when this transport dials
+	// another peer. listenerTLSConfig is the *server* TLS config used by the
+	// gossip listener and includes ClientAuth / ClientCAs for peer
+	// authentication; using tlsConfig for the listener would silently accept
+	// any peer (ClientAuth defaults to NoClientCert).
+	tlsConfig         *tls.Config
+	listenerTLSConfig *tls.Config
 
 	shutdown atomic.Int32
 
@@ -127,9 +202,18 @@ func NewTCPTransport(config TCPTransportConfig, logger log.Logger) (*TCPTranspor
 
 	var err error
 	if config.TLSEnabled {
+		// Dial-side TLS config (used when we are the client of another peer).
 		t.tlsConfig, err = config.TLS.GetTLSConfig()
 		if err != nil {
 			return nil, errors.Wrap(err, "unable to create TLS config")
+		}
+		// Listener-side TLS config: a *server* config that sets ClientAuth and
+		// ClientCAs so peers must present a certificate issued by the cluster
+		// CA. Reusing config.TLS.GetTLSConfig() here would leave ClientAuth as
+		// tls.NoClientCert and silently accept any peer.
+		t.listenerTLSConfig, err = config.buildListenerTLSConfig()
+		if err != nil {
+			return nil, errors.Wrap(err, "unable to create memberlist listener TLS config")
 		}
 	}
 
@@ -151,7 +235,7 @@ func NewTCPTransport(config TCPTransportConfig, logger log.Logger) (*TCPTranspor
 
 		var tcpLn net.Listener
 		if config.TLSEnabled {
-			tcpLn, err = tls.Listen("tcp", tcpAddr.String(), t.tlsConfig)
+			tcpLn, err = tls.Listen("tcp", tcpAddr.String(), t.listenerTLSConfig)
 			if err != nil {
 				return nil, errors.Wrapf(err, "failed to start TLS TCP listener on %q port %d", addr, port)
 			}
