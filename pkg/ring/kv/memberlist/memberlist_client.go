@@ -238,6 +238,16 @@ type KV struct {
 	// Codec registry
 	codecs map[string]codec.Codec
 
+	// Allowlist of keys/prefixes this process has registered interest in. Only KV
+	// pairs whose key is in allowedKeys, or starts with one of allowedPrefixes, are
+	// accepted from gossip peers. Entries are added by local client operations
+	// (Get/CAS/WatchKey/WatchPrefix/List). This caps peer-driven growth of m.store
+	// and of per-key Prometheus label children, both of which were previously
+	// unbounded (CWE-770).
+	allowedKeysMu   sync.RWMutex
+	allowedKeys     map[string]struct{}
+	allowedPrefixes map[string]struct{}
+
 	// Key watchers
 	watchersMu     sync.Mutex
 	watchers       map[string][]chan string
@@ -270,6 +280,7 @@ type KV struct {
 	casFailures                         prometheus.Counter
 	casSuccesses                        prometheus.Counter
 	watchPrefixDroppedNotifications     *prometheus.CounterVec
+	numberOfRejectedUnknownKeys         prometheus.Counter
 
 	storeValuesDesc        *prometheus.Desc
 	storeTombstones        *prometheus.GaugeVec
@@ -344,12 +355,14 @@ func NewKV(cfg KVConfig, logger log.Logger, dnsProvider DNSProvider, registerer 
 		registerer: registerer,
 		provider:   dnsProvider,
 
-		store:          make(map[string]valueDesc),
-		codecs:         make(map[string]codec.Codec),
-		watchers:       make(map[string][]chan string),
-		prefixWatchers: make(map[string][]chan string),
-		shutdown:       make(chan struct{}),
-		maxCasRetries:  maxCasRetries,
+		store:           make(map[string]valueDesc),
+		codecs:          make(map[string]codec.Codec),
+		allowedKeys:     make(map[string]struct{}),
+		allowedPrefixes: make(map[string]struct{}),
+		watchers:        make(map[string][]chan string),
+		prefixWatchers:  make(map[string][]chan string),
+		shutdown:        make(chan struct{}),
+		maxCasRetries:   maxCasRetries,
 	}
 
 	mlkv.createAndRegisterMetrics()
@@ -640,6 +653,7 @@ func (m *KV) stopping(_ error) error {
 // List returns all known keys under a given prefix.
 // No communication with other nodes in the cluster is done here.
 func (m *KV) List(prefix string) []string {
+	m.registerAllowedPrefix(prefix)
 	m.storeMu.Lock()
 	defer m.storeMu.Unlock()
 
@@ -652,6 +666,52 @@ func (m *KV) List(prefix string) []string {
 	return keys
 }
 
+// registerAllowedKey records that this process has registered interest in the
+// given exact key, so KV pairs for the key received from gossip peers are
+// accepted rather than treated as unsolicited.
+func (m *KV) registerAllowedKey(key string) {
+	if key == "" {
+		return
+	}
+	m.allowedKeysMu.Lock()
+	m.allowedKeys[key] = struct{}{}
+	m.allowedKeysMu.Unlock()
+}
+
+// registerAllowedPrefix records that this process has registered interest in
+// any key under the given prefix. Empty prefix is ignored: it would allow all
+// keys and defeat the point of the allowlist. Callers that need to accept all
+// keys under a logical prefix should wrap the client with kv.PrefixClient so
+// the memberlist layer still sees a non-empty prefix.
+func (m *KV) registerAllowedPrefix(prefix string) {
+	if prefix == "" {
+		return
+	}
+	m.allowedKeysMu.Lock()
+	m.allowedPrefixes[prefix] = struct{}{}
+	m.allowedKeysMu.Unlock()
+}
+
+// isKeyAllowed reports whether the given key matches the current local
+// allowlist (an exact watched key, or any registered prefix). This is the
+// check used to drop peer-supplied keys that this process never asked for.
+func (m *KV) isKeyAllowed(key string) bool {
+	if key == "" {
+		return false
+	}
+	m.allowedKeysMu.RLock()
+	defer m.allowedKeysMu.RUnlock()
+	if _, ok := m.allowedKeys[key]; ok {
+		return true
+	}
+	for p := range m.allowedPrefixes {
+		if strings.HasPrefix(key, p) {
+			return true
+		}
+	}
+	return false
+}
+
 // Get returns current value associated with given key.
 // No communication with other nodes in the cluster is done here.
 func (m *KV) Get(key string, codec codec.Codec) (interface{}, error) {
@@ -661,6 +721,7 @@ func (m *KV) Get(key string, codec codec.Codec) (interface{}, error) {
 
 // Returns current value with removed tombstones.
 func (m *KV) get(key string, codec codec.Codec) (out interface{}, version uint, err error) {
+	m.registerAllowedKey(key)
 	m.storeMu.Lock()
 	v := m.store[key].Clone()
 	m.storeMu.Unlock()
@@ -679,6 +740,7 @@ func (m *KV) get(key string, codec codec.Codec) (out interface{}, version uint, 
 //
 // Watching ends when 'f' returns false, context is done, or this client is shut down.
 func (m *KV) WatchKey(ctx context.Context, key string, codec codec.Codec, f func(interface{}) bool) {
+	m.registerAllowedKey(key)
 	// keep one extra notification, to avoid missing notification if we're busy running the function
 	w := make(chan string, 1)
 
@@ -726,6 +788,7 @@ func (m *KV) WatchKey(ctx context.Context, key string, codec codec.Codec, f func
 //
 // Watching ends when 'f' returns false, context is done, or this client is shut down.
 func (m *KV) WatchPrefix(ctx context.Context, prefix string, codec codec.Codec, f func(string, interface{}) bool) {
+	m.registerAllowedPrefix(prefix)
 	// we use bigger buffer here, since keys are interesting and we don't want to lose them.
 	w := make(chan string, 16)
 
@@ -825,6 +888,7 @@ func (m *KV) notifyWatchers(key string) {
 // detect removals. If Merge doesn't result in any change (returns nil), then operation fails and is retried again.
 // After too many failed retries, this method returns error.
 func (m *KV) CAS(ctx context.Context, key string, codec codec.Codec, f func(in interface{}) (out interface{}, retry bool, err error)) error {
+	m.registerAllowedKey(key)
 	var lastError error
 
 outer:
@@ -975,6 +1039,16 @@ func (m *KV) NotifyMsg(msg []byte) {
 	if len(kvPair.Key) == 0 {
 		level.Warn(m.logger).Log("msg", "received an invalid KV Pair (empty key)")
 		m.numberOfInvalidReceivedMessages.Inc()
+		return
+	}
+
+	if !m.isKeyAllowed(kvPair.Key) {
+		// Peer-supplied key does not match any key or prefix the local process has
+		// registered interest in. Dropping it prevents an unauthenticated gossip
+		// peer from growing m.store, the broadcast queue and (indirectly, via the
+		// per-key tombstone label) Prometheus label cardinality without bound.
+		m.numberOfRejectedUnknownKeys.Inc()
+		level.Warn(m.logger).Log("msg", "ignoring KV Pair for key this process did not register", "key", kvPair.Key)
 		return
 	}
 
@@ -1154,6 +1228,14 @@ func (m *KV) MergeRemoteState(data []byte, join bool) {
 		codec := m.GetCodec(kvPair.GetCodec())
 		if codec == nil {
 			level.Error(m.logger).Log("msg", "failed to parse remote state: unknown codec for key", "codec", kvPair.GetCodec(), "key", kvPair.GetKey())
+			continue
+		}
+
+		if !m.isKeyAllowed(kvPair.Key) {
+			// Peer-supplied key does not match any key or prefix the local process has
+			// registered interest in. Drop it to cap store/metric/broadcast growth.
+			m.numberOfRejectedUnknownKeys.Inc()
+			level.Warn(m.logger).Log("msg", "ignoring KV Pair in remote state for key this process did not register", "key", kvPair.Key)
 			continue
 		}
 
