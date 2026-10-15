@@ -7,6 +7,8 @@ import (
 	"testing"
 
 	"github.com/go-kit/log"
+	"github.com/prometheus/client_golang/prometheus"
+	promtestutil "github.com/prometheus/client_golang/prometheus/testutil"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
@@ -31,7 +33,41 @@ func TestUsersScanner_ScanUsers_ShouldReturnedOwnedUsersOnly(t *testing.T) {
 
 }
 
-func TestUsersScanner_ScanUsers_ShouldReturnUsersForWhichOwnerCheckOrTenantDeletionCheckFailed(t *testing.T) {
+// TestUsersScanner_ScanUsers_ShouldFailClosedOnOwnershipError verifies that when the
+// ownership check (e.g. a compactor ring lookup) returns an error for a tenant, the
+// scanner drops that tenant from the returned list instead of treating it as owned.
+// This is required so that a transient ring/KV fault does not cause every compactor
+// replica to simultaneously consider itself the owner of every tenant and race on
+// block deletion and per-tenant bucket index writes. Cleanup is idempotent across
+// cycles, so deferring the tenant to the next scan is strictly safer than fail-open.
+func TestUsersScanner_ScanUsers_ShouldFailClosedOnOwnershipError(t *testing.T) {
+	bucketClient := &bucket.ClientMock{}
+	bucketClient.MockIter("", []string{"user-1", "user-2"}, nil)
+
+	isOwned := func(userID string) (bool, error) {
+		return false, errors.New("failed to check if user is owned")
+	}
+
+	skipped := prometheus.NewCounter(prometheus.CounterOpts{Name: "test_skipped"})
+
+	s := NewUsersScanner(bucketClient, isOwned, log.NewNopLogger())
+	s.SetOwnershipFailedCounter(skipped)
+	actual, deleted, err := s.ScanUsers(context.Background())
+	require.NoError(t, err)
+	assert.Empty(t, actual)
+	assert.Empty(t, deleted)
+	assert.Equal(t, float64(2), promtestutil.ToFloat64(skipped))
+}
+
+// TestUsersScanner_ScanUsers_ShouldReturnUsersForWhichTenantDeletionCheckFailed verifies
+// that an error reading the tenant-deletion mark does not drop the tenant: unlike the
+// ownership check, the tenant-deletion-mark read failure means we cannot distinguish
+// "active" from "marked for deletion" but the tenant is still (per the ownership check)
+// ours to handle, and treating it as a regular active tenant is the safer default (the
+// only tenant-deletion-mark-driven code path is the explicit full-tenant deletion
+// performed by BlocksCleaner.deleteUserMarkedForDeletion, which requires a positive
+// mark read, not a failed one).
+func TestUsersScanner_ScanUsers_ShouldReturnUsersForWhichTenantDeletionCheckFailed(t *testing.T) {
 	expected := []string{"user-1", "user-2"}
 
 	bucketClient := &bucket.ClientMock{}
@@ -40,7 +76,7 @@ func TestUsersScanner_ScanUsers_ShouldReturnUsersForWhichOwnerCheckOrTenantDelet
 	bucketClient.MockExists(path.Join("user-2", TenantDeletionMarkPath), false, errors.New("fail"))
 
 	isOwned := func(userID string) (bool, error) {
-		return false, errors.New("failed to check if user is owned")
+		return true, nil
 	}
 
 	s := NewUsersScanner(bucketClient, isOwned, log.NewNopLogger())
