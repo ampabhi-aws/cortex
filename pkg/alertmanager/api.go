@@ -261,6 +261,33 @@ func validateUserConfig(logger log.Logger, cfg alertspb.AlertConfigDesc, limits 
 
 func (am *MultitenantAlertmanager) ListAllConfigs(w http.ResponseWriter, r *http.Request) {
 	logger := util_log.WithContext(r.Context(), am.logger)
+
+	// This endpoint streams every tenant's raw Alertmanager configuration,
+	// including notification secrets (Slack, PagerDuty, SMTP, webhook URLs).
+	// It is disabled by default and must be explicitly enabled by operators;
+	// see docs/api/_index.md.
+	if am.cfg == nil || !am.cfg.EnableAllTenantsConfigsAPI {
+		http.Error(w, "list all alertmanager configurations endpoint is disabled; enable with -alertmanager.enable-all-tenants-configs-api", http.StatusNotFound)
+		return
+	}
+
+	// If an admin tenant is configured, require the caller to carry that tenant
+	// identity. This stops any tenant that happens to reach the shared HTTP
+	// listener from retrieving every other tenant's configuration.
+	if adminTenant := am.cfg.AllTenantsConfigsAdminTenantID; adminTenant != "" {
+		callerID, err := tenant.TenantID(r.Context())
+		if err != nil {
+			level.Warn(logger).Log("msg", "rejecting list all alertmanager configs: missing tenant", "err", err.Error())
+			http.Error(w, fmt.Sprintf("%s: %s", errNoOrgID, err.Error()), http.StatusUnauthorized)
+			return
+		}
+		if callerID != adminTenant {
+			level.Warn(logger).Log("msg", "rejecting list all alertmanager configs: caller is not the admin tenant", "caller", callerID)
+			http.Error(w, "forbidden", http.StatusForbidden)
+			return
+		}
+	}
+
 	userIDs, err := am.store.ListAllUsers(r.Context())
 	if err != nil {
 		level.Error(logger).Log("msg", "failed to list users of alertmanager", "err", err)

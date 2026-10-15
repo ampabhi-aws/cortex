@@ -670,6 +670,7 @@ receivers:
 	// Create the Multitenant Alertmanager.
 	reg := prometheus.NewPedanticRegistry()
 	cfg := mockAlertmanagerConfig(t)
+	cfg.EnableAllTenantsConfigsAPI = true
 	am, err := createMultitenantAlertmanager(cfg, nil, nil, alertStore, nil, nil, log.NewNopLogger(), reg)
 	require.NoError(t, err)
 	require.NoError(t, services.StartAndAwaitRunning(context.Background(), am))
