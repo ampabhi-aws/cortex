@@ -37,6 +37,15 @@ const (
 	errTemplateTooBig        = "template %s is too big: %d bytes (limit: %d bytes)"
 
 	fetchConcurrency = 16
+
+	// defaultMaxConfigSize is the hard upper bound (in bytes) applied to any
+	// Alertmanager config upload request body, regardless of per-tenant
+	// configuration. It protects the shared multi-tenant Alertmanager process
+	// from an arbitrarily large body being buffered entirely in memory when
+	// the per-tenant -alertmanager.max-config-size-bytes limit is left at its
+	// default of 0 (= no limit). The per-tenant limit, when set, is applied
+	// as a tighter cap on top of this one.
+	defaultMaxConfigSize = 100 * 1024 * 1024 // 100 MiB
 )
 
 var (
@@ -100,14 +109,18 @@ func (am *MultitenantAlertmanager) SetUserConfig(w http.ResponseWriter, r *http.
 		return
 	}
 
-	var input io.Reader
+	// Always wrap the request body in a hard cap so a tenant cannot force the
+	// shared Alertmanager process to buffer an arbitrarily large body into
+	// memory. The per-tenant AlertmanagerMaxConfigSize limit, when set, is
+	// applied on top as a (potentially tighter) inner cap so we can still
+	// return the specific "configuration is too big" error for that case.
 	maxConfigSize := am.limits.AlertmanagerMaxConfigSize(userID)
+	r.Body = http.MaxBytesReader(w, r.Body, int64(defaultMaxConfigSize))
+	var input io.Reader = r.Body
 	if maxConfigSize > 0 {
 		// LimitReader will return EOF after reading specified number of bytes. To check if
 		// we have read too many bytes, allow one extra byte.
 		input = io.LimitReader(r.Body, int64(maxConfigSize)+1)
-	} else {
-		input = r.Body
 	}
 
 	payload, err := io.ReadAll(input)
