@@ -20,6 +20,7 @@ import (
 	amconfig "github.com/prometheus/alertmanager/config"
 	amtemplate "github.com/prometheus/alertmanager/template"
 
+	"github.com/cortexproject/cortex/pkg/alertmanager"
 	"github.com/cortexproject/cortex/pkg/configs/db"
 	"github.com/cortexproject/cortex/pkg/configs/userconfig"
 	"github.com/cortexproject/cortex/pkg/tenant"
@@ -239,6 +240,17 @@ func validateAlertmanagerConfig(cfg string, noCfg NotificationsConfig) error {
 		}
 	}
 
+	// Defense in depth: run the Cortex Alertmanager hardening deny-list on
+	// configs stored through the legacy configs API, matching the validation
+	// performed by the Alertmanager write API. This prevents tenants from
+	// persisting configs that reference *_file options (password_file,
+	// bearer_token_file, credentials_file, client_secret_file,
+	// slack_api_url_file, api_key_file, TLS *_file) which would otherwise be
+	// read at notification time and exfiltrated to a tenant-chosen URL.
+	if err := alertmanager.ValidateAlertmanagerConfig(cfg); err != nil {
+		return err
+	}
+
 	return nil
 }
 
@@ -249,6 +261,15 @@ func validateRulesFiles(c userconfig.Config) error {
 
 func validateTemplateFiles(c userconfig.Config) error {
 	for fn, content := range c.TemplateFiles {
+		// Reject template file names that contain a path, matching the
+		// Alertmanager multitenant guard (safeTemplateFilepath +
+		// validateTemplateFilename). Without this, the legacy configs API
+		// could persist template keys like "../templates-x/evil.tmpl" which
+		// would then be written outside the per-tenant templates directory
+		// on load.
+		if err := alertmanager.ValidateTemplateFilename(fn); err != nil {
+			return err
+		}
 		if _, err := template.New(fn).Funcs(template.FuncMap(amtemplate.DefaultFuncs)).Parse(content); err != nil {
 			return err
 		}
