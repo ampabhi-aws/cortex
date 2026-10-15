@@ -2324,7 +2324,10 @@ The `etcd_config` configures the etcd client. The supported CLI flags `<prefix>`
 # CLI flag: -<prefix>.etcd.username
 [username: <string> | default = ""]
 
-# Etcd password.
+# Etcd password. Setting this requires TLS to be enabled (via
+# -<prefix>etcd.tls-enabled=true, an https:// endpoint, or TLS file paths) so
+# the password is not sent in cleartext; prefer certificate-based client
+# authentication (tls_cert_path/tls_key_path).
 # CLI flag: -<prefix>.etcd.password
 [password: <string> | default = ""]
 ```

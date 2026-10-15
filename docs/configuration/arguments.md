@@ -190,7 +190,7 @@ prefix these flags with `distributor.ha-tracker.`
 - `etcd.max-retries`
    The maximum number of retries to do for failed ops.
 - `etcd.tls-enabled`
-   Enable TLS.
+   Enable TLS. Required whenever `etcd.password` is set so the password is not sent in cleartext (TLS is also auto-enabled when an `https://` endpoint or any `etcd.tls-*-path` is configured). Prefer certificate-based client authentication over username/password.
 - `etcd.tls-cert-path`
    The TLS certificate file path.
 - `etcd.tls-key-path`
