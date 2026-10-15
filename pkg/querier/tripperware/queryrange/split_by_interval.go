@@ -92,6 +92,15 @@ func splitQuery(r tripperware.Request, interval time.Duration) ([]tripperware.Re
 	return reqs, nil
 }
 
+// maxQueryExpressionDepth bounds the AST nesting depth we accept in the
+// query-frontend, as a last line of defense against pathological, deeply
+// nested PromQL expressions that make recursive AST walks and the recursive
+// pretty-printer quadratic in nesting depth. The limit is intentionally much
+// larger than any realistic query: a reasonable manually authored query is a
+// few tens of levels deep, and generated queries very rarely exceed a few
+// hundred.
+const maxQueryExpressionDepth = 10_000
+
 // evaluateAtModifierFunction parse the query and evaluates the `start()` and `end()` at modifier functions into actual constant timestamps.
 // For example given the start of the query is 10.00, `http_requests_total[1h] @ start()` query will be replaced with `http_requests_total[1h] @ 10.00`
 // If the modifier is already a constant, it will be returned as is.
@@ -100,19 +109,46 @@ func evaluateAtModifierFunction(query string, start, end int64) (string, error) 
 	if err != nil {
 		return "", httpgrpc.Errorf(http.StatusBadRequest, "%s", err)
 	}
-	parser.Inspect(expr, func(n parser.Node, _ []parser.Node) error {
+	// Walk the AST once:
+	//   * reject the request if nesting depth exceeds maxQueryExpressionDepth
+	//     (so we never hand a pathological expression to the recursive
+	//     printer below);
+	//   * replace any `@ start()` / `@ end()` modifier with its constant
+	//     timestamp;
+	//   * remember whether we actually rewrote anything so we can skip the
+	//     quadratic `expr.String()` re-serialization when the expression
+	//     contains no start()/end() modifier.
+	var rewritten bool
+	var depthErr error
+	parser.Inspect(expr, func(n parser.Node, path []parser.Node) error {
+		if len(path) > maxQueryExpressionDepth {
+			depthErr = httpgrpc.Errorf(http.StatusBadRequest, "query expression nesting depth exceeds the maximum of %d", maxQueryExpressionDepth)
+			return depthErr
+		}
 		if selector, ok := n.(*parser.VectorSelector); ok {
 			switch selector.StartOrEnd {
 			case parser.START:
 				selector.Timestamp = &start
+				rewritten = true
 			case parser.END:
 				selector.Timestamp = &end
+				rewritten = true
 			}
 			selector.StartOrEnd = 0
 		}
 		return nil
 	})
-	return expr.String(), err
+	if depthErr != nil {
+		return "", depthErr
+	}
+	// If the expression contains no start()/end() modifier there is nothing to
+	// rewrite, so return the original query string and avoid the recursive
+	// `expr.String()` printer whose per-level fmt.Sprintf makes
+	// re-serialization quadratic in nesting depth.
+	if !rewritten {
+		return query, nil
+	}
+	return expr.String(), nil
 }
 
 // Round up to the step before the next interval boundary.

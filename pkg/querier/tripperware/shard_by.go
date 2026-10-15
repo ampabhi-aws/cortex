@@ -42,6 +42,16 @@ func (s shardBy) Do(ctx context.Context, r Request) (Response, error) {
 		return nil, httpgrpc.Errorf(http.StatusBadRequest, err.Error())
 	}
 
+	// Enforce the max query expression size (in bytes) before any PromQL
+	// parsing/analysis happens. This protects the query-frontend from
+	// pathological, deeply nested expressions whose parse + re-serialize
+	// cost is quadratic in nesting depth.
+	if maxExprSize := validation.SmallestPositiveNonZeroIntPerTenant(tenantIDs, s.limits.MaxQueryExpressionSizeBytes); maxExprSize > 0 {
+		if n := len(r.GetQuery()); n > maxExprSize {
+			return nil, httpgrpc.Errorf(http.StatusBadRequest, "the query expression is too large (%d bytes, maximum %d bytes)", n, maxExprSize)
+		}
+	}
+
 	numShards := validation.SmallestPositiveIntPerTenant(tenantIDs, s.limits.QueryVerticalShardSize)
 
 	if numShards <= 1 {
