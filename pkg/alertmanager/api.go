@@ -304,6 +304,30 @@ func (am *MultitenantAlertmanager) ListAllConfigs(w http.ResponseWriter, r *http
 	<-done
 }
 
+// ValidateAlertmanagerConfig is the exported entry point for the reflection-based
+// Alertmanager config validation. It rejects local file-reference settings
+// (basic_auth.password_file, authorization.credentials_file, bearer_token_file,
+// oauth2.client_secret_file, tls_config ca/cert/key_file, slack api_url_file /
+// global slack_api_url_file, victorops api_key_file) which, if accepted, would
+// let a tenant exfiltrate process-readable files through its own receiver.
+//
+// The same function must be used from every path that admits raw tenant
+// Alertmanager YAML into the per-tenant Alertmanager (both the modern API
+// and the legacy configs API), as well as on the load path, so that configs
+// which entered the store before this validation was applied cannot be used
+// to read local files.
+func ValidateAlertmanagerConfig(cfg interface{}) error {
+	return validateAlertmanagerConfig(cfg)
+}
+
+// ValidateTemplateFilename validates a template filename and returns an error
+// if it is not a plain basename (e.g. contains any path segments). Exported
+// so other packages that admit tenant Alertmanager configs can enforce the
+// same restriction.
+func ValidateTemplateFilename(filename string) error {
+	return validateTemplateFilename(filename)
+}
+
 // validateAlertmanagerConfig recursively scans the input config looking for data types for which
 // we have a specific validation and, whenever encountered, it runs their validation. Returns the
 // first error or nil if validation succeeds.
