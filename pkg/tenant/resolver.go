@@ -83,6 +83,17 @@ func (t *SingleResolver) TenantID(ctx context.Context) (string, error) {
 		return "", err
 	}
 
+	// Enforce the documented tenant ID character set (see
+	// https://cortexmetrics.io/docs/guides/limitations/#tenant-id-naming).
+	// Rejecting characters like ':' and '|' here prevents a tenant from
+	// embedding separators that are used as delimiters elsewhere (e.g. the
+	// query-frontend results cache key and the multi-tenant separator), which
+	// would otherwise allow one tenant to craft a request that collides with
+	// another tenant's cache entry.
+	if err := ValidTenantID(id); err != nil {
+		return "", err
+	}
+
 	if containsUnsafePathSegments(id) {
 		return "", errInvalidTenantID
 	}
