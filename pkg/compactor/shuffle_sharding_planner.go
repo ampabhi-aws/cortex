@@ -3,6 +3,7 @@ package compactor
 import (
 	"context"
 	"fmt"
+	"math"
 	"time"
 
 	"github.com/go-kit/log"
@@ -58,6 +59,13 @@ func (p *ShuffleShardingPlanner) Plan(_ context.Context, metasByMinTime []*metad
 	// Modifed from https://github.com/cortexproject/cortex/pull/2616/files#diff-e3051fc530c48bb276ba958dd8fadc684e546bd7964e6bc75cef9a86ef8df344R28-R63
 	largestRange := p.ranges[len(p.ranges)-1]
 	rangeStart := getRangeStart(metasByMinTime[0], largestRange)
+	// Guard against int64 overflow when computing rangeEnd. The grouper is
+	// expected to filter out blocks whose meta.json timestamps are out of a
+	// sane range, but defend here as well so that a malformed block cannot
+	// cause the planner to produce wrap-around comparisons.
+	if largestRange <= 0 || rangeStart > math.MaxInt64-largestRange {
+		return nil, fmt.Errorf("compaction range overflow: rangeStart=%d, largestRange=%d", rangeStart, largestRange)
+	}
 	rangeEnd := rangeStart + largestRange
 	noCompactMarked := p.noCompBlocksFunc()
 	resultMetas := make([]*metadata.Meta, 0, len(metasByMinTime))
