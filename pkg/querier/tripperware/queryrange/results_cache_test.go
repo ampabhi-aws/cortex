@@ -2,6 +2,7 @@ package queryrange
 
 import (
 	"context"
+	"crypto/sha256"
 	"fmt"
 	"strconv"
 	"testing"
@@ -1173,20 +1174,22 @@ func Test_resultsCache_MissingData(t *testing.T) {
 func TestConstSplitter_generateCacheKey(t *testing.T) {
 	t.Parallel()
 
+	fooHash := fmt.Sprintf("%x", sha256.Sum256([]byte("foo{}")))
+
 	tests := []struct {
 		name     string
 		r        tripperware.Request
 		interval time.Duration
 		want     string
 	}{
-		{"0", &PrometheusRequest{Start: 0, Step: 10, Query: "foo{}"}, 30 * time.Minute, "fake:foo{}:10:0"},
-		{"<30m", &PrometheusRequest{Start: toMs(10 * time.Minute), Step: 10, Query: "foo{}"}, 30 * time.Minute, "fake:foo{}:10:0"},
-		{"30m", &PrometheusRequest{Start: toMs(30 * time.Minute), Step: 10, Query: "foo{}"}, 30 * time.Minute, "fake:foo{}:10:1"},
-		{"91m", &PrometheusRequest{Start: toMs(91 * time.Minute), Step: 10, Query: "foo{}"}, 30 * time.Minute, "fake:foo{}:10:3"},
-		{"0", &PrometheusRequest{Start: 0, Step: 10, Query: "foo{}"}, 24 * time.Hour, "fake:foo{}:10:0"},
-		{"<1d", &PrometheusRequest{Start: toMs(22 * time.Hour), Step: 10, Query: "foo{}"}, 24 * time.Hour, "fake:foo{}:10:0"},
-		{"4d", &PrometheusRequest{Start: toMs(4 * 24 * time.Hour), Step: 10, Query: "foo{}"}, 24 * time.Hour, "fake:foo{}:10:4"},
-		{"3d5h", &PrometheusRequest{Start: toMs(77 * time.Hour), Step: 10, Query: "foo{}"}, 24 * time.Hour, "fake:foo{}:10:3"},
+		{"0", &PrometheusRequest{Start: 0, Step: 10, Query: "foo{}"}, 30 * time.Minute, fmt.Sprintf("fake:%s:10:0", fooHash)},
+		{"<30m", &PrometheusRequest{Start: toMs(10 * time.Minute), Step: 10, Query: "foo{}"}, 30 * time.Minute, fmt.Sprintf("fake:%s:10:0", fooHash)},
+		{"30m", &PrometheusRequest{Start: toMs(30 * time.Minute), Step: 10, Query: "foo{}"}, 30 * time.Minute, fmt.Sprintf("fake:%s:10:1", fooHash)},
+		{"91m", &PrometheusRequest{Start: toMs(91 * time.Minute), Step: 10, Query: "foo{}"}, 30 * time.Minute, fmt.Sprintf("fake:%s:10:3", fooHash)},
+		{"0", &PrometheusRequest{Start: 0, Step: 10, Query: "foo{}"}, 24 * time.Hour, fmt.Sprintf("fake:%s:10:0", fooHash)},
+		{"<1d", &PrometheusRequest{Start: toMs(22 * time.Hour), Step: 10, Query: "foo{}"}, 24 * time.Hour, fmt.Sprintf("fake:%s:10:0", fooHash)},
+		{"4d", &PrometheusRequest{Start: toMs(4 * 24 * time.Hour), Step: 10, Query: "foo{}"}, 24 * time.Hour, fmt.Sprintf("fake:%s:10:4", fooHash)},
+		{"3d5h", &PrometheusRequest{Start: toMs(77 * time.Hour), Step: 10, Query: "foo{}"}, 24 * time.Hour, fmt.Sprintf("fake:%s:10:3", fooHash)},
 	}
 	for _, tt := range tests {
 		t.Run(fmt.Sprintf("%s - %s", tt.name, tt.interval), func(t *testing.T) {
