@@ -87,6 +87,16 @@ func (t *SingleResolver) TenantID(ctx context.Context) (string, error) {
 		return "", errInvalidTenantID
 	}
 
+	// Enforce the documented 150-byte tenant ID length limit even in the
+	// single-tenant resolver. This is intentionally only a length check (the
+	// SingleResolver still accepts a wider character set than MultiResolver,
+	// which was its original purpose) so it bounds the size of any value that
+	// subsequently reaches tenant-labelled metrics / logs / caches without
+	// otherwise changing accepted tenant IDs.
+	if len(id) > 150 {
+		return "", errTenantIDTooLong
+	}
+
 	return id, nil
 }
 
