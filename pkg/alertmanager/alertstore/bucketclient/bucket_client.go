@@ -103,8 +103,28 @@ func (s *BucketAlertStore) GetAlertConfig(ctx context.Context, userID string) (a
 	return cfg, err
 }
 
+// ErrBlankAlertConfig is returned by SetAlertConfig when a caller attempts to
+// store an empty (blank) alertmanager configuration while a non-blank
+// configuration already exists for the same tenant. Overwriting a real
+// configuration with a blank one would silently destroy the tenant's routes,
+// receivers, templates and embedded notification secrets.
+var ErrBlankAlertConfig = errors.New("refusing to overwrite existing alertmanager configuration with a blank one")
+
 // SetAlertConfig implements alertstore.AlertStore.
 func (s *BucketAlertStore) SetAlertConfig(ctx context.Context, cfg alertspb.AlertConfigDesc) error {
+	// Guard against destructive writes: if the caller is trying to store a
+	// blank configuration (empty RawConfig and no templates), make sure we
+	// don't overwrite a tenant's existing non-blank configuration.
+	if cfg.RawConfig == "" && len(cfg.Templates) == 0 {
+		existing, err := s.getAlertConfig(ctx, cfg.User)
+		if err != nil && !s.alertsBucket.IsObjNotFoundErr(err) {
+			return err
+		}
+		if err == nil && (existing.RawConfig != "" || len(existing.Templates) > 0) {
+			return ErrBlankAlertConfig
+		}
+	}
+
 	cfgBytes, err := cfg.Marshal()
 	if err != nil {
 		return err

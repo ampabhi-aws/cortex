@@ -1014,6 +1014,25 @@ func (am *MultitenantAlertmanager) serveRequest(w http.ResponseWriter, req *http
 		http.Error(w, err.Error(), http.StatusUnauthorized)
 		return
 	}
+
+	// When sharding is enabled, only owning replicas may serve a tenant's
+	// requests. Serving on a non-owner would miss the per-tenant Alertmanager
+	// map, fall through to alertmanagerFromFallbackConfig and clobber the
+	// tenant's stored configuration. Forward unsupported (catch-all) requests
+	// to one of the owning replicas instead.
+	//
+	// forwardedHeader is set on requests that have already been proxied once
+	// through DistributeRequestToOwner, so if a stale ring causes the
+	// forwarded request to land on another non-owner we serve locally rather
+	// than loop forever.
+	const forwardedHeader = "X-Cortex-Alertmanager-Forwarded"
+	alreadyForwarded := req.Header.Get(forwardedHeader) != ""
+	if am.cfg.ShardingEnabled && !alreadyForwarded && !am.isUserOwned(userID) {
+		req.Header.Set(forwardedHeader, "1")
+		am.distributor.DistributeRequestToOwner(w, req)
+		return
+	}
+
 	am.alertmanagersMtx.Lock()
 	userAM, ok := am.alertmanagers[userID]
 	am.alertmanagersMtx.Unlock()
@@ -1040,16 +1059,27 @@ func (am *MultitenantAlertmanager) serveRequest(w http.ResponseWriter, req *http
 }
 
 func (am *MultitenantAlertmanager) alertmanagerFromFallbackConfig(userID string) (*Alertmanager, error) {
-	// Upload an empty config so that the Alertmanager is no de-activated in the next poll
-	cfgDesc := alertspb.ToProto("", nil, userID)
-	err := am.store.SetAlertConfig(context.Background(), cfgDesc)
+	// Be non-destructive: if a configuration already exists for this tenant,
+	// use it as-is instead of overwriting the stored object with an empty one.
+	// Only write a placeholder (empty) descriptor when the tenant currently
+	// has no stored configuration, so that the fallback config is applied by
+	// setConfig and the Alertmanager is not deactivated on the next poll.
+	cfgDesc, err := am.store.GetAlertConfig(context.Background(), userID)
 	if err != nil {
-		return nil, err
+		if !errors.Is(err, alertspb.ErrNotFound) {
+			return nil, err
+		}
+		// No stored configuration yet: create a placeholder so that the
+		// Alertmanager is not de-activated by the next poll.
+		cfgDesc = alertspb.ToProto("", nil, userID)
+		if err := am.store.SetAlertConfig(context.Background(), cfgDesc); err != nil {
+			return nil, err
+		}
 	}
 
-	// Calling setConfig with an empty configuration will use the fallback config.
-	err = am.setConfig(cfgDesc)
-	if err != nil {
+	// Calling setConfig will either apply the user's existing configuration
+	// or, if the stored config is blank, fall back to am.fallbackConfig.
+	if err := am.setConfig(cfgDesc); err != nil {
 		return nil, err
 	}
 
