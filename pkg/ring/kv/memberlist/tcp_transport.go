@@ -304,13 +304,28 @@ func (t *TCPTransport) handleConnection(conn net.Conn) {
 			level.Warn(t.logger).Log("msg", "packet digest mismatch", "expected", fmt.Sprintf("%x", expectedDigest), "received", fmt.Sprintf("%x", receivedDigest), "data_length", len(buf), "remote", conn.RemoteAddr())
 		}
 
-		t.debugLog().Log("msg", "Received packet", "addr", addr(addrBuf), "size", len(buf), "hash", fmt.Sprintf("%x", receivedDigest))
+		// Validate the declared source address before trusting it as the packet origin.
+		// The declared address is used by memberlist as the destination for replies
+		// (e.g. ping acks), which TCPTransport.WriteTo turns into net.DialTimeout. If we
+		// trusted attacker-supplied bytes here, a single unauthenticated inbound packet
+		// could coerce this process into opening a TCP connection to any host:port the
+		// peer names (origin forgery / forced outbound connections, CWE-346).
+		//
+		// We parse the declared address as host:port and require its host to match the
+		// IP of conn.RemoteAddr(). The port is allowed to differ because the sender's
+		// gossip port is not the same as the ephemeral source port of this TCP
+		// connection (which is why the transport sends the advertised address at all).
+		// If the declared address is missing or inconsistent, we fall back to
+		// conn.RemoteAddr(), which is at worst a reflection to the actual peer.
+		packetFrom := t.validatePacketOrigin(addrBuf, conn.RemoteAddr())
+
+		t.debugLog().Log("msg", "Received packet", "addr", packetFrom, "size", len(buf), "hash", fmt.Sprintf("%x", receivedDigest))
 
 		t.receivedPacketsBytes.Add(float64(len(buf)))
 
 		t.packetCh <- &memberlist.Packet{
 			Buf:       buf,
-			From:      addr(addrBuf),
+			From:      packetFrom,
 			Timestamp: time.Now(),
 		}
 	} else {
@@ -327,6 +342,55 @@ func (a addr) Network() string {
 
 func (a addr) String() string {
 	return string(a)
+}
+
+// validatePacketOrigin returns the net.Addr that should be used as Packet.From.
+// It parses the declared source address (sent by the peer in the packet frame)
+// and requires its host to match the IP of conn.RemoteAddr(). If the declared
+// address is missing, malformed, or references a different host than the TCP
+// peer, it falls back to conn.RemoteAddr() so that unauthenticated callers
+// cannot coerce this process into dialing arbitrary host:port destinations.
+func (t *TCPTransport) validatePacketOrigin(declared []byte, remote net.Addr) net.Addr {
+	if len(declared) == 0 {
+		return remote
+	}
+
+	declaredStr := string(declared)
+	host, _, err := net.SplitHostPort(declaredStr)
+	if err != nil {
+		level.Warn(t.logger).Log("msg", "ignoring malformed declared source address in packet, falling back to remote addr", "declared", declaredStr, "remote", remote, "err", err)
+		return remote
+	}
+
+	declaredIP := net.ParseIP(host)
+	if declaredIP == nil {
+		level.Warn(t.logger).Log("msg", "ignoring declared source address with non-IP host, falling back to remote addr", "declared", declaredStr, "remote", remote)
+		return remote
+	}
+
+	var remoteIP net.IP
+	switch r := remote.(type) {
+	case *net.TCPAddr:
+		remoteIP = r.IP
+	case *net.UDPAddr:
+		remoteIP = r.IP
+	default:
+		if remote != nil {
+			if rh, _, splitErr := net.SplitHostPort(remote.String()); splitErr == nil {
+				remoteIP = net.ParseIP(rh)
+			}
+		}
+	}
+
+	if remoteIP == nil || !declaredIP.Equal(remoteIP) {
+		level.Warn(t.logger).Log("msg", "declared source address does not match connection remote IP, falling back to remote addr", "declared", declaredStr, "remote", remote)
+		return remote
+	}
+
+	// Declared IP matches the actual TCP peer; preserve the declared address so
+	// memberlist can match it against the known node (gossip port != ephemeral TCP
+	// source port of this inbound connection).
+	return addr(declaredStr)
 }
 
 func (t *TCPTransport) getConnection(addr string, timeout time.Duration) (net.Conn, error) {
