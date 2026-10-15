@@ -183,6 +183,12 @@ type Ingester struct {
 	// Rate of pushed samples. Only used by V2-ingester to limit global samples push rate.
 	ingestionRate        *util_math.EwmaRate
 	inflightPushRequests atomic.Int64
+
+	// Number of asynchronous flushHandler goroutines currently in flight.
+	// Bounded by maxInflightAsyncFlushes to prevent an unauthenticated caller
+	// from amplifying a single HTTP request into unbounded compaction/shipping
+	// work on the ingester.
+	inflightAsyncFlushes atomic.Int64
 }
 
 // Shipper interface is used to have an easy way to mock it in tests.
@@ -834,7 +840,20 @@ func (i *Ingester) updateActiveSeries() {
 // ShutdownHandler triggers the following set of operations in order:
 //   - Change the state of ring to stop accepting writes.
 //   - Flush all the chunks.
-func (i *Ingester) ShutdownHandler(w http.ResponseWriter, _ *http.Request) {
+//
+// This handler is destructive and is restricted to POST at the HTTP
+// registration layer (see pkg/api/api.go). As defence-in-depth it also
+// rejects non-POST calls here, so that it cannot be accidentally triggered
+// by a browser prefetch or a cross-site GET if the route is ever remounted.
+func (i *Ingester) ShutdownHandler(w http.ResponseWriter, r *http.Request) {
+	// r may be nil when invoked from internal tests; in that case we fall
+	// through to the shutdown logic (the HTTP mux already rejects non-POST).
+	if r != nil && r.Method != http.MethodPost {
+		w.Header().Set("Allow", http.MethodPost)
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
 	originalFlush := i.lifecycler.FlushOnShutdown()
 	// We want to flush the chunks if transfer fails irrespective of original flag.
 	i.lifecycler.SetFlushOnShutdown(true)
@@ -2478,10 +2497,25 @@ func (i *Ingester) lifecyclerFlush() {
 const (
 	tenantParam = "tenant"
 	waitParam   = "wait"
+
+	// maxInflightAsyncFlushes bounds how many flush goroutines started by
+	// flushHandler (invoked without wait=true) may run concurrently. This
+	// prevents a caller from amplifying a single HTTP request into unbounded
+	// background compaction/shipping work.
+	maxInflightAsyncFlushes = 8
 )
 
 // Blocks version of Flush handler. It force-compacts blocks, and triggers shipping.
 func (i *Ingester) flushHandler(w http.ResponseWriter, r *http.Request) {
+	// This endpoint is destructive (forces head compaction and block shipping
+	// for every tenant held by this ingester). Allow only POST to avoid being
+	// triggered by a browser prefetch, a cross-site GET, or a link crawler.
+	if r.Method != http.MethodPost {
+		w.Header().Set("Allow", http.MethodPost)
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
 	err := r.ParseForm()
 	if err != nil {
 		level.Warn(logutil.WithContext(r.Context(), i.logger)).Log("msg", "failed to parse HTTP request in flush handler", "err", err)
@@ -2549,7 +2583,23 @@ func (i *Ingester) flushHandler(w http.ResponseWriter, r *http.Request) {
 		// Run synchronously. This simplifies and speeds up tests.
 		run()
 	} else {
-		go run()
+		// Bound the number of concurrent async flushes so that an
+		// unauthenticated caller cannot amplify a single HTTP request into
+		// unbounded background compaction/shipping work.
+		if inflight := i.inflightAsyncFlushes.Inc(); inflight > maxInflightAsyncFlushes {
+			i.inflightAsyncFlushes.Dec()
+			level.Warn(logutil.WithContext(r.Context(), i.logger)).Log(
+				"msg", "rejecting flush request: too many concurrent async flushes",
+				"inflight", inflight-1,
+				"limit", maxInflightAsyncFlushes,
+			)
+			http.Error(w, "too many concurrent flush requests; retry later or use ?wait=true", http.StatusTooManyRequests)
+			return
+		}
+		go func() {
+			defer i.inflightAsyncFlushes.Dec()
+			run()
+		}()
 	}
 
 	w.WriteHeader(http.StatusNoContent)
