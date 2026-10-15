@@ -591,7 +591,13 @@ func (t *Cortex) initConfig() (serv services.Service, err error) {
 	}
 
 	t.ConfigAPI = configAPI.New(t.ConfigDB, t.Cfg.Configs.API)
-	t.ConfigAPI.RegisterRoutes(t.Server.HTTP)
+	// Apply the standard HTTP auth middleware to per-tenant configs routes so
+	// the tenant is resolved from the request context by the same mechanism as
+	// every other tenant-scoped endpoint, rather than from the raw X-Scope-OrgID
+	// header read inside the handler. The admin landing page and the internal
+	// /private/api/prom/configs/* poller endpoints remain unauthenticated and
+	// must be bound to an admin-only listener by the operator.
+	t.ConfigAPI.RegisterRoutesWithMiddleware(t.Server.HTTP, t.Cfg.API.HTTPAuthMiddleware)
 	return services.NewIdleService(nil, func(_ error) error {
 		t.ConfigDB.Close()
 		return nil

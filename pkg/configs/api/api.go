@@ -19,6 +19,7 @@ import (
 	"github.com/gorilla/mux"
 	amconfig "github.com/prometheus/alertmanager/config"
 	amtemplate "github.com/prometheus/alertmanager/template"
+	"github.com/weaveworks/common/middleware"
 
 	"github.com/cortexproject/cortex/pkg/configs/db"
 	"github.com/cortexproject/cortex/pkg/configs/userconfig"
@@ -81,35 +82,69 @@ func (a *API) admin(w http.ResponseWriter, r *http.Request) {
 `)
 }
 
-// RegisterRoutes registers the configs API HTTP routes with the provided Router.
+// RegisterRoutes registers the configs API HTTP routes with the provided
+// Router without applying any authentication middleware. Callers that mount
+// these routes on an externally reachable HTTP server MUST either wrap the
+// provided router with an authentication middleware beforehand or use
+// RegisterRoutesWithMiddleware so that per-tenant routes are protected.
+// This signature is retained for backwards compatibility and for the
+// internal subrouter built by New() (which is only exposed through
+// a.ServeHTTP in tests and in callers that apply their own middleware).
 func (a *API) RegisterRoutes(r *mux.Router) {
+	a.RegisterRoutesWithMiddleware(r, middleware.Identity)
+}
+
+// RegisterRoutesWithMiddleware registers the configs API HTTP routes with
+// the provided Router, wrapping every per-tenant endpoint with the supplied
+// authentication middleware. Per-tenant handlers resolve the tenant from the
+// request context (as populated by the auth middleware) rather than reading
+// the raw X-Scope-OrgID header, so the authentication middleware must inject
+// the tenant into the request context (as middleware.AuthenticateUser and the
+// fakeauth injector do).
+//
+// The admin landing page and the internal /private/api/prom/configs/*
+// endpoints are NOT wrapped: the former is a static page and the latter are
+// poller endpoints consumed by other Cortex instances that do not send
+// X-Scope-OrgID. Operators MUST ensure these /private endpoints are bound to
+// a non-public (admin) listener, as they expose every tenant's configuration.
+func (a *API) RegisterRoutesWithMiddleware(r *mux.Router, authMiddleware middleware.Interface) {
+	if authMiddleware == nil {
+		authMiddleware = middleware.Identity
+	}
 	for _, route := range []struct {
 		name, method, path string
 		handler            http.HandlerFunc
+		auth               bool
 	}{
-		{"root", "GET", "/", a.admin},
+		{"root", "GET", "/", a.admin, false},
 		// Dedicated APIs for updating rules config. In the future, these *must*
 		// be used.
-		{"get_rules", "GET", "/api/prom/configs/rules", a.getConfig},
-		{"set_rules", "POST", "/api/prom/configs/rules", a.setConfig},
-		{"get_templates", "GET", "/api/prom/configs/templates", a.getConfig},
-		{"set_templates", "POST", "/api/prom/configs/templates", a.setConfig},
-		{"get_alertmanager_config", "GET", "/api/prom/configs/alertmanager", a.getConfig},
-		{"set_alertmanager_config", "POST", "/api/prom/configs/alertmanager", a.setConfig},
-		{"validate_alertmanager_config", "POST", "/api/prom/configs/alertmanager/validate", a.validateAlertmanagerConfig},
-		{"deactivate_config", "DELETE", "/api/prom/configs/deactivate", a.deactivateConfig},
-		{"restore_config", "POST", "/api/prom/configs/restore", a.restoreConfig},
-		// Internal APIs.
-		{"private_get_rules", "GET", "/private/api/prom/configs/rules", a.getConfigs},
-		{"private_get_alertmanager_config", "GET", "/private/api/prom/configs/alertmanager", a.getConfigs},
+		{"get_rules", "GET", "/api/prom/configs/rules", a.getConfig, true},
+		{"set_rules", "POST", "/api/prom/configs/rules", a.setConfig, true},
+		{"get_templates", "GET", "/api/prom/configs/templates", a.getConfig, true},
+		{"set_templates", "POST", "/api/prom/configs/templates", a.setConfig, true},
+		{"get_alertmanager_config", "GET", "/api/prom/configs/alertmanager", a.getConfig, true},
+		{"set_alertmanager_config", "POST", "/api/prom/configs/alertmanager", a.setConfig, true},
+		{"validate_alertmanager_config", "POST", "/api/prom/configs/alertmanager/validate", a.validateAlertmanagerConfig, true},
+		{"deactivate_config", "DELETE", "/api/prom/configs/deactivate", a.deactivateConfig, true},
+		{"restore_config", "POST", "/api/prom/configs/restore", a.restoreConfig, true},
+		// Internal APIs. These are consumed by in-cluster pollers without
+		// X-Scope-OrgID and dump every tenant's configuration, so they must
+		// only be exposed on an admin-only listener (not the public ingress).
+		{"private_get_rules", "GET", "/private/api/prom/configs/rules", a.getConfigs, false},
+		{"private_get_alertmanager_config", "GET", "/private/api/prom/configs/alertmanager", a.getConfigs, false},
 	} {
-		r.Handle(route.path, route.handler).Methods(route.method).Name(route.name)
+		var handler http.Handler = route.handler
+		if route.auth {
+			handler = authMiddleware.Wrap(handler)
+		}
+		r.Handle(route.path, handler).Methods(route.method).Name(route.name)
 	}
 }
 
 // getConfig returns the request configuration.
 func (a *API) getConfig(w http.ResponseWriter, r *http.Request) {
-	userID, _, err := tenant.ExtractTenantIDFromHTTPRequest(r)
+	userID, err := tenant.TenantID(r.Context())
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusUnauthorized)
 		return
@@ -147,7 +182,7 @@ func (a *API) getConfig(w http.ResponseWriter, r *http.Request) {
 }
 
 func (a *API) setConfig(w http.ResponseWriter, r *http.Request) {
-	userID, _, err := tenant.ExtractTenantIDFromHTTPRequest(r)
+	userID, err := tenant.TenantID(r.Context())
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusUnauthorized)
 		return
@@ -297,7 +332,7 @@ func (a *API) getConfigs(w http.ResponseWriter, r *http.Request) {
 }
 
 func (a *API) deactivateConfig(w http.ResponseWriter, r *http.Request) {
-	userID, _, err := tenant.ExtractTenantIDFromHTTPRequest(r)
+	userID, err := tenant.TenantID(r.Context())
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusUnauthorized)
 		return
@@ -319,7 +354,7 @@ func (a *API) deactivateConfig(w http.ResponseWriter, r *http.Request) {
 }
 
 func (a *API) restoreConfig(w http.ResponseWriter, r *http.Request) {
-	userID, _, err := tenant.ExtractTenantIDFromHTTPRequest(r)
+	userID, err := tenant.TenantID(r.Context())
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusUnauthorized)
 		return
