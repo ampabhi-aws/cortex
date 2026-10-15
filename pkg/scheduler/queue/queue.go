@@ -20,6 +20,9 @@ const (
 var (
 	ErrTooManyRequests = errors.New("too many outstanding requests")
 	ErrStopped         = errors.New("queue is stopped")
+	// ErrTooManyTenants is returned when creating a new per-tenant queue
+	// would exceed the configured cap on concurrent tenant queues.
+	ErrTooManyTenants = errors.New("too many tenant queues")
 )
 
 // UserIndex is opaque type that allows to resume iteration over users between successive calls
@@ -62,8 +65,14 @@ type RequestQueue struct {
 }
 
 func NewRequestQueue(maxOutstandingPerTenant int, forgetDelay time.Duration, queueLength *prometheus.GaugeVec, discardedRequests *prometheus.CounterVec) *RequestQueue {
+	return NewRequestQueueWithMaxTenants(maxOutstandingPerTenant, 0, forgetDelay, queueLength, discardedRequests)
+}
+
+// NewRequestQueueWithMaxTenants is like NewRequestQueue but also caps the number
+// of concurrent per-tenant queues. maxTenants <= 0 disables the cap.
+func NewRequestQueueWithMaxTenants(maxOutstandingPerTenant, maxTenants int, forgetDelay time.Duration, queueLength *prometheus.GaugeVec, discardedRequests *prometheus.CounterVec) *RequestQueue {
 	q := &RequestQueue{
-		queues:                  newUserQueues(maxOutstandingPerTenant, forgetDelay),
+		queues:                  newUserQueuesWithMax(maxOutstandingPerTenant, maxTenants, forgetDelay),
 		connectedQuerierWorkers: atomic.NewInt32(0),
 		queueLength:             queueLength,
 		discardedRequests:       discardedRequests,
@@ -88,7 +97,16 @@ func (q *RequestQueue) EnqueueRequest(userID string, req Request, maxQueriers in
 		return ErrStopped
 	}
 
-	queue := q.queues.getOrAddQueue(userID, maxQueriers)
+	queue, err := q.queues.getOrAddQueue(userID, maxQueriers)
+	if err != nil {
+		if errors.Is(err, errTooManyTenants) {
+			// Do not record the per-user discardedRequests label here: the whole
+			// reason we reject at the tenant-queue cap is to bound metric
+			// cardinality against arbitrary userID strings from the peer.
+			return ErrTooManyTenants
+		}
+		return err
+	}
 	if queue == nil {
 		// This can only happen if userID is "".
 		return errors.New("no queue found")

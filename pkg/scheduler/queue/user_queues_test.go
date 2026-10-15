@@ -158,7 +158,9 @@ func TestQueuesConsistency(t *testing.T) {
 			for i := 0; i < 10000; i++ {
 				switch r.Int() % 6 {
 				case 0:
-					assert.NotNil(t, uq.getOrAddQueue(generateTenant(r), 3))
+					ch, err := uq.getOrAddQueue(generateTenant(r), 3)
+					assert.NoError(t, err)
+					assert.NotNil(t, ch)
 				case 1:
 					qid := generateQuerier(r)
 					_, _, luid := uq.getNextQueueForQuerier(lastUserIndexes[qid], qid)
@@ -360,10 +362,13 @@ func generateQuerier(r *rand.Rand) string {
 }
 
 func getOrAdd(t *testing.T, uq *queues, tenant string, maxQueriers int) chan Request {
-	q := uq.getOrAddQueue(tenant, maxQueriers)
+	q, err := uq.getOrAddQueue(tenant, maxQueriers)
+	assert.NoError(t, err)
 	assert.NotNil(t, q)
 	assert.NoError(t, isConsistent(uq))
-	assert.Equal(t, q, uq.getOrAddQueue(tenant, maxQueriers))
+	q2, err := uq.getOrAddQueue(tenant, maxQueriers)
+	assert.NoError(t, err)
+	assert.Equal(t, q, q2)
 	return q
 }
 
