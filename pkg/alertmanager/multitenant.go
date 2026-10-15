@@ -821,6 +821,16 @@ func (am *MultitenantAlertmanager) setConfig(cfg alertspb.AlertConfigDesc) error
 		}
 	}
 
+	// Validate template filenames before touching the on-disk tenant directory.
+	// The security validation on the HTTP write path (SetUserConfig) is a fast fail,
+	// but the apply path must not trust the alert store (e.g. the configdb backend
+	// is populated by the configs service, whose handler does not run this check).
+	for _, tmpl := range cfg.Templates {
+		if err := validateTemplateFilename(tmpl.Filename); err != nil {
+			return err
+		}
+	}
+
 	for _, tmpl := range cfg.Templates {
 		templateFilePath, err := safeTemplateFilepath(userTemplateDir, tmpl.Filename)
 		if err != nil {
@@ -871,6 +881,23 @@ func (am *MultitenantAlertmanager) setConfig(cfg alertspb.AlertConfigDesc) error
 			// they submit a broken one, the Manager will keep running the last known
 			// working configuration.
 			return fmt.Errorf("invalid Cortex configuration for %v: %v", cfg.User, err)
+		}
+
+		// Re-run the security validation at the point of use. The HTTP write path
+		// (SetUserConfig) already performs this check, but other write paths into
+		// the alert store (notably the configdb backend, populated by the configs
+		// service) do not. Refuse to start/replace the tenant Alertmanager when the
+		// stored config references local files that Cortex forbids, or when any
+		// template name referenced from the alertmanager config contains a path.
+		if userAmConfig != nil {
+			if err := validateAlertmanagerConfig(userAmConfig); err != nil {
+				return fmt.Errorf("invalid Cortex configuration for %v: %v", cfg.User, err)
+			}
+			for _, name := range userAmConfig.Templates {
+				if err := validateTemplateFilename(name); err != nil {
+					return fmt.Errorf("invalid Cortex configuration for %v: %v", cfg.User, err)
+				}
+			}
 		}
 	}
 
