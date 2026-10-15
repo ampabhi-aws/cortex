@@ -238,7 +238,7 @@ GET /distributor/ha_tracker
 GET /ha-tracker
 ```
 
-Displays a web page with the current status of the HA tracker, including the elected replica for each Prometheus HA cluster.
+Displays a web page with the current status of the HA tracker, including the elected replica for each Prometheus HA cluster. The handler requires a tenant ID (via the `X-Scope-OrgID` header) and only returns rows for that tenant; operators should additionally block `/distributor/ha_tracker` and the legacy `/ha-tracker` at any front-facing reverse proxy / gateway so that end users cannot reach this endpoint directly.
 
 
 ## Ingester
