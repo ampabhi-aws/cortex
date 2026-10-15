@@ -822,6 +822,14 @@ func (am *MultitenantAlertmanager) setConfig(cfg alertspb.AlertConfigDesc) error
 	}
 
 	for _, tmpl := range cfg.Templates {
+		// Validate the template filename to prevent writing files outside of
+		// the per-tenant templates directory. This mirrors the check performed
+		// by the write API (validateUserConfig) so that configs loaded from the
+		// alert store cannot bypass the guard.
+		if err := validateTemplateFilename(tmpl.Filename); err != nil {
+			return err
+		}
+
 		templateFilePath, err := safeTemplateFilepath(userTemplateDir, tmpl.Filename)
 		if err != nil {
 			return err
@@ -871,6 +879,23 @@ func (am *MultitenantAlertmanager) setConfig(cfg alertspb.AlertConfigDesc) error
 			// they submit a broken one, the Manager will keep running the last known
 			// working configuration.
 			return fmt.Errorf("invalid Cortex configuration for %v: %v", cfg.User, err)
+		}
+	}
+
+	// Re-apply the Alertmanager hardening deny-list (e.g. *_file options)
+	// on every load. This defends against configs that were accepted by a
+	// different writer (such as the legacy configs API) which does not run
+	// the same validation, as well as any pre-existing config stored before
+	// the hardening was introduced. If the config fails validation we refuse
+	// to apply it rather than silently loading an unsafe configuration.
+	if userAmConfig != nil {
+		if err := validateAlertmanagerConfig(userAmConfig); err != nil {
+			return fmt.Errorf("invalid Cortex configuration for %v: %v", cfg.User, err)
+		}
+		for _, name := range userAmConfig.Templates {
+			if err := validateTemplateFilename(name); err != nil {
+				return fmt.Errorf("invalid Cortex configuration for %v: %v", cfg.User, err)
+			}
 		}
 	}
 
@@ -1325,8 +1350,10 @@ func safeTemplateFilepath(dir, templateName string) (string, error) {
 
 	// Ensure the actual path of the template is within the expected directory.
 	// This check is a counter-measure to make sure the tenant is not trying to
-	// escape its own directory on disk.
-	if !strings.HasPrefix(actualPath, containerDir) {
+	// escape its own directory on disk. We compare against containerDir plus
+	// the OS path separator so that a sibling directory sharing the same
+	// prefix (e.g. templates-x vs templates) cannot bypass the check.
+	if actualPath != containerDir && !strings.HasPrefix(actualPath, containerDir+string(filepath.Separator)) {
 		return "", fmt.Errorf("invalid template name %q: the template filepath is escaping the per-tenant local directory", templateName)
 	}
 
