@@ -34,6 +34,7 @@ import (
 	"github.com/cortexproject/cortex/pkg/scheduler/schedulerpb"
 	"github.com/cortexproject/cortex/pkg/storegateway"
 	"github.com/cortexproject/cortex/pkg/storegateway/storegatewaypb"
+	"github.com/cortexproject/cortex/pkg/util/adminauth"
 	"github.com/cortexproject/cortex/pkg/util/flagext"
 	"github.com/cortexproject/cortex/pkg/util/push"
 )
@@ -52,6 +53,15 @@ type Config struct {
 	ServerPrefix       string               `yaml:"-"`
 	LegacyHTTPPrefix   string               `yaml:"-"`
 	HTTPAuthMiddleware middleware.Interface `yaml:"-"`
+
+	// HTTPAdminAuthMiddleware is an operator-supplied middleware applied to
+	// cross-tenant admin routes (e.g. /multitenant_alertmanager/configs,
+	// /ruler/rule_groups, /distributor/all_user_stats, /runtime_config).
+	// It MUST perform operator (not tenant) authentication. If left nil, admin
+	// routes are protected by a default-deny middleware that returns 401; set
+	// this to middleware.Identity to intentionally expose these endpoints on a
+	// trusted internal network.
+	HTTPAdminAuthMiddleware middleware.Interface `yaml:"-"`
 
 	// This allows downstream projects to wrap the distributor push function
 	// and access the deserialized write requests before/after they are pushed.
@@ -91,12 +101,69 @@ func (cfg *Config) wrapDistributorPush(d *distributor.Distributor) push.Func {
 
 type API struct {
 	AuthMiddleware       middleware.Interface
+	AdminAuthMiddleware  middleware.Interface
 	cfg                  Config
 	server               *server.Server
 	logger               log.Logger
 	sourceIPs            *middleware.SourceIPExtractor
 	indexPage            *IndexPageContent
 	HTTPHeaderMiddleware *HTTPHeaderMiddleware
+}
+
+// WithAdminAuthorized is a convenience wrapper around adminauth.With that
+// annotates the context as operator-authorized. Admin-auth middleware MUST
+// attach this value before invoking the next handler.
+func WithAdminAuthorized(ctx context.Context) context.Context {
+	return adminauth.With(ctx)
+}
+
+// AdminAuthorized reports whether the context has been marked as
+// operator-authorized by an admin-auth middleware. Handlers that aggregate
+// data across every tenant SHOULD use this (or adminauth.Authorized
+// directly) as a defence-in-depth check.
+func AdminAuthorized(ctx context.Context) bool {
+	return adminauth.Authorized(ctx)
+}
+
+// defaultAdminAuthDeny is the strict default admin-auth middleware used when
+// the operator has not supplied one. It rejects every request with 401.
+var defaultAdminAuthDeny = middleware.Func(func(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		http.Error(w, "admin authorization required", http.StatusUnauthorized)
+	})
+})
+
+// wrapAdminHandler wraps an admin handler with the admin-authorization
+// middleware. The wrapper also attaches the admin-authorized marker to the
+// request context so handlers can perform a defence-in-depth check.
+func (a *API) wrapAdminHandler(handler http.Handler) http.Handler {
+	marker := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		handler.ServeHTTP(w, r.WithContext(WithAdminAuthorized(r.Context())))
+	})
+	if a.AdminAuthMiddleware == nil {
+		return defaultAdminAuthDeny.Wrap(marker)
+	}
+	return a.AdminAuthMiddleware.Wrap(marker)
+}
+
+// RegisterAdminRoute registers a cross-tenant admin route. The handler is
+// always wrapped with the admin-authorization middleware (default-deny if
+// one has not been configured); it is never anonymous. Compare with
+// RegisterRoute, where auth=false leaves the handler anonymous.
+func (a *API) RegisterAdminRoute(path string, handler http.Handler, method string, methods ...string) {
+	methods = append([]string{method}, methods...)
+
+	handler = a.wrapAdminHandler(handler)
+
+	if a.cfg.ResponseCompression {
+		handler = gziphandler.GzipHandler(handler)
+	}
+	if a.HTTPHeaderMiddleware != nil {
+		handler = a.HTTPHeaderMiddleware.Wrap(handler)
+	}
+
+	level.Debug(a.logger).Log("msg", "api: registering admin route", "methods", strings.Join(methods, ","), "path", path)
+	a.server.HTTP.Path(path).Methods(methods...).Handler(handler)
 }
 
 func New(cfg Config, serverCfg server.Config, s *server.Server, logger log.Logger) (*API, error) {
@@ -114,12 +181,13 @@ func New(cfg Config, serverCfg server.Config, s *server.Server, logger log.Logge
 	}
 
 	api := &API{
-		cfg:            cfg,
-		AuthMiddleware: cfg.HTTPAuthMiddleware,
-		server:         s,
-		logger:         logger,
-		sourceIPs:      sourceIPs,
-		indexPage:      newIndexPageContent(),
+		cfg:                 cfg,
+		AuthMiddleware:      cfg.HTTPAuthMiddleware,
+		AdminAuthMiddleware: cfg.HTTPAdminAuthMiddleware,
+		server:              s,
+		logger:              logger,
+		sourceIPs:           sourceIPs,
+		indexPage:           newIndexPageContent(),
 	}
 
 	// If no authentication middleware is present in the config, use the default authentication middleware.
@@ -187,7 +255,10 @@ func (a *API) RegisterAlertmanager(am *alertmanager.MultitenantAlertmanager, tar
 	a.indexPage.AddLink(SectionAdminEndpoints, "/multitenant_alertmanager/ring", "Alertmanager Ring Status")
 	// Ensure this route is registered before the prefixed AM route
 	a.RegisterRoute("/multitenant_alertmanager/status", am.GetStatusHandler(), false, "GET")
-	a.RegisterRoute("/multitenant_alertmanager/configs", http.HandlerFunc(am.ListAllConfigs), false, "GET")
+	// Cross-tenant admin endpoint: streams every tenant's Alertmanager config.
+	// Must be gated by operator authorization, not the tenant AuthenticateUser
+	// middleware (which only copies X-Scope-OrgID into the context).
+	a.RegisterAdminRoute("/multitenant_alertmanager/configs", http.HandlerFunc(am.ListAllConfigs), "GET")
 	a.RegisterRoute("/multitenant_alertmanager/ring", http.HandlerFunc(am.RingHandler), false, "GET", "POST")
 	a.RegisterRoute("/multitenant_alertmanager/delete_tenant_config", http.HandlerFunc(am.DeleteUserConfig), true, "POST")
 
@@ -227,7 +298,8 @@ func (a *API) RegisterRuntimeConfig(runtimeConfigHandler http.HandlerFunc) {
 	a.indexPage.AddLink(SectionAdminEndpoints, "/runtime_config", "Current Runtime Config (incl. Overrides)")
 	a.indexPage.AddLink(SectionAdminEndpoints, "/runtime_config?mode=diff", "Current Runtime Config (show only values that differ from the defaults)")
 
-	a.RegisterRoute("/runtime_config", runtimeConfigHandler, false, "GET")
+	// Cross-tenant admin endpoint: exposes per-tenant limit overrides.
+	a.RegisterAdminRoute("/runtime_config", runtimeConfigHandler, "GET")
 }
 
 // RegisterDistributor registers the endpoints associated with the distributor.
@@ -241,12 +313,13 @@ func (a *API) RegisterDistributor(d *distributor.Distributor, pushConfig distrib
 	a.indexPage.AddLink(SectionAdminEndpoints, "/distributor/ha_tracker", "HA Tracking Status")
 
 	a.RegisterRoute("/distributor/ring", d, false, "GET", "POST")
-	a.RegisterRoute("/distributor/all_user_stats", http.HandlerFunc(d.AllUserStatsHandler), false, "GET")
+	// Cross-tenant admin endpoint: enumerates every tenant and ingest rates.
+	a.RegisterAdminRoute("/distributor/all_user_stats", http.HandlerFunc(d.AllUserStatsHandler), "GET")
 	a.RegisterRoute("/distributor/ha_tracker", d.HATracker, false, "GET")
 
 	// Legacy Routes
 	a.RegisterRoute(path.Join(a.cfg.LegacyHTTPPrefix, "/push"), push.Handler(pushConfig.MaxRecvMsgSize, a.sourceIPs, a.cfg.wrapDistributorPush(d)), true, "POST")
-	a.RegisterRoute("/all_user_stats", http.HandlerFunc(d.AllUserStatsHandler), false, "GET")
+	a.RegisterAdminRoute("/all_user_stats", http.HandlerFunc(d.AllUserStatsHandler), "GET")
 	a.RegisterRoute("/ha-tracker", d.HATracker, false, "GET")
 }
 
@@ -291,8 +364,8 @@ func (a *API) RegisterRuler(r *ruler.Ruler) {
 	// Legacy Ring Route
 	a.RegisterRoute("/ruler_ring", r, false, "GET", "POST")
 
-	// List all user rule groups
-	a.RegisterRoute("/ruler/rule_groups", http.HandlerFunc(r.ListAllRules), false, "GET")
+	// List all user rule groups (cross-tenant admin endpoint: operator auth required).
+	a.RegisterAdminRoute("/ruler/rule_groups", http.HandlerFunc(r.ListAllRules), "GET")
 
 	ruler.RegisterRulerServer(a.server.GRPC, r)
 }

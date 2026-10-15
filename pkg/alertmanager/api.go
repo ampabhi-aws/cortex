@@ -8,6 +8,7 @@ import (
 	"os"
 	"path/filepath"
 	"reflect"
+	"strings"
 
 	"github.com/go-kit/log"
 	"github.com/go-kit/log/level"
@@ -20,6 +21,7 @@ import (
 	"github.com/cortexproject/cortex/pkg/alertmanager/alertspb"
 	"github.com/cortexproject/cortex/pkg/tenant"
 	"github.com/cortexproject/cortex/pkg/util"
+	"github.com/cortexproject/cortex/pkg/util/adminauth"
 	"github.com/cortexproject/cortex/pkg/util/concurrency"
 	util_log "github.com/cortexproject/cortex/pkg/util/log"
 )
@@ -261,6 +263,15 @@ func validateUserConfig(logger log.Logger, cfg alertspb.AlertConfigDesc, limits 
 
 func (am *MultitenantAlertmanager) ListAllConfigs(w http.ResponseWriter, r *http.Request) {
 	logger := util_log.WithContext(r.Context(), am.logger)
+	// Defence-in-depth: this handler aggregates data across every tenant and
+	// must only run when the request has been authorised by the operator-
+	// authorisation middleware. If the admin wrapping was somehow bypassed,
+	// refuse to serve rather than leaking cross-tenant data.
+	if !adminauth.Authorized(r.Context()) {
+		level.Warn(logger).Log("msg", "refusing to list all alertmanager configs: request is not operator-authorized")
+		http.Error(w, "admin authorization required", http.StatusUnauthorized)
+		return
+	}
 	userIDs, err := am.store.ListAllUsers(r.Context())
 	if err != nil {
 		level.Error(logger).Log("msg", "failed to list users of alertmanager", "err", err)
@@ -286,7 +297,7 @@ func (am *MultitenantAlertmanager) ListAllConfigs(w http.ResponseWriter, r *http
 		data := map[string]*UserConfig{
 			userID: {
 				TemplateFiles:      alertspb.ParseTemplates(cfg),
-				AlertmanagerConfig: cfg.RawConfig,
+				AlertmanagerConfig: redactAlertmanagerConfigYAML(cfg.RawConfig),
 			},
 		}
 
@@ -448,4 +459,148 @@ func validateVictorOpsConfig(cfg config.VictorOpsConfig) error {
 		return errVictorOpsAPIKeyFileNotAllowed
 	}
 	return nil
+}
+
+// redactedPlaceholder is the string substituted for secret-bearing values in
+// cross-tenant Alertmanager config listings.
+const redactedPlaceholder = "<redacted>"
+
+// redactedSecretKeys is the set of exact keys whose scalar values are
+// considered sensitive and must not be streamed from an aggregate endpoint.
+var redactedSecretKeys = map[string]struct{}{
+	"auth_password":    {}, // smtp_auth_password (global) and per-receiver auth_password
+	"smtp_auth_password": {},
+	"bearer_token":     {},
+	"password":         {}, // basic_auth.password
+	"secret":           {}, // generic secret (webhook, pushover)
+	"routing_key":      {}, // pagerduty routing_key
+	"service_key":      {}, // pagerduty service_key
+	"user_key":         {}, // pushover user_key
+	"token":            {}, // pushover token, webex token
+	"api_url":          {}, // slack api_url, webhook_configs url under global
+	"api_key":          {},
+	"api_token":        {},
+	"credentials":      {},
+}
+
+// redactedSecretKeySuffixes matches sensitive keys by suffix, for keys like
+// "slack_api_url", "opsgenie_api_key", "victorops_api_key" and similar in
+// the Alertmanager global config block.
+var redactedSecretKeySuffixes = []string{
+	"_api_url",
+	"_api_key",
+	"_api_token",
+	"_auth_password",
+	"_bearer_token",
+	"_password",
+	"_secret",
+	"_token",
+}
+
+// isSecretKey reports whether a map key names a secret-bearing field that
+// must be redacted before streaming a tenant's Alertmanager configuration
+// from an aggregate endpoint.
+func isSecretKey(key string) bool {
+	if _, ok := redactedSecretKeys[key]; ok {
+		return true
+	}
+	for _, suffix := range redactedSecretKeySuffixes {
+		if strings.HasSuffix(key, suffix) {
+			return true
+		}
+	}
+	return false
+}
+
+// redactAlertmanagerConfigYAML parses an Alertmanager YAML document and
+// returns an equivalent document with every secret-bearing value replaced
+// by a placeholder. The structure of the document is preserved so callers
+// can still see routing/receiver topology; only credential values change.
+// If the input cannot be parsed as YAML we fall back to returning the
+// placeholder for the entire document rather than streaming the raw secrets.
+func redactAlertmanagerConfigYAML(raw string) string {
+	if strings.TrimSpace(raw) == "" {
+		return raw
+	}
+	var doc interface{}
+	if err := yaml.Unmarshal([]byte(raw), &doc); err != nil {
+		// If we cannot parse it, we must not stream it: it may still contain
+		// credentials. Return a placeholder document instead.
+		return redactedPlaceholder
+	}
+	redactYAMLNode(doc, "")
+	out, err := yaml.Marshal(doc)
+	if err != nil {
+		return redactedPlaceholder
+	}
+	return string(out)
+}
+
+// redactYAMLNode walks a YAML-decoded tree (as produced by gopkg.in/yaml.v2
+// into interface{}) and redacts the value of any map key classified as a
+// secret by isSecretKey. The parentKey argument is used to redact entire
+// http_config blocks (where sub-keys like username/credentials may carry
+// credentials even when their names do not match the suffix patterns).
+func redactYAMLNode(node interface{}, parentKey string) {
+	switch v := node.(type) {
+	case map[interface{}]interface{}:
+		for k, val := range v {
+			keyStr, _ := k.(string)
+			if parentKey == "http_config" || parentKey == "basic_auth" || parentKey == "authorization" {
+				// Any scalar inside an HTTP client or auth block is a credential.
+				if _, isMap := val.(map[interface{}]interface{}); !isMap {
+					if _, isSlice := val.([]interface{}); !isSlice {
+						if sv, ok := val.(string); ok && sv != "" {
+							v[k] = redactedPlaceholder
+							continue
+						}
+					}
+				}
+			}
+			if isSecretKey(keyStr) {
+				switch val.(type) {
+				case string:
+					if val.(string) != "" {
+						v[k] = redactedPlaceholder
+						continue
+					}
+				case nil:
+					// leave nil as-is
+				default:
+					// For non-scalar sensitive keys (e.g. http_config), keep
+					// walking so nested credentials inside are redacted too.
+				}
+			}
+			redactYAMLNode(val, keyStr)
+		}
+	case map[string]interface{}:
+		for k, val := range v {
+			if parentKey == "http_config" || parentKey == "basic_auth" || parentKey == "authorization" {
+				if _, isMap := val.(map[string]interface{}); !isMap {
+					if _, isSlice := val.([]interface{}); !isSlice {
+						if sv, ok := val.(string); ok && sv != "" {
+							v[k] = redactedPlaceholder
+							continue
+						}
+					}
+				}
+			}
+			if isSecretKey(k) {
+				switch val.(type) {
+				case string:
+					if val.(string) != "" {
+						v[k] = redactedPlaceholder
+						continue
+					}
+				case nil:
+				default:
+				}
+			}
+			redactYAMLNode(val, k)
+		}
+	case []interface{}:
+		for _, item := range v {
+			redactYAMLNode(item, parentKey)
+		}
+	}
 }

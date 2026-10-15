@@ -32,6 +32,7 @@ import (
 	"github.com/cortexproject/cortex/pkg/ruler/rulestore"
 	"github.com/cortexproject/cortex/pkg/tenant"
 	"github.com/cortexproject/cortex/pkg/util"
+	"github.com/cortexproject/cortex/pkg/util/adminauth"
 	"github.com/cortexproject/cortex/pkg/util/concurrency"
 	"github.com/cortexproject/cortex/pkg/util/flagext"
 	"github.com/cortexproject/cortex/pkg/util/grpcclient"
@@ -862,6 +863,15 @@ func (r *Ruler) DeleteTenantConfiguration(w http.ResponseWriter, req *http.Reque
 
 func (r *Ruler) ListAllRules(w http.ResponseWriter, req *http.Request) {
 	logger := util_log.WithContext(req.Context(), r.logger)
+
+	// Defence-in-depth: this handler enumerates every tenant's rule groups
+	// and must only run when the request has been authorised by the
+	// operator-authorisation middleware configured in the API layer.
+	if !adminauth.Authorized(req.Context()) {
+		level.Warn(logger).Log("msg", "refusing to list all ruler configs: request is not operator-authorized")
+		http.Error(w, "admin authorization required", http.StatusUnauthorized)
+		return
+	}
 
 	userIDs, err := r.store.ListAllUsers(req.Context())
 	if err != nil {
