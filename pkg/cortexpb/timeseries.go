@@ -290,18 +290,26 @@ func TimeseriesFromPool() *TimeSeries {
 
 // ReuseTimeseries puts the timeseries back into a sync.Pool for reuse.
 func ReuseTimeseries(ts *TimeSeries) {
-	// Name and Value may point into a large gRPC buffer, so clear the reference to allow GC
-	for i := 0; i < len(ts.Labels); i++ {
-		ts.Labels[i].Name = ""
-		ts.Labels[i].Value = ""
+	// Name and Value may point into a large gRPC buffer, so clear the reference to allow GC.
+	// Clear up to cap (not just len): callers such as the distributor's removeLabel may have
+	// shrunk the length while leaving stale LabelAdapter values (with string headers aliasing
+	// the request buffer) in the tail slots. Those stale slots would otherwise keep the whole
+	// decompressed request body reachable through the process-global timeSeriesPool.
+	labels := ts.Labels[:cap(ts.Labels)]
+	for i := range labels {
+		labels[i].Name = ""
+		labels[i].Value = ""
 	}
 	ts.Labels = ts.Labels[:0]
 	ts.Samples = ts.Samples[:0]
-	// Name and Value may point into a large gRPC buffer, so clear the reference in each exemplar to allow GC
-	for i := range ts.Exemplars {
-		for j := range ts.Exemplars[i].Labels {
-			ts.Exemplars[i].Labels[j].Name = ""
-			ts.Exemplars[i].Labels[j].Value = ""
+	// Name and Value may point into a large gRPC buffer, so clear the reference in each exemplar to allow GC.
+	// Clear exemplar label slots up to cap for the same reason as above.
+	exemplars := ts.Exemplars[:cap(ts.Exemplars)]
+	for i := range exemplars {
+		exLabels := exemplars[i].Labels[:cap(exemplars[i].Labels)]
+		for j := range exLabels {
+			exLabels[j].Name = ""
+			exLabels[j].Value = ""
 		}
 	}
 	ts.Exemplars = ts.Exemplars[:0]

@@ -469,6 +469,11 @@ func removeLabel(labelName string, labels *[]cortexpb.LabelAdapter) {
 		pair := (*labels)[i]
 		if pair.Name == labelName {
 			*labels = append((*labels)[:i], (*labels)[i+1:]...)
+			// Zero the now-vacated tail slot so we don't retain string headers that
+			// alias the (potentially large) request buffer via the pooled TimeSeries
+			// backing array. See cortexpb.ReuseTimeseries for the pool invariant.
+			tail := (*labels)[:len(*labels)+1]
+			tail[len(tail)-1] = cortexpb.LabelAdapter{}
 			return
 		}
 	}
