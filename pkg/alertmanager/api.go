@@ -45,6 +45,9 @@ var (
 	errTLSFileNotAllowed             = errors.New("setting TLS ca_file, cert_file and key_file is not allowed")
 	errSlackAPIURLFileNotAllowed     = errors.New("setting Slack api_url_file and global slack_api_url_file is not allowed")
 	errVictorOpsAPIKeyFileNotAllowed = errors.New("setting VictorOps api_key_file is not allowed")
+	errSNSCredentialsRequired        = errors.New("SNS sigv4 access_key and secret_key must both be set inline; use of the Cortex process's ambient AWS credentials is not allowed")
+	errSNSProfileNotAllowed          = errors.New("setting SNS sigv4 profile is not allowed; it would select a named profile from the Cortex process's shared credentials file")
+	errSNSRoleARNNotAllowed          = errors.New("setting SNS sigv4 role_arn is not allowed; it would force Cortex to call sts:AssumeRole with its own ambient identity")
 )
 
 // UserConfig is used to communicate a users alertmanager configs
@@ -350,6 +353,11 @@ func validateAlertmanagerConfig(cfg interface{}) error {
 		if err := validateVictorOpsConfig(v.Interface().(config.VictorOpsConfig)); err != nil {
 			return err
 		}
+
+	case reflect.TypeOf(config.SNSConfig{}):
+		if err := validateSNSConfig(v.Interface().(config.SNSConfig)); err != nil {
+			return err
+		}
 	}
 
 	// If the input config is a struct, recursively iterate on all fields.
@@ -446,6 +454,23 @@ func validateSlackConfig(cfg config.SlackConfig) error {
 func validateVictorOpsConfig(cfg config.VictorOpsConfig) error {
 	if cfg.APIKeyFile != "" {
 		return errVictorOpsAPIKeyFileNotAllowed
+	}
+	return nil
+}
+
+// validateSNSConfig validates the SNS config and returns an error if it would cause Cortex to
+// sign SNS/STS calls with its own ambient AWS identity. Tenants must supply explicit inline
+// sigv4 access_key and secret_key; using the process's default credential chain, a named profile
+// from the operator's shared credentials file, or a tenant-chosen role_arn is forbidden.
+func validateSNSConfig(cfg config.SNSConfig) error {
+	if cfg.Sigv4.Profile != "" {
+		return errSNSProfileNotAllowed
+	}
+	if cfg.Sigv4.RoleARN != "" {
+		return errSNSRoleARNNotAllowed
+	}
+	if cfg.Sigv4.AccessKey == "" || cfg.Sigv4.SecretKey == "" {
+		return errSNSCredentialsRequired
 	}
 	return nil
 }

@@ -15,6 +15,7 @@ import (
 	"github.com/prometheus/alertmanager/config"
 	"github.com/prometheus/client_golang/prometheus"
 	commoncfg "github.com/prometheus/common/config"
+	"github.com/prometheus/common/sigv4"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	"github.com/thanos-io/objstore"
@@ -784,6 +785,47 @@ func TestValidateAlertmanagerConfig(t *testing.T) {
 				}},
 			},
 			expected: errTLSFileNotAllowed,
+		},
+		"SNSConfig without sigv4 access_key/secret_key (ambient credentials)": {
+			input: config.SNSConfig{
+				Sigv4: sigv4.SigV4Config{Region: "us-east-1"},
+			},
+			expected: errSNSCredentialsRequired,
+		},
+		"SNSConfig with only sigv4 access_key": {
+			input: config.SNSConfig{
+				Sigv4: sigv4.SigV4Config{Region: "us-east-1", AccessKey: "AKIA"},
+			},
+			expected: errSNSCredentialsRequired,
+		},
+		"SNSConfig with sigv4 profile set": {
+			input: config.SNSConfig{
+				Sigv4: sigv4.SigV4Config{Profile: "default"},
+			},
+			expected: errSNSProfileNotAllowed,
+		},
+		"SNSConfig with sigv4 role_arn set": {
+			input: config.SNSConfig{
+				Sigv4: sigv4.SigV4Config{AccessKey: "AKIA", SecretKey: "secret", RoleARN: "arn:aws:iam::123:role/x"},
+			},
+			expected: errSNSRoleARNNotAllowed,
+		},
+		"SNSConfig with inline sigv4 access_key and secret_key": {
+			input: config.SNSConfig{
+				Sigv4: sigv4.SigV4Config{Region: "us-east-1", AccessKey: "AKIA", SecretKey: "secret"},
+			},
+			expected: nil,
+		},
+		"receivers containing SNSConfig with ambient credentials": {
+			input: config.Config{
+				Receivers: []*config.Receiver{{
+					Name: "sns",
+					SNSConfigs: []*config.SNSConfig{{
+						Sigv4: sigv4.SigV4Config{Region: "us-east-1"},
+					}},
+				}},
+			},
+			expected: errSNSCredentialsRequired,
 		},
 	}
 
