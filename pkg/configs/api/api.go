@@ -82,6 +82,12 @@ func (a *API) admin(w http.ResponseWriter, r *http.Request) {
 }
 
 // RegisterRoutes registers the configs API HTTP routes with the provided Router.
+//
+// Deprecated: production code must use pkg/api.API.RegisterConfigAPI, which
+// routes handlers through the shared Cortex middleware chain and omits the
+// unauthenticated cross-tenant "/private/api/prom/configs/*" endpoints. This
+// method remains only for the self-contained in-process router used by the
+// configs service tests and admin page.
 func (a *API) RegisterRoutes(r *mux.Router) {
 	for _, route := range []struct {
 		name, method, path string
@@ -105,6 +111,35 @@ func (a *API) RegisterRoutes(r *mux.Router) {
 	} {
 		r.Handle(route.path, route.handler).Methods(route.method).Name(route.name)
 	}
+}
+
+// Exported handler wrappers used by pkg/api.API.RegisterConfigAPI so that the
+// deprecated configs service is wired onto the shared Cortex HTTP mux through
+// RegisterRoute (with the standard middleware chain) instead of attaching its
+// own router. The cross-tenant getConfigs handler is deliberately NOT exposed
+// here: callers must not reach it on the tenant-facing listener.
+
+// GetConfigHandler serves the per-tenant GET for rules, templates and
+// alertmanager configuration.
+func (a *API) GetConfigHandler(w http.ResponseWriter, r *http.Request) { a.getConfig(w, r) }
+
+// SetConfigHandler serves the per-tenant POST for rules, templates and
+// alertmanager configuration.
+func (a *API) SetConfigHandler(w http.ResponseWriter, r *http.Request) { a.setConfig(w, r) }
+
+// ValidateAlertmanagerConfigHandler serves the validation endpoint.
+func (a *API) ValidateAlertmanagerConfigHandler(w http.ResponseWriter, r *http.Request) {
+	a.validateAlertmanagerConfig(w, r)
+}
+
+// DeactivateConfigHandler serves the per-tenant deactivation endpoint.
+func (a *API) DeactivateConfigHandler(w http.ResponseWriter, r *http.Request) {
+	a.deactivateConfig(w, r)
+}
+
+// RestoreConfigHandler serves the per-tenant restore endpoint.
+func (a *API) RestoreConfigHandler(w http.ResponseWriter, r *http.Request) {
+	a.restoreConfig(w, r)
 }
 
 // getConfig returns the request configuration.

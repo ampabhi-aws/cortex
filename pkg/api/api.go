@@ -18,6 +18,7 @@ import (
 	"github.com/cortexproject/cortex/pkg/alertmanager"
 	"github.com/cortexproject/cortex/pkg/alertmanager/alertmanagerpb"
 	"github.com/cortexproject/cortex/pkg/compactor"
+	configsapi "github.com/cortexproject/cortex/pkg/configs/api"
 	"github.com/cortexproject/cortex/pkg/cortexpb"
 	"github.com/cortexproject/cortex/pkg/distributor"
 	"github.com/cortexproject/cortex/pkg/distributor/distributorpb"
@@ -278,6 +279,26 @@ func (a *API) RegisterIngester(i Ingester, pushConfig distributor.Config) {
 func (a *API) RegisterTenantDeletion(api *purger.TenantDeletionAPI) {
 	a.RegisterRoute("/purger/delete_tenant", http.HandlerFunc(api.DeleteTenant), true, "POST")
 	a.RegisterRoute("/purger/delete_tenant_status", http.HandlerFunc(api.DeleteTenantStatus), true, "GET")
+}
+
+// RegisterConfigAPI registers the (deprecated) configs service routes on the
+// shared Cortex HTTP mux using RegisterRoute so the standard middleware chain
+// (including AuthMiddleware for auth=true routes) applies. The cross-tenant
+// "/private/api/prom/configs/*" endpoints are intentionally NOT registered
+// here: they return every tenant's rules and Alertmanager YAML (notifier
+// secrets included) and must not be exposed on the tenant-facing listener.
+// Operators that need the legacy cross-tenant feed for the configdb-backed
+// ruler/alertmanager must front it with a separate admin listener/proxy.
+func (a *API) RegisterConfigAPI(c *configsapi.API) {
+	a.RegisterRoute("/api/prom/configs/rules", http.HandlerFunc(c.GetConfigHandler), true, "GET")
+	a.RegisterRoute("/api/prom/configs/rules", http.HandlerFunc(c.SetConfigHandler), true, "POST")
+	a.RegisterRoute("/api/prom/configs/templates", http.HandlerFunc(c.GetConfigHandler), true, "GET")
+	a.RegisterRoute("/api/prom/configs/templates", http.HandlerFunc(c.SetConfigHandler), true, "POST")
+	a.RegisterRoute("/api/prom/configs/alertmanager", http.HandlerFunc(c.GetConfigHandler), true, "GET")
+	a.RegisterRoute("/api/prom/configs/alertmanager", http.HandlerFunc(c.SetConfigHandler), true, "POST")
+	a.RegisterRoute("/api/prom/configs/alertmanager/validate", http.HandlerFunc(c.ValidateAlertmanagerConfigHandler), true, "POST")
+	a.RegisterRoute("/api/prom/configs/deactivate", http.HandlerFunc(c.DeactivateConfigHandler), true, "DELETE")
+	a.RegisterRoute("/api/prom/configs/restore", http.HandlerFunc(c.RestoreConfigHandler), true, "POST")
 }
 
 // RegisterRuler registers routes associated with the Ruler service.
