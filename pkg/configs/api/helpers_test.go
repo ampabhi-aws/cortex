@@ -10,6 +10,7 @@ import (
 	"testing"
 
 	"github.com/cortexproject/cortex/pkg/configs/userconfig"
+	"github.com/cortexproject/cortex/pkg/util/flagext"
 
 	"github.com/stretchr/testify/require"
 	"github.com/weaveworks/common/user"
@@ -24,6 +25,10 @@ var (
 	counter  int
 )
 
+// adminUserID is the tenant ID configured as admin in the test API; the
+// private cross-tenant endpoints are only served to this user.
+const adminUserID = "admin"
+
 // setup sets up the environment for the tests.
 func setup(t *testing.T) {
 	database = dbtest.Setup(t)
@@ -31,6 +36,7 @@ func setup(t *testing.T) {
 		Notifications: NotificationsConfig{
 			DisableEmail: true,
 		},
+		AdminTenantIDs: flagext.StringSliceCSV{adminUserID},
 	})
 	counter = 0
 }
@@ -42,6 +48,7 @@ func setupWithEmailEnabled(t *testing.T) {
 		Notifications: NotificationsConfig{
 			DisableEmail: false,
 		},
+		AdminTenantIDs: flagext.StringSliceCSV{adminUserID},
 	})
 	counter = 0
 }
