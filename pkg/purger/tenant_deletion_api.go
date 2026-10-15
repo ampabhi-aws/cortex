@@ -52,6 +52,16 @@ func (api *TenantDeletionAPI) DeleteTenant(w http.ResponseWriter, r *http.Reques
 		return
 	}
 
+	// Require an explicit confirmation parameter whose value matches the
+	// tenant ID resolved from X-Scope-OrgID. This proves the caller intended
+	// to destroy that specific tenant's data, and defeats CSRF (a cross-site
+	// POST will not know the correct tenant string to supply).
+	if err := requireTenantConfirmation(r, userID); err != nil {
+		level.Warn(api.logger).Log("msg", "rejected tenant deletion request without matching confirmation parameter", "user", userID, "err", err)
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
+
 	err = cortex_tsdb.WriteTenantDeletionMark(r.Context(), api.bucketClient, userID, api.cfgProvider, cortex_tsdb.NewTenantDeletionMark(time.Now()))
 	if err != nil {
 		level.Error(api.logger).Log("msg", "failed to write tenant deletion mark", "user", userID, "err", err)
@@ -63,6 +73,55 @@ func (api *TenantDeletionAPI) DeleteTenant(w http.ResponseWriter, r *http.Reques
 	level.Info(api.logger).Log("msg", "tenant deletion mark in blocks storage created", "user", userID)
 
 	w.WriteHeader(http.StatusOK)
+}
+
+// UndeleteTenant removes a previously written tenant deletion marker so that
+// the compactor's blocks cleaner stops hard-deleting the tenant's blocks on
+// subsequent cleanup cycles. Like DeleteTenant it is scoped to the caller's
+// own X-Scope-OrgID and requires the matching confirmation parameter.
+//
+// Note: this reliably reverts an accidental or malicious delete_tenant call
+// only if invoked before the next compactor cleanup cycle
+// (-compactor.cleanup-interval, default 15m); any blocks the cleaner has
+// already removed will not be restored.
+func (api *TenantDeletionAPI) UndeleteTenant(w http.ResponseWriter, r *http.Request) {
+	ctx := r.Context()
+	userID, err := tenant.TenantID(ctx)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusUnauthorized)
+		return
+	}
+
+	if err := requireTenantConfirmation(r, userID); err != nil {
+		level.Warn(api.logger).Log("msg", "rejected tenant undeletion request without matching confirmation parameter", "user", userID, "err", err)
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
+
+	err = cortex_tsdb.DeleteTenantDeletionMark(r.Context(), api.bucketClient, userID, api.cfgProvider)
+	if err != nil {
+		level.Error(api.logger).Log("msg", "failed to remove tenant deletion mark", "user", userID, "err", err)
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+
+	level.Info(api.logger).Log("msg", "tenant deletion mark in blocks storage removed", "user", userID)
+
+	w.WriteHeader(http.StatusOK)
+}
+
+// requireTenantConfirmation returns an error unless the request carries a
+// `tenant` form or query parameter whose value equals userID. r.FormValue
+// transparently reads from the URL query and, for POST, the
+// application/x-www-form-urlencoded body.
+func requireTenantConfirmation(r *http.Request, userID string) error {
+	if v := r.FormValue("tenant"); v != "" {
+		if v == userID {
+			return nil
+		}
+		return errors.Errorf("confirmation parameter 'tenant' does not match X-Scope-OrgID")
+	}
+	return errors.Errorf("missing required confirmation parameter 'tenant'; it must equal the X-Scope-OrgID value")
 }
 
 type DeleteTenantStatusResponse struct {

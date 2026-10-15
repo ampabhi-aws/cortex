@@ -277,6 +277,7 @@ func (a *API) RegisterIngester(i Ingester, pushConfig distributor.Config) {
 
 func (a *API) RegisterTenantDeletion(api *purger.TenantDeletionAPI) {
 	a.RegisterRoute("/purger/delete_tenant", http.HandlerFunc(api.DeleteTenant), true, "POST")
+	a.RegisterRoute("/purger/undelete_tenant", http.HandlerFunc(api.UndeleteTenant), true, "POST")
 	a.RegisterRoute("/purger/delete_tenant_status", http.HandlerFunc(api.DeleteTenantStatus), true, "GET")
 }
 
