@@ -100,7 +100,7 @@ var (
 			return nil, nil, err
 		}
 
-		plannerFactory := func(ctx context.Context, bkt objstore.InstrumentedBucket, logger log.Logger, cfg Config, noCompactionMarkFilter *compact.GatherNoCompactionMarkFilter, ringLifecycle *ring.Lifecycler, _ prometheus.Counter, _ prometheus.Counter) compact.Planner {
+		plannerFactory := func(ctx context.Context, bkt objstore.InstrumentedBucket, logger log.Logger, cfg Config, noCompactionMarkFilter *compact.GatherNoCompactionMarkFilter, ringLifecycle *ring.Lifecycler, _ prometheus.Counter, _ prometheus.Counter, _ prometheus.Gauge) compact.Planner {
 			return compact.NewPlanner(logger, cfg.BlockRanges.ToMilliseconds(), noCompactionMarkFilter)
 		}
 
@@ -113,9 +113,9 @@ var (
 			return nil, nil, err
 		}
 
-		plannerFactory := func(ctx context.Context, bkt objstore.InstrumentedBucket, logger log.Logger, cfg Config, noCompactionMarkFilter *compact.GatherNoCompactionMarkFilter, ringLifecycle *ring.Lifecycler, blockVisitMarkerReadFailed prometheus.Counter, blockVisitMarkerWriteFailed prometheus.Counter) compact.Planner {
+		plannerFactory := func(ctx context.Context, bkt objstore.InstrumentedBucket, logger log.Logger, cfg Config, noCompactionMarkFilter *compact.GatherNoCompactionMarkFilter, ringLifecycle *ring.Lifecycler, blockVisitMarkerReadFailed prometheus.Counter, blockVisitMarkerWriteFailed prometheus.Counter, blockVisitMarkerHeartbeats prometheus.Gauge) compact.Planner {
 
-			return NewShuffleShardingPlanner(ctx, bkt, logger, cfg.BlockRanges.ToMilliseconds(), noCompactionMarkFilter.NoCompactMarkedBlocks, ringLifecycle.ID, cfg.BlockVisitMarkerTimeout, cfg.BlockVisitMarkerFileUpdateInterval, blockVisitMarkerReadFailed, blockVisitMarkerWriteFailed)
+			return NewShuffleShardingPlannerWithMetrics(ctx, bkt, logger, cfg.BlockRanges.ToMilliseconds(), noCompactionMarkFilter.NoCompactMarkedBlocks, ringLifecycle.ID, cfg.BlockVisitMarkerTimeout, cfg.BlockVisitMarkerFileUpdateInterval, blockVisitMarkerReadFailed, blockVisitMarkerWriteFailed, blockVisitMarkerHeartbeats)
 		}
 		return compactor, plannerFactory, nil
 	}
@@ -157,6 +157,7 @@ type PlannerFactory func(
 	ringLifecycle *ring.Lifecycler,
 	blockVisitMarkerReadFailed prometheus.Counter,
 	blockVisitMarkerWriteFailed prometheus.Counter,
+	blockVisitMarkerHeartbeats prometheus.Gauge,
 ) compact.Planner
 
 // Limits defines limits used by the Compactor.
@@ -327,6 +328,7 @@ type Compactor struct {
 	remainingPlannedCompactions    prometheus.Gauge
 	blockVisitMarkerReadFailed     prometheus.Counter
 	blockVisitMarkerWriteFailed    prometheus.Counter
+	blockVisitMarkerHeartbeats     prometheus.Gauge
 
 	// TSDB syncer metrics
 	syncerMetrics *syncerMetrics
@@ -451,6 +453,10 @@ func newCompactor(
 		blockVisitMarkerWriteFailed: promauto.With(registerer).NewCounter(prometheus.CounterOpts{
 			Name: "cortex_compactor_block_visit_marker_write_failed",
 			Help: "Number of block visit marker file failed to be written.",
+		}),
+		blockVisitMarkerHeartbeats: promauto.With(registerer).NewGauge(prometheus.GaugeOpts{
+			Name: "cortex_compactor_block_visit_marker_heartbeats_active",
+			Help: "Number of block visit marker heartbeat goroutines currently running. Should stay close to the number of actively compacting groups; sustained growth indicates a leak.",
 		}),
 		remainingPlannedCompactions: remainingPlannedCompactions,
 		limits:                      limits,
@@ -792,11 +798,18 @@ func (c *Compactor) compactUser(ctx context.Context, userID string) error {
 
 	currentCtx, cancel := context.WithCancel(ctx)
 	defer cancel()
+	planner := c.blocksPlannerFactory(currentCtx, bucket, ulogger, c.compactorCfg, noCompactMarkerFilter, c.ringLifecycler, c.blockVisitMarkerReadFailed, c.blockVisitMarkerWriteFailed, c.blockVisitMarkerHeartbeats)
+	// Ensure any per-group heartbeat goroutines started by the planner are torn down
+	// when this user's compaction returns, instead of leaking until the parent context
+	// is cancelled. ShuffleShardingPlanner implements io.Closer-like semantics via Close().
+	if p, ok := planner.(interface{ Close() }); ok {
+		defer p.Close()
+	}
 	compactor, err := compact.NewBucketCompactor(
 		ulogger,
 		syncer,
 		c.blocksGrouperFactory(currentCtx, c.compactorCfg, bucket, ulogger, reg, c.blocksMarkedForDeletion, c.blocksMarkedForNoCompaction, c.garbageCollectedBlocks, c.remainingPlannedCompactions, c.blockVisitMarkerReadFailed, c.blockVisitMarkerWriteFailed, c.ring, c.ringLifecycler, c.limits, userID),
-		c.blocksPlannerFactory(currentCtx, bucket, ulogger, c.compactorCfg, noCompactMarkerFilter, c.ringLifecycler, c.blockVisitMarkerReadFailed, c.blockVisitMarkerWriteFailed),
+		planner,
 		c.blocksCompactor,
 		path.Join(c.compactorCfg.DataDir, "compact"),
 		bucket,

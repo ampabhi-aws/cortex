@@ -8,6 +8,7 @@ import (
 	"io"
 	"path"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/go-kit/log"
@@ -107,13 +108,55 @@ func markBlocksVisited(
 	}
 }
 
-func markBlocksVisitedHeartBeat(ctx context.Context, bkt objstore.Bucket, logger log.Logger, blocks []*metadata.Meta, compactorID string, blockVisitMarkerFileUpdateInterval time.Duration, blockVisitMarkerWriteFailed prometheus.Counter) {
-	var blockIds []string
-	for _, block := range blocks {
+// markBlocksVisitedHeartBeat periodically re-uploads visit markers for the given blocks until
+// ctx is cancelled or every tracked block has been removed from the bucket.
+//
+// Scope and lifetime:
+//   - ctx should be a per-group context so the heartbeat stops as soon as that group's
+//     compaction finishes. Callers typically derive it with context.WithCancel of a parent
+//     context and arrange a cancel()/wg.Done() when planning/compaction of the group ends.
+//   - When non-nil, wg is Done()'d when the heartbeat returns so the caller can Wait() for
+//     all heartbeats to finish before returning.
+//   - When non-nil, activeHeartbeats is incremented for the lifetime of this goroutine so
+//     operators can observe heartbeat leaks via a gauge.
+//
+// Self-bounding: on each tick, if a marker upload for a block fails because the block
+// directory no longer exists (i.e. hard-deleted by the blocks cleaner once compaction
+// superseded the source blocks), that block is dropped from the refresh set so we do not
+// recreate <ULID>/visit-mark.json and resurrect the block as an orphaned partial block.
+// Once every block has been dropped, the heartbeat exits even if ctx is still live.
+func markBlocksVisitedHeartBeat(
+	ctx context.Context,
+	bkt objstore.InstrumentedBucket,
+	logger log.Logger,
+	blocks []*metadata.Meta,
+	compactorID string,
+	blockVisitMarkerFileUpdateInterval time.Duration,
+	blockVisitMarkerWriteFailed prometheus.Counter,
+	activeHeartbeats prometheus.Gauge,
+	wg *sync.WaitGroup,
+) {
+	if wg != nil {
+		defer wg.Done()
+	}
+	if activeHeartbeats != nil {
+		activeHeartbeats.Inc()
+		defer activeHeartbeats.Dec()
+	}
+
+	// Work on a local copy so we can prune blocks that have been hard-deleted without
+	// mutating the slice the caller may still be using.
+	remaining := make([]*metadata.Meta, len(blocks))
+	copy(remaining, blocks)
+
+	blockIds := make([]string, 0, len(remaining))
+	for _, block := range remaining {
 		blockIds = append(blockIds, block.ULID.String())
 	}
 	blocksInfo := strings.Join(blockIds, ",")
 	level.Info(logger).Log("msg", fmt.Sprintf("start heart beat for blocks: %s", blocksInfo))
+	defer level.Info(logger).Log("msg", fmt.Sprintf("stop heart beat for blocks: %s", blocksInfo))
+
 	ticker := time.NewTicker(blockVisitMarkerFileUpdateInterval)
 	defer ticker.Stop()
 heartBeat:
@@ -124,7 +167,12 @@ heartBeat:
 			CompactorID: compactorID,
 			Version:     VisitMarkerVersion1,
 		}
-		markBlocksVisited(ctx, bkt, logger, blocks, blockVisitMarker, blockVisitMarkerWriteFailed)
+		remaining = refreshBlockVisitMarkers(ctx, bkt, logger, remaining, blockVisitMarker, blockVisitMarkerWriteFailed)
+		if len(remaining) == 0 {
+			// Every block we were tracking has been removed from the bucket, so there is
+			// nothing left to refresh.
+			break heartBeat
+		}
 
 		select {
 		case <-ctx.Done():
@@ -133,5 +181,41 @@ heartBeat:
 			continue
 		}
 	}
-	level.Info(logger).Log("msg", fmt.Sprintf("stop heart beat for blocks: %s", blocksInfo))
+}
+
+// refreshBlockVisitMarkers uploads the given marker for each block and returns the subset of
+// blocks that still exist in the bucket. Blocks whose upload fails with a not-found error are
+// dropped so subsequent heartbeat ticks do not resurrect them as orphaned partial blocks.
+func refreshBlockVisitMarkers(
+	ctx context.Context,
+	bkt objstore.InstrumentedBucket,
+	logger log.Logger,
+	blocks []*metadata.Meta,
+	marker BlockVisitMarker,
+	blockVisitMarkerWriteFailed prometheus.Counter,
+) []*metadata.Meta {
+	visitMarkerFileContent, err := json.Marshal(marker)
+	if err != nil {
+		blockVisitMarkerWriteFailed.Inc()
+		return blocks
+	}
+	kept := blocks[:0]
+	reader := bytes.NewReader(visitMarkerFileContent)
+	for _, b := range blocks {
+		blockID := b.ULID.String()
+		visitMarkerFilePath := path.Join(blockID, BlockVisitMarkerFile)
+		reader.Reset(visitMarkerFileContent)
+		if err := bkt.Upload(ctx, visitMarkerFilePath, reader); err != nil {
+			if bkt.IsObjNotFoundErr(err) {
+				// The block is gone from the bucket, do not refresh its visit marker
+				// (would otherwise resurrect it as an orphaned partial block).
+				level.Info(logger).Log("msg", "stop refreshing visit marker for block that no longer exists", "blockID", blockID)
+				continue
+			}
+			blockVisitMarkerWriteFailed.Inc()
+			level.Error(logger).Log("msg", "unable to upsert visit marker file content for block", "blockID", blockID, "err", err)
+		}
+		kept = append(kept, b)
+	}
+	return kept
 }

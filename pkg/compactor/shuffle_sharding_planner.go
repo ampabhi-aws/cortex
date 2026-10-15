@@ -3,6 +3,7 @@ package compactor
 import (
 	"context"
 	"fmt"
+	"sync"
 	"time"
 
 	"github.com/go-kit/log"
@@ -23,6 +24,13 @@ type ShuffleShardingPlanner struct {
 	blockVisitMarkerFileUpdateInterval time.Duration
 	blockVisitMarkerReadFailed         prometheus.Counter
 	blockVisitMarkerWriteFailed        prometheus.Counter
+	blockVisitMarkerHeartbeats         prometheus.Gauge
+
+	// heartbeatsMtx protects heartbeatCancels and heartbeatsWg access on Close.
+	heartbeatsMtx     sync.Mutex
+	heartbeatCancels  []context.CancelFunc
+	heartbeatsWg      sync.WaitGroup
+	heartbeatsStopped bool
 }
 
 func NewShuffleShardingPlanner(
@@ -37,6 +45,25 @@ func NewShuffleShardingPlanner(
 	blockVisitMarkerReadFailed prometheus.Counter,
 	blockVisitMarkerWriteFailed prometheus.Counter,
 ) *ShuffleShardingPlanner {
+	return NewShuffleShardingPlannerWithMetrics(ctx, bkt, logger, ranges, noCompBlocksFunc, ringLifecyclerID, blockVisitMarkerTimeout, blockVisitMarkerFileUpdateInterval, blockVisitMarkerReadFailed, blockVisitMarkerWriteFailed, nil)
+}
+
+// NewShuffleShardingPlannerWithMetrics is like NewShuffleShardingPlanner but also wires in
+// an optional gauge that tracks the number of live block-visit-marker heartbeat goroutines
+// so leaks are observable.
+func NewShuffleShardingPlannerWithMetrics(
+	ctx context.Context,
+	bkt objstore.InstrumentedBucket,
+	logger log.Logger,
+	ranges []int64,
+	noCompBlocksFunc func() map[ulid.ULID]*metadata.NoCompactMark,
+	ringLifecyclerID string,
+	blockVisitMarkerTimeout time.Duration,
+	blockVisitMarkerFileUpdateInterval time.Duration,
+	blockVisitMarkerReadFailed prometheus.Counter,
+	blockVisitMarkerWriteFailed prometheus.Counter,
+	blockVisitMarkerHeartbeats prometheus.Gauge,
+) *ShuffleShardingPlanner {
 	return &ShuffleShardingPlanner{
 		ctx:                                ctx,
 		bkt:                                bkt,
@@ -48,10 +75,11 @@ func NewShuffleShardingPlanner(
 		blockVisitMarkerFileUpdateInterval: blockVisitMarkerFileUpdateInterval,
 		blockVisitMarkerReadFailed:         blockVisitMarkerReadFailed,
 		blockVisitMarkerWriteFailed:        blockVisitMarkerWriteFailed,
+		blockVisitMarkerHeartbeats:         blockVisitMarkerHeartbeats,
 	}
 }
 
-func (p *ShuffleShardingPlanner) Plan(_ context.Context, metasByMinTime []*metadata.Meta) ([]*metadata.Meta, error) {
+func (p *ShuffleShardingPlanner) Plan(ctx context.Context, metasByMinTime []*metadata.Meta) ([]*metadata.Meta, error) {
 	// Ensure all blocks fits within the largest range. This is a double check
 	// to ensure there's no bug in the previous blocks grouping, given this Plan()
 	// is just a pass-through.
@@ -89,7 +117,51 @@ func (p *ShuffleShardingPlanner) Plan(_ context.Context, metasByMinTime []*metad
 		return nil, nil
 	}
 
-	go markBlocksVisitedHeartBeat(p.ctx, p.bkt, p.logger, resultMetas, p.ringLifecyclerID, p.blockVisitMarkerFileUpdateInterval, p.blockVisitMarkerWriteFailed)
+	// Scope the heartbeat to this group so it stops as soon as the group's compaction
+	// finishes. We derive from the per-call ctx (per-Compact-iteration) when available so
+	// that cancellation of the Compact pass terminates heartbeats for all groups planned
+	// in that pass; we also keep a cancel handle so Close() can tear down any heartbeat
+	// that is still running. The underlying heartbeat loop additionally self-terminates
+	// when every block it is tracking has been removed from the bucket.
+	parentCtx := ctx
+	if parentCtx == nil {
+		parentCtx = p.ctx
+	}
+	hbCtx, cancel := context.WithCancel(parentCtx)
+
+	p.heartbeatsMtx.Lock()
+	if p.heartbeatsStopped {
+		// Planner has been closed; do not launch new heartbeats.
+		p.heartbeatsMtx.Unlock()
+		cancel()
+		return resultMetas, nil
+	}
+	p.heartbeatCancels = append(p.heartbeatCancels, cancel)
+	p.heartbeatsWg.Add(1)
+	p.heartbeatsMtx.Unlock()
+
+	go markBlocksVisitedHeartBeat(hbCtx, p.bkt, p.logger, resultMetas, p.ringLifecyclerID, p.blockVisitMarkerFileUpdateInterval, p.blockVisitMarkerWriteFailed, p.blockVisitMarkerHeartbeats, &p.heartbeatsWg)
 
 	return resultMetas, nil
+}
+
+// Close cancels every heartbeat goroutine the planner has started and waits for them to
+// exit. It is safe to call multiple times. Call this when the planner is no longer needed
+// (e.g. after BucketCompactor.Compact returns) so that heartbeats do not outlive their
+// enclosing scope even if their per-group contexts are still live.
+func (p *ShuffleShardingPlanner) Close() {
+	p.heartbeatsMtx.Lock()
+	if p.heartbeatsStopped {
+		p.heartbeatsMtx.Unlock()
+		return
+	}
+	p.heartbeatsStopped = true
+	cancels := p.heartbeatCancels
+	p.heartbeatCancels = nil
+	p.heartbeatsMtx.Unlock()
+
+	for _, c := range cancels {
+		c()
+	}
+	p.heartbeatsWg.Wait()
 }
