@@ -120,6 +120,7 @@ type Config struct {
 	RuntimeConfig       runtimeconfig.Config                       `yaml:"runtime_config"`
 	MemberlistKV        memberlist.KVConfig                        `yaml:"memberlist"`
 	QueryScheduler      scheduler.Config                           `yaml:"query_scheduler"`
+	Purger              purger.Config                              `yaml:"purger"`
 
 	Tracing tracing.Config `yaml:"tracing"`
 }
@@ -166,6 +167,7 @@ func (c *Config) RegisterFlags(f *flag.FlagSet) {
 	c.RuntimeConfig.RegisterFlags(f)
 	c.MemberlistKV.RegisterFlags(f)
 	c.QueryScheduler.RegisterFlags(f)
+	c.Purger.RegisterFlags(f)
 	c.Tracing.RegisterFlags(f)
 }
 

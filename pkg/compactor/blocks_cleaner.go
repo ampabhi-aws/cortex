@@ -204,7 +204,22 @@ func (c *BlocksCleaner) deleteUserMarkedForDeletion(ctx context.Context, userID 
 	c.tenantBucketIndexLastUpdate.DeleteLabelValues(userID)
 
 	var deletedBlocks, failed int
-	err := userBucket.Iter(ctx, "", func(name string) error {
+	var deletedPreDeletionMarkBlocks int
+	// Read the deletion mark upfront so we can decide which blocks are "old"
+	// (ingested before the deletion request) and which are "new". Only deletions
+	// of old blocks keep refreshing FinishedTime; otherwise a tenant that keeps
+	// writing after calling /purger/delete_tenant would prevent the mark from
+	// ever expiring.
+	mark, err := cortex_tsdb.ReadTenantDeletionMark(ctx, c.bucketClient, userID)
+	if err != nil {
+		return errors.Wrap(err, "failed to read tenant deletion mark")
+	}
+	if mark == nil {
+		return errors.New("cannot find tenant deletion mark anymore")
+	}
+	deletionTime := time.Unix(mark.DeletionTime, 0)
+
+	err = userBucket.Iter(ctx, "", func(name string) error {
 		if err := ctx.Err(); err != nil {
 			return err
 		}
@@ -213,6 +228,14 @@ func (c *BlocksCleaner) deleteUserMarkedForDeletion(ctx context.Context, userID 
 		if !ok {
 			return nil
 		}
+
+		// A block's ULID encodes the time it was generated. Treat blocks whose
+		// ULID timestamp predates the tenant deletion request as "pre-existing"
+		// data that the deletion is intended to erase; blocks generated after
+		// the request are being shipped by an ingester that has not yet seen
+		// the mark (or by a tenant that is still writing) and must not keep
+		// resetting FinishedTime, otherwise the mark can never be removed.
+		preDeletion := ulid.Time(id.Time()).Before(deletionTime)
 
 		err := block.Delete(ctx, userLogger, userBucket, id)
 		if err != nil {
@@ -223,6 +246,9 @@ func (c *BlocksCleaner) deleteUserMarkedForDeletion(ctx context.Context, userID 
 		}
 
 		deletedBlocks++
+		if preDeletion {
+			deletedPreDeletionMarkBlocks++
+		}
 		c.blocksCleanedTotal.Inc()
 		level.Info(userLogger).Log("msg", "deleted block", "block", id)
 		return nil
@@ -253,18 +279,15 @@ func (c *BlocksCleaner) deleteUserMarkedForDeletion(ctx context.Context, userID 
 		level.Info(userLogger).Log("msg", "deleted blocks for tenant marked for deletion", "deletedBlocks", deletedBlocks)
 	}
 
-	mark, err := cortex_tsdb.ReadTenantDeletionMark(ctx, c.bucketClient, userID)
-	if err != nil {
-		return errors.Wrap(err, "failed to read tenant deletion mark")
-	}
-	if mark == nil {
-		return errors.Wrap(err, "cannot find tenant deletion mark anymore")
-	}
-
-	// If we have just deleted some blocks, update "finished" time. Also update "finished" time if it wasn't set yet, but there are no blocks.
+	// If we have just deleted blocks ingested before the deletion request,
+	// update "finished" time. Also update "finished" time if it wasn't set yet
+	// and there are no blocks. Blocks ingested after the deletion request
+	// (newer ULIDs than DeletionTime) are still deleted above, but they do
+	// NOT refresh FinishedTime; otherwise a tenant that keeps remote-writing
+	// would prevent the deletion mark from ever being removed.
 	// Note: this UPDATES the tenant deletion mark. Components that use caching bucket will NOT SEE this update,
 	// but that is fine -- they only check whether tenant deletion marker exists or not.
-	if deletedBlocks > 0 || mark.FinishedTime == 0 {
+	if deletedPreDeletionMarkBlocks > 0 || mark.FinishedTime == 0 {
 		level.Info(userLogger).Log("msg", "updating finished time in tenant deletion mark")
 		mark.FinishedTime = time.Now().Unix()
 		return errors.Wrap(cortex_tsdb.WriteTenantDeletionMark(ctx, c.bucketClient, userID, c.cfgProvider, mark), "failed to update tenant deletion mark")

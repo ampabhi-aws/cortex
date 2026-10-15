@@ -789,15 +789,38 @@ _Requires [authentication](#authentication)._
 
 The Purger service provides APIs for requesting deletion of tenants.
 
+These endpoints are **disabled by default** because they permanently destroy
+tenant data. Enable them by setting `-purger.enable-api=true` (or
+`purger.enable_api: true` in YAML). Every request is logged with the
+authenticated tenant and request origin.
+
 ### Tenant Delete Request
 
 ```
-POST /purger/delete_tenant
+POST /purger/delete_tenant?tenant=<tenant-id>
 ```
 
 Request deletion of ALL tenant data. Only works with blocks storage. Experimental.
 
-_Requires [authentication](#authentication)._
+The `tenant` query (or form) parameter is required and MUST match the
+`X-Scope-OrgID` header of the request. This confirmation parameter protects
+against accidental invocations that merely rely on an ambient tenant header
+(for example a Grafana datasource proxying the user's request).
+
+_Requires [authentication](#authentication) and `-purger.enable-api=true`._
+
+### Tenant Undo Delete Request
+
+```
+DELETE /purger/delete_tenant?tenant=<tenant-id>
+```
+
+Removes a previously created tenant deletion mark from object storage. Call
+this endpoint to cancel a tenant deletion that was issued by mistake before
+the compactor finishes removing the tenant's remaining data. The same
+`tenant` confirmation parameter is required.
+
+_Requires [authentication](#authentication) and `-purger.enable-api=true`._
 
 ### Tenant Delete Status
 
@@ -807,7 +830,7 @@ GET /purger/delete_tenant_status
 
 Returns status of tenant deletion. Output format to be defined. Experimental.
 
-_Requires [authentication](#authentication)._
+_Requires [authentication](#authentication) and `-purger.enable-api=true`._
 
 ## Store-gateway
 
