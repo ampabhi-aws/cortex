@@ -5,6 +5,7 @@ import (
 	"flag"
 	"io"
 	"net/http"
+	"strings"
 	"sync"
 	"time"
 
@@ -235,6 +236,9 @@ func (s *Scheduler) frontendConnected(frontend schedulerpb.SchedulerForFrontend_
 	if msg.Type != schedulerpb.INIT || msg.FrontendAddress == "" {
 		return "", nil, errors.New("no frontend address")
 	}
+	if err := validateFrontendAddress(msg.FrontendAddress); err != nil {
+		return "", nil, err
+	}
 
 	s.connectedFrontendsMu.Lock()
 	defer s.connectedFrontendsMu.Unlock()
@@ -283,6 +287,24 @@ func (s *Scheduler) enqueueRequest(frontendContext context.Context, frontendAddr
 	}
 
 	userID := msg.GetUserID()
+
+	// Validate the tenant ID supplied in the FrontendLoop message body. This is a
+	// defence-in-depth check: because the FrontendLoop stream is exempted from
+	// the gRPC user-header interceptor (see pkg/cortex/cortex.go) the scheduler
+	// otherwise trusts msg.UserID verbatim, which is risky if the operator has
+	// not deployed the documented perimeter around internal component ports
+	// (reverse proxy / network policy / gRPC mTLS). At minimum reject tenant
+	// IDs that are structurally invalid, and reject messages where the
+	// X-Scope-OrgID header carried inside HttpRequest disagrees with msg.UserID
+	// — queriers re-derive the executing tenant from that header, so the two
+	// values must agree. Legitimate frontends set both from the same tenant
+	// context (see pkg/querier/tripperware/roundtrip.go: InjectOrgIDIntoHTTPRequest).
+	if err := validateUserID(userID); err != nil {
+		return err
+	}
+	if err := checkHTTPRequestTenantHeader(msg.HttpRequest, userID); err != nil {
+		return err
+	}
 
 	req := &schedulerRequest{
 		frontendAddress: frontendAddr,
@@ -525,4 +547,74 @@ func (s *Scheduler) getConnectedFrontendClientsMetric() float64 {
 	}
 
 	return float64(count)
+}
+
+// validateUserID applies the standard Cortex tenant-ID rules to every tenant
+// contained in a (potentially pipe-separated, multi-tenant) orgID string.
+// TenantIDsFromOrgID is still invoked later in enqueueRequest; this check
+// front-loads the same per-tenant character/length rules so a malformed body
+// is rejected before it mutates scheduler state.
+func validateUserID(userID string) error {
+	if userID == "" {
+		return errors.New("missing tenant ID in FrontendLoop message")
+	}
+	tenantIDs, err := tenant.TenantIDsFromOrgID(userID)
+	if err != nil {
+		return err
+	}
+	for _, id := range tenantIDs {
+		if err := tenant.ValidTenantID(id); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// checkHTTPRequestTenantHeader enforces that the X-Scope-OrgID header carried
+// inside the attacker-supplied HttpRequest agrees with the UserID advertised
+// on the FrontendLoop message. Queriers re-derive the executing tenant from
+// that header (see pkg/querier/worker/scheduler_processor.go), so letting
+// the two values diverge is a cross-tenant hazard. Legitimate query-frontends
+// always set both from the same tenant context, so this check never fires
+// on a well-behaved caller.
+func checkHTTPRequestTenantHeader(req *httpgrpc.HTTPRequest, userID string) error {
+	if req == nil {
+		return nil
+	}
+	for _, h := range req.Headers {
+		if h == nil || !strings.EqualFold(h.Key, user.OrgIDHeaderName) {
+			continue
+		}
+		for _, v := range h.Values {
+			if v != userID {
+				return errors.Errorf("tenant ID in FrontendLoop message (%q) does not match %s header in HttpRequest (%q)", userID, user.OrgIDHeaderName, v)
+			}
+		}
+	}
+	return nil
+}
+
+// validateFrontendAddress sanity-checks the self-asserted dial-back address a
+// frontend advertises on the FrontendLoop INIT message. The scheduler uses
+// this string both as a dial target (grpc.DialContext in forwardErrorToFrontend
+// and in the querier worker) and as the key for pendingRequests /
+// connectedFrontends, so a free-form value lets a hostile peer steer outbound
+// connections and collide / enumerate map keys. Reject obviously malformed
+// values (over-long, containing control characters or whitespace / path
+// separators) before they reach any of those sites. Full peer-based
+// resolution would require an authenticated transport (see cortex.go
+// grpc-auth exemption list) which is outside the scope of this change.
+func validateFrontendAddress(addr string) error {
+	if len(addr) > 253+6 { // RFC 1035 max hostname + ":65535"
+		return errors.New("frontend address is too long")
+	}
+	for _, r := range addr {
+		if r < 0x20 || r == 0x7f {
+			return errors.New("frontend address contains control characters")
+		}
+	}
+	if strings.ContainsAny(addr, " \t\r\n/\\") {
+		return errors.New("frontend address contains disallowed characters")
+	}
+	return nil
 }
