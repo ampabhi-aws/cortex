@@ -4,10 +4,12 @@ import (
 	"bytes"
 	"crypto/md5"
 	"crypto/tls"
+	"crypto/x509"
 	"flag"
 	"fmt"
 	"io"
 	"net"
+	"os"
 	"strings"
 	"sync"
 	"time"
@@ -59,6 +61,22 @@ type TCPTransportConfig struct {
 
 	TLSEnabled bool                   `yaml:"tls_enabled"`
 	TLS        cortextls.ClientConfig `yaml:",inline"`
+
+	// Memberlist-specific server-side TLS options. These are kept separate from
+	// the client-role TLS config above because the gossip transport uses the
+	// same object for both tls.Listen (server role) and tls.Dial (client role),
+	// and a client tls.Config does not carry server-side fields such as
+	// ClientAuth / ClientCAs. When TLSEnabled is true and TLSClientCAPath is
+	// set, incoming gossip connections are required to present a client
+	// certificate signed by that CA (crypto/tls default is NoClientCert, i.e.
+	// no peer authentication). TLSAllowedCNs/TLSAllowedDNSNames further pin
+	// the accepted peer identity.
+	TLSServerCertPath   string              `yaml:"tls_server_cert_path"`
+	TLSServerKeyPath    string              `yaml:"tls_server_key_path"`
+	TLSClientCAPath     string              `yaml:"tls_client_ca_path"`
+	TLSClientAuth       string              `yaml:"tls_client_auth"`
+	TLSAllowedCNs       flagext.StringSlice `yaml:"tls_allowed_cns"`
+	TLSAllowedDNSNames  flagext.StringSlice `yaml:"tls_allowed_dns_names"`
 }
 
 func (cfg *TCPTransportConfig) RegisterFlags(f *flag.FlagSet) {
@@ -76,6 +94,118 @@ func (cfg *TCPTransportConfig) RegisterFlagsWithPrefix(f *flag.FlagSet, prefix s
 
 	f.BoolVar(&cfg.TLSEnabled, prefix+"memberlist.tls-enabled", false, "Enable TLS on the memberlist transport layer.")
 	cfg.TLS.RegisterFlagsWithPrefix(prefix+"memberlist", f)
+
+	f.StringVar(&cfg.TLSServerCertPath, prefix+"memberlist.tls-server-cert-path", "", "Path to the server certificate file presented by the memberlist TLS listener. Defaults to the client -memberlist.tls-cert-path if unset.")
+	f.StringVar(&cfg.TLSServerKeyPath, prefix+"memberlist.tls-server-key-path", "", "Path to the private key file for the memberlist TLS listener's server certificate. Defaults to -memberlist.tls-key-path if unset.")
+	f.StringVar(&cfg.TLSClientCAPath, prefix+"memberlist.tls-client-ca-path", "", "Path to a CA certificate bundle used to verify client certificates presented by peers connecting to the memberlist TLS listener. When set, ClientAuth defaults to RequireAndVerifyClientCert so unauthenticated peers cannot inject ring state.")
+	f.StringVar(&cfg.TLSClientAuth, prefix+"memberlist.tls-client-auth", "", "Policy for client authentication on the memberlist TLS listener. One of: NoClientCert, RequestClientCert, RequireAnyClientCert, VerifyClientCertIfGiven, RequireAndVerifyClientCert. Defaults to RequireAndVerifyClientCert when a client CA is configured, otherwise NoClientCert.")
+	f.Var(&cfg.TLSAllowedCNs, prefix+"memberlist.tls-allowed-cn", "If set, incoming gossip connections must present a client certificate whose Common Name matches one of these values. May be specified multiple times.")
+	f.Var(&cfg.TLSAllowedDNSNames, prefix+"memberlist.tls-allowed-dns-name", "If set, incoming gossip connections must present a client certificate whose Subject Alternative Name (DNS) matches one of these values. May be specified multiple times.")
+}
+
+// parseClientAuthType maps the user-facing name to a crypto/tls.ClientAuthType.
+// An empty name means "auto": RequireAndVerifyClientCert when a client CA is
+// configured, NoClientCert otherwise.
+func parseClientAuthType(name string, haveClientCA bool) (tls.ClientAuthType, error) {
+	switch name {
+	case "":
+		if haveClientCA {
+			return tls.RequireAndVerifyClientCert, nil
+		}
+		return tls.NoClientCert, nil
+	case "NoClientCert":
+		return tls.NoClientCert, nil
+	case "RequestClientCert":
+		return tls.RequestClientCert, nil
+	case "RequireAnyClientCert":
+		return tls.RequireAnyClientCert, nil
+	case "VerifyClientCertIfGiven":
+		return tls.VerifyClientCertIfGiven, nil
+	case "RequireAndVerifyClientCert":
+		return tls.RequireAndVerifyClientCert, nil
+	default:
+		return tls.NoClientCert, fmt.Errorf("unknown TLS ClientAuth value %q", name)
+	}
+}
+
+// buildServerTLSConfig builds a tls.Config suitable for tls.Listen that
+// authenticates incoming gossip peers. Unlike the client config returned by
+// ClientConfig.GetTLSConfig, it populates Certificates with the server key
+// pair and ClientAuth / ClientCAs so that the listener actually requests and
+// verifies peer certificates. An allowed-SAN/CN allowlist is enforced via
+// VerifyPeerCertificate when configured.
+func buildServerTLSConfig(cfg TCPTransportConfig) (*tls.Config, error) {
+	serverCertPath := cfg.TLSServerCertPath
+	if serverCertPath == "" {
+		serverCertPath = cfg.TLS.CertPath
+	}
+	serverKeyPath := cfg.TLSServerKeyPath
+	if serverKeyPath == "" {
+		serverKeyPath = cfg.TLS.KeyPath
+	}
+
+	serverCfg := &tls.Config{}
+
+	if serverCertPath != "" || serverKeyPath != "" {
+		if serverCertPath == "" || serverKeyPath == "" {
+			return nil, errors.New("memberlist TLS listener requires both a server certificate and key")
+		}
+		cert, err := tls.LoadX509KeyPair(serverCertPath, serverKeyPath)
+		if err != nil {
+			return nil, errors.Wrapf(err, "failed to load memberlist server TLS certificate %s,%s", serverCertPath, serverKeyPath)
+		}
+		serverCfg.Certificates = []tls.Certificate{cert}
+	}
+
+	clientCAPath := cfg.TLSClientCAPath
+	if clientCAPath != "" {
+		caBytes, err := os.ReadFile(clientCAPath)
+		if err != nil {
+			return nil, errors.Wrapf(err, "failed to read memberlist client CA file: %s", clientCAPath)
+		}
+		pool := x509.NewCertPool()
+		if !pool.AppendCertsFromPEM(caBytes) {
+			return nil, errors.Errorf("failed to parse memberlist client CA file: %s", clientCAPath)
+		}
+		serverCfg.ClientCAs = pool
+	}
+
+	auth, err := parseClientAuthType(cfg.TLSClientAuth, clientCAPath != "")
+	if err != nil {
+		return nil, err
+	}
+	if (auth == tls.RequireAndVerifyClientCert || auth == tls.VerifyClientCertIfGiven) && serverCfg.ClientCAs == nil {
+		return nil, errors.Errorf("memberlist tls_client_auth=%q requires -memberlist.tls-client-ca-path to be set", cfg.TLSClientAuth)
+	}
+	serverCfg.ClientAuth = auth
+
+	// Pin the acceptable peer identity if an allowlist was provided. This runs
+	// after crypto/tls has already validated the chain against ClientCAs.
+	if len(cfg.TLSAllowedCNs) > 0 || len(cfg.TLSAllowedDNSNames) > 0 {
+		allowedCNs := append([]string(nil), cfg.TLSAllowedCNs...)
+		allowedDNS := append([]string(nil), cfg.TLSAllowedDNSNames...)
+		serverCfg.VerifyPeerCertificate = func(_ [][]byte, verifiedChains [][]*x509.Certificate) error {
+			if len(verifiedChains) == 0 || len(verifiedChains[0]) == 0 {
+				return errors.New("memberlist: no verified peer certificate chain presented")
+			}
+			leaf := verifiedChains[0][0]
+			for _, cn := range allowedCNs {
+				if cn == leaf.Subject.CommonName {
+					return nil
+				}
+			}
+			for _, want := range allowedDNS {
+				for _, got := range leaf.DNSNames {
+					if want == got {
+						return nil
+					}
+				}
+			}
+			return errors.Errorf("memberlist: peer certificate identity %q (DNS=%v) not in allowed list", leaf.Subject.CommonName, leaf.DNSNames)
+		}
+	}
+
+	return serverCfg, nil
 }
 
 // TCPTransport is a memberlist.Transport implementation that uses TCP for both packet and stream
@@ -87,8 +217,9 @@ type TCPTransport struct {
 	packetCh     chan *memberlist.Packet
 	connCh       chan net.Conn
 	wg           sync.WaitGroup
-	tcpListeners []net.Listener
-	tlsConfig    *tls.Config
+	tcpListeners    []net.Listener
+	tlsConfig       *tls.Config // client role (tls.Dial)
+	serverTLSConfig *tls.Config // server role (tls.Listen) with ClientAuth
 
 	shutdown atomic.Int32
 
@@ -131,6 +262,17 @@ func NewTCPTransport(config TCPTransportConfig, logger log.Logger) (*TCPTranspor
 		if err != nil {
 			return nil, errors.Wrap(err, "unable to create TLS config")
 		}
+		// The client config returned above is suitable for tls.Dial (client
+		// role) only: it never populates ClientAuth / ClientCAs, so if it were
+		// also handed to tls.Listen the server would default to NoClientCert
+		// and accept any peer. Build a dedicated server config instead.
+		t.serverTLSConfig, err = buildServerTLSConfig(config)
+		if err != nil {
+			return nil, errors.Wrap(err, "unable to create memberlist server TLS config")
+		}
+		if t.serverTLSConfig.ClientAuth == tls.NoClientCert {
+			level.Warn(t.logger).Log("msg", "memberlist TLS listener is running with ClientAuth=NoClientCert; any host that reaches the gossip port can inject ring state. Configure -memberlist.tls-client-ca-path (and optionally -memberlist.tls-allowed-cn / -memberlist.tls-allowed-dns-name) to authenticate peers.")
+		}
 	}
 
 	t.registerMetrics(config.MetricsRegisterer)
@@ -151,7 +293,7 @@ func NewTCPTransport(config TCPTransportConfig, logger log.Logger) (*TCPTranspor
 
 		var tcpLn net.Listener
 		if config.TLSEnabled {
-			tcpLn, err = tls.Listen("tcp", tcpAddr.String(), t.tlsConfig)
+			tcpLn, err = tls.Listen("tcp", tcpAddr.String(), t.serverTLSConfig)
 			if err != nil {
 				return nil, errors.Wrapf(err, "failed to start TLS TCP listener on %q port %d", addr, port)
 			}
