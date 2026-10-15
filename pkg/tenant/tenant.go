@@ -12,6 +12,7 @@ import (
 
 var (
 	errTenantIDTooLong = errors.New("tenant ID is too long: max 150 characters")
+	errEmptyTenantID   = errors.New("empty tenant ID")
 )
 
 type errTenantIDUnsupportedCharacter struct {
@@ -49,8 +50,15 @@ func NormalizeTenantIDs(tenantIDs []string) []string {
 	return tenantIDs[0:posOut]
 }
 
-// ValidTenantID
+// ValidTenantID returns an error when the given string does not match the
+// documented tenant ID invariants: it must be non-empty, no longer than 150
+// bytes and composed only of characters accepted by isSupported (see
+// https://cortexmetrics.io/docs/guides/limitations/#tenant-id-naming).
 func ValidTenantID(s string) error {
+	if len(s) == 0 {
+		return errEmptyTenantID
+	}
+
 	// check if it contains invalid runes
 	for pos, r := range s {
 		if !isSupported(r) {
