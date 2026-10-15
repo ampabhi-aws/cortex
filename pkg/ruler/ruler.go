@@ -123,6 +123,14 @@ type Config struct {
 
 	EnableQueryStats      bool `yaml:"query_stats_enabled"`
 	DisableRuleGroupLabel bool `yaml:"disable_rule_group_label"`
+
+	// ListAllRuleGroupsEnabled gates the operator-only `/ruler/rule_groups`
+	// endpoint that lists every tenant's complete rule groups. It is always
+	// served without authentication (Cortex has no built-in authentication:
+	// `X-Scope-OrgID` is a trust-the-header mechanism, not a credential), so
+	// operators are expected to protect this path at a reverse proxy. When
+	// this flag is false the endpoint returns 404 Not Found.
+	ListAllRuleGroupsEnabled bool `yaml:"list_all_rule_groups_enabled"`
 }
 
 // Validate config and returns error on failure
@@ -183,6 +191,7 @@ func (cfg *Config) RegisterFlags(f *flag.FlagSet) {
 
 	f.BoolVar(&cfg.EnableQueryStats, "ruler.query-stats-enabled", false, "Report the wall time for ruler queries to complete as a per user metric and as an info level log message.")
 	f.BoolVar(&cfg.DisableRuleGroupLabel, "ruler.disable-rule-group-label", false, "Disable the rule_group label on exported metrics")
+	f.BoolVar(&cfg.ListAllRuleGroupsEnabled, "ruler.list-all-rule-groups-enabled", true, "Enable the operator-only GET /ruler/rule_groups endpoint, which lists every tenant's rule groups. This endpoint is never tenant-scoped and is served without authentication; it must be protected at a reverse proxy. Set to false to disable it entirely (returns 404).")
 
 	cfg.RingCheckPeriod = 5 * time.Second
 }
@@ -284,6 +293,9 @@ func newRuler(cfg Config, manager MultiTenantManager, reg prometheus.Registerer,
 	}
 	if len(cfg.DisabledTenants) > 0 {
 		level.Info(ruler.logger).Log("msg", "ruler using disabled users", "disabled", strings.Join(cfg.DisabledTenants, ", "))
+	}
+	if cfg.ListAllRuleGroupsEnabled {
+		level.Warn(ruler.logger).Log("msg", "the GET /ruler/rule_groups endpoint is enabled; it lists every tenant's rule groups without authentication and must be blocked at a reverse proxy for any untrusted caller. Set -ruler.list-all-rule-groups-enabled=false to disable it entirely.")
 	}
 
 	if cfg.EnableSharding {
@@ -862,6 +874,17 @@ func (r *Ruler) DeleteTenantConfiguration(w http.ResponseWriter, req *http.Reque
 
 func (r *Ruler) ListAllRules(w http.ResponseWriter, req *http.Request) {
 	logger := util_log.WithContext(req.Context(), r.logger)
+
+	// This endpoint is intentionally not tenant-scoped: it exposes every tenant's
+	// complete rule groups. Cortex does not authenticate requests itself (the
+	// X-Scope-OrgID header is trusted verbatim), so operators are required to
+	// block this path at a reverse proxy for any untrusted caller. The
+	// `-ruler.list-all-rule-groups-enabled` flag is provided as a defence-in-depth
+	// kill switch so deployments that do not need the endpoint can turn it off.
+	if !r.cfg.ListAllRuleGroupsEnabled {
+		http.Error(w, "list all rule groups endpoint is disabled", http.StatusNotFound)
+		return
+	}
 
 	userIDs, err := r.store.ListAllUsers(req.Context())
 	if err != nil {
