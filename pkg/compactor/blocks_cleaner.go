@@ -49,6 +49,7 @@ type BlocksCleaner struct {
 	runsCompleted                     prometheus.Counter
 	runsFailed                        prometheus.Counter
 	runsLastSuccess                   prometheus.Gauge
+	tenantsSkipped                    prometheus.Counter
 	blocksCleanedTotal                prometheus.Counter
 	blocksFailedTotal                 prometheus.Counter
 	blocksMarkedForDeletion           prometheus.Counter
@@ -81,6 +82,10 @@ func NewBlocksCleaner(cfg BlocksCleanerConfig, bucketClient objstore.Bucket, use
 		runsLastSuccess: promauto.With(reg).NewGauge(prometheus.GaugeOpts{
 			Name: "cortex_compactor_block_cleanup_last_successful_run_timestamp_seconds",
 			Help: "Unix timestamp of the last successful blocks cleanup run.",
+		}),
+		tenantsSkipped: promauto.With(reg).NewCounter(prometheus.CounterOpts{
+			Name: "cortex_compactor_block_cleanup_tenants_skipped_total",
+			Help: "Total number of tenants skipped during blocks cleanup because the shard-ownership check failed (e.g. ring/KV store degraded). Cleanup is deferred to the next cycle.",
 		}),
 		blocksCleanedTotal: promauto.With(reg).NewCounter(prometheus.CounterOpts{
 			Name: "cortex_compactor_blocks_cleaned_total",
@@ -119,6 +124,13 @@ func NewBlocksCleaner(cfg BlocksCleanerConfig, bucketClient objstore.Bucket, use
 			Name: "cortex_bucket_index_last_successful_update_timestamp_seconds",
 			Help: "Timestamp of the last successful update of a tenant's bucket index.",
 		}, []string{"user"}),
+	}
+
+	// Wire the skipped-tenants counter into the shared users scanner so that failures
+	// of the shard-ownership check (which cause the scanner to fail closed and defer
+	// the tenant to the next scan cycle) are observable by operators.
+	if usersScanner != nil {
+		usersScanner.SetOwnershipFailedCounter(c.tenantsSkipped)
 	}
 
 	c.Service = services.NewTimerService(cfg.CleanupInterval, c.starting, c.ticker, nil)
