@@ -20,6 +20,7 @@ import (
 	amconfig "github.com/prometheus/alertmanager/config"
 	amtemplate "github.com/prometheus/alertmanager/template"
 
+	"github.com/cortexproject/cortex/pkg/alertmanager"
 	"github.com/cortexproject/cortex/pkg/configs/db"
 	"github.com/cortexproject/cortex/pkg/configs/userconfig"
 	"github.com/cortexproject/cortex/pkg/tenant"
@@ -225,6 +226,16 @@ func (a *API) validateAlertmanagerConfig(w http.ResponseWriter, r *http.Request)
 }
 
 func validateAlertmanagerConfig(cfg string, noCfg NotificationsConfig) error {
+	// Reuse the hardened Alertmanager validator so that tenant-supplied YAML
+	// cannot smuggle in *_file options (bearer_token_file, password_file,
+	// slack_api_url_file, TLS ca/cert/key_file, VictorOps api_key_file, ...),
+	// which would otherwise allow Cortex to read local files on the tenant's
+	// behalf when the config is applied by the Alertmanager loaded from the
+	// configdb alertstore.
+	if err := alertmanager.ValidateAlertmanagerConfig(cfg); err != nil {
+		return err
+	}
+
 	amCfg, err := amconfig.Load(cfg)
 	if err != nil {
 		return err
@@ -249,6 +260,11 @@ func validateRulesFiles(c userconfig.Config) error {
 
 func validateTemplateFiles(c userconfig.Config) error {
 	for fn, content := range c.TemplateFiles {
+		// Reject template filenames that would escape the per-tenant data
+		// directory on disk when applied by the Alertmanager.
+		if err := alertmanager.ValidateTemplateFilename(fn); err != nil {
+			return err
+		}
 		if _, err := template.New(fn).Funcs(template.FuncMap(amtemplate.DefaultFuncs)).Parse(content); err != nil {
 			return err
 		}

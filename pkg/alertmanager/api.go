@@ -449,3 +449,42 @@ func validateVictorOpsConfig(cfg config.VictorOpsConfig) error {
 	}
 	return nil
 }
+
+// ValidateAlertmanagerConfig parses the given raw Alertmanager YAML config and
+// recursively validates it, rejecting any options that reference local files
+// (e.g. *_file HTTP/TLS credentials, slack_api_url_file, VictorOps api_key_file).
+// It is intended to be reused by alternative ingestion paths (such as the
+// legacy configs API) so that configurations stored on the Alertmanager's
+// behalf are subject to the same restrictions enforced by SetUserConfig.
+//
+// It also validates any referenced template filenames and rejects empty
+// configurations in the same way as the hardened write path.
+func ValidateAlertmanagerConfig(rawCfg string) error {
+	if rawCfg == "" {
+		return fmt.Errorf("configuration provided is empty, if you'd like to remove your configuration please use the delete configuration endpoint")
+	}
+
+	amCfg, err := config.Load(rawCfg)
+	if err != nil {
+		return err
+	}
+
+	if err := validateAlertmanagerConfig(amCfg); err != nil {
+		return err
+	}
+
+	for _, name := range amCfg.Templates {
+		if err := validateTemplateFilename(name); err != nil {
+			return err
+		}
+	}
+
+	return nil
+}
+
+// ValidateTemplateFilename validates a template filename as required by the
+// hardened Alertmanager write path. It is exported so other ingestion paths
+// can enforce the same template-filename restriction.
+func ValidateTemplateFilename(filename string) error {
+	return validateTemplateFilename(filename)
+}
