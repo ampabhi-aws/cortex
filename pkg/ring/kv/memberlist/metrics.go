@@ -164,6 +164,13 @@ func (m *KV) createAndRegisterMetrics() {
 		Help:      "Number of dropped notifications in WatchPrefix function",
 	}, []string{"prefix"})
 
+	m.numberOfRejectedUnknownKeys = promauto.With(m.registerer).NewCounter(prometheus.CounterOpts{
+		Namespace: m.cfg.MetricsNamespace,
+		Subsystem: subsystem,
+		Name:      "received_unknown_key_rejected_total",
+		Help:      "Number of KV pairs received from gossip peers that were rejected because the key is not registered locally",
+	})
+
 	if m.cfg.MetricsRegisterer == nil {
 		return
 	}
