@@ -47,6 +47,19 @@ type Email struct {
 	tmpl     *template.Template
 	logger   log.Logger
 	hostname string
+
+	// dialContext, when non-nil, is used to establish the TCP connection to the
+	// SMTP smarthost. This allows wrapping the dialer (for example, to enforce
+	// a per-tenant firewall) without changing the exported New constructor
+	// signature.
+	dialContext func(ctx context.Context, network, addr string) (net.Conn, error)
+}
+
+// SetDialContext overrides the dial function used to connect to the SMTP
+// smarthost. Pass nil to restore the default behaviour (a bare net.Dialer).
+// This is a Cortex extension used to inject the per-tenant FirewallDialer.
+func (n *Email) SetDialContext(f func(ctx context.Context, network, addr string) (net.Conn, error)) {
+	n.dialContext = f
 }
 
 // New returns a new Email notifier.
@@ -122,6 +135,11 @@ func (n *Email) Notify(ctx context.Context, as ...*types.Alert) (bool, error) {
 		err     error
 		success = false
 	)
+	dial := n.dialContext
+	if dial == nil {
+		d := net.Dialer{}
+		dial = d.DialContext
+	}
 	if n.conf.Smarthost.Port == "465" {
 		tlsConfig, err := commoncfg.NewTLSConfig(&n.conf.TLSConfig)
 		if err != nil {
@@ -131,16 +149,18 @@ func (n *Email) Notify(ctx context.Context, as ...*types.Alert) (bool, error) {
 			tlsConfig.ServerName = n.conf.Smarthost.Host
 		}
 
-		conn, err = tls.Dial("tcp", n.conf.Smarthost.String(), tlsConfig)
+		rawConn, err := dial(ctx, "tcp", n.conf.Smarthost.String())
 		if err != nil {
+			return true, errors.Wrap(err, "establish connection to server")
+		}
+		tlsConn := tls.Client(rawConn, tlsConfig)
+		if err := tlsConn.Handshake(); err != nil {
+			rawConn.Close()
 			return true, errors.Wrap(err, "establish TLS connection to server")
 		}
+		conn = tlsConn
 	} else {
-		var (
-			d   = net.Dialer{}
-			err error
-		)
-		conn, err = d.DialContext(ctx, "tcp", n.conf.Smarthost.String())
+		conn, err = dial(ctx, "tcp", n.conf.Smarthost.String())
 		if err != nil {
 			return true, errors.Wrap(err, "establish connection to server")
 		}
