@@ -17,6 +17,7 @@ import (
 	"github.com/prometheus/prometheus/storage"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+	"github.com/weaveworks/common/httpgrpc"
 	"github.com/weaveworks/common/user"
 
 	"github.com/cortexproject/cortex/pkg/querier/series"
@@ -970,4 +971,35 @@ type spanWithTags struct {
 type expectedTag struct {
 	key    string
 	values []string
+}
+
+func TestMergeQueryable_MaxTenants(t *testing.T) {
+	tenant.WithDefaultResolver(tenant.NewMultiResolver())
+
+	queryable := &mockTenantQueryableWithFilter{}
+
+	t.Run("request with tenants within the limit should succeed", func(t *testing.T) {
+		q := NewQueryableWithMaxTenants(queryable, false /* byPassWithSingleQuerier */, 3)
+		ctx := user.InjectOrgID(context.Background(), "team-a|team-b|team-c")
+		_, err := q.Querier(ctx, mint, maxt)
+		require.NoError(t, err)
+	})
+
+	t.Run("request exceeding max-tenants should be rejected with HTTP 422", func(t *testing.T) {
+		q := NewQueryableWithMaxTenants(queryable, false /* byPassWithSingleQuerier */, 2)
+		ctx := user.InjectOrgID(context.Background(), "team-a|team-b|team-c")
+		_, err := q.Querier(ctx, mint, maxt)
+		require.Error(t, err)
+		resp, ok := httpgrpc.HTTPResponseFromError(err)
+		require.True(t, ok, "expected httpgrpc error, got %T: %v", err, err)
+		require.Equal(t, int32(422), resp.Code)
+		require.Contains(t, string(resp.Body), "too many tenant IDs")
+	})
+
+	t.Run("max-tenants of 0 means unlimited", func(t *testing.T) {
+		q := NewQueryableWithMaxTenants(queryable, false /* byPassWithSingleQuerier */, 0)
+		ctx := user.InjectOrgID(context.Background(), "team-a|team-b|team-c|team-d|team-e")
+		_, err := q.Querier(ctx, mint, maxt)
+		require.NoError(t, err)
+	})
 }
