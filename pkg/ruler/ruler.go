@@ -491,6 +491,13 @@ func (r *Ruler) syncRules(ctx context.Context, reason string) {
 		return
 	}
 
+	// LoadRuleGroups silently drops rule groups that have vanished between
+	// listing and loading (rulestore.ErrGroupNotFound) rather than failing the
+	// whole batch, so one tenant deleting its own rule groups cannot stall the
+	// sync for every other tenant. Any error returned here is a genuine
+	// infrastructure failure; in that case we skip this sync and keep the
+	// existing per-tenant managers running on their last-known configuration
+	// until the next successful sync.
 	err = r.store.LoadRuleGroups(ctx, configs)
 	if err != nil {
 		level.Error(r.logger).Log("msg", "unable to load rules owned by this ruler", "err", err)
@@ -596,7 +603,11 @@ func (r *Ruler) listRulesShuffleSharding(ctx context.Context) (map[string]rulesp
 			for userID := range userCh {
 				groups, err := r.store.ListRuleGroupsForUserAndNamespace(gctx, userID, "")
 				if err != nil {
-					return errors.Wrapf(err, "failed to fetch rule groups for user %s", userID)
+					// Isolate per-tenant errors: log and skip this user so one
+					// tenant's listing failure does not discard the result set
+					// for every other tenant.
+					level.Error(r.logger).Log("msg", "failed to fetch rule groups for user", "user", userID, "err", err)
+					continue
 				}
 
 				filtered := filterRuleGroups(userID, groups, userRings[userID], r.lifecycler.GetInstanceAddr(), r.logger, r.ringCheckErrors)

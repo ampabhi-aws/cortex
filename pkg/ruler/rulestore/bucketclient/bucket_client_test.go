@@ -162,9 +162,35 @@ func TestLoadRules(t *testing.T) {
 		require.NoError(t, rs.SetRuleGroup(context.Background(), "user1", "hello", &rulespb.RuleGroupDesc{User: "user2", Namespace: "world", Name: "first testGroup"}))
 		require.EqualError(t, rs.LoadRuleGroups(context.Background(), allGroupsMap), "mismatch between requested rule group and loaded rule group, requested: user=\"user1\", namespace=\"hello\", group=\"first testGroup\", loaded: user=\"user2\", namespace=\"world\", group=\"first testGroup\"")
 
-		// Load with missing rule groups fails.
+		// Rule groups that have vanished between listing and loading are silently
+		// dropped from the result rather than failing the whole batch. This
+		// isolates a concurrent delete by one tenant from affecting the sync of
+		// unrelated tenants.
+		// Snapshot the current listing first, then simulate the race by deleting
+		// one of the listed objects before calling LoadRuleGroups.
+		raceMap, err := rs.ListAllRuleGroups(context.Background())
+		require.NoError(t, err)
 		require.NoError(t, rs.DeleteRuleGroup(context.Background(), "user1", "hello", "first testGroup"))
-		require.EqualError(t, rs.LoadRuleGroups(context.Background(), allGroupsMap), "get rule group user=\"user2\", namespace=\"world\", name=\"first testGroup\": group does not exist")
+		require.NoError(t, rs.LoadRuleGroups(context.Background(), raceMap))
+		// The vanished group was dropped; the remaining groups were still loaded
+		// for every tenant.
+		require.ElementsMatch(t, []*rulespb.RuleGroupDesc{
+			{User: "user1", Namespace: "hello", Name: "second testGroup", Interval: 2 * time.Minute},
+			{User: "user1", Namespace: "world", Name: "another namespace testGroup", Interval: time.Hour},
+		}, raceMap["user1"])
+		require.ElementsMatch(t, []*rulespb.RuleGroupDesc{
+			{User: "user2", Namespace: "+-!@#$%. ", Name: "different user", Interval: 5 * time.Minute},
+		}, raceMap["user2"])
+
+		// If a tenant has every group vanish, the tenant is removed from the map
+		// entirely so downstream code treats it as a user that no longer owns any
+		// rules.
+		raceMap, err = rs.ListAllRuleGroups(context.Background())
+		require.NoError(t, err)
+		require.NoError(t, rs.DeleteRuleGroup(context.Background(), "user2", "+-!@#$%. ", "different user"))
+		require.NoError(t, rs.LoadRuleGroups(context.Background(), raceMap))
+		_, exists := raceMap["user2"]
+		require.False(t, exists)
 	})
 }
 
