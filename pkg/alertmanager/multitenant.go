@@ -29,6 +29,7 @@ import (
 	"github.com/cortexproject/cortex/pkg/alertmanager/alertmanagerpb"
 	"github.com/cortexproject/cortex/pkg/alertmanager/alertspb"
 	"github.com/cortexproject/cortex/pkg/alertmanager/alertstore"
+	"github.com/cortexproject/cortex/pkg/alertmanager/amvalidation"
 	"github.com/cortexproject/cortex/pkg/ring"
 	"github.com/cortexproject/cortex/pkg/ring/client"
 	"github.com/cortexproject/cortex/pkg/ring/kv"
@@ -871,6 +872,25 @@ func (am *MultitenantAlertmanager) setConfig(cfg alertspb.AlertConfigDesc) error
 			// they submit a broken one, the Manager will keep running the last known
 			// working configuration.
 			return fmt.Errorf("invalid Cortex configuration for %v: %v", cfg.User, err)
+		}
+	}
+
+	// Defense in depth: re-validate the loaded configuration against the
+	// shared Cortex rules even when it came from a storage backend that is
+	// not the Alertmanager's own HTTP write path (e.g. the configdb backend,
+	// which stores configs via the configs service). This ensures no storage
+	// backend can bypass the screen that rejects file-valued credential and
+	// TLS fields (bearer_token_file, password_file, credentials_file,
+	// client_secret_file, tls_config ca/cert/key_file, slack_api_url_file,
+	// victorops/opsgenie api_key_file, ...). See
+	// pkg/alertmanager/amvalidation for the full list.
+	if userAmConfig != nil {
+		if vErr := amvalidation.Validate(userAmConfig); vErr != nil {
+			if hasExisting {
+				return fmt.Errorf("invalid Cortex configuration for %v: %v", cfg.User, vErr)
+			}
+			// No prior working config to keep running: refuse to start one.
+			return fmt.Errorf("invalid Cortex configuration for %v: %v", cfg.User, vErr)
 		}
 	}
 

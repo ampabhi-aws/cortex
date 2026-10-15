@@ -20,6 +20,7 @@ import (
 	amconfig "github.com/prometheus/alertmanager/config"
 	amtemplate "github.com/prometheus/alertmanager/template"
 
+	"github.com/cortexproject/cortex/pkg/alertmanager/amvalidation"
 	"github.com/cortexproject/cortex/pkg/configs/db"
 	"github.com/cortexproject/cortex/pkg/configs/userconfig"
 	"github.com/cortexproject/cortex/pkg/tenant"
@@ -237,6 +238,19 @@ func validateAlertmanagerConfig(cfg string, noCfg NotificationsConfig) error {
 		if noCfg.DisableWebHook && len(recv.WebhookConfigs) > 0 {
 			return ErrWebhookNotificationsAreDisabled
 		}
+	}
+
+	// Reject tenant configurations that reference credential or TLS material
+	// through *_file settings. These would otherwise cause the Alertmanager
+	// process to read local files (object-store credentials, TLS keys,
+	// service-account tokens, ...) and leak their contents to a
+	// tenant-chosen receiver URL at notify time. The same checks are
+	// enforced by the tenant-facing Alertmanager HTTP API
+	// (pkg/alertmanager/api.go); we apply them here so that configurations
+	// stored through the configs service cannot bypass the screen when the
+	// Alertmanager is run with the configdb storage backend.
+	if err := amvalidation.Validate(amCfg); err != nil {
+		return err
 	}
 
 	return nil
