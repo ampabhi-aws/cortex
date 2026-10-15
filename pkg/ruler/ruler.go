@@ -78,6 +78,10 @@ type Config struct {
 	ClientTLSConfig grpcclient.Config `yaml:"ruler_client"`
 	// How frequently to evaluate rules by default.
 	EvaluationInterval time.Duration `yaml:"evaluation_interval"`
+	// Minimum allowed rule-group evaluation interval. Tenant-supplied intervals
+	// below this value are rejected by ValidateRuleGroup and clamped at sync.
+	// A value of 0 means the floor defaults to EvaluationInterval.
+	MinRuleEvaluationInterval time.Duration `yaml:"min_rule_evaluation_interval"`
 	// How frequently to poll for updated rules.
 	PollInterval time.Duration `yaml:"poll_interval"`
 	// Path to store rule files for prom manager.
@@ -141,6 +145,19 @@ func (cfg *Config) Validate(limits validation.Limits, log log.Logger) error {
 	return nil
 }
 
+// minEvaluationInterval returns the operator-configured minimum rule-group
+// evaluation interval. When -ruler.min-rule-evaluation-interval is unset the
+// feature is disabled and tenants may configure any positive interval. When
+// set, group intervals smaller than this value are rejected on ingest and
+// clamped at sync time so a tenant cannot drive the shared ruler at an
+// arbitrarily high evaluation rate.
+func (cfg *Config) minEvaluationInterval() time.Duration {
+	if cfg.MinRuleEvaluationInterval > 0 {
+		return cfg.MinRuleEvaluationInterval
+	}
+	return 0
+}
+
 // RegisterFlags adds the flags required to config this to the given FlagSet
 func (cfg *Config) RegisterFlags(f *flag.FlagSet) {
 	cfg.ClientTLSConfig.RegisterFlagsWithPrefix("ruler.client", f)
@@ -159,6 +176,7 @@ func (cfg *Config) RegisterFlags(f *flag.FlagSet) {
 	cfg.ExternalURL.URL, _ = url.Parse("") // Must be non-nil
 	f.Var(&cfg.ExternalURL, "ruler.external.url", "URL of alerts return path.")
 	f.DurationVar(&cfg.EvaluationInterval, "ruler.evaluation-interval", 1*time.Minute, "How frequently to evaluate rules")
+	f.DurationVar(&cfg.MinRuleEvaluationInterval, "ruler.min-rule-evaluation-interval", 0, "Minimum allowed rule-group evaluation interval. Rule groups submitted via the ruler API with a smaller interval are rejected, and already-stored groups with a smaller interval are clamped to this value at sync time. A value of 0 falls back to -ruler.evaluation-interval.")
 	f.DurationVar(&cfg.PollInterval, "ruler.poll-interval", 1*time.Minute, "How frequently to poll for rule changes")
 
 	f.StringVar(&cfg.AlertmanagerURL, "ruler.alertmanager-url", "", "Comma-separated list of URL(s) of the Alertmanager(s) to send notifications to. Each Alertmanager URL is treated as a separate group in the configuration. Multiple Alertmanagers in HA per group can be supported by using DNS resolution via -ruler.alertmanager-discovery.")
