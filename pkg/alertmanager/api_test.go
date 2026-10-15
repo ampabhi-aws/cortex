@@ -15,6 +15,7 @@ import (
 	"github.com/prometheus/alertmanager/config"
 	"github.com/prometheus/client_golang/prometheus"
 	commoncfg "github.com/prometheus/common/config"
+	"github.com/prometheus/common/sigv4"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	"github.com/thanos-io/objstore"
@@ -784,6 +785,132 @@ func TestValidateAlertmanagerConfig(t *testing.T) {
 				}},
 			},
 			expected: errTLSFileNotAllowed,
+		},
+		"SNSConfig missing both sigv4 keys falls back to ambient credentials": {
+			input: config.SNSConfig{
+				TopicARN: "arn:aws:sns:us-east-1:111122223333:topic",
+				Sigv4:    sigv4.SigV4Config{Region: "us-east-1"},
+			},
+			expected: errSNSMissingSigV4Credentials,
+		},
+		"SNSConfig with only access_key falls back to ambient credentials": {
+			input: config.SNSConfig{
+				TopicARN: "arn:aws:sns:us-east-1:111122223333:topic",
+				Sigv4:    sigv4.SigV4Config{Region: "us-east-1", AccessKey: "AKIA"},
+			},
+			expected: errSNSMissingSigV4Credentials,
+		},
+		"SNSConfig with sigv4.profile is rejected": {
+			input: config.SNSConfig{
+				TopicARN: "arn:aws:sns:us-east-1:111122223333:topic",
+				Sigv4: sigv4.SigV4Config{
+					Region:    "us-east-1",
+					AccessKey: "AKIA",
+					SecretKey: "secret",
+					Profile:   "operator-local",
+				},
+			},
+			expected: errSNSSigV4ProfileNotAllowed,
+		},
+		"SNSConfig with sigv4.role_arn is rejected": {
+			input: config.SNSConfig{
+				TopicARN: "arn:aws:sns:us-east-1:111122223333:topic",
+				Sigv4: sigv4.SigV4Config{
+					Region:    "us-east-1",
+					AccessKey: "AKIA",
+					SecretKey: "secret",
+					RoleARN:   "arn:aws:iam::111122223333:role/other",
+				},
+			},
+			expected: errSNSSigV4RoleARNNotAllowed,
+		},
+		"SNSConfig with attacker-controlled api_url is rejected": {
+			input: config.SNSConfig{
+				TopicARN: "arn:aws:sns:us-east-1:111122223333:topic",
+				APIUrl:   "https://attacker.example.com/",
+				Sigv4: sigv4.SigV4Config{
+					Region:    "us-east-1",
+					AccessKey: "AKIA",
+					SecretKey: "secret",
+				},
+			},
+			expected: errSNSAPIURLNotAllowed,
+		},
+		"SNSConfig with templated api_url is rejected": {
+			input: config.SNSConfig{
+				TopicARN: "arn:aws:sns:us-east-1:111122223333:topic",
+				APIUrl:   "https://sns.{{ .Region }}.amazonaws.com/",
+				Sigv4: sigv4.SigV4Config{
+					Region:    "us-east-1",
+					AccessKey: "AKIA",
+					SecretKey: "secret",
+				},
+			},
+			expected: errSNSAPIURLNotAllowed,
+		},
+		"SNSConfig with http scheme api_url is rejected": {
+			input: config.SNSConfig{
+				TopicARN: "arn:aws:sns:us-east-1:111122223333:topic",
+				APIUrl:   "http://sns.us-east-1.amazonaws.com/",
+				Sigv4: sigv4.SigV4Config{
+					Region:    "us-east-1",
+					AccessKey: "AKIA",
+					SecretKey: "secret",
+				},
+			},
+			expected: errSNSAPIURLNotAllowed,
+		},
+		"SNSConfig with api_url path is rejected": {
+			input: config.SNSConfig{
+				TopicARN: "arn:aws:sns:us-east-1:111122223333:topic",
+				APIUrl:   "https://sns.us-east-1.amazonaws.com/evil",
+				Sigv4: sigv4.SigV4Config{
+					Region:    "us-east-1",
+					AccessKey: "AKIA",
+					SecretKey: "secret",
+				},
+			},
+			expected: errSNSAPIURLNotAllowed,
+		},
+		"SNSConfig with official SNS endpoint and static credentials is accepted": {
+			input: config.SNSConfig{
+				TopicARN: "arn:aws:sns:us-east-1:111122223333:topic",
+				APIUrl:   "https://sns.us-east-1.amazonaws.com/",
+				Sigv4: sigv4.SigV4Config{
+					Region:    "us-east-1",
+					AccessKey: "AKIA",
+					SecretKey: "secret",
+				},
+			},
+			expected: nil,
+		},
+		"SNSConfig without api_url and with static credentials is accepted": {
+			input: config.SNSConfig{
+				TopicARN: "arn:aws:sns:us-east-1:111122223333:topic",
+				Sigv4: sigv4.SigV4Config{
+					Region:    "us-east-1",
+					AccessKey: "AKIA",
+					SecretKey: "secret",
+				},
+			},
+			expected: nil,
+		},
+		"nested SNSConfig in receiver is validated": {
+			input: config.Config{
+				Receivers: []*config.Receiver{{
+					Name: "sns",
+					SNSConfigs: []*config.SNSConfig{{
+						TopicARN: "arn:aws:sns:us-east-1:111122223333:topic",
+						APIUrl:   "https://attacker.example.com/",
+						Sigv4: sigv4.SigV4Config{
+							Region:    "us-east-1",
+							AccessKey: "AKIA",
+							SecretKey: "secret",
+						},
+					}},
+				}},
+			},
+			expected: errSNSAPIURLNotAllowed,
 		},
 	}
 
