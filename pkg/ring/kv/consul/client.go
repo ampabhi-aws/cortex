@@ -152,14 +152,16 @@ func (c *Client) cas(ctx context.Context, key string, f func(in interface{}) (ou
 		options := &consul.QueryOptions{}
 		kvp, _, err := c.kv.Get(key, options.WithContext(ctx))
 		if err != nil {
-			level.Error(c.logger).Log("msg", "error getting key", "key", key, "err", err)
+			// Do not log the raw key: in the HA tracker path the key contains an attacker-controlled
+			// cluster label value that may be arbitrarily large.
+			level.Error(c.logger).Log("msg", "error getting key", "err", err)
 			continue
 		}
 		var intermediate interface{}
 		if kvp != nil {
 			out, err := c.codec.Decode(kvp.Value)
 			if err != nil {
-				level.Error(c.logger).Log("msg", "error decoding key", "key", key, "err", err)
+				level.Error(c.logger).Log("msg", "error decoding key", "err", err)
 				continue
 			}
 			// If key doesn't exist, index will be 0.
@@ -183,7 +185,7 @@ func (c *Client) cas(ctx context.Context, key string, f func(in interface{}) (ou
 
 		bytes, err := c.codec.Encode(intermediate)
 		if err != nil {
-			level.Error(c.logger).Log("msg", "error serialising value", "key", key, "err", err)
+			level.Error(c.logger).Log("msg", "error serialising value", "err", err)
 			continue
 		}
 		ok, _, err := c.kv.CAS(&consul.KVPair{
@@ -192,16 +194,16 @@ func (c *Client) cas(ctx context.Context, key string, f func(in interface{}) (ou
 			ModifyIndex: index,
 		}, writeOptions.WithContext(ctx))
 		if err != nil {
-			level.Error(c.logger).Log("msg", "error CASing", "key", key, "err", err)
+			level.Error(c.logger).Log("msg", "error CASing", "err", err)
 			continue
 		}
 		if !ok {
-			level.Debug(c.logger).Log("msg", "error CASing, trying again", "key", key, "index", index)
+			level.Debug(c.logger).Log("msg", "error CASing, trying again", "index", index)
 			continue
 		}
 		return nil
 	}
-	return fmt.Errorf("failed to CAS %s", key)
+	return fmt.Errorf("failed to CAS key")
 }
 
 // WatchKey will watch a given key in consul for changes. When the value

@@ -379,6 +379,7 @@ func (c *haTracker) checkReplica(ctx context.Context, userID, cluster, replica s
 	c.electedLock.RLock()
 	entry, ok := c.elected[key]
 	clusters := len(c.clusters[userID])
+	_, clusterKnown := c.clusters[userID][cluster]
 	c.electedLock.RUnlock()
 
 	if ok && now.Sub(timestamp.Time(entry.ReceivedAt)) < c.cfg.UpdateTimeout+c.updateTimeoutJitter {
@@ -388,23 +389,51 @@ func (c *haTracker) checkReplica(ctx context.Context, userID, cluster, replica s
 		return nil
 	}
 
-	if !ok {
+	limit := c.limits.MaxHAClusters(userID)
+	if !clusterKnown {
 		// If we don't know about this cluster yet and we have reached the limit for number of clusters, we error out now.
-		if limit := c.limits.MaxHAClusters(userID); limit > 0 && clusters+1 > limit {
+		// This check is intentionally performed again below (synchronously under the write lock), because the
+		// c.clusters[userID] set is otherwise only populated asynchronously by the KV watch callback and
+		// concurrent requests can race past this read-only check.
+		if limit > 0 && clusters+1 > limit {
 			return tooManyClustersError{limit: limit}
 		}
+
+		// Reserve a slot in the in-memory clusters set synchronously, so that a flood of concurrent
+		// requests carrying distinct cluster values can never allocate more state than max_ha_clusters
+		// allows, regardless of how long the KV watch takes to catch up. The watch callback
+		// (populated after a successful CAS) will idempotently re-add the same entry.
+		c.electedLock.Lock()
+		existingClusters := len(c.clusters[userID])
+		if _, alreadyKnown := c.clusters[userID][cluster]; !alreadyKnown {
+			if limit > 0 && existingClusters+1 > limit {
+				c.electedLock.Unlock()
+				return tooManyClustersError{limit: limit}
+			}
+			if c.clusters[userID] == nil {
+				c.clusters[userID] = map[string]struct{}{}
+			}
+			c.clusters[userID][cluster] = struct{}{}
+		}
+		c.electedLock.Unlock()
 	}
 
 	err := c.checkKVStore(ctx, key, replica, now)
-	c.kvCASCalls.WithLabelValues(userID, cluster).Inc()
 	if err != nil {
 		// The callback within checkKVStore will return a replicasNotMatchError if the sample is being deduped,
-		// otherwise there may have been an actual error CAS'ing that we should log.
+		// otherwise there may have been an actual error CAS'ing that we should log. Do NOT include the raw
+		// key in the log message: it is derived from an attacker-controlled cluster label value and may be
+		// arbitrarily large.
 		if !errors.Is(err, replicasNotMatchError{}) {
-			level.Error(c.logger).Log("msg", "rejecting sample", "err", err)
+			level.Error(c.logger).Log("msg", "rejecting sample", "user", userID, "err", err)
 		}
+		return err
 	}
-	return err
+	// Only emit the kvCASCalls metric for clusters whose CAS actually succeeded. Attacker-controlled
+	// cluster values whose CAS failed must not create a retained metric series whose label value is
+	// the raw unvalidated cluster label.
+	c.kvCASCalls.WithLabelValues(userID, cluster).Inc()
+	return nil
 }
 
 func (c *haTracker) checkKVStore(ctx context.Context, key, replica string, now time.Time) error {

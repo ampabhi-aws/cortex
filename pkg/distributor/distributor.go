@@ -474,6 +474,30 @@ func removeLabel(labelName string, labels *[]cortexpb.LabelAdapter) {
 	}
 }
 
+// isValidHAClusterValue returns true if the given HA cluster label value is safe to use as part
+// of a KV-store key component and as a Prometheus metric label value. We restrict the character
+// set to printable ASCII characters that are safe inside URL path segments and metric label
+// values: letters, digits and a small set of punctuation. The value also must not contain a '/'
+// (which is the separator used by the HA tracker to build the KV key as "<userID>/<cluster>").
+// Reject empty values as well. The caller is also expected to enforce a maximum length.
+func isValidHAClusterValue(cluster string) bool {
+	if cluster == "" {
+		return false
+	}
+	for i := 0; i < len(cluster); i++ {
+		c := cluster[i]
+		switch {
+		case c >= 'a' && c <= 'z':
+		case c >= 'A' && c <= 'Z':
+		case c >= '0' && c <= '9':
+		case c == '-' || c == '_' || c == '.' || c == ':':
+		default:
+			return false
+		}
+	}
+	return true
+}
+
 // Returns a boolean that indicates whether or not we want to remove the replica label going forward,
 // and an error that indicates whether we want to accept samples based on the cluster/replica found in ts.
 // nil for the error means accept the sample.
@@ -486,6 +510,14 @@ func (d *Distributor) checkSample(ctx context.Context, userID, cluster, replica 
 
 	// If replica label is too long, don't use it. We accept the sample here, but it will fail validation later anyway.
 	if len(replica) > d.limits.MaxLabelValueLength(userID) {
+		return false, nil
+	}
+
+	// If the cluster label is too long or contains characters that are unsafe to use as part of a KV
+	// store key / Prometheus metric label value, don't use it. We accept the sample here, but it will
+	// fail validation later anyway. Rejecting the HA labels early prevents an attacker-controlled
+	// value from being retained by the HA tracker's KV store and metrics before per-series validation runs.
+	if len(cluster) > d.limits.MaxLabelValueLength(userID) || !isValidHAClusterValue(cluster) {
 		return false, nil
 	}
 
@@ -606,7 +638,10 @@ func (d *Distributor) Push(ctx context.Context, req *cortexpb.WriteRequest) (*co
 			cortexpb.ReuseSlice(req.Timeseries)
 
 			if errors.Is(err, replicasNotMatchError{}) {
-				// These samples have been deduped.
+				// These samples have been deduped. The cluster value has already been validated by
+				// checkSample (length + character set) and the HA tracker only returns
+				// replicasNotMatchError for clusters that are present in its elected set, so the
+				// metric label value is bounded.
 				d.dedupedSamples.WithLabelValues(userID, cluster).Add(float64(numSamples))
 				return nil, httpgrpc.Errorf(http.StatusAccepted, err.Error())
 			}
