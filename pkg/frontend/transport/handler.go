@@ -31,6 +31,20 @@ const (
 	// StatusClientClosedRequest is the status code for when a client request cancellation of an http request
 	StatusClientClosedRequest = 499
 	ServiceTimingHeaderName   = "Server-Timing"
+
+	// maxQueryStringLogFieldValueLength caps the length of a single parameter
+	// value included in slow-query / query-stats log records.
+	maxQueryStringLogFieldValueLength = 1024
+
+	// maxQueryStringLogFields caps the number of param_* fields emitted by
+	// formatQueryString. Any additional parameters are dropped and signalled
+	// via a single "param_truncated_count" marker.
+	maxQueryStringLogFields = 64
+
+	// maxQueryStringLogBodyBytes bounds the request body buffered solely to
+	// extract query parameters for logging. Only the first N bytes are used
+	// because urlencoded query parameters do not require the full body.
+	maxQueryStringLogBodyBytes = 128 * 1024
 )
 
 var (
@@ -127,10 +141,17 @@ func (f *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		_ = r.Body.Close()
 	}()
 
-	// Buffer the body for later use to track slow queries.
-	var buf bytes.Buffer
 	r.Body = http.MaxBytesReader(w, r.Body, f.cfg.MaxBodySize)
-	r.Body = io.NopCloser(io.TeeReader(r.Body, &buf))
+
+	// Buffer (up to a small, dedicated cap of) the body for later use to
+	// extract query parameters for slow-query / query-stats logging. We only
+	// install the TeeReader when at least one of those features is enabled;
+	// otherwise the buffer would never be consumed.
+	var buf bytes.Buffer
+	shouldBufferBody := f.cfg.LogQueriesLongerThan != 0 || f.cfg.QueryStatsEnabled
+	if shouldBufferBody {
+		r.Body = io.NopCloser(io.TeeReader(r.Body, limitedBufferWriter(&buf, maxQueryStringLogBodyBytes)))
+	}
 
 	startTime := time.Now()
 	resp, err := f.roundTripper.RoundTrip(r)
@@ -233,10 +254,50 @@ func (f *Handler) parseRequestQueryString(r *http.Request, bodyBuf bytes.Buffer)
 }
 
 func formatQueryString(queryString url.Values) (fields []interface{}) {
+	emitted := 0
+	truncatedFields := 0
 	for k, v := range queryString {
-		fields = append(fields, fmt.Sprintf("param_%s", k), strings.Join(v, ","))
+		if emitted >= maxQueryStringLogFields {
+			truncatedFields++
+			continue
+		}
+		value := strings.Join(v, ",")
+		if len(value) > maxQueryStringLogFieldValueLength {
+			value = value[:maxQueryStringLogFieldValueLength] + "...[truncated]"
+		}
+		fields = append(fields, fmt.Sprintf("param_%s", k), value)
+		emitted++
+	}
+	if truncatedFields > 0 {
+		fields = append(fields, "param_truncated_count", truncatedFields)
 	}
 	return fields
+}
+
+// limitedWriter wraps a bytes.Buffer and only accepts up to limit bytes;
+// subsequent writes are silently discarded. This bounds how much of the
+// request body is retained purely for logging.
+type limitedWriter struct {
+	buf   *bytes.Buffer
+	limit int
+}
+
+func limitedBufferWriter(buf *bytes.Buffer, limit int) io.Writer {
+	return &limitedWriter{buf: buf, limit: limit}
+}
+
+func (w *limitedWriter) Write(p []byte) (int, error) {
+	remaining := w.limit - w.buf.Len()
+	if remaining <= 0 {
+		return len(p), nil
+	}
+	if len(p) <= remaining {
+		return w.buf.Write(p)
+	}
+	if _, err := w.buf.Write(p[:remaining]); err != nil {
+		return 0, err
+	}
+	return len(p), nil
 }
 
 func writeError(w http.ResponseWriter, err error) {
