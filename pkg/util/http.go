@@ -199,8 +199,18 @@ func decompressFromReader(reader io.Reader, expectedSize, maxSize int, compressi
 		body []byte
 		err  error
 	)
+	// Do not trust expectedSize for pre-allocation sizing: it is derived from a
+	// client-controlled Content-Length and would otherwise let a caller force the
+	// server to commit up to maxSize of heap before a single body byte is read.
+	// Clamp the pre-allocation to a small constant; bytes.Buffer will still grow
+	// as data actually arrives, up to the LimitReader cap below.
+	const maxPreallocSize = 64 << 10 // 64 KiB
 	if expectedSize > 0 {
-		buf.Grow(expectedSize + bytes.MinRead) // extra space guarantees no reallocation
+		preallocSize := expectedSize + bytes.MinRead
+		if preallocSize > maxPreallocSize {
+			preallocSize = maxPreallocSize
+		}
+		buf.Grow(preallocSize)
 	}
 	// Read from LimitReader with limit max+1. So if the underlying
 	// reader is over limit, the result will be bigger than max.
