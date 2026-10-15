@@ -19,6 +19,7 @@ import (
 	"github.com/gorilla/mux"
 	amconfig "github.com/prometheus/alertmanager/config"
 	amtemplate "github.com/prometheus/alertmanager/template"
+	"github.com/weaveworks/common/user"
 
 	"github.com/cortexproject/cortex/pkg/configs/db"
 	"github.com/cortexproject/cortex/pkg/configs/userconfig"
@@ -82,7 +83,23 @@ func (a *API) admin(w http.ResponseWriter, r *http.Request) {
 }
 
 // RegisterRoutes registers the configs API HTTP routes with the provided Router.
+//
+// This registers both the tenant-facing routes and the internal /private/*
+// routes on the same router. Prefer calling RegisterTenantRoutes and
+// RegisterPrivateRoutes separately when the caller wants to attach the
+// internal fan-out endpoints to a different (admin/internal) listener or
+// wrap them with additional middleware; see pkg/cortex.(*Cortex).initConfig
+// where the private routes are registered through pkg/api.(*API).RegisterRoute
+// so they flow through the central API registration (and can be gated
+// alongside the other admin endpoints such as /multitenant_alertmanager/configs).
 func (a *API) RegisterRoutes(r *mux.Router) {
+	a.RegisterTenantRoutes(r)
+	a.RegisterPrivateRoutes(r)
+}
+
+// RegisterTenantRoutes registers the tenant-facing configs API HTTP routes.
+// All these handlers extract and scope by X-Scope-OrgID.
+func (a *API) RegisterTenantRoutes(r *mux.Router) {
 	for _, route := range []struct {
 		name, method, path string
 		handler            http.HandlerFunc
@@ -99,12 +116,38 @@ func (a *API) RegisterRoutes(r *mux.Router) {
 		{"validate_alertmanager_config", "POST", "/api/prom/configs/alertmanager/validate", a.validateAlertmanagerConfig},
 		{"deactivate_config", "DELETE", "/api/prom/configs/deactivate", a.deactivateConfig},
 		{"restore_config", "POST", "/api/prom/configs/restore", a.restoreConfig},
-		// Internal APIs.
+	} {
+		r.Handle(route.path, route.handler).Methods(route.method).Name(route.name)
+	}
+}
+
+// RegisterPrivateRoutes registers the internal /private/* configs API HTTP
+// routes. These endpoints return every tenant's configuration and are
+// intended to be consumed by internal components only (the ruler /
+// alertmanager ConfigDBClient in pkg/configs/client). The handler itself
+// enforces that it is only usable by an internal, non-tenant caller: any
+// request that carries a tenant identity (X-Scope-OrgID) is rejected so
+// that it cannot be used by a tenant to dump other tenants' Alertmanager
+// configurations and receiver secrets.
+func (a *API) RegisterPrivateRoutes(r *mux.Router) {
+	for _, route := range []struct {
+		name, method, path string
+		handler            http.HandlerFunc
+	}{
 		{"private_get_rules", "GET", "/private/api/prom/configs/rules", a.getConfigs},
 		{"private_get_alertmanager_config", "GET", "/private/api/prom/configs/alertmanager", a.getConfigs},
 	} {
 		r.Handle(route.path, route.handler).Methods(route.method).Name(route.name)
 	}
+}
+
+// GetConfigsHandler returns the internal fan-out handler used by the
+// /private/api/prom/configs/{rules,alertmanager} routes. It is exported so
+// the main Cortex API can register the route itself (via
+// pkg/api.(*API).RegisterRoute) and keep the private endpoints alongside
+// the other admin endpoints rather than bypassing the API registration.
+func (a *API) GetConfigsHandler() http.Handler {
+	return http.HandlerFunc(a.getConfigs)
 }
 
 // getConfig returns the request configuration.
@@ -264,9 +307,25 @@ type ConfigsView struct {
 }
 
 func (a *API) getConfigs(w http.ResponseWriter, r *http.Request) {
+	logger := util_log.WithContext(r.Context(), util_log.Logger)
+
+	// This is an internal fan-out endpoint that returns every tenant's
+	// configuration (rules, templates, and Alertmanager YAML, which contains
+	// receiver secrets). It must only be called by trusted internal
+	// components (the ruler / alertmanager ConfigDBClient in
+	// pkg/configs/client), never by a tenant. The internal client
+	// deliberately sends no X-Scope-OrgID header, so any request that does
+	// carry a tenant identity is coming from a tenant-facing caller and must
+	// be rejected to avoid handing out other tenants' configurations and
+	// secrets.
+	if orgID := r.Header.Get(user.OrgIDHeaderName); orgID != "" {
+		level.Warn(logger).Log("msg", "refusing all-tenant configs request from tenant-identified caller", "orgID", orgID, "path", r.URL.Path)
+		http.Error(w, "forbidden", http.StatusForbidden)
+		return
+	}
+
 	var cfgs map[string]userconfig.View
 	var cfgErr error
-	logger := util_log.WithContext(r.Context(), util_log.Logger)
 	rawSince := r.FormValue("since")
 	if rawSince == "" {
 		cfgs, cfgErr = a.db.GetAllConfigs(r.Context())
