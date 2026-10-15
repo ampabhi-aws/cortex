@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"net/http"
 	"sync"
+	"time"
 
 	"github.com/go-kit/log"
 	"github.com/go-kit/log/level"
@@ -123,6 +124,22 @@ func (r *DefaultMultiTenantManager) SyncRuleGroups(ctx context.Context, ruleGrou
 // syncRulesToManager maps the rule files to disk, detects any changes and will create/update the
 // the users Prometheus Rules Manager.
 func (r *DefaultMultiTenantManager) syncRulesToManager(ctx context.Context, user string, groups rulespb.RuleGroupList) {
+	// Clamp any tenant-supplied group intervals below the configured minimum
+	// before mapping to disk. Groups already persisted in the bucket bypass
+	// the write-path validation gate, so this defense-in-depth clamp ensures
+	// stored groups cannot pin unbounded query load on the shared ruler.
+	if min := r.minRuleEvaluationInterval(); min > 0 {
+		for _, g := range groups {
+			if g == nil {
+				continue
+			}
+			if g.Interval > 0 && g.Interval < min {
+				level.Warn(r.logger).Log("msg", "clamping rule group evaluation interval below configured minimum", "user", user, "group", g.Name, "namespace", g.Namespace, "interval", g.Interval, "min", min)
+				g.Interval = min
+			}
+		}
+	}
+
 	// Map the files to disk and return the file names to be passed to the users manager if they
 	// have been updated
 	update, files, err := r.mapper.MapRules(user, groups.Formatted())
@@ -267,7 +284,7 @@ func (r *DefaultMultiTenantManager) Stop() {
 	r.mapper.cleanup()
 }
 
-func (*DefaultMultiTenantManager) ValidateRuleGroup(g rulefmt.RuleGroup) []error {
+func (r *DefaultMultiTenantManager) ValidateRuleGroup(g rulefmt.RuleGroup) []error {
 	var errs []error
 
 	if g.Name == "" {
@@ -277,6 +294,11 @@ func (*DefaultMultiTenantManager) ValidateRuleGroup(g rulefmt.RuleGroup) []error
 
 	if len(g.Rules) == 0 {
 		errs = append(errs, fmt.Errorf("invalid rules config: rule group '%s' has no rules", g.Name))
+		return errs
+	}
+
+	if min := r.minRuleEvaluationInterval(); min > 0 && g.Interval > 0 && time.Duration(g.Interval) < min {
+		errs = append(errs, fmt.Errorf("invalid rules config: rule group '%s' interval %s is below the minimum allowed evaluation interval %s", g.Name, time.Duration(g.Interval), min))
 		return errs
 	}
 
@@ -298,4 +320,17 @@ func (*DefaultMultiTenantManager) ValidateRuleGroup(g rulefmt.RuleGroup) []error
 	}
 
 	return errs
+}
+
+// minRuleEvaluationInterval returns the minimum allowed rule-group evaluation
+// interval. When set to a positive duration, a tenant-supplied group interval
+// below this value is rejected by ValidateRuleGroup and clamped by
+// syncRulesToManager so that rule groups already persisted in the bucket
+// cannot bypass the write-path check. A value <= 0 disables the floor and
+// preserves the previous unbounded behavior for backward compatibility.
+func (r *DefaultMultiTenantManager) minRuleEvaluationInterval() time.Duration {
+	if r.cfg.MinRuleEvaluationInterval > 0 {
+		return r.cfg.MinRuleEvaluationInterval
+	}
+	return 0
 }
