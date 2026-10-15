@@ -15,7 +15,8 @@ func TestHeaderMapFromMetadata(t *testing.T) {
 
 	ctx := context.Background()
 
-	ctx = ContextWithHeaderMapFromMetadata(ctx, md)
+	allowlist := []string{"TestHeader1", "TestHeader2"}
+	ctx = ContextWithHeaderMapFromMetadata(ctx, md, allowlist)
 
 	headerMap := HeaderMapFromContext(ctx)
 
@@ -31,10 +32,44 @@ func TestHeaderMapFromMetadataWithImproperLength(t *testing.T) {
 
 	ctx := context.Background()
 
-	ctx = ContextWithHeaderMapFromMetadata(ctx, md)
+	ctx = ContextWithHeaderMapFromMetadata(ctx, md, []string{"TestHeader1", "TestHeader2", "Test3"})
 
 	headerMap := HeaderMapFromContext(ctx)
 	require.Nil(t, headerMap)
+}
+
+func TestHeaderMapFromMetadataRejectsNonAllowlistedKeys(t *testing.T) {
+	md := metadata.New(nil)
+	// Allowed, forged (not allowlisted) and syntactically invalid keys.
+	md.Append(HeaderPropagationStringForRequestLogging,
+		"TestHeader1", "ok",
+		"org_id", "attacker",
+		" ", "empty-key",
+		"has=equals", "bad",
+	)
+
+	ctx := ContextWithHeaderMapFromMetadata(context.Background(), md, []string{"TestHeader1"})
+	headerMap := HeaderMapFromContext(ctx)
+
+	require.NotNil(t, headerMap)
+	require.Equal(t, map[string]string{"TestHeader1": "ok"}, headerMap)
+}
+
+func TestHeaderMapFromMetadataWithoutAllowlistIsIgnored(t *testing.T) {
+	md := metadata.New(nil)
+	md.Append(HeaderPropagationStringForRequestLogging, "TestHeader1", "ok")
+
+	ctx := ContextWithHeaderMapFromMetadata(context.Background(), md, nil)
+	require.Nil(t, HeaderMapFromContext(ctx))
+}
+
+func TestHeaderMapFromMetadataIsCaseInsensitive(t *testing.T) {
+	md := metadata.New(nil)
+	md.Append(HeaderPropagationStringForRequestLogging, "testheader1", "ok")
+
+	ctx := ContextWithHeaderMapFromMetadata(context.Background(), md, []string{"TestHeader1"})
+	headerMap := HeaderMapFromContext(ctx)
+	require.Equal(t, map[string]string{"TestHeader1": "ok"}, headerMap)
 }
 
 func TestInjectHeadersIntoHTTPRequest(t *testing.T) {

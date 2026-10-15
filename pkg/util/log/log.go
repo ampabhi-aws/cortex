@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"net/http"
 	"os"
+	"strings"
 
 	"github.com/go-kit/log"
 	kitlog "github.com/go-kit/log"
@@ -14,6 +15,38 @@ import (
 	"github.com/weaveworks/common/server"
 	"google.golang.org/grpc/metadata"
 )
+
+// Limits applied when materialising the propagated-header map from untrusted
+// gRPC metadata. These bound how much caller-controlled data can leak into
+// per-request log fields.
+const (
+	// maxForwardedHeaderPairs caps the number of header key/value pairs we
+	// will accept from gRPC metadata regardless of the allowlist size.
+	maxForwardedHeaderPairs = 32
+	// maxForwardedHeaderValueLen caps the length of each forwarded header
+	// value we will retain; longer values are truncated.
+	maxForwardedHeaderValueLen = 1024
+)
+
+// isValidHeaderToken reports whether s matches the "token" production of RFC
+// 7230 (i.e. the set of characters allowed in an HTTP header field-name).
+func isValidHeaderToken(s string) bool {
+	if s == "" {
+		return false
+	}
+	for i := 0; i < len(s); i++ {
+		c := s[i]
+		switch {
+		case c >= 'a' && c <= 'z':
+		case c >= 'A' && c <= 'Z':
+		case c >= '0' && c <= '9':
+		case strings.IndexByte("!#$%&'*+-.^_`|~", c) >= 0:
+		default:
+			return false
+		}
+	}
+	return true
+}
 
 type contextKey int
 
@@ -94,7 +127,32 @@ func NewPrometheusLogger(l logging.Level, format logging.Format) (log.Logger, er
 
 // Log increments the appropriate Prometheus counter depending on the log level.
 func (pl *PrometheusLogger) Log(kv ...interface{}) error {
-	pl.logger.Log(kv...)
+	err := pl.logger.Log(kv...)
+	if err != nil {
+		// The underlying encoder (typically logfmt) rejected one of the
+		// supplied fields and dropped the whole record. Retry with the
+		// values rewritten so the record still gets emitted; this prevents
+		// a caller-controlled field name from silently suppressing an
+		// entire log line.
+		safe := make([]interface{}, 0, len(kv)+2)
+		for i := 0; i < len(kv); i += 2 {
+			var key interface{} = "invalid_key"
+			if i < len(kv) {
+				if s, ok := kv[i].(string); ok && s != "" {
+					key = sanitizeLogFieldKey(s)
+				} else if kv[i] != nil {
+					key = fmt.Sprintf("%v", kv[i])
+				}
+			}
+			var val interface{}
+			if i+1 < len(kv) {
+				val = kv[i+1]
+			}
+			safe = append(safe, key, val)
+		}
+		safe = append(safe, "log_encoding_err", err.Error())
+		_ = pl.logger.Log(safe...)
+	}
 	l := "unknown"
 	for i := 1; i < len(kv); i += 2 {
 		if v, ok := kv[i].(level.Value); ok {
@@ -156,15 +214,60 @@ func InjectHeadersIntoHTTPRequest(headerMap map[string]string, request *http.Req
 	}
 }
 
-func ContextWithHeaderMapFromMetadata(ctx context.Context, md metadata.MD) context.Context {
+// ContextWithHeaderMapFromMetadata extracts the request-logging header map
+// forwarded over gRPC metadata and places it on the context. The caller must
+// supply the operator-configured allowlist of header names (typically
+// -api.http-request-headers-to-log): only metadata entries whose key matches
+// an allowlist entry case-insensitively AND is a syntactically valid HTTP
+// header-name token are retained. The total number of pairs is capped and
+// each value is truncated to a maximum length. An empty allowlist disables
+// propagation (returns ctx unchanged) so that an untrusted gRPC caller cannot
+// synthesise log fields when the operator has not opted in.
+func ContextWithHeaderMapFromMetadata(ctx context.Context, md metadata.MD, allowlist []string) context.Context {
+	if len(allowlist) == 0 {
+		return ctx
+	}
 	headersSlice, ok := md[HeaderPropagationStringForRequestLogging]
 	if !ok || len(headersSlice)%2 == 1 {
 		return ctx
 	}
 
+	// Build a lowercase lookup of allowlisted header names, remembering the
+	// original (operator-chosen) spelling so that the resulting map keys are
+	// stable regardless of the casing used by the caller on the wire.
+	allowed := make(map[string]string, len(allowlist))
+	for _, name := range allowlist {
+		if name == "" {
+			continue
+		}
+		allowed[strings.ToLower(name)] = name
+	}
+	if len(allowed) == 0 {
+		return ctx
+	}
+
 	headerMap := make(map[string]string)
-	for i := 0; i < len(headersSlice); i += 2 {
-		headerMap[headersSlice[i]] = headersSlice[i+1]
+	for i := 0; i < len(headersSlice) && len(headerMap) < maxForwardedHeaderPairs; i += 2 {
+		key := headersSlice[i]
+		value := headersSlice[i+1]
+		if !isValidHeaderToken(key) {
+			continue
+		}
+		canonical, ok := allowed[strings.ToLower(key)]
+		if !ok {
+			continue
+		}
+		if len(value) > maxForwardedHeaderValueLen {
+			value = value[:maxForwardedHeaderValueLen]
+		}
+		if _, exists := headerMap[canonical]; exists {
+			// Preserve the first value seen for a given header name.
+			continue
+		}
+		headerMap[canonical] = value
+	}
+	if len(headerMap) == 0 {
+		return ctx
 	}
 
 	return ContextWithHeaderMap(ctx, headerMap)
