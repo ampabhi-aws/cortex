@@ -83,6 +83,15 @@ func (t *SingleResolver) TenantID(ctx context.Context) (string, error) {
 		return "", err
 	}
 
+	// Defensively reject an empty tenant ID. Although the upstream
+	// middleware already rejects a missing/empty X-Scope-OrgID header,
+	// in-process callers (e.g. test harnesses or custom middleware) can
+	// still inject an empty org ID into the context; an empty tenant ID
+	// collapses per-tenant storage prefixes onto their shared parents.
+	if id == "" {
+		return "", errTenantIDEmpty
+	}
+
 	if containsUnsafePathSegments(id) {
 		return "", errInvalidTenantID
 	}
@@ -127,6 +136,16 @@ func (t *MultiResolver) TenantIDs(ctx context.Context) ([]string, error) {
 	orgID, err := user.ExtractOrgID(ctx)
 	if err != nil {
 		return nil, err
+	}
+
+	// Reject headers that split into empty components (leading, trailing
+	// or repeated '|'), which would otherwise be normalized into an
+	// empty tenant ID and collapse per-tenant storage onto the shared
+	// parent prefix (see CWE-1286). ValidTenantID below also rejects an
+	// empty component, but checking the raw header first produces a more
+	// specific error and defends against future refactors.
+	if orgID == "" || strings.HasPrefix(orgID, tenantIDsLabelSeparator) || strings.HasSuffix(orgID, tenantIDsLabelSeparator) || strings.Contains(orgID, tenantIDsLabelSeparator+tenantIDsLabelSeparator) {
+		return nil, errTenantIDEmpty
 	}
 
 	orgIDs := strings.Split(orgID, tenantIDsLabelSeparator)

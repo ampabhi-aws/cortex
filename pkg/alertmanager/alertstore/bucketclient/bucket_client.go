@@ -54,6 +54,12 @@ func NewBucketAlertStore(bkt objstore.Bucket, cfgProvider bucket.TenantConfigPro
 	}
 }
 
+// errEmptyUser is returned when an empty user ID is supplied to a per-tenant
+// bucket operation. Writing or deleting an object whose name is the empty
+// string would, after PrefixedBucketClient composes the key, operate on the
+// shared parent prefix (e.g. "alerts/") instead of a per-tenant key.
+var errEmptyUser = errors.New("alertstore: user ID must not be empty")
+
 // ListAllUsers implements alertstore.AlertStore.
 func (s *BucketAlertStore) ListAllUsers(ctx context.Context) ([]string, error) {
 	var userIDs []string
@@ -95,6 +101,9 @@ func (s *BucketAlertStore) GetAlertConfigs(ctx context.Context, userIDs []string
 
 // GetAlertConfig implements alertstore.AlertStore.
 func (s *BucketAlertStore) GetAlertConfig(ctx context.Context, userID string) (alertspb.AlertConfigDesc, error) {
+	if userID == "" {
+		return alertspb.AlertConfigDesc{}, errEmptyUser
+	}
 	cfg, err := s.getAlertConfig(ctx, userID)
 	if s.alertsBucket.IsObjNotFoundErr(err) {
 		return cfg, alertspb.ErrNotFound
@@ -105,6 +114,9 @@ func (s *BucketAlertStore) GetAlertConfig(ctx context.Context, userID string) (a
 
 // SetAlertConfig implements alertstore.AlertStore.
 func (s *BucketAlertStore) SetAlertConfig(ctx context.Context, cfg alertspb.AlertConfigDesc) error {
+	if cfg.User == "" {
+		return errEmptyUser
+	}
 	cfgBytes, err := cfg.Marshal()
 	if err != nil {
 		return err
@@ -115,6 +127,9 @@ func (s *BucketAlertStore) SetAlertConfig(ctx context.Context, cfg alertspb.Aler
 
 // DeleteAlertConfig implements alertstore.AlertStore.
 func (s *BucketAlertStore) DeleteAlertConfig(ctx context.Context, userID string) error {
+	if userID == "" {
+		return errEmptyUser
+	}
 	userBkt := s.getUserBucket(userID)
 
 	err := userBkt.Delete(ctx, userID)
@@ -138,6 +153,9 @@ func (s *BucketAlertStore) ListUsersWithFullState(ctx context.Context) ([]string
 
 // GetFullState implements alertstore.AlertStore.
 func (s *BucketAlertStore) GetFullState(ctx context.Context, userID string) (alertspb.FullStateDesc, error) {
+	if userID == "" {
+		return alertspb.FullStateDesc{}, errEmptyUser
+	}
 	bkt := s.getAlertmanagerUserBucket(userID)
 	fs := alertspb.FullStateDesc{}
 
@@ -151,6 +169,9 @@ func (s *BucketAlertStore) GetFullState(ctx context.Context, userID string) (ale
 
 // SetFullState implements alertstore.AlertStore.
 func (s *BucketAlertStore) SetFullState(ctx context.Context, userID string, fs alertspb.FullStateDesc) error {
+	if userID == "" {
+		return errEmptyUser
+	}
 	bkt := s.getAlertmanagerUserBucket(userID)
 
 	fsBytes, err := fs.Marshal()
@@ -163,6 +184,9 @@ func (s *BucketAlertStore) SetFullState(ctx context.Context, userID string, fs a
 
 // DeleteFullState implements alertstore.AlertStore.
 func (s *BucketAlertStore) DeleteFullState(ctx context.Context, userID string) error {
+	if userID == "" {
+		return errEmptyUser
+	}
 	userBkt := s.getAlertmanagerUserBucket(userID)
 
 	err := userBkt.Delete(ctx, fullStateName)
