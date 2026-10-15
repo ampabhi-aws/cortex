@@ -89,7 +89,7 @@ func (rn *rulerNotifier) stop() {
 // Builds a Prometheus config.Config from a ruler.Config with just the required
 // options to configure notifications to Alertmanager.
 func buildNotifierConfig(rulerConfig *Config) (*config.Config, error) {
-	amURLs := strings.Split(rulerConfig.AlertmanagerURL, ",")
+	amURLs := strings.Split(string(rulerConfig.AlertmanagerURL), ",")
 	validURLs := make([]*url.URL, 0, len(amURLs))
 
 	srvDNSregexp := regexp.MustCompile(`^_.+._.+`)
@@ -193,7 +193,7 @@ func amConfigFromURL(rulerConfig *Config, url *url.URL, apiVersion config.Alertm
 	if rulerConfig.Notifier.BasicAuth.IsEnabled() {
 		amConfig.HTTPClientConfig.BasicAuth = &config_util.BasicAuth{
 			Username: rulerConfig.Notifier.BasicAuth.Username,
-			Password: config_util.Secret(rulerConfig.Notifier.BasicAuth.Password),
+			Password: config_util.Secret(rulerConfig.Notifier.BasicAuth.Password.Value),
 		}
 	}
 
