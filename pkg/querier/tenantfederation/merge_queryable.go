@@ -3,6 +3,7 @@ package tenantfederation
 import (
 	"context"
 	"fmt"
+	"net/http"
 	"sort"
 	"strings"
 
@@ -11,6 +12,7 @@ import (
 	"github.com/prometheus/prometheus/storage"
 	"github.com/prometheus/prometheus/tsdb/chunkenc"
 	tsdb_errors "github.com/prometheus/prometheus/tsdb/errors"
+	"github.com/weaveworks/common/httpgrpc"
 	"github.com/weaveworks/common/user"
 
 	"github.com/cortexproject/cortex/pkg/tenant"
@@ -37,14 +39,27 @@ const (
 // by the tenant ID and the previous value is exposed through a new label
 // prefixed with "original_". This behaviour is not implemented recursively.
 func NewQueryable(upstream storage.Queryable, byPassWithSingleQuerier bool) storage.Queryable {
-	return NewMergeQueryable(defaultTenantLabel, tenantQuerierCallback(upstream), byPassWithSingleQuerier)
+	return NewQueryableWithMaxTenants(upstream, byPassWithSingleQuerier, 0)
 }
 
-func tenantQuerierCallback(queryable storage.Queryable) MergeQuerierCallback {
+// NewQueryableWithMaxTenants is like NewQueryable but also enforces a maximum
+// number of tenant IDs per request. A maxTenants of 0 means no limit.
+// Requests exceeding maxTenants are rejected with an HTTP 422 error so that
+// a single caller cannot fan out a query into an unbounded number of
+// per-tenant sub-queriers.
+func NewQueryableWithMaxTenants(upstream storage.Queryable, byPassWithSingleQuerier bool, maxTenants int) storage.Queryable {
+	return NewMergeQueryable(defaultTenantLabel, tenantQuerierCallbackWithMaxTenants(upstream, maxTenants), byPassWithSingleQuerier)
+}
+
+func tenantQuerierCallbackWithMaxTenants(queryable storage.Queryable, maxTenants int) MergeQuerierCallback {
 	return func(ctx context.Context, mint int64, maxt int64) ([]string, []storage.Querier, error) {
 		tenantIDs, err := tenant.TenantIDs(ctx)
 		if err != nil {
 			return nil, nil, err
+		}
+
+		if maxTenants > 0 && len(tenantIDs) > maxTenants {
+			return nil, nil, httpgrpc.Errorf(http.StatusUnprocessableEntity, "too many tenant IDs in request: got %d, limit is %d (-tenant-federation.max-tenants)", len(tenantIDs), maxTenants)
 		}
 
 		var queriers = make([]storage.Querier, len(tenantIDs))
