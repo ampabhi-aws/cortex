@@ -865,6 +865,14 @@ func (am *MultitenantAlertmanager) setConfig(cfg alertspb.AlertConfigDesc) error
 		}
 		rawCfg = am.fallbackConfig
 	} else {
+		// Defence in depth: re-validate the raw configuration before parsing
+		// it so that any config loaded from a store (including the configdb
+		// alertstore populated by the legacy configs API) is rejected if it
+		// references local files via *_file options.
+		if err := ValidateAlertmanagerConfig(cfg.RawConfig); err != nil {
+			return fmt.Errorf("invalid Cortex configuration for %v: %v", cfg.User, err)
+		}
+
 		userAmConfig, err = amconfig.Load(cfg.RawConfig)
 		if err != nil && hasExisting {
 			// This means that if a user has a working config and
