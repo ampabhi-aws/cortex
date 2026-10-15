@@ -5,9 +5,11 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"net/url"
 	"os"
 	"path/filepath"
 	"reflect"
+	"strings"
 
 	"github.com/go-kit/log"
 	"github.com/go-kit/log/level"
@@ -45,6 +47,10 @@ var (
 	errTLSFileNotAllowed             = errors.New("setting TLS ca_file, cert_file and key_file is not allowed")
 	errSlackAPIURLFileNotAllowed     = errors.New("setting Slack api_url_file and global slack_api_url_file is not allowed")
 	errVictorOpsAPIKeyFileNotAllowed = errors.New("setting VictorOps api_key_file is not allowed")
+	errSNSMissingSigV4Credentials    = errors.New("setting SNS receiver without explicit sigv4.access_key and sigv4.secret_key is not allowed: a tenant SNS receiver would otherwise be signed with the Cortex process's ambient AWS credentials")
+	errSNSSigV4ProfileNotAllowed     = errors.New("setting SNS sigv4.profile is not allowed: it would reference an operator-local AWS shared credentials profile")
+	errSNSSigV4RoleARNNotAllowed     = errors.New("setting SNS sigv4.role_arn is not allowed: it would make Cortex call sts:AssumeRole with the operator's AWS identity")
+	errSNSAPIURLNotAllowed           = errors.New("setting SNS api_url is not allowed: it must point to the official AWS SNS service endpoint (sns.<region>.amazonaws.com), which the AWS SDK resolves automatically from sigv4.region")
 )
 
 // UserConfig is used to communicate a users alertmanager configs
@@ -350,6 +356,11 @@ func validateAlertmanagerConfig(cfg interface{}) error {
 		if err := validateVictorOpsConfig(v.Interface().(config.VictorOpsConfig)); err != nil {
 			return err
 		}
+
+	case reflect.TypeOf(config.SNSConfig{}):
+		if err := validateSNSConfig(v.Interface().(config.SNSConfig)); err != nil {
+			return err
+		}
 	}
 
 	// If the input config is a struct, recursively iterate on all fields.
@@ -446,6 +457,95 @@ func validateSlackConfig(cfg config.SlackConfig) error {
 func validateVictorOpsConfig(cfg config.VictorOpsConfig) error {
 	if cfg.APIKeyFile != "" {
 		return errVictorOpsAPIKeyFileNotAllowed
+	}
+	return nil
+}
+
+// validateSNSConfig validates the SNS config and returns an error if it contains
+// settings not allowed by Cortex. The tenant-controlled SNS receiver would otherwise
+// be signed with the Cortex process's ambient AWS credentials (instance role / IRSA /
+// env / named profile) and sent to a tenant-controlled endpoint (api_url), acting as a
+// confused deputy and leaking SigV4-signed credential material (access key ID, session
+// token) to the tenant.
+func validateSNSConfig(cfg config.SNSConfig) error {
+	// Require explicit static sigv4 credentials. Rejecting the empty-both case
+	// prevents the AWS SDK from falling back to the Cortex process's default
+	// credentials chain. The upstream SigV4Config.Validate already rejects the
+	// case where only one of access_key/secret_key is set.
+	if cfg.Sigv4.AccessKey == "" || cfg.Sigv4.SecretKey == "" {
+		return errSNSMissingSigV4Credentials
+	}
+	// Reject profile and role_arn: both would make the signer use operator-side
+	// identity material rather than the tenant-provided static credentials.
+	if cfg.Sigv4.Profile != "" {
+		return errSNSSigV4ProfileNotAllowed
+	}
+	if cfg.Sigv4.RoleARN != "" {
+		return errSNSSigV4RoleARNNotAllowed
+	}
+	// Constrain api_url to the official AWS SNS service endpoints. The vendored
+	// notifier passes api_url directly as the AWS SDK Endpoint, so an attacker
+	// controlled host would receive the SigV4-signed request. The AWS SDK
+	// resolves the correct SNS endpoint from sigv4.region when api_url is
+	// empty, so disallowing it entirely is the safest option. We additionally
+	// permit tenants to spell the official SNS endpoint explicitly for
+	// backwards compatibility.
+	if cfg.APIUrl != "" {
+		if err := validateSNSAPIURL(cfg.APIUrl); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// validateSNSAPIURL accepts only https URLs whose host is an official AWS SNS
+// service endpoint, i.e. sns.<region>.amazonaws.com (including the China and
+// GovCloud partitions and the FIPS variant). It rejects templates and any
+// userinfo, path, query or fragment that could redirect or alter the request.
+func validateSNSAPIURL(raw string) error {
+	// Reject Alertmanager templating in api_url outright: templated hosts would
+	// bypass this allowlist at notify time.
+	if strings.ContainsAny(raw, "{}") {
+		return errSNSAPIURLNotAllowed
+	}
+	u, err := url.Parse(raw)
+	if err != nil {
+		return errSNSAPIURLNotAllowed
+	}
+	if u.Scheme != "https" {
+		return errSNSAPIURLNotAllowed
+	}
+	if u.User != nil {
+		return errSNSAPIURLNotAllowed
+	}
+	if u.RawQuery != "" || u.Fragment != "" {
+		return errSNSAPIURLNotAllowed
+	}
+	if u.Path != "" && u.Path != "/" {
+		return errSNSAPIURLNotAllowed
+	}
+	host := u.Hostname()
+	if host == "" {
+		return errSNSAPIURLNotAllowed
+	}
+	// Only accept the canonical AWS SNS service hostnames:
+	//   sns.<region>.amazonaws.com
+	//   sns-fips.<region>.amazonaws.com
+	//   sns.<region>.amazonaws.com.cn
+	host = strings.ToLower(host)
+	switch {
+	case strings.HasPrefix(host, "sns.") || strings.HasPrefix(host, "sns-fips."):
+	default:
+		return errSNSAPIURLNotAllowed
+	}
+	if !(strings.HasSuffix(host, ".amazonaws.com") || strings.HasSuffix(host, ".amazonaws.com.cn")) {
+		return errSNSAPIURLNotAllowed
+	}
+	// Require a region label between the "sns[-fips]." prefix and the AWS
+	// suffix, i.e. at least 3 dot-separated labels.
+	labels := strings.Split(host, ".")
+	if len(labels) < 4 {
+		return errSNSAPIURLNotAllowed
 	}
 	return nil
 }
