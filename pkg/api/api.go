@@ -18,6 +18,7 @@ import (
 	"github.com/cortexproject/cortex/pkg/alertmanager"
 	"github.com/cortexproject/cortex/pkg/alertmanager/alertmanagerpb"
 	"github.com/cortexproject/cortex/pkg/compactor"
+	configAPI "github.com/cortexproject/cortex/pkg/configs/api"
 	"github.com/cortexproject/cortex/pkg/cortexpb"
 	"github.com/cortexproject/cortex/pkg/distributor"
 	"github.com/cortexproject/cortex/pkg/distributor/distributorpb"
@@ -345,6 +346,25 @@ func (a *API) RegisterStoreGateway(s *storegateway.StoreGateway) {
 func (a *API) RegisterCompactor(c *compactor.Compactor) {
 	a.indexPage.AddLink(SectionAdminEndpoints, "/compactor/ring", "Compactor Ring Status")
 	a.RegisterRoute("/compactor/ring", http.HandlerFunc(c.RingHandler), false, "GET", "POST")
+}
+
+// RegisterConfigAPI registers routes for the legacy (deprecated) configs
+// service. All configs routes are wrapped with the shared authentication
+// middleware so that no configs endpoint — including the internal
+// /private/api/prom/configs/* bulk endpoints that embed cross-tenant
+// credentials — is served without passing through the configured auth
+// middleware.
+//
+// Note: the configs API's own "root" ("/") route is intentionally skipped
+// here because the main API already serves "/" via RegisterAPI; registering
+// it twice on the shared gorilla/mux router would collide.
+func (a *API) RegisterConfigAPI(c *configAPI.API) {
+	for _, route := range c.Routes() {
+		if route.Path == "/" {
+			continue
+		}
+		a.RegisterRoute(route.Path, route.Handler, true, route.Method)
+	}
 }
 
 type Distributor interface {

@@ -24,6 +24,7 @@ import (
 	"github.com/cortexproject/cortex/pkg/configs/userconfig"
 	"github.com/cortexproject/cortex/pkg/tenant"
 	"github.com/cortexproject/cortex/pkg/util"
+	"github.com/cortexproject/cortex/pkg/util/flagext"
 	util_log "github.com/cortexproject/cortex/pkg/util/log"
 )
 
@@ -35,6 +36,15 @@ var (
 // Config configures Configs API
 type Config struct {
 	Notifications NotificationsConfig `yaml:"notifications"`
+
+	// AdminTenantIDs is the list of tenant IDs that are allowed to call the
+	// internal /private/api/prom/configs/* endpoints which return every
+	// tenant's rules/Alertmanager configuration. The caller must present
+	// one of these tenant IDs via the authenticated request context
+	// (e.g. the X-Scope-OrgID header, which the auth middleware pins into
+	// the context). If this list is empty, those endpoints fail closed with
+	// HTTP 403 and never return cross-tenant data.
+	AdminTenantIDs flagext.StringSliceCSV `yaml:"admin_tenant_ids"`
 }
 
 // NotificationsConfig configures Alertmanager notifications method.
@@ -47,6 +57,7 @@ type NotificationsConfig struct {
 func (cfg *Config) RegisterFlags(f *flag.FlagSet) {
 	f.BoolVar(&cfg.Notifications.DisableEmail, "configs.notifications.disable-email", false, "Disable Email notifications for Alertmanager.")
 	f.BoolVar(&cfg.Notifications.DisableWebHook, "configs.notifications.disable-webhook", false, "Disable WebHook notifications for Alertmanager.")
+	f.Var(&cfg.AdminTenantIDs, "configs.admin-tenant-ids", "Comma-separated list of tenant IDs allowed to call the internal /private/api/prom/configs/* bulk endpoints that return every tenant's rules/Alertmanager configs. If empty, those endpoints always return 403.")
 }
 
 // API implements the configs api.
@@ -81,12 +92,21 @@ func (a *API) admin(w http.ResponseWriter, r *http.Request) {
 `)
 }
 
-// RegisterRoutes registers the configs API HTTP routes with the provided Router.
-func (a *API) RegisterRoutes(r *mux.Router) {
-	for _, route := range []struct {
-		name, method, path string
-		handler            http.HandlerFunc
-	}{
+// Route describes a single configs API HTTP route so callers that register the
+// routes via pkg/api.API (which wraps each route with the auth middleware) can
+// enumerate them without reaching into the embedded gorilla router.
+type Route struct {
+	Name    string
+	Method  string
+	Path    string
+	Handler http.HandlerFunc
+}
+
+// Routes returns the full set of HTTP routes served by the configs API. The
+// routes are intentionally returned so the caller can wrap each with the
+// shared authentication middleware (see pkg/api.API.RegisterConfigAPI).
+func (a *API) Routes() []Route {
+	return []Route{
 		{"root", "GET", "/", a.admin},
 		// Dedicated APIs for updating rules config. In the future, these *must*
 		// be used.
@@ -99,12 +119,40 @@ func (a *API) RegisterRoutes(r *mux.Router) {
 		{"validate_alertmanager_config", "POST", "/api/prom/configs/alertmanager/validate", a.validateAlertmanagerConfig},
 		{"deactivate_config", "DELETE", "/api/prom/configs/deactivate", a.deactivateConfig},
 		{"restore_config", "POST", "/api/prom/configs/restore", a.restoreConfig},
-		// Internal APIs.
+		// Internal, operator-only APIs. These are gated by both the
+		// authentication middleware (when the API is registered via
+		// pkg/api.API.RegisterConfigAPI) and by an admin tenant-ID check
+		// inside getConfigs.
 		{"private_get_rules", "GET", "/private/api/prom/configs/rules", a.getConfigs},
 		{"private_get_alertmanager_config", "GET", "/private/api/prom/configs/alertmanager", a.getConfigs},
-	} {
-		r.Handle(route.path, route.handler).Methods(route.method).Name(route.name)
 	}
+}
+
+// RegisterRoutes registers the configs API HTTP routes with the provided Router.
+//
+// Deprecated: this bypasses the shared authentication middleware. Prefer
+// pkg/api.API.RegisterConfigAPI, which wraps each route with the auth
+// middleware before mounting it on the HTTP server. This remains for tests
+// and internal callers that have already enforced authentication/authorization
+// at a different layer.
+func (a *API) RegisterRoutes(r *mux.Router) {
+	for _, route := range a.Routes() {
+		r.Handle(route.Path, route.Handler).Methods(route.Method).Name(route.Name)
+	}
+}
+
+// isAdminTenant reports whether the given tenant ID is in the configured list
+// of admin tenants permitted to read cross-tenant configs.
+func (a *API) isAdminTenant(tenantID string) bool {
+	if tenantID == "" {
+		return false
+	}
+	for _, allowed := range a.cfg.AdminTenantIDs {
+		if allowed == tenantID {
+			return true
+		}
+	}
+	return false
 }
 
 // getConfig returns the request configuration.
@@ -264,9 +312,28 @@ type ConfigsView struct {
 }
 
 func (a *API) getConfigs(w http.ResponseWriter, r *http.Request) {
+	logger := util_log.WithContext(r.Context(), util_log.Logger)
+
+	// Fail closed: the private bulk endpoints return every tenant's rules
+	// and Alertmanager configuration (including embedded third-party
+	// credentials). Only serve them to an authenticated principal whose
+	// tenant ID has been explicitly granted cross-tenant privilege via
+	// -configs.admin-tenant-ids. If no admin tenant is configured, or the
+	// caller is not one of them, deny the request.
+	userID, _, err := tenant.ExtractTenantIDFromHTTPRequest(r)
+	if err != nil {
+		level.Info(logger).Log("msg", "rejecting cross-tenant configs request: no authenticated tenant", "err", err)
+		http.Error(w, "unauthorized", http.StatusUnauthorized)
+		return
+	}
+	if !a.isAdminTenant(userID) {
+		level.Info(logger).Log("msg", "rejecting cross-tenant configs request: tenant is not an admin", "user", userID)
+		http.Error(w, "forbidden", http.StatusForbidden)
+		return
+	}
+
 	var cfgs map[string]userconfig.View
 	var cfgErr error
-	logger := util_log.WithContext(r.Context(), util_log.Logger)
 	rawSince := r.FormValue("since")
 	if rawSince == "" {
 		cfgs, cfgErr = a.db.GetAllConfigs(r.Context())
