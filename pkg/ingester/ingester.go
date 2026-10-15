@@ -306,6 +306,14 @@ func (u *userTSDB) casState(from, to tsdbState) bool {
 	return true
 }
 
+// maxCompactHeadIterations caps the number of per-block-range compaction iterations
+// performed by a single compactHead invocation. This defends against pathological
+// head MinTime/MaxTime spans (for example induced by samples carrying attacker-controlled
+// far-future timestamps) that would otherwise force the loop to walk one block range
+// at a time between now and the poisoned maxTime. Legitimate workloads never need to
+// cut more than a handful of blocks in a single invocation.
+const maxCompactHeadIterations = 1000
+
 // compactHead compacts the Head block at specified block durations avoiding a single huge block.
 func (u *userTSDB) compactHead(blockDuration int64) error {
 	if !u.casState(active, forceCompacting) {
@@ -323,7 +331,16 @@ func (u *userTSDB) compactHead(blockDuration int64) error {
 
 	minTime, maxTime := h.MinTime(), h.MaxTime()
 
+	iterations := 0
 	for (minTime/blockDuration)*blockDuration != (maxTime/blockDuration)*blockDuration {
+		if iterations >= maxCompactHeadIterations {
+			// Safety guard: avoid walking an unbounded number of block ranges per
+			// invocation. The remaining head data will be compacted on the next
+			// scheduled compaction tick.
+			return errors.Errorf("TSDB head compaction aborted after %d block-range iterations (minTime=%d, maxTime=%d, blockDuration=%d); head may contain samples with far-future timestamps", iterations, minTime, maxTime, blockDuration)
+		}
+		iterations++
+
 		// Data in Head spans across multiple block ranges, so we break it into blocks here.
 		// Block max time is exclusive, so we do a -1 here.
 		blockMaxTime := ((minTime/blockDuration)+1)*blockDuration - 1
@@ -970,6 +987,20 @@ func (i *Ingester) Push(ctx context.Context, req *cortexpb.WriteRequest) (*corte
 
 		for _, s := range ts.Samples {
 			var err error
+
+			// Validate the sample before touching the TSDB appender. The /ingester/push
+			// (and legacy /push) debug routes are tenant-reachable and do not go through
+			// Distributor.Push, so if we don't re-apply the distributor-side sample
+			// validation here a tenant could inject a sample with an arbitrary
+			// future timestamp, raising the TSDB head MaxTime and causing head
+			// compaction to walk one block range at a time between now and the
+			// poisoned maxTime.
+			if validationErr := validation.ValidateSample(i.limits, userID, ts.Labels, s); validationErr != nil {
+				failedSamplesCount++
+				verr := validationErr
+				updateFirstPartial(func() error { return makeLimitError(sampleTimestampValidation, verr) })
+				continue
+			}
 
 			// If the cached reference exists, we try to use it.
 			if ref != 0 {
