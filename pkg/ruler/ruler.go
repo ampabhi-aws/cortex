@@ -78,6 +78,11 @@ type Config struct {
 	ClientTLSConfig grpcclient.Config `yaml:"ruler_client"`
 	// How frequently to evaluate rules by default.
 	EvaluationInterval time.Duration `yaml:"evaluation_interval"`
+	// Minimum allowed rule-group evaluation interval. Tenant-supplied rule
+	// group intervals below this value are rejected on write and clamped on
+	// read so a single tenant cannot pin unbounded query load on the shared
+	// ruler. 0 disables the floor.
+	MinRuleEvaluationInterval time.Duration `yaml:"min_rule_evaluation_interval"`
 	// How frequently to poll for updated rules.
 	PollInterval time.Duration `yaml:"poll_interval"`
 	// Path to store rule files for prom manager.
@@ -159,6 +164,7 @@ func (cfg *Config) RegisterFlags(f *flag.FlagSet) {
 	cfg.ExternalURL.URL, _ = url.Parse("") // Must be non-nil
 	f.Var(&cfg.ExternalURL, "ruler.external.url", "URL of alerts return path.")
 	f.DurationVar(&cfg.EvaluationInterval, "ruler.evaluation-interval", 1*time.Minute, "How frequently to evaluate rules")
+	f.DurationVar(&cfg.MinRuleEvaluationInterval, "ruler.min-rule-evaluation-interval", 0, "Minimum allowed tenant-supplied rule-group evaluation interval. Groups with an interval below this value are rejected on write and clamped on read so a single tenant cannot pin unbounded query load on the shared ruler. 0 to disable.")
 	f.DurationVar(&cfg.PollInterval, "ruler.poll-interval", 1*time.Minute, "How frequently to poll for rule changes")
 
 	f.StringVar(&cfg.AlertmanagerURL, "ruler.alertmanager-url", "", "Comma-separated list of URL(s) of the Alertmanager(s) to send notifications to. Each Alertmanager URL is treated as a separate group in the configuration. Multiple Alertmanagers in HA per group can be supported by using DNS resolution via -ruler.alertmanager-discovery.")
