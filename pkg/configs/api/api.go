@@ -20,6 +20,7 @@ import (
 	amconfig "github.com/prometheus/alertmanager/config"
 	amtemplate "github.com/prometheus/alertmanager/template"
 
+	"github.com/cortexproject/cortex/pkg/alertmanager"
 	"github.com/cortexproject/cortex/pkg/configs/db"
 	"github.com/cortexproject/cortex/pkg/configs/userconfig"
 	"github.com/cortexproject/cortex/pkg/tenant"
@@ -30,11 +31,24 @@ import (
 var (
 	ErrEmailNotificationsAreDisabled   = errors.New("email notifications are disabled")
 	ErrWebhookNotificationsAreDisabled = errors.New("webhook notifications are disabled")
+	ErrAlertmanagerConfigTooBig        = errors.New("Alertmanager configuration is too big")
 )
+
+// defaultMaxAlertmanagerConfigSize is the maximum size (in bytes) of a tenant's
+// Alertmanager configuration accepted by the legacy configs API when the
+// operator has not overridden the limit. It mirrors a conservative size that
+// stops obvious resource-exhaustion abuses while leaving legitimate configs
+// unaffected. A value of 0 disables the limit.
+const defaultMaxAlertmanagerConfigSize = 1 * 1024 * 1024 // 1 MiB
 
 // Config configures Configs API
 type Config struct {
 	Notifications NotificationsConfig `yaml:"notifications"`
+
+	// AlertmanagerMaxConfigSize is the maximum size, in bytes, of the
+	// Alertmanager configuration accepted on the legacy configs write path.
+	// 0 disables the limit.
+	AlertmanagerMaxConfigSize int `yaml:"alertmanager_max_config_size"`
 }
 
 // NotificationsConfig configures Alertmanager notifications method.
@@ -47,6 +61,7 @@ type NotificationsConfig struct {
 func (cfg *Config) RegisterFlags(f *flag.FlagSet) {
 	f.BoolVar(&cfg.Notifications.DisableEmail, "configs.notifications.disable-email", false, "Disable Email notifications for Alertmanager.")
 	f.BoolVar(&cfg.Notifications.DisableWebHook, "configs.notifications.disable-webhook", false, "Disable WebHook notifications for Alertmanager.")
+	f.IntVar(&cfg.AlertmanagerMaxConfigSize, "configs.alertmanager-max-config-size-bytes", defaultMaxAlertmanagerConfigSize, "Maximum size, in bytes, of the Alertmanager configuration accepted on the legacy configs write path. 0 disables the limit.")
 }
 
 // API implements the configs api.
@@ -154,17 +169,26 @@ func (a *API) setConfig(w http.ResponseWriter, r *http.Request) {
 	}
 	logger := util_log.WithContext(r.Context(), util_log.Logger)
 
+	// Enforce a maximum request body size to avoid obvious resource-exhaustion
+	// abuses, matching what the modern Alertmanager API does via
+	// AlertmanagerMaxConfigSize.
+	var body io.Reader = r.Body
+	if a.cfg.AlertmanagerMaxConfigSize > 0 {
+		// Allow one extra byte so we can detect that the limit was exceeded.
+		body = http.MaxBytesReader(w, r.Body, int64(a.cfg.AlertmanagerMaxConfigSize)+1)
+	}
+
 	var cfg userconfig.Config
 	switch parseConfigFormat(r.Header.Get("Content-Type"), FormatJSON) {
 	case FormatJSON:
-		if err := json.NewDecoder(r.Body).Decode(&cfg); err != nil {
+		if err := json.NewDecoder(body).Decode(&cfg); err != nil {
 			// XXX: Untested
 			level.Error(logger).Log("msg", "error decoding json body", "err", err)
 			http.Error(w, err.Error(), http.StatusBadRequest)
 			return
 		}
 	case FormatYAML:
-		if err := yaml.NewDecoder(r.Body).Decode(&cfg); err != nil {
+		if err := yaml.NewDecoder(body).Decode(&cfg); err != nil {
 			// XXX: Untested
 			level.Error(logger).Log("msg", "error decoding yaml body", "err", err)
 			http.Error(w, err.Error(), http.StatusBadRequest)
@@ -174,6 +198,13 @@ func (a *API) setConfig(w http.ResponseWriter, r *http.Request) {
 		// should never reach this point
 		level.Error(logger).Log("msg", "unexpected error detecting the config format")
 		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+
+	if a.cfg.AlertmanagerMaxConfigSize > 0 && len(cfg.AlertmanagerConfig) > a.cfg.AlertmanagerMaxConfigSize {
+		msg := fmt.Sprintf("%s: limit %d bytes", ErrAlertmanagerConfigTooBig.Error(), a.cfg.AlertmanagerMaxConfigSize)
+		level.Warn(logger).Log("msg", msg)
+		http.Error(w, msg, http.StatusBadRequest)
 		return
 	}
 
@@ -203,10 +234,24 @@ func (a *API) setConfig(w http.ResponseWriter, r *http.Request) {
 
 func (a *API) validateAlertmanagerConfig(w http.ResponseWriter, r *http.Request) {
 	logger := util_log.WithContext(r.Context(), util_log.Logger)
-	cfg, err := io.ReadAll(r.Body)
+	var body io.Reader = r.Body
+	if a.cfg.AlertmanagerMaxConfigSize > 0 {
+		// Allow one extra byte so we can detect that the limit was exceeded.
+		body = io.LimitReader(r.Body, int64(a.cfg.AlertmanagerMaxConfigSize)+1)
+	}
+	cfg, err := io.ReadAll(body)
 	if err != nil {
 		level.Error(logger).Log("msg", "error reading request body", "err", err)
 		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+
+	if a.cfg.AlertmanagerMaxConfigSize > 0 && len(cfg) > a.cfg.AlertmanagerMaxConfigSize {
+		w.WriteHeader(http.StatusBadRequest)
+		util.WriteJSONResponse(w, map[string]string{
+			"status": "error",
+			"error":  fmt.Sprintf("%s: limit %d bytes", ErrAlertmanagerConfigTooBig.Error(), a.cfg.AlertmanagerMaxConfigSize),
+		})
 		return
 	}
 
@@ -236,6 +281,26 @@ func validateAlertmanagerConfig(cfg string, noCfg NotificationsConfig) error {
 		}
 		if noCfg.DisableWebHook && len(recv.WebhookConfigs) > 0 {
 			return ErrWebhookNotificationsAreDisabled
+		}
+	}
+
+	// Reject local file-reference settings (basic_auth.password_file,
+	// authorization.credentials_file, bearer_token_file,
+	// oauth2.client_secret_file, tls_config ca/cert/key_file,
+	// slack api_url_file / global slack_api_url_file, victorops api_key_file).
+	// Without this check, a tenant could set e.g. bearer_token_file to
+	// /etc/cortex/cortex.yaml or /var/run/secrets/kubernetes.io/serviceaccount/token
+	// and exfiltrate the file contents to a tenant-controlled receiver URL.
+	// This mirrors the modern Alertmanager API (pkg/alertmanager/api.go).
+	if err := alertmanager.ValidateAlertmanagerConfig(amCfg); err != nil {
+		return err
+	}
+
+	// Validate that any referenced template filenames are plain basenames and
+	// cannot escape the per-tenant template directory on disk.
+	for _, name := range amCfg.Templates {
+		if err := alertmanager.ValidateTemplateFilename(name); err != nil {
+			return err
 		}
 	}
 

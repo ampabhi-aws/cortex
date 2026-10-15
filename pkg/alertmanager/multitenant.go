@@ -872,6 +872,18 @@ func (am *MultitenantAlertmanager) setConfig(cfg alertspb.AlertConfigDesc) error
 			// working configuration.
 			return fmt.Errorf("invalid Cortex configuration for %v: %v", cfg.User, err)
 		}
+		if err == nil {
+			// Re-validate the loaded Alertmanager config against the file-reference
+			// restrictions enforced by the write paths. This is a defence-in-depth
+			// check so that configurations that entered the store before the write
+			// path applied this validation (for example via the legacy configs API
+			// before this fix) cannot be used to read process-local files such as
+			// bearer tokens, TLS keys, or object-store credentials and ship them to
+			// a tenant-chosen receiver URL.
+			if verr := validateAlertmanagerConfig(userAmConfig); verr != nil {
+				return fmt.Errorf("invalid Cortex configuration for %v: %v", cfg.User, verr)
+			}
+		}
 	}
 
 	// We can have an empty configuration here if:
