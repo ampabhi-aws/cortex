@@ -8,6 +8,7 @@ import (
 	"os"
 	"path/filepath"
 	"reflect"
+	"strings"
 
 	"github.com/go-kit/log"
 	"github.com/go-kit/log/level"
@@ -45,6 +46,8 @@ var (
 	errTLSFileNotAllowed             = errors.New("setting TLS ca_file, cert_file and key_file is not allowed")
 	errSlackAPIURLFileNotAllowed     = errors.New("setting Slack api_url_file and global slack_api_url_file is not allowed")
 	errVictorOpsAPIKeyFileNotAllowed = errors.New("setting VictorOps api_key_file is not allowed")
+	errOpsGenieAPIKeyFileNotAllowed  = errors.New("setting OpsGenie api_key_file and global opsgenie_api_key_file is not allowed")
+	errFilePathNotAllowed            = errors.New("setting a file path reference in Alertmanager configuration is not allowed")
 )
 
 // UserConfig is used to communicate a users alertmanager configs
@@ -350,6 +353,11 @@ func validateAlertmanagerConfig(cfg interface{}) error {
 		if err := validateVictorOpsConfig(v.Interface().(config.VictorOpsConfig)); err != nil {
 			return err
 		}
+
+	case reflect.TypeOf(config.OpsGenieConfig{}):
+		if err := validateOpsGenieConfig(v.Interface().(config.OpsGenieConfig)); err != nil {
+			return err
+		}
 	}
 
 	// If the input config is a struct, recursively iterate on all fields.
@@ -357,6 +365,16 @@ func validateAlertmanagerConfig(cfg interface{}) error {
 		for i := 0; i < t.NumField(); i++ {
 			field := t.Field(i)
 			fieldValue := v.FieldByIndex(field.Index)
+
+			// Positive (allow-list) validation: reject any non-empty string-valued
+			// field whose yaml tag name ends in "_file". This is a fail-closed
+			// defence so that newly vendored *_file settings (which cause
+			// Alertmanager to read a local file and send its contents to a
+			// tenant-controlled destination) are rejected without having to be
+			// added to a hand-maintained deny-list.
+			if err := validateYAMLFilePathField(field, fieldValue); err != nil {
+				return err
+			}
 
 			// Skip any field value which can't be converted to interface (eg. primitive types).
 			if fieldValue.CanInterface() {
@@ -429,7 +447,62 @@ func validateGlobalConfig(cfg config.GlobalConfig) error {
 	if cfg.SlackAPIURLFile != "" {
 		return errSlackAPIURLFileNotAllowed
 	}
+	if cfg.OpsGenieAPIKeyFile != "" {
+		return errOpsGenieAPIKeyFileNotAllowed
+	}
 	return nil
+}
+
+// validateOpsGenieConfig validates the OpsGenie receiver config and returns an
+// error if it contains settings not allowed by Cortex. Cortex forbids any
+// file-path reference because the vendored Alertmanager notifier reads the
+// referenced path at notification time and sends its contents to the
+// tenant-controlled api_url (see
+// vendor/github.com/prometheus/alertmanager/notify/opsgenie/opsgenie.go).
+func validateOpsGenieConfig(cfg config.OpsGenieConfig) error {
+	if cfg.APIKeyFile != "" {
+		return errOpsGenieAPIKeyFileNotAllowed
+	}
+	return nil
+}
+
+// validateYAMLFilePathField rejects any non-empty string-valued struct field
+// whose yaml tag name ends in "_file". Cortex's security requirement is that
+// tenants must not be able to make the Alertmanager read local files; this
+// positive check fails closed when the vendored Alertmanager grows new
+// *_file fields that have not yet been added to the explicit per-type
+// validators above.
+func validateYAMLFilePathField(field reflect.StructField, value reflect.Value) error {
+	tag := field.Tag.Get("yaml")
+	if tag == "" || tag == "-" {
+		return nil
+	}
+	// The yaml tag is of the form "name[,opt1,opt2]". We only care about the name.
+	name := tag
+	if comma := strings.Index(tag, ","); comma >= 0 {
+		name = tag[:comma]
+	}
+	if name == "" || !strings.HasSuffix(name, "_file") {
+		return nil
+	}
+
+	// Only reject non-empty scalar string values. Nested structs are already
+	// handled by the recursive walk, and non-string file-path fields do not
+	// exist in the vendored Alertmanager config today.
+	v := value
+	for v.Kind() == reflect.Ptr {
+		if v.IsNil() {
+			return nil
+		}
+		v = v.Elem()
+	}
+	if v.Kind() != reflect.String {
+		return nil
+	}
+	if v.Len() == 0 {
+		return nil
+	}
+	return errors.Wrapf(errFilePathNotAllowed, "field %q (yaml %q)", field.Name, name)
 }
 
 // validateSlackConfig validates the Slack config and returns an error if it contains
