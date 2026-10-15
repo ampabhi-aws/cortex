@@ -3,14 +3,23 @@ package querier
 import (
 	"context"
 
-	"github.com/cortexproject/cortex/pkg/util/validation"
-
+	"github.com/go-kit/log/level"
 	"github.com/gogo/status"
 	"github.com/pkg/errors"
 	"github.com/prometheus/prometheus/model/labels"
 	"github.com/prometheus/prometheus/promql"
 	"github.com/prometheus/prometheus/storage"
+
+	util_log "github.com/cortexproject/cortex/pkg/util/log"
+	"github.com/cortexproject/cortex/pkg/util/validation"
 )
+
+// genericInternalQueryError is the client-facing message returned for 5xx /
+// internal querier failures. The original error (which may embed internal
+// topology such as store-gateway instance addresses) is logged server-side
+// but never forwarded to the tenant. See the CWE-497 remediation in
+// TranslateToPromqlAPIError below.
+var genericInternalQueryError = errors.New("internal error executing query")
 
 // TranslateToPromqlAPIError converts error to one of promql.Errors for consumption in PromQL API.
 // PromQL API only recognizes few errors, and converts everything else to HTTP status code 422.
@@ -55,17 +64,32 @@ func TranslateToPromqlAPIError(err error) error {
 
 			// Treat these as HTTP status codes, even though they are supposed to be grpc codes.
 			if code >= 400 && code < 500 {
-				// Return directly, will be mapped to 422
+				// Return directly, will be mapped to 422.
+				// 4xx errors are client-caused and safe to forward verbatim.
 				return err
 			} else if code >= 500 && code < 599 {
-				// Wrap into ErrStorage for mapping to 500
-				return promql.ErrStorage{Err: err}
+				// Wrap into ErrStorage for mapping to 500. The original error
+				// may embed internal topology (e.g. store-gateway/ingester
+				// instance addresses from pkg/querier/blocks_store_queryable.go);
+				// log it server-side and return a generic message to the client.
+				return sanitizeInternalQueryError(err)
 			}
 		}
 
-		// All other errors will be returned as 500.
-		return promql.ErrStorage{Err: err}
+		// All other errors will be returned as 500. Same sanitization as
+		// the explicit 5xx gRPC branch above: never leak the wrapped
+		// internal error text to the tenant.
+		return sanitizeInternalQueryError(err)
 	}
+}
+
+// sanitizeInternalQueryError logs the original internal error server-side
+// and returns a generic promql.ErrStorage so that internal cluster topology
+// (store-gateway/ingester addresses, gRPC dial details, etc.) is never
+// serialized into the tenant-facing HTTP 500 response body.
+func sanitizeInternalQueryError(err error) error {
+	level.Warn(util_log.Logger).Log("msg", "internal error executing query", "err", err)
+	return promql.ErrStorage{Err: genericInternalQueryError}
 }
 
 // ErrTranslateFn is used to translate or wrap error before returning it by functions in
