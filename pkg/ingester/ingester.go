@@ -522,6 +522,14 @@ type TSDBState struct {
 	// Number of series in memory, across all tenants.
 	seriesCount atomic.Int64
 
+	// Singleflight-style coordination for per-tenant TSDB creation. The in-flight
+	// map tracks TSDBs that are currently being created so we only run the
+	// expensive tsdb.Open/Compact/shipper initialisation once per tenant, and so
+	// that we don't need to hold the global stoppedMtx write lock across that
+	// filesystem I/O.
+	tsdbCreationMtx sync.Mutex
+	tsdbCreationCh  map[string]chan struct{}
+
 	// Head compactions metrics.
 	compactionsTriggered   prometheus.Counter
 	compactionsFailed      prometheus.Counter
@@ -559,6 +567,7 @@ func newTSDBState(bucketClient objstore.Bucket, registerer prometheus.Registerer
 		tsdbMetrics:         newTSDBMetrics(registerer),
 		forceCompactTrigger: make(chan requestWithUsersAndCallback),
 		shipTrigger:         make(chan requestWithUsersAndCallback),
+		tsdbCreationCh:      make(map[string]chan struct{}),
 
 		compactionsTriggered: promauto.With(registerer).NewCounter(prometheus.CounterOpts{
 			Name: "cortex_ingester_tsdb_compactions_triggered_total",
@@ -1761,44 +1770,92 @@ func (i *Ingester) getOrCreateTSDB(userID string, force bool) (*userTSDB, error)
 		return db, nil
 	}
 
-	i.stoppedMtx.Lock()
-	defer i.stoppedMtx.Unlock()
-
-	// Check again for DB in the event it was created in-between locks
-	var ok bool
-	db, ok = i.TSDBState.dbs[userID]
-	if ok {
-		return db, nil
-	}
-
-	// We're ready to create the TSDB, however we must be sure that the ingester
-	// is in the ACTIVE state, otherwise it may conflict with the transfer in/out.
-	// The TSDB is created when the first series is pushed and this shouldn't happen
-	// to a non-ACTIVE ingester, however we want to protect from any bug, cause we
-	// may have data loss or TSDB WAL corruption if the TSDB is created before/during
-	// a transfer in occurs.
-	if ingesterState := i.lifecycler.GetState(); !force && ingesterState != ring.ACTIVE {
-		return nil, fmt.Errorf(errTSDBCreateIncompatibleState, ingesterState)
-	}
-
-	gl := i.getInstanceLimits()
-	if gl != nil && gl.MaxInMemoryTenants > 0 {
-		if users := int64(len(i.TSDBState.dbs)); users >= gl.MaxInMemoryTenants {
-			return nil, errMaxUsersLimitReached
+	// Coordinate concurrent creations for the same tenant with a per-user
+	// singleflight channel so we don't need to hold the global stoppedMtx write
+	// lock across the expensive tsdb.Open/Compact/shipper initialisation. All
+	// other callers of stoppedMtx (push and read paths) are therefore not
+	// blocked while the TSDB for a brand new tenant is being created.
+	for {
+		i.TSDBState.tsdbCreationMtx.Lock()
+		if ch, inflight := i.TSDBState.tsdbCreationCh[userID]; inflight {
+			i.TSDBState.tsdbCreationMtx.Unlock()
+			// Another goroutine is creating this TSDB; wait for it to finish
+			// and then re-check the map.
+			<-ch
+			if db = i.getTSDB(userID); db != nil {
+				return db, nil
+			}
+			// The other creation failed (or the TSDB was removed since). Loop
+			// and try to become the creator ourselves.
+			continue
 		}
+
+		// Re-check the dbs map under stoppedMtx in case it was created between
+		// our fast-path getTSDB and acquiring tsdbCreationMtx. We also validate
+		// the ingester state and instance limits here, then register the
+		// in-flight marker before releasing the lock. This critical section
+		// touches only in-memory maps; the expensive filesystem work is done
+		// outside any global lock below.
+		i.stoppedMtx.Lock()
+		if existing, ok := i.TSDBState.dbs[userID]; ok {
+			i.stoppedMtx.Unlock()
+			i.TSDBState.tsdbCreationMtx.Unlock()
+			return existing, nil
+		}
+
+		// We're ready to create the TSDB, however we must be sure that the ingester
+		// is in the ACTIVE state, otherwise it may conflict with the transfer in/out.
+		// The TSDB is created when the first series is pushed and this shouldn't happen
+		// to a non-ACTIVE ingester, however we want to protect from any bug, cause we
+		// may have data loss or TSDB WAL corruption if the TSDB is created before/during
+		// a transfer in occurs.
+		if ingesterState := i.lifecycler.GetState(); !force && ingesterState != ring.ACTIVE {
+			i.stoppedMtx.Unlock()
+			i.TSDBState.tsdbCreationMtx.Unlock()
+			return nil, fmt.Errorf(errTSDBCreateIncompatibleState, ingesterState)
+		}
+
+		gl := i.getInstanceLimits()
+		if gl != nil && gl.MaxInMemoryTenants > 0 {
+			// Count both already-created TSDBs and in-flight creations so a
+			// burst of concurrent fresh-tenant pushes can't race past the cap.
+			if users := int64(len(i.TSDBState.dbs) + len(i.TSDBState.tsdbCreationCh)); users >= gl.MaxInMemoryTenants {
+				i.stoppedMtx.Unlock()
+				i.TSDBState.tsdbCreationMtx.Unlock()
+				return nil, errMaxUsersLimitReached
+			}
+		}
+		i.stoppedMtx.Unlock()
+
+		ch := make(chan struct{})
+		i.TSDBState.tsdbCreationCh[userID] = ch
+		i.TSDBState.tsdbCreationMtx.Unlock()
+
+		// Create the database and a shipper for a user. This performs filesystem
+		// I/O (tsdb.Open, Compact, shipper initialisation) and is intentionally
+		// done without holding stoppedMtx so that push and read lookups for
+		// other tenants are not stalled.
+		createdDB, createErr := i.createTSDB(userID)
+
+		// Publish the result (or clear the in-flight marker on failure) under
+		// the appropriate locks, and signal any waiters.
+		if createErr == nil {
+			i.stoppedMtx.Lock()
+			i.TSDBState.dbs[userID] = createdDB
+			i.stoppedMtx.Unlock()
+			i.metrics.memUsers.Inc()
+		}
+
+		i.TSDBState.tsdbCreationMtx.Lock()
+		delete(i.TSDBState.tsdbCreationCh, userID)
+		i.TSDBState.tsdbCreationMtx.Unlock()
+		close(ch)
+
+		if createErr != nil {
+			return nil, createErr
+		}
+		return createdDB, nil
 	}
-
-	// Create the database and a shipper for a user
-	db, err := i.createTSDB(userID)
-	if err != nil {
-		return nil, err
-	}
-
-	// Add the db to list of user databases
-	i.TSDBState.dbs[userID] = db
-	i.metrics.memUsers.Inc()
-
-	return db, nil
 }
 
 // createTSDB creates a TSDB for a given userID, and returns the created db.
