@@ -74,6 +74,15 @@ func containsUnsafePathSegments(id string) bool {
 	return strings.ContainsAny(id, "\\/")
 }
 
+// containsCacheKeyDelimiter reports whether the tenant ID contains the ':'
+// character used as a field delimiter in the results-cache key. A tenant ID
+// containing ':' can produce an ambiguous cache key across the (tenant, query)
+// boundary, so SingleResolver rejects it even though it is otherwise an
+// in-charset character for the single-tenant resolver.
+func containsCacheKeyDelimiter(id string) bool {
+	return strings.ContainsRune(id, ':')
+}
+
 var errInvalidTenantID = errors.New("invalid tenant ID")
 
 func (t *SingleResolver) TenantID(ctx context.Context) (string, error) {
@@ -84,6 +93,10 @@ func (t *SingleResolver) TenantID(ctx context.Context) (string, error) {
 	}
 
 	if containsUnsafePathSegments(id) {
+		return "", errInvalidTenantID
+	}
+
+	if containsCacheKeyDelimiter(id) {
 		return "", errInvalidTenantID
 	}
 
