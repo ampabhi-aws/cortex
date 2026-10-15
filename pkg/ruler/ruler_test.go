@@ -1101,6 +1101,7 @@ type ruleGroupKey struct {
 func TestRuler_ListAllRules(t *testing.T) {
 	store := newMockRuleStore(mockRules)
 	cfg := defaultRulerConfig(t)
+	cfg.EnableAdminAPI = true
 
 	r := newTestRuler(t, cfg, store, nil)
 	defer services.StopAndAwaitTerminated(context.Background(), r) //nolint:errcheck
@@ -1133,6 +1134,31 @@ func TestRuler_ListAllRules(t *testing.T) {
 	expectedResponse, err := yaml.Marshal(gs)
 	require.NoError(t, err)
 	require.YAMLEq(t, string(expectedResponse), string(body))
+}
+
+func TestRuler_ListAllRules_AdminAPIDisabledByDefault(t *testing.T) {
+	store := newMockRuleStore(mockRules)
+	cfg := defaultRulerConfig(t)
+	// EnableAdminAPI defaults to false; verify the endpoint refuses to serve.
+
+	r := newTestRuler(t, cfg, store, nil)
+	defer services.StopAndAwaitTerminated(context.Background(), r) //nolint:errcheck
+
+	router := mux.NewRouter()
+	router.Path("/ruler/rule_groups").Methods(http.MethodGet).HandlerFunc(r.ListAllRules)
+
+	req := requestFor(t, http.MethodGet, "https://localhost:8080/ruler/rule_groups", nil, "")
+	w := httptest.NewRecorder()
+	router.ServeHTTP(w, req)
+
+	resp := w.Result()
+	body, _ := io.ReadAll(resp.Body)
+
+	require.Equal(t, http.StatusNotFound, resp.StatusCode)
+	// Response body must not contain any tenant IDs or rule contents.
+	for userID := range mockRules {
+		require.NotContains(t, string(body), userID)
+	}
 }
 
 type senderFunc func(alerts ...*notifier.Alert)
