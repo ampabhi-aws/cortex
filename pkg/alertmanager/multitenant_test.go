@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"io"
 	"math/rand"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"net/http/pprof"
@@ -370,10 +371,10 @@ templates:
 
 func TestMultitenantAlertmanager_FirewallShouldBlockHTTPBasedReceiversWhenEnabled(t *testing.T) {
 	tests := map[string]struct {
-		getAlertmanagerConfig func(backendURL string) string
+		getAlertmanagerConfig func(backendHostPort string) string
 	}{
 		"webhook": {
-			getAlertmanagerConfig: func(backendURL string) string {
+			getAlertmanagerConfig: func(backendHostPort string) string {
 				return fmt.Sprintf(`
 route:
   receiver: webhook
@@ -383,12 +384,12 @@ route:
 receivers:
   - name: webhook
     webhook_configs:
-      - url: %s
-`, backendURL)
+      - url: http://%s
+`, backendHostPort)
 			},
 		},
 		"pagerduty": {
-			getAlertmanagerConfig: func(backendURL string) string {
+			getAlertmanagerConfig: func(backendHostPort string) string {
 				return fmt.Sprintf(`
 route:
   receiver: pagerduty
@@ -398,13 +399,13 @@ route:
 receivers:
   - name: pagerduty
     pagerduty_configs:
-      - url: %s
+      - url: http://%s
         routing_key: secret
-`, backendURL)
+`, backendHostPort)
 			},
 		},
 		"slack": {
-			getAlertmanagerConfig: func(backendURL string) string {
+			getAlertmanagerConfig: func(backendHostPort string) string {
 				return fmt.Sprintf(`
 route:
   receiver: slack
@@ -414,13 +415,13 @@ route:
 receivers:
   - name: slack
     slack_configs:
-      - api_url: %s
+      - api_url: http://%s
         channel: test
-`, backendURL)
+`, backendHostPort)
 			},
 		},
 		"opsgenie": {
-			getAlertmanagerConfig: func(backendURL string) string {
+			getAlertmanagerConfig: func(backendHostPort string) string {
 				return fmt.Sprintf(`
 route:
   receiver: opsgenie
@@ -430,13 +431,13 @@ route:
 receivers:
   - name: opsgenie
     opsgenie_configs:
-      - api_url: %s
+      - api_url: http://%s
         api_key: secret
-`, backendURL)
+`, backendHostPort)
 			},
 		},
 		"wechat": {
-			getAlertmanagerConfig: func(backendURL string) string {
+			getAlertmanagerConfig: func(backendHostPort string) string {
 				return fmt.Sprintf(`
 route:
   receiver: wechat
@@ -446,10 +447,28 @@ route:
 receivers:
   - name: wechat
     wechat_configs:
-      - api_url: %s
+      - api_url: http://%s
         api_secret: secret
         corp_id: babycorp
-`, backendURL)
+`, backendHostPort)
+			},
+		},
+		"email": {
+			getAlertmanagerConfig: func(backendHostPort string) string {
+				return fmt.Sprintf(`
+route:
+  receiver: mail
+  group_wait: 0s
+  group_interval: 1s
+
+receivers:
+  - name: mail
+    email_configs:
+      - to: probe@example.com
+        from: cortex@example.com
+        smarthost: %s
+        require_tls: false
+`, backendHostPort)
 			},
 		},
 	}
@@ -467,15 +486,39 @@ receivers:
 				userID := "user-1"
 				serverInvoked := atomic.NewBool(false)
 
-				// Create a local HTTP server to test whether the request is received.
-				server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
-					serverInvoked.Store(true)
-					writer.WriteHeader(http.StatusOK)
-				}))
-				defer server.Close()
+				var backendHostPort string
+				if receiverName == "email" {
+					// SMTP integrations are not HTTP, so stand up a bare TCP
+					// listener that just records any inbound connection and
+					// immediately closes it. This is sufficient to prove that
+					// the firewall dialer prevented (or did not prevent) the
+					// connection to the smarthost.
+					listener, err := net.Listen("tcp", "127.0.0.1:0")
+					require.NoError(t, err)
+					defer listener.Close()
+					go func() {
+						for {
+							conn, err := listener.Accept()
+							if err != nil {
+								return
+							}
+							serverInvoked.Store(true)
+							conn.Close()
+						}
+					}()
+					backendHostPort = listener.Addr().String()
+				} else {
+					// Create a local HTTP server to test whether the request is received.
+					server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+						serverInvoked.Store(true)
+						writer.WriteHeader(http.StatusOK)
+					}))
+					defer server.Close()
+					backendHostPort = server.Listener.Addr().String()
+				}
 
 				// Create the alertmanager config.
-				alertmanagerCfg := testData.getAlertmanagerConfig(fmt.Sprintf("http://%s", server.Listener.Addr().String()))
+				alertmanagerCfg := testData.getAlertmanagerConfig(backendHostPort)
 
 				// Store the alertmanager config in the bucket.
 				store := prepareInMemoryAlertStore()
