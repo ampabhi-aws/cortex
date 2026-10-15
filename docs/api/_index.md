@@ -797,6 +797,36 @@ POST /purger/delete_tenant
 
 Request deletion of ALL tenant data. Only works with blocks storage. Experimental.
 
+The request MUST include an explicit confirmation parameter named `tenant`
+(URL query parameter or `application/x-www-form-urlencoded` body) whose value
+equals the tenant ID supplied in the `X-Scope-OrgID` header. Requests without
+this parameter, or where it does not match the header, are rejected with
+`400 Bad Request`. This prevents accidental or cross-site POSTs from
+destroying tenant data.
+
+> **Warning:** this is an administrative, irreversible-after-cleanup endpoint.
+> It MUST NOT be exposed directly to tenants. Operators are expected to block
+> `/purger/*` for tenant traffic at the authenticating reverse proxy and
+> restrict it to a dedicated admin path.
+
+_Requires [authentication](#authentication)._
+
+### Tenant Undelete Request
+
+```
+POST /purger/undelete_tenant
+```
+
+Removes a previously written tenant deletion marker so that the compactor's
+blocks cleaner stops hard-deleting the tenant's blocks on subsequent cleanup
+cycles. Like `/purger/delete_tenant` it requires the matching `tenant`
+confirmation parameter.
+
+Note: this reliably reverts an accidental or malicious `delete_tenant` call
+only if invoked before the next compactor cleanup cycle
+(`-compactor.cleanup-interval`, default 15m); any blocks the cleaner has
+already removed will not be restored.
+
 _Requires [authentication](#authentication)._
 
 ### Tenant Delete Status
