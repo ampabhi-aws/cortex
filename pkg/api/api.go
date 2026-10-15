@@ -291,7 +291,11 @@ func (a *API) RegisterRuler(r *ruler.Ruler) {
 	// Legacy Ring Route
 	a.RegisterRoute("/ruler_ring", r, false, "GET", "POST")
 
-	// List all user rule groups
+	// List all user rule groups. The handler itself is gated by the
+	// -ruler.enable-admin-api flag (disabled by default) because it returns
+	// every tenant's rule groups and tenant IDs in a single response. The
+	// route is still registered so that operators get a predictable 404 when
+	// the admin API is disabled, instead of a 405 or a reroute.
 	a.RegisterRoute("/ruler/rule_groups", http.HandlerFunc(r.ListAllRules), false, "GET")
 
 	ruler.RegisterRulerServer(a.server.GRPC, r)

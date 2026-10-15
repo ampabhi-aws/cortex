@@ -116,6 +116,12 @@ type Config struct {
 
 	EnableAPI bool `yaml:"enable_api"`
 
+	// EnableAdminAPI, when false (the default), disables the all-tenant admin
+	// endpoint (GET /ruler/rule_groups). Operators must opt in explicitly and
+	// terminate authentication/authorization at an external gateway, because
+	// the handler returns every tenant's rule groups in a single response.
+	EnableAdminAPI bool `yaml:"enable_admin_api"`
+
 	EnabledTenants  flagext.StringSliceCSV `yaml:"enabled_tenants"`
 	DisabledTenants flagext.StringSliceCSV `yaml:"disabled_tenants"`
 
@@ -174,6 +180,7 @@ func (cfg *Config) RegisterFlags(f *flag.FlagSet) {
 	f.DurationVar(&cfg.FlushCheckPeriod, "ruler.flush-period", 1*time.Minute, "Period with which to attempt to flush rule groups.")
 	f.StringVar(&cfg.RulePath, "ruler.rule-path", "/rules", "file path to store temporary rule files for the prometheus rule managers")
 	f.BoolVar(&cfg.EnableAPI, "experimental.ruler.enable-api", false, "Enable the ruler api")
+	f.BoolVar(&cfg.EnableAdminAPI, "ruler.enable-admin-api", false, "Enable the all-tenant ruler admin endpoint (GET /ruler/rule_groups). Disabled by default because the endpoint returns every tenant's rule groups and must only be exposed to trusted operators behind an authenticating gateway.")
 	f.DurationVar(&cfg.OutageTolerance, "ruler.for-outage-tolerance", time.Hour, `Max time to tolerate outage for restoring "for" state of alert.`)
 	f.DurationVar(&cfg.ForGracePeriod, "ruler.for-grace-period", 10*time.Minute, `Minimum duration between alert and restored "for" state. This is maintained only for alerts with configured "for" time greater than grace period.`)
 	f.DurationVar(&cfg.ResendDelay, "ruler.resend-delay", time.Minute, `Minimum amount of time to wait before resending an alert to Alertmanager.`)
@@ -862,6 +869,19 @@ func (r *Ruler) DeleteTenantConfiguration(w http.ResponseWriter, req *http.Reque
 
 func (r *Ruler) ListAllRules(w http.ResponseWriter, req *http.Request) {
 	logger := util_log.WithContext(req.Context(), r.logger)
+
+	// This endpoint streams every tenant's rule groups and must only be
+	// reachable by trusted operators. It is disabled by default so that a
+	// Cortex deployment that is accidentally exposed without an authenticating
+	// gateway does not leak cross-tenant rule configuration (PromQL
+	// expressions, alert annotations, tenant IDs). Operators that need this
+	// endpoint must opt in explicitly via -ruler.enable-admin-api and front it
+	// with an authenticating reverse proxy as described in
+	// docs/guides/authentication-and-authorisation.md.
+	if !r.cfg.EnableAdminAPI {
+		http.Error(w, "the ruler admin API is disabled; enable it with -ruler.enable-admin-api and only expose it to trusted operators", http.StatusNotFound)
+		return
+	}
 
 	userIDs, err := r.store.ListAllUsers(req.Context())
 	if err != nil {

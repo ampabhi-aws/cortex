@@ -1330,6 +1330,12 @@ ring:
 # CLI flag: -experimental.ruler.enable-api
 [enable_api: <boolean> | default = false]
 
+# Enable the all-tenant ruler admin endpoint (GET /ruler/rule_groups). Disabled
+# by default because the endpoint returns every tenant's rule groups and must
+# only be exposed to trusted operators behind an authenticating gateway.
+# CLI flag: -ruler.enable-admin-api
+[enable_admin_api: <boolean> | default = false]
+
 # Comma separated list of tenants whose rules this ruler can evaluate. If
 # specified, only these tenants will be handled by ruler, otherwise this ruler
 # can process rules from all tenants. Subject to sharding.
