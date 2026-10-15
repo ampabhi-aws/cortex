@@ -160,6 +160,80 @@ func (d *Distributor) DistributeRequest(w http.ResponseWriter, r *http.Request) 
 	http.Error(w, "route not supported by distributor", http.StatusNotFound)
 }
 
+// DistributeRequestToOwner forwards an HTTP request for a tenant to one of the
+// Alertmanager replicas that own the tenant in the ring. It is used as a
+// catch-all route for paths that the Distributor does not natively support
+// (such as the Alertmanager web UI and static assets) when the receiving
+// replica does not own the tenant. Forwarding goes through the same gRPC
+// transport used by DistributeRequest, so the owning replica serves the
+// request locally via its handlerForGRPCServer -> serveRequest path.
+func (d *Distributor) DistributeRequestToOwner(w http.ResponseWriter, r *http.Request) {
+	d.requestsInFlight.Add(1)
+	defer d.requestsInFlight.Done()
+
+	userID, err := tenant.TenantID(r.Context())
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusUnauthorized)
+		return
+	}
+
+	logger := util_log.WithContext(r.Context(), d.logger)
+
+	replicationSet, err := d.alertmanagerRing.Get(shardByUser(userID), RingOp, nil, nil, nil)
+	if err != nil {
+		level.Error(logger).Log("msg", "failed to get replication set from the ring", "err", err)
+		http.Error(w, "failed to get alertmanager replicas from the ring", http.StatusInternalServerError)
+		return
+	}
+
+	var body []byte
+	if r.Body != nil {
+		body, err = io.ReadAll(http.MaxBytesReader(w, r.Body, d.maxRecvMsgSize))
+		if err != nil {
+			if util.IsRequestBodyTooLarge(err) {
+				http.Error(w, "Request body too large", http.StatusRequestEntityTooLarge)
+				return
+			}
+			level.Error(logger).Log("msg", "failed to read the request body during owner forward", "err", err)
+			http.Error(w, "failed to read request body", http.StatusInternalServerError)
+			return
+		}
+	}
+
+	req := &httpgrpc.HTTPRequest{
+		Method:  r.Method,
+		Url:     r.RequestURI,
+		Body:    body,
+		Headers: httpToHttpgrpcHeaders(r.Header),
+	}
+
+	sp, ctx := opentracing.StartSpanFromContext(r.Context(), "Distributor.DistributeRequestToOwner")
+	defer sp.Finish()
+
+	// Try the owning instances in a random order and return the first success.
+	instances := make([]ring.InstanceDesc, len(replicationSet.Instances))
+	copy(instances, replicationSet.Instances)
+	rand.Shuffle(len(instances), func(i, j int) {
+		instances[i], instances[j] = instances[j], instances[i]
+	})
+
+	var lastErr error
+	for _, instance := range instances {
+		resp, err := d.doRequest(ctx, instance, req)
+		if err != nil {
+			lastErr = err
+			continue
+		}
+		respondFromHTTPGRPCResponse(w, resp)
+		return
+	}
+	if lastErr != nil {
+		respondFromError(lastErr, w, logger)
+		return
+	}
+	http.Error(w, "no alertmanager replicas available for tenant", http.StatusServiceUnavailable)
+}
+
 func (d *Distributor) doQuorum(userID string, w http.ResponseWriter, r *http.Request, logger log.Logger, m merger.Merger) {
 	var body []byte
 	var err error
