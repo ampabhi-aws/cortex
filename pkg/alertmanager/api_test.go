@@ -419,6 +419,39 @@ alertmanager_config: |
 			err: errors.Wrap(errVictorOpsAPIKeyFileNotAllowed, "error validating Alertmanager config"),
 		},
 		{
+			name: "Should return error if OpsGenie api_key_file is set on receiver",
+			cfg: `
+alertmanager_config: |
+  receivers:
+    - name: default-receiver
+      opsgenie_configs:
+        - api_key_file: /secrets
+
+  route:
+    receiver: 'default-receiver'
+`,
+			err: errors.Wrap(errOpsGenieAPIKeyFileNotAllowed, "error validating Alertmanager config"),
+		},
+		{
+			name: "Should return error if global opsgenie_api_key_file is set",
+			cfg: `
+alertmanager_config: |
+  global:
+    opsgenie_api_key_file: /secrets
+    opsgenie_api_url: https://example.invalid/
+  receivers:
+    - name: default-receiver
+      opsgenie_configs:
+        - message: x
+
+  route:
+    receiver: 'default-receiver'
+    group_wait: 0s
+    group_interval: 1s
+`,
+			err: errors.Wrap(errOpsGenieAPIKeyFileNotAllowed, "error validating Alertmanager config"),
+		},
+		{
 			name: "should return error if template is wrong",
 			cfg: `
 alertmanager_config: |
@@ -785,6 +818,18 @@ func TestValidateAlertmanagerConfig(t *testing.T) {
 			},
 			expected: errTLSFileNotAllowed,
 		},
+		"OpsGenieConfig with api_key_file": {
+			input: config.OpsGenieConfig{
+				APIKeyFile: "/secrets",
+			},
+			expected: errOpsGenieAPIKeyFileNotAllowed,
+		},
+		"GlobalConfig with opsgenie_api_key_file": {
+			input: config.GlobalConfig{
+				OpsGenieAPIKeyFile: "/secrets",
+			},
+			expected: errOpsGenieAPIKeyFileNotAllowed,
+		},
 	}
 
 	for testName, testData := range tests {
@@ -793,4 +838,171 @@ func TestValidateAlertmanagerConfig(t *testing.T) {
 			assert.ErrorIs(t, err, testData.expected)
 		})
 	}
+}
+
+// TestValidateAlertmanagerConfig_RejectsAllFilePathFields is a regression test
+// for CWE-497 "Alertmanager config validation deny-list misses OpsGenie
+// api_key_file". It unmarshals a full Alertmanager YAML config that references
+// every file-path setting the vendored Alertmanager v0.24 supports and asserts
+// that validateAlertmanagerConfig rejects each one. If a future vendor bump
+// introduces a new "*_file" field in the alertmanager config, add a case here
+// so the positive validation in validateYAMLFilePathField continues to cover
+// it; the deny-list must stay complete.
+func TestValidateAlertmanagerConfig_RejectsAllFilePathFields(t *testing.T) {
+	// Each entry is a self-contained alertmanager_config YAML that sets
+	// exactly one "*_file" field reachable from a tenant-submitted config.
+	cases := map[string]string{
+		"http_config.basic_auth.password_file": `
+route:
+  receiver: r
+receivers:
+  - name: r
+    webhook_configs:
+      - url: http://example.invalid
+        http_config:
+          basic_auth:
+            username: u
+            password_file: /secrets
+`,
+		"http_config.authorization.credentials_file": `
+route:
+  receiver: r
+receivers:
+  - name: r
+    webhook_configs:
+      - url: http://example.invalid
+        http_config:
+          authorization:
+            credentials_file: /secrets
+`,
+		"http_config.bearer_token_file": `
+route:
+  receiver: r
+receivers:
+  - name: r
+    webhook_configs:
+      - url: http://example.invalid
+        http_config:
+          bearer_token_file: /secrets
+`,
+		"http_config.oauth2.client_secret_file": `
+route:
+  receiver: r
+receivers:
+  - name: r
+    webhook_configs:
+      - url: http://example.invalid
+        http_config:
+          oauth2:
+            client_id: id
+            client_secret_file: /secrets
+            token_url: http://example.invalid/token
+`,
+		"http_config.tls_config.ca_file": `
+route:
+  receiver: r
+receivers:
+  - name: r
+    webhook_configs:
+      - url: http://example.invalid
+        http_config:
+          tls_config:
+            ca_file: /secrets
+`,
+		"http_config.tls_config.cert_file": `
+route:
+  receiver: r
+receivers:
+  - name: r
+    webhook_configs:
+      - url: http://example.invalid
+        http_config:
+          tls_config:
+            cert_file: /secrets
+`,
+		"http_config.tls_config.key_file": `
+route:
+  receiver: r
+receivers:
+  - name: r
+    webhook_configs:
+      - url: http://example.invalid
+        http_config:
+          tls_config:
+            key_file: /secrets
+`,
+		"global.slack_api_url_file": `
+global:
+  slack_api_url_file: /secrets
+route:
+  receiver: r
+receivers:
+  - name: r
+`,
+		"slack_configs.api_url_file": `
+route:
+  receiver: r
+receivers:
+  - name: r
+    slack_configs:
+      - api_url_file: /secrets
+`,
+		"victorops_configs.api_key_file": `
+route:
+  receiver: r
+receivers:
+  - name: r
+    victorops_configs:
+      - api_key_file: /secrets
+        api_key: k
+        routing_key: rk
+`,
+		"global.opsgenie_api_key_file": `
+global:
+  opsgenie_api_key_file: /secrets
+  opsgenie_api_url: https://example.invalid/
+route:
+  receiver: r
+  group_wait: 0s
+  group_interval: 1s
+receivers:
+  - name: r
+    opsgenie_configs:
+      - message: x
+`,
+		"opsgenie_configs.api_key_file": `
+route:
+  receiver: r
+receivers:
+  - name: r
+    opsgenie_configs:
+      - api_key_file: /secrets
+`,
+	}
+
+	for name, raw := range cases {
+		t.Run(name, func(t *testing.T) {
+			cfg, err := config.Load(raw)
+			require.NoError(t, err, "test fixture must be a parseable Alertmanager config")
+			err = validateAlertmanagerConfig(cfg)
+			assert.Errorf(t, err, "expected validateAlertmanagerConfig to reject %q", name)
+		})
+	}
+}
+
+// TestValidateAlertmanagerConfig_PositiveFilePathWalk asserts the generic
+// "yaml tag ends in _file" fail-closed walk is wired into the recursive
+// validator by exercising it on a synthetic struct that doesn't match any of
+// the hand-maintained per-type validators above.
+func TestValidateAlertmanagerConfig_PositiveFilePathWalk(t *testing.T) {
+	type synthetic struct {
+		SecretPath string `yaml:"future_api_key_file,omitempty"`
+	}
+	err := validateAlertmanagerConfig(synthetic{SecretPath: "/etc/passwd"})
+	require.Error(t, err)
+	assert.ErrorIs(t, err, errFilePathNotAllowed)
+
+	// Empty value is accepted (no false positive on absent fields).
+	err = validateAlertmanagerConfig(synthetic{})
+	assert.NoError(t, err)
 }
