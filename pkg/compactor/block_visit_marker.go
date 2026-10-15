@@ -25,11 +25,18 @@ const (
 	BlockVisitMarkerFile = "visit-mark.json"
 	// VisitMarkerVersion1 is the current supported version of visit-mark file.
 	VisitMarkerVersion1 = 1
+	// blockVisitMarkerFutureAllowance is the maximum amount of clock skew we tolerate
+	// in a visit marker's VisitTime before treating the marker as untrustworthy. Any
+	// marker whose VisitTime is more than this far in the future (e.g. because of
+	// clock skew on the writer or a tampered/corrupt marker file) is ignored by the
+	// visited check so that the group is not stalled forever.
+	blockVisitMarkerFutureAllowance = 5 * time.Minute
 )
 
 var (
-	ErrorBlockVisitMarkerNotFound  = errors.New("block visit marker not found")
-	ErrorUnmarshalBlockVisitMarker = errors.New("unmarshal block visit marker JSON")
+	ErrorBlockVisitMarkerNotFound        = errors.New("block visit marker not found")
+	ErrorUnmarshalBlockVisitMarker       = errors.New("unmarshal block visit marker JSON")
+	ErrorBlockVisitMarkerVersionMismatch = errors.New("unexpected block visit marker version")
 )
 
 type BlockVisitMarker struct {
@@ -40,12 +47,45 @@ type BlockVisitMarker struct {
 	Version int `json:"version"`
 }
 
+// effectiveExpiry returns the time at which the marker should be considered
+// expired, bounded so that a far-future VisitTime cannot keep the marker
+// "valid" beyond now+blockVisitMarkerTimeout. If VisitTime is more than the
+// small allowance in the future it is treated as invalid (zero time), which
+// callers interpret as not-visited.
+func (b *BlockVisitMarker) effectiveExpiry(blockVisitMarkerTimeout time.Duration) time.Time {
+	now := time.Now()
+	visit := time.Unix(b.VisitTime, 0)
+	// Reject markers whose VisitTime is implausibly far in the future.
+	if visit.After(now.Add(blockVisitMarkerFutureAllowance)) {
+		return time.Time{}
+	}
+	expiry := visit.Add(blockVisitMarkerTimeout)
+	// Cap the effective expiry so that a VisitTime slightly in the future (within
+	// the allowance) still cannot keep the marker alive longer than one timeout
+	// window from now.
+	if maxExpiry := now.Add(blockVisitMarkerTimeout); expiry.After(maxExpiry) {
+		expiry = maxExpiry
+	}
+	return expiry
+}
+
 func (b *BlockVisitMarker) isVisited(blockVisitMarkerTimeout time.Duration) bool {
-	return time.Now().Before(time.Unix(b.VisitTime, 0).Add(blockVisitMarkerTimeout))
+	expiry := b.effectiveExpiry(blockVisitMarkerTimeout)
+	if expiry.IsZero() {
+		return false
+	}
+	return time.Now().Before(expiry)
 }
 
 func (b *BlockVisitMarker) isVisitedByCompactor(blockVisitMarkerTimeout time.Duration, compactorID string) bool {
-	return b.CompactorID == compactorID && time.Now().Before(time.Unix(b.VisitTime, 0).Add(blockVisitMarkerTimeout))
+	if b.CompactorID != compactorID {
+		return false
+	}
+	expiry := b.effectiveExpiry(blockVisitMarkerTimeout)
+	if expiry.IsZero() {
+		return false
+	}
+	return time.Now().Before(expiry)
 }
 
 func ReadBlockVisitMarker(ctx context.Context, bkt objstore.InstrumentedBucketReader, logger log.Logger, blockID string, blockVisitMarkerReadFailed prometheus.Counter) (*BlockVisitMarker, error) {
@@ -70,7 +110,8 @@ func ReadBlockVisitMarker(ctx context.Context, bkt objstore.InstrumentedBucketRe
 		return nil, errors.Wrapf(ErrorUnmarshalBlockVisitMarker, "block visit marker file: %s, error: %v", visitMarkerFile, err.Error())
 	}
 	if blockVisitMarker.Version != VisitMarkerVersion1 {
-		return nil, errors.Errorf("unexpected block visit mark file version %d, expected %d", blockVisitMarker.Version, VisitMarkerVersion1)
+		blockVisitMarkerReadFailed.Inc()
+		return nil, errors.Wrapf(ErrorBlockVisitMarkerVersionMismatch, "block visit marker file: %s, version %d, expected %d", visitMarkerFile, blockVisitMarker.Version, VisitMarkerVersion1)
 	}
 	return &blockVisitMarker, nil
 }
