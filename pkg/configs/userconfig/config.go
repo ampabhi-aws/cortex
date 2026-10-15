@@ -103,7 +103,29 @@ type Config struct {
 	// RulesFiles maps from a rules filename to file contents.
 	RulesConfig        RulesConfig
 	TemplateFiles      map[string]string
+	// AlertmanagerConfig is the tenant's raw Alertmanager YAML, which
+	// normally contains third-party notification credentials (Slack
+	// webhooks, PagerDuty/OpsGenie keys, SMTP passwords, ...). It must
+	// NEVER be logged in clear text; see the String/GoString methods on
+	// Config and View below for the masking that enforces this.
 	AlertmanagerConfig string
+}
+
+// String implements fmt.Stringer and redacts the sensitive fields of a
+// Config so that logging a Config value with %s / %v does not leak
+// tenant Alertmanager secrets.
+func (c Config) String() string {
+	return fmt.Sprintf(
+		"userconfig.Config{AlertmanagerConfig:<redacted len=%d>, TemplateFiles:<redacted count=%d>, RulesConfig:<redacted files=%d>}",
+		len(c.AlertmanagerConfig), len(c.TemplateFiles), len(c.RulesConfig.Files),
+	)
+}
+
+// GoString implements fmt.GoStringer so that logging a Config value with
+// %#v (as the configs DB tracing decorator used to do) does not leak
+// tenant Alertmanager secrets. See CWE-215.
+func (c Config) GoString() string {
+	return c.String()
 }
 
 // configCompat is a compatibility struct to support old JSON config blobs
@@ -184,6 +206,18 @@ type View struct {
 	ID        ID        `json:"id"`
 	Config    Config    `json:"config"`
 	DeletedAt time.Time `json:"deleted_at"`
+}
+
+// String implements fmt.Stringer and redacts the embedded Config so that
+// a View value cannot be logged in clear text.
+func (v View) String() string {
+	return fmt.Sprintf("userconfig.View{ID:%d, DeletedAt:%s, Config:%s}", v.ID, v.DeletedAt.Format(time.RFC3339), v.Config.String())
+}
+
+// GoString implements fmt.GoStringer so that %#v on a View does not leak
+// tenant secrets.
+func (v View) GoString() string {
+	return v.String()
 }
 
 // IsDeleted tells you if the config is deleted.
