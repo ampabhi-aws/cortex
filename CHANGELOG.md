@@ -2,6 +2,8 @@
 
 ## master / unreleased
 
+* [BUGFIX] Ruler: don't abort the whole sync of all tenants when one tenant's rule group is concurrently deleted. `BucketRuleStore.LoadRuleGroups` now silently drops rule groups that return `ErrGroupNotFound` from the batch instead of failing it, and `listRulesShuffleSharding` logs and skips per-user listing errors instead of discarding the entire result set. #ruler-sync-isolation
+
   **This release removes support for chunks storage. See below for more.**
 * [CHANGE] Remove support for chunks storage entirely. If you are using chunks storage on a previous version, you must [migrate your data](https://github.com/cortexproject/cortex/blob/v1.11.1/docs/blocks-storage/migrate-from-chunks-to-blocks.md) on version 1.12 or earlier. Before upgrading to this release, you should also remove any deprecated chunks-related configuration, as this release will no longer accept that. The following flags are gone:
   - `-dynamodb.*`

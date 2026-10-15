@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"io"
 	"strings"
+	"sync"
 
 	"github.com/go-kit/log"
 	"github.com/go-kit/log/level"
@@ -165,8 +166,19 @@ func (b *BucketRuleStore) ListRuleGroupsForUserAndNamespace(ctx context.Context,
 }
 
 // LoadRuleGroups implements rules.RuleStore.
+//
+// Rule groups that have vanished (returning rulestore.ErrGroupNotFound) between
+// the listing phase and the fetch phase are silently dropped from groupsToLoad
+// rather than failing the whole batch. This isolates one tenant's concurrent
+// deletes from affecting the sync of unrelated tenants.
 func (b *BucketRuleStore) LoadRuleGroups(ctx context.Context, groupsToLoad map[string]rulespb.RuleGroupList) error {
 	ch := make(chan *rulespb.RuleGroupDesc)
+
+	// Pointers to rule group descriptors that were requested but have vanished
+	// from the object store since they were listed. These are later dropped from
+	// groupsToLoad so callers do not see stale entries.
+	var missingMu sync.Mutex
+	missing := map[*rulespb.RuleGroupDesc]struct{}{}
 
 	// Given we store one file per rule group. With this, we create a pool of workers that will
 	// download all rule groups in parallel. We limit the number of workers to avoid a
@@ -180,13 +192,23 @@ func (b *BucketRuleStore) LoadRuleGroups(ctx context.Context, groupsToLoad map[s
 					return fmt.Errorf("invalid rule group: user=%q, namespace=%q, group=%q", user, namespace, group)
 				}
 
-				gr, err := b.getRuleGroup(gCtx, user, namespace, group, gr) // reuse group pointer from the map.
+				loaded, err := b.getRuleGroup(gCtx, user, namespace, group, gr) // reuse group pointer from the map.
 				if err != nil {
+					// Tolerate rule groups that were deleted between listing and
+					// fetching: mark them as missing and continue so one tenant
+					// deleting its own groups cannot abort the whole sync.
+					if errors.Is(err, rulestore.ErrGroupNotFound) {
+						level.Debug(b.logger).Log("msg", "rule group vanished during load; skipping", "user", user, "namespace", namespace, "group", group)
+						missingMu.Lock()
+						missing[gr] = struct{}{}
+						missingMu.Unlock()
+						continue
+					}
 					return errors.Wrapf(err, "get rule group user=%q, namespace=%q, name=%q", user, namespace, group)
 				}
 
-				if user != gr.User || namespace != gr.Namespace || group != gr.Name {
-					return fmt.Errorf("mismatch between requested rule group and loaded rule group, requested: user=%q, namespace=%q, group=%q, loaded: user=%q, namespace=%q, group=%q", user, namespace, group, gr.User, gr.Namespace, gr.Name)
+				if user != loaded.User || namespace != loaded.Namespace || group != loaded.Name {
+					return fmt.Errorf("mismatch between requested rule group and loaded rule group, requested: user=%q, namespace=%q, group=%q, loaded: user=%q, namespace=%q, group=%q", user, namespace, group, loaded.User, loaded.Namespace, loaded.Name)
 				}
 			}
 
@@ -210,7 +232,30 @@ outer:
 	}
 	close(ch)
 
-	return g.Wait()
+	if err := g.Wait(); err != nil {
+		return err
+	}
+
+	// Drop vanished rule groups from groupsToLoad so callers only see entries
+	// that were successfully loaded.
+	if len(missing) > 0 {
+		for user, gs := range groupsToLoad {
+			filtered := gs[:0]
+			for _, g := range gs {
+				if _, gone := missing[g]; gone {
+					continue
+				}
+				filtered = append(filtered, g)
+			}
+			if len(filtered) == 0 {
+				delete(groupsToLoad, user)
+			} else {
+				groupsToLoad[user] = filtered
+			}
+		}
+	}
+
+	return nil
 }
 
 // GetRuleGroup implements rules.RuleStore.
