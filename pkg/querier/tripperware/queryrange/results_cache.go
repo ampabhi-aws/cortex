@@ -601,7 +601,7 @@ func (s resultsCache) filterRecentExtents(req tripperware.Request, maxCacheFresh
 }
 
 func (s resultsCache) get(ctx context.Context, key string) ([]Extent, bool) {
-	found, bufs, _ := s.cache.Fetch(ctx, []string{cache.HashKey(key)})
+	found, bufs, _ := s.cache.Fetch(ctx, []string{resultsCacheStorageKey(key)})
 	if len(found) != 1 {
 		return nil, false
 	}
@@ -642,7 +642,24 @@ func (s resultsCache) put(ctx context.Context, key string, extents []Extent) {
 		return
 	}
 
-	s.cache.Store(ctx, []string{cache.HashKey(key)}, [][]byte{buf})
+	s.cache.Store(ctx, []string{resultsCacheStorageKey(key)}, [][]byte{buf})
+}
+
+// resultsCacheStorageKey builds the storage-layer cache key for the results
+// cache. It preserves an unhashed per-tenant prefix so that one tenant can
+// never address another tenant's cache slots (even in the theoretical case
+// of a digest collision), and hashes the remainder with the collision-
+// resistant cache.HashKey (SHA-256 truncated to 128 bits) so that colliding
+// keys cannot be computed offline. The plaintext key format produced by
+// GenerateCacheKey is "<tenantIDs>:<query>:<step>:<interval>" and tenant
+// IDs may not contain ':' (see pkg/tenant), so splitting on the first ':'
+// reliably recovers the tenant prefix.
+func resultsCacheStorageKey(key string) string {
+	tenantPrefix := ""
+	if idx := strings.IndexByte(key, ':'); idx >= 0 {
+		tenantPrefix = key[:idx]
+	}
+	return "results:" + tenantPrefix + ":" + cache.HashKey(key)
 }
 
 func jaegerSpanID(ctx context.Context) string {
