@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
 	"os"
 	"path/filepath"
@@ -45,6 +46,9 @@ var (
 	errTLSFileNotAllowed             = errors.New("setting TLS ca_file, cert_file and key_file is not allowed")
 	errSlackAPIURLFileNotAllowed     = errors.New("setting Slack api_url_file and global slack_api_url_file is not allowed")
 	errVictorOpsAPIKeyFileNotAllowed = errors.New("setting VictorOps api_key_file is not allowed")
+	errEmailSmarthostBlocked         = errors.New("email smarthost resolves to a blocked address")
+	errEmailSmarthostInvalid         = errors.New("email smarthost is not a valid host:port address")
+	errEmailSmarthostUnresolvable    = errors.New("email smarthost host could not be resolved")
 )
 
 // UserConfig is used to communicate a users alertmanager configs
@@ -187,6 +191,16 @@ func validateUserConfig(logger log.Logger, cfg alertspb.AlertConfigDesc, limits 
 
 	// Validate the config recursively scanning it.
 	if err := validateAlertmanagerConfig(amCfg); err != nil {
+		return err
+	}
+
+	// Enforce the per-tenant receivers firewall on tenant-controlled SMTP smarthosts.
+	// The vendored email notifier dials the smarthost with a bare net.Dialer, so the
+	// commoncfg.WithDialContextFunc(firewallDialer.DialContext) injected into HTTP
+	// integrations does not cover it. Validate the resolved address at config-upload
+	// time against the same block list used by FirewallDialer so the email receiver
+	// cannot be used as an SSRF primitive to loopback/private/blocked addresses.
+	if err := validateEmailSmarthosts(amCfg, limits, user); err != nil {
 		return err
 	}
 
@@ -448,4 +462,97 @@ func validateVictorOpsConfig(cfg config.VictorOpsConfig) error {
 		return errVictorOpsAPIKeyFileNotAllowed
 	}
 	return nil
+}
+
+// validateEmailSmarthosts enforces the per-tenant receivers firewall against SMTP
+// smarthosts configured in email_configs (and global smtp_smarthost, which the
+// upstream config.Load copies into each EmailConfig when email_configs[].smarthost
+// is unset). It resolves the host and rejects the config if any resolved IP is
+// blocked by the tenant limits (private/loopback addresses when enabled, or any of
+// the configured block CIDR networks). This mirrors util_net.FirewallDialer.control
+// but runs at config-upload time, because the vendored email notifier opens the
+// SMTP TCP connection with a bare net.Dialer and the firewall dialer injected into
+// HTTP-based integrations does not cover that path.
+func validateEmailSmarthosts(cfg *config.Config, limits Limits, user string) error {
+	if cfg == nil || limits == nil {
+		return nil
+	}
+
+	blockPrivate := limits.AlertmanagerReceiversBlockPrivateAddresses(user)
+	blockCIDRs := limits.AlertmanagerReceiversBlockCIDRNetworks(user)
+
+	// Fast path: if the firewall is not enabled for this tenant, nothing to enforce.
+	if !blockPrivate && len(blockCIDRs) == 0 {
+		return nil
+	}
+
+	check := func(hp config.HostPort) error {
+		if hp.String() == "" {
+			// Empty smarthost: nothing to validate here. If the user still references
+			// an email_config with no effective smarthost, upstream config.Load will
+			// have already rejected it with "no global SMTP smarthost set".
+			return nil
+		}
+
+		if hp.Host == "" || hp.Port == "" {
+			return errors.Wrapf(errEmailSmarthostInvalid, "smarthost %q", hp.String())
+		}
+
+		// Resolve to IPs so we check what will actually be dialed, mirroring the
+		// behaviour of FirewallDialer which runs after DNS resolution.
+		ips, err := net.LookupIP(hp.Host)
+		if err != nil || len(ips) == 0 {
+			return errors.Wrapf(errEmailSmarthostUnresolvable, "smarthost %q", hp.String())
+		}
+
+		for _, ip := range ips {
+			if blockPrivate && (isPrivateIP(ip) || isLocalIP(ip)) {
+				return errors.Wrapf(errEmailSmarthostBlocked, "smarthost %q resolves to %s", hp.String(), ip)
+			}
+			for _, cidr := range blockCIDRs {
+				if cidr.Value.Contains(ip) {
+					return errors.Wrapf(errEmailSmarthostBlocked, "smarthost %q resolves to %s", hp.String(), ip)
+				}
+			}
+		}
+		return nil
+	}
+
+	// Check the global SMTP smarthost explicitly: even if no receiver inherits it
+	// (e.g. all email_configs override it), validating it prevents operators from
+	// relying on a stale global default being safely scoped later.
+	if cfg.Global != nil {
+		if err := check(cfg.Global.SMTPSmarthost); err != nil {
+			return err
+		}
+	}
+
+	for _, rcv := range cfg.Receivers {
+		for _, ec := range rcv.EmailConfigs {
+			if ec == nil {
+				continue
+			}
+			if err := check(ec.Smarthost); err != nil {
+				return err
+			}
+		}
+	}
+
+	return nil
+}
+
+// isLocalIP mirrors util_net.isLocal so we can reuse the FirewallDialer policy
+// without importing that package here (it has no exported helper).
+func isLocalIP(ip net.IP) bool {
+	return ip.IsLoopback() || ip.IsLinkLocalUnicast() || ip.IsLinkLocalMulticast()
+}
+
+// isPrivateIP mirrors util_net.isPrivate (RFC 1918 for IPv4, RFC 4193 for IPv6).
+func isPrivateIP(ip net.IP) bool {
+	if ip4 := ip.To4(); ip4 != nil {
+		return ip4[0] == 10 ||
+			(ip4[0] == 172 && ip4[1]&0xf0 == 16) ||
+			(ip4[0] == 192 && ip4[1] == 168)
+	}
+	return len(ip) == net.IPv6len && ip[0]&0xfe == 0xfc
 }
