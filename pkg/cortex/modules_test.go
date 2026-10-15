@@ -91,6 +91,7 @@ func TestAPIConfig(t *testing.T) {
 			require.NoError(t, err)
 
 			req := httptest.NewRequest("GET", tc.path, nil)
+			req.Header.Set("X-Scope-OrgID", "fake")
 			resp := httptest.NewRecorder()
 
 			cortex.Server.HTTP.ServeHTTP(resp, req)
