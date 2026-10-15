@@ -4,6 +4,7 @@
 package frontendv2pb
 
 import (
+	bytes "bytes"
 	context "context"
 	fmt "fmt"
 	stats "github.com/cortexproject/cortex/pkg/querier/stats"
@@ -35,6 +36,7 @@ type QueryResultRequest struct {
 	QueryID      uint64                 `protobuf:"varint,1,opt,name=queryID,proto3" json:"queryID,omitempty"`
 	HttpResponse *httpgrpc.HTTPResponse `protobuf:"bytes,2,opt,name=httpResponse,proto3" json:"httpResponse,omitempty"`
 	Stats        *stats.Stats           `protobuf:"bytes,3,opt,name=stats,proto3" json:"stats,omitempty"`
+	Nonce        []byte                 `protobuf:"bytes,4,opt,name=nonce,proto3" json:"nonce,omitempty"`
 }
 
 func (m *QueryResultRequest) Reset()      { *m = QueryResultRequest{} }
@@ -86,6 +88,13 @@ func (m *QueryResultRequest) GetHttpResponse() *httpgrpc.HTTPResponse {
 func (m *QueryResultRequest) GetStats() *stats.Stats {
 	if m != nil {
 		return m.Stats
+	}
+	return nil
+}
+
+func (m *QueryResultRequest) GetNonce() []byte {
+	if m != nil {
+		return m.Nonce
 	}
 	return nil
 }
@@ -186,6 +195,9 @@ func (this *QueryResultRequest) Equal(that interface{}) bool {
 	if !this.Stats.Equal(that1.Stats) {
 		return false
 	}
+	if !bytes.Equal(this.Nonce, that1.Nonce) {
+		return false
+	}
 	return true
 }
 func (this *QueryResultResponse) Equal(that interface{}) bool {
@@ -222,6 +234,7 @@ func (this *QueryResultRequest) GoString() string {
 	if this.Stats != nil {
 		s = append(s, "Stats: "+fmt.Sprintf("%#v", this.Stats)+",\n")
 	}
+	s = append(s, "Nonce: "+fmt.Sprintf("%#v", this.Nonce)+",\n")
 	s = append(s, "}")
 	return strings.Join(s, "")
 }
@@ -343,6 +356,13 @@ func (m *QueryResultRequest) MarshalToSizedBuffer(dAtA []byte) (int, error) {
 	_ = i
 	var l int
 	_ = l
+	if len(m.Nonce) > 0 {
+		i -= len(m.Nonce)
+		copy(dAtA[i:], m.Nonce)
+		i = encodeVarintFrontend(dAtA, i, uint64(len(m.Nonce)))
+		i--
+		dAtA[i] = 0x22
+	}
 	if m.Stats != nil {
 		{
 			size, err := m.Stats.MarshalToSizedBuffer(dAtA[:i])
@@ -424,6 +444,10 @@ func (m *QueryResultRequest) Size() (n int) {
 	}
 	if m.Stats != nil {
 		l = m.Stats.Size()
+		n += 1 + l + sovFrontend(uint64(l))
+	}
+	l = len(m.Nonce)
+	if l > 0 {
 		n += 1 + l + sovFrontend(uint64(l))
 	}
 	return n
@@ -591,6 +615,40 @@ func (m *QueryResultRequest) Unmarshal(dAtA []byte) error {
 			}
 			if err := m.Stats.Unmarshal(dAtA[iNdEx:postIndex]); err != nil {
 				return err
+			}
+			iNdEx = postIndex
+		case 4:
+			if wireType != 2 {
+				return fmt.Errorf("proto: wrong wireType = %d for field Nonce", wireType)
+			}
+			var byteLen int
+			for shift := uint(0); ; shift += 7 {
+				if shift >= 64 {
+					return ErrIntOverflowFrontend
+				}
+				if iNdEx >= l {
+					return io.ErrUnexpectedEOF
+				}
+				b := dAtA[iNdEx]
+				iNdEx++
+				byteLen |= int(b&0x7F) << shift
+				if b < 0x80 {
+					break
+				}
+			}
+			if byteLen < 0 {
+				return ErrInvalidLengthFrontend
+			}
+			postIndex := iNdEx + byteLen
+			if postIndex < 0 {
+				return ErrInvalidLengthFrontend
+			}
+			if postIndex > l {
+				return io.ErrUnexpectedEOF
+			}
+			m.Nonce = append(m.Nonce[:0], dAtA[iNdEx:postIndex]...)
+			if m.Nonce == nil {
+				m.Nonce = []byte{}
 			}
 			iNdEx = postIndex
 		default:

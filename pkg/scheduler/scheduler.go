@@ -151,6 +151,10 @@ type schedulerRequest struct {
 	queryID         uint64
 	request         *httpgrpc.HTTPRequest
 	statsEnabled    bool
+	// nonce is a per-query single-use token minted by the frontend. The
+	// scheduler stores it opaquely and relays it to the querier that is
+	// dispatched this request. See frontendv2pb.QueryResultRequest.Nonce.
+	nonce []byte
 
 	enqueueTime time.Time
 
@@ -290,6 +294,7 @@ func (s *Scheduler) enqueueRequest(frontendContext context.Context, frontendAddr
 		queryID:         msg.QueryID,
 		request:         msg.HttpRequest,
 		statsEnabled:    msg.StatsEnabled,
+		nonce:           msg.Nonce,
 	}
 
 	now := time.Now()
@@ -413,6 +418,7 @@ func (s *Scheduler) forwardRequestToQuerier(querier schedulerpb.SchedulerForQuer
 			FrontendAddress: req.frontendAddress,
 			HttpRequest:     req.request,
 			StatsEnabled:    req.statsEnabled,
+			Nonce:           req.nonce,
 		})
 		if err != nil {
 			errCh <- err
@@ -466,6 +472,7 @@ func (s *Scheduler) forwardErrorToFrontend(ctx context.Context, req *schedulerRe
 	userCtx := user.InjectOrgID(ctx, req.userID)
 	_, err = client.QueryResult(userCtx, &frontendv2pb.QueryResultRequest{
 		QueryID: req.queryID,
+		Nonce:   req.nonce,
 		HttpResponse: &httpgrpc.HTTPResponse{
 			Code: http.StatusInternalServerError,
 			Body: []byte(requestErr.Error()),

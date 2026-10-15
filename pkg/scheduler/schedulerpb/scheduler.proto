@@ -45,6 +45,14 @@ message SchedulerToQuerier {
   // Whether query statistics tracking should be enabled. The response will include
   // statistics only when this option is enabled.
   bool statsEnabled = 5;
+
+  // Nonce is a per-query single-use token minted by the frontend (crypto/rand) and
+  // relayed by the scheduler. The querier must copy it verbatim into
+  // QueryResultRequest.nonce when reporting back to the frontend. The frontend
+  // compares it in constant time with the stored request's nonce and consumes it on
+  // first use so that a peer who merely guesses a (userID, queryID) pair cannot
+  // inject forged responses.
+  bytes nonce = 6;
 }
 
 // Scheduler interface exposed to Frontend. Frontend can enqueue and cancel requests.
@@ -78,6 +86,11 @@ message FrontendToScheduler {
   string userID = 4;
   httpgrpc.HTTPRequest httpRequest = 5;
   bool statsEnabled = 6;
+
+  // Nonce is a per-query single-use token minted by the frontend (crypto/rand) and
+  // sent with ENQUEUE. The scheduler relays it to the chosen querier in
+  // SchedulerToQuerier.nonce. See QueryResultRequest.nonce.
+  bytes nonce = 7;
 }
 
 enum SchedulerToFrontendStatus {
