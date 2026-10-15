@@ -286,8 +286,17 @@ func (g *ShuffleShardingGrouper) isGroupVisited(blocks []*metadata.Meta, compact
 				level.Debug(g.logger).Log("msg", "no visit marker file for block", "blockID", blockID)
 				continue
 			}
+			// A corrupt (unparseable) or version-mismatched marker must not
+			// permanently stall compaction. Treat it like a missing marker so
+			// the caller can proceed to overwrite it with a fresh marker on
+			// this run (unconditional repair path). The read-failed counter was
+			// already incremented by ReadBlockVisitMarker for visibility.
+			if errors.Is(err, ErrorUnmarshalBlockVisitMarker) || errors.Is(err, ErrorBlockVisitMarkerVersionMismatch) {
+				level.Warn(g.logger).Log("msg", "ignoring corrupt or unsupported block visit marker; will be overwritten", "blockID", blockID, "err", err)
+				continue
+			}
 			level.Error(g.logger).Log("msg", "unable to read block visit marker file", "blockID", blockID, "err", err)
-			return true, err
+			return false, err
 		}
 		if compactorID != blockVisitMarker.CompactorID && blockVisitMarker.isVisited(g.blockVisitMarkerTimeout) {
 			level.Debug(g.logger).Log("msg", fmt.Sprintf("visited block: %s", blockID))
