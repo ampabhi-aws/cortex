@@ -5,11 +5,13 @@ import (
 	"context"
 	"crypto/rand"
 	"encoding/binary"
+	"encoding/hex"
 	"errors"
 	"flag"
 	"fmt"
 	"math"
 	mathrand "math/rand"
+	"os"
 	"strings"
 	"sync"
 	"time"
@@ -157,6 +159,22 @@ type KVConfig struct {
 	// How much space to use to keep received and sent messages in memory (for troubleshooting).
 	MessageHistoryBufferBytes int `yaml:"message_history_buffer_bytes"`
 
+	// GossipSecretKey is the symmetric key used by memberlist to authenticate
+	// (and optionally encrypt) gossip packets. When set, it is wired into
+	// memberlist.Config.SecretKey, which makes memberlist reject any inbound
+	// gossip whose HMAC does not match. Length must be 16, 24 or 32 bytes
+	// (AES-128/192/256) when provided inline. GossipSecretKeyFile loads the
+	// same material from a file (recommended), stripping a trailing newline.
+	GossipSecretKey     string `yaml:"gossip_secret_key"`
+	GossipSecretKeyFile string `yaml:"gossip_secret_key_file"`
+
+	// ClusterLabel is a free-form identifier for this gossip cluster. When
+	// set, remote cluster peers that advertise a different label (or none)
+	// are rejected by the MergeDelegate, so a mis-configured node in a
+	// different cluster cannot pollute this ring. The label is advertised
+	// in the node name suffix (`<name>:<label>`), see buildMemberlistConfig.
+	ClusterLabel string `yaml:"cluster_label"`
+
 	TCPTransport TCPTransportConfig `yaml:",inline"`
 
 	// Where to put custom metrics. Metrics are not registered, if this is nil.
@@ -193,6 +211,10 @@ func (cfg *KVConfig) RegisterFlagsWithPrefix(f *flag.FlagSet, prefix string) {
 	f.BoolVar(&cfg.EnableCompression, prefix+"memberlist.compression-enabled", mlDefaults.EnableCompression, "Enable message compression. This can be used to reduce bandwidth usage at the cost of slightly more CPU utilization.")
 	f.StringVar(&cfg.AdvertiseAddr, prefix+"memberlist.advertise-addr", mlDefaults.AdvertiseAddr, "Gossip address to advertise to other members in the cluster. Used for NAT traversal.")
 	f.IntVar(&cfg.AdvertisePort, prefix+"memberlist.advertise-port", mlDefaults.AdvertisePort, "Gossip port to advertise to other members in the cluster. Used for NAT traversal.")
+
+	f.StringVar(&cfg.GossipSecretKey, prefix+"memberlist.gossip-secret-key", "", "Symmetric key used to authenticate and encrypt memberlist gossip. Length must be 16, 24 or 32 bytes (AES-128/192/256). When set, inbound gossip is rejected unless it is signed with this key. Prefer -memberlist.gossip-secret-key-file over passing the secret on the command line.")
+	f.StringVar(&cfg.GossipSecretKeyFile, prefix+"memberlist.gossip-secret-key-file", "", "Path to a file containing the memberlist gossip secret key. Trailing newline is stripped. See -memberlist.gossip-secret-key.")
+	f.StringVar(&cfg.ClusterLabel, prefix+"memberlist.cluster-label", "", "Free-form identifier for this gossip cluster. When set, peers whose advertised node name does not carry the same cluster label suffix are rejected (defence in depth against a mis-configured node joining the wrong ring).")
 
 	cfg.TCPTransport.RegisterFlagsWithPrefix(f, prefix)
 }
@@ -397,6 +419,44 @@ func (m *KV) buildMemberlistConfig() (*memberlist.Config, error) {
 
 	mlCfg.LogOutput = newMemberlistLoggerAdapter(m.logger, false)
 	mlCfg.Transport = tr
+
+	// Wire the gossip encryption / authentication key through to memberlist.
+	// When SecretKey is non-nil memberlist signs all outbound gossip and
+	// rejects inbound packets that do not match. This is the only in-protocol
+	// authentication of gossip peers short of mutual TLS on the transport.
+	secretKey, err := m.cfg.loadGossipSecretKey()
+	if err != nil {
+		return nil, fmt.Errorf("failed to load memberlist gossip secret key: %w", err)
+	}
+	if len(secretKey) > 0 {
+		mlCfg.SecretKey = secretKey
+	}
+
+	// Attach a MergeDelegate that rejects merges from peers which have not
+	// been authenticated. A merge is accepted only when at least one of the
+	// following is true:
+	//   - mutual TLS on the memberlist listener requires and verifies a
+	//     client certificate (the peer presented one issued by our CA),
+	//   - a gossip SecretKey is configured (the peer proved possession of
+	//     the shared symmetric key by signing its gossip),
+	//   - a cluster label is configured and the peer's advertised name
+	//     carries that label.
+	// If none of those is true any host that can reach the gossip port is a
+	// full peer, which is the vulnerability we are closing.
+	mlCfg.Merge = &clusterAuthMergeDelegate{
+		logger:       m.logger,
+		clusterLabel: m.cfg.ClusterLabel,
+		mtlsEnforced: m.cfg.TCPTransport.TLSEnabled && isMutualTLSEnforced(m.cfg.TCPTransport.TLSClientAuth),
+		hasSecretKey: len(secretKey) > 0,
+	}
+
+	// Advertise the cluster label as a suffix on the node name so that the
+	// MergeDelegate can tell peers in the right cluster apart from peers in
+	// the wrong cluster. We cannot use memberlist's native Label here because
+	// the vendored memberlist (grafana fork v0.2.5) predates that feature.
+	if m.cfg.ClusterLabel != "" {
+		mlCfg.Name = mlCfg.Name + clusterLabelSeparator + m.cfg.ClusterLabel
+	}
 
 	// Memberlist uses UDPBufferSize to figure out how many messages it can put into single "packet".
 	// As we don't use UDP for sending packets, we can use higher value here.
@@ -1335,4 +1395,107 @@ func addMessageToBuffer(msgs []message, size int, limit int, msg message) ([]mes
 	}
 
 	return msgs, size
+}
+
+// clusterLabelSeparator is the character used to separate the node name from
+// the cluster label in a node's advertised memberlist name
+// (`<name>:<cluster-label>`). The character is deliberately uncommon in
+// hostnames so legitimate node names do not collide with the suffix.
+const clusterLabelSeparator = "@"
+
+// loadGossipSecretKey resolves the symmetric gossip key from (in order):
+//
+//   - GossipSecretKey (inline, treated as raw bytes unless it decodes as
+//     hex of length 16/24/32, in which case the decoded bytes are used),
+//   - GossipSecretKeyFile (read from disk, trailing newline trimmed, same
+//     hex-decoding rule applied).
+//
+// Returns nil, nil if no key is configured. Returns a non-nil error if the
+// key material is present but the wrong length for AES.
+func (cfg *KVConfig) loadGossipSecretKey() ([]byte, error) {
+	var raw []byte
+	switch {
+	case cfg.GossipSecretKey != "" && cfg.GossipSecretKeyFile != "":
+		return nil, fmt.Errorf("only one of memberlist.gossip-secret-key and memberlist.gossip-secret-key-file may be set")
+	case cfg.GossipSecretKey != "":
+		raw = []byte(cfg.GossipSecretKey)
+	case cfg.GossipSecretKeyFile != "":
+		b, err := os.ReadFile(cfg.GossipSecretKeyFile)
+		if err != nil {
+			return nil, fmt.Errorf("reading %s: %w", cfg.GossipSecretKeyFile, err)
+		}
+		raw = bytes.TrimRight(b, "\r\n")
+	default:
+		return nil, nil
+	}
+
+	// Allow a hex-encoded key: easier to put a 32-byte random key in YAML
+	// and still have memberlist get the raw bytes it expects.
+	if decoded, err := hex.DecodeString(string(raw)); err == nil && (len(decoded) == 16 || len(decoded) == 24 || len(decoded) == 32) {
+		raw = decoded
+	}
+
+	switch len(raw) {
+	case 16, 24, 32:
+		return raw, nil
+	default:
+		return nil, fmt.Errorf("memberlist gossip secret key must be 16, 24 or 32 bytes (got %d)", len(raw))
+	}
+}
+
+// isMutualTLSEnforced reports whether the configured TLS client-auth policy
+// requires the peer to present a certificate verified against the configured
+// CA. Modes that only request or require any certificate without verifying
+// its chain are not considered enforced for the purpose of merge admission.
+func isMutualTLSEnforced(clientAuth string) bool {
+	return clientAuth == "RequireAndVerifyClientCert"
+}
+
+// clusterAuthMergeDelegate implements memberlist.MergeDelegate. It is
+// consulted when a push-pull merge is about to be applied (i.e. during a
+// join / periodic push-pull) and may reject the whole merge. Together with
+// the TCP listener's ClientAuth and the gossip SecretKey this provides
+// authenticated gossip even if an operator has misconfigured one of them.
+type clusterAuthMergeDelegate struct {
+	logger       log.Logger
+	clusterLabel string
+	mtlsEnforced bool
+	hasSecretKey bool
+}
+
+// NotifyMerge is called by memberlist before a push-pull merge is applied.
+// Returning a non-nil error cancels the merge, so the local ring state is
+// unchanged.
+func (d *clusterAuthMergeDelegate) NotifyMerge(peers []*memberlist.Node) error {
+	// If the gossip transport authenticates peers (mutual TLS verified
+	// against our CA) or every packet is signed with the shared secret
+	// key, we have in-protocol peer authentication and accept the merge.
+	if d.mtlsEnforced || d.hasSecretKey {
+		return nil
+	}
+
+	// Fall back to a cluster-label check. The label is advertised in the
+	// node name suffix; peers in a different cluster will not carry it.
+	if d.clusterLabel == "" {
+		level.Warn(d.logger).Log(
+			"msg", "accepting memberlist merge from unauthenticated peer: "+
+				"neither mutual TLS, gossip-secret-key, nor cluster-label is configured. "+
+				"Any host that can reach the gossip port can rewrite ring state. "+
+				"Set -memberlist.tls-client-auth=RequireAndVerifyClientCert (with a client CA) "+
+				"or -memberlist.gossip-secret-key[-file] to authenticate peers.",
+			"peers", len(peers),
+		)
+		return nil
+	}
+
+	suffix := clusterLabelSeparator + d.clusterLabel
+	for _, n := range peers {
+		if n == nil {
+			continue
+		}
+		if !strings.HasSuffix(n.Name, suffix) {
+			return fmt.Errorf("rejecting memberlist merge: peer %q does not carry cluster-label %q", n.Name, d.clusterLabel)
+		}
+	}
+	return nil
 }
