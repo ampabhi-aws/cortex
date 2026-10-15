@@ -68,6 +68,16 @@ func (l limitsMiddleware) Do(ctx context.Context, r tripperware.Request) (trippe
 		}
 	}
 
+	// Enforce the max query expression size, in bytes, before any PromQL
+	// parsing happens. This protects the shared query-frontend from
+	// pathological, deeply nested expressions that make parsing and
+	// re-serialization quadratic in nesting depth.
+	if maxExprSize := validation.SmallestPositiveNonZeroIntPerTenant(tenantIDs, l.MaxQueryExpressionSizeBytes); maxExprSize > 0 {
+		if n := len(r.GetQuery()); n > maxExprSize {
+			return nil, httpgrpc.Errorf(http.StatusBadRequest, "the query expression is too large (%d bytes, maximum %d bytes)", n, maxExprSize)
+		}
+	}
+
 	// Enforce the max query length.
 	if maxQueryLength := validation.SmallestPositiveNonZeroDurationPerTenant(tenantIDs, l.MaxQueryLength); maxQueryLength > 0 {
 		queryLen := timestamp.Time(r.GetEnd()).Sub(timestamp.Time(r.GetStart()))

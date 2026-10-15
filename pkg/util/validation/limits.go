@@ -76,6 +76,7 @@ type Limits struct {
 	MaxFetchedDataBytesPerQuery  int            `yaml:"max_fetched_data_bytes_per_query" json:"max_fetched_data_bytes_per_query"`
 	MaxQueryLookback             model.Duration `yaml:"max_query_lookback" json:"max_query_lookback"`
 	MaxQueryLength               model.Duration `yaml:"max_query_length" json:"max_query_length"`
+	MaxQueryExpressionSizeBytes  int            `yaml:"max_query_expression_size_bytes" json:"max_query_expression_size_bytes"`
 	MaxQueryParallelism          int            `yaml:"max_query_parallelism" json:"max_query_parallelism"`
 	MaxCacheFreshness            model.Duration `yaml:"max_cache_freshness" json:"max_cache_freshness"`
 	MaxQueriersPerTenant         int            `yaml:"max_queriers_per_tenant" json:"max_queriers_per_tenant"`
@@ -154,6 +155,7 @@ func (l *Limits) RegisterFlags(f *flag.FlagSet) {
 	f.IntVar(&l.MaxFetchedChunkBytesPerQuery, "querier.max-fetched-chunk-bytes-per-query", 0, "Deprecated (user max-fetched-data-bytes-per-query instead): The maximum size of all chunks in bytes that a query can fetch from each ingester and storage. This limit is enforced in the querier, ruler and store-gateway. 0 to disable.")
 	f.IntVar(&l.MaxFetchedDataBytesPerQuery, "querier.max-fetched-data-bytes-per-query", 0, "The maximum combined size of all data that a query can fetch from each ingester and storage. This limit is enforced in the querier and ruler for `query`, `query_range` and `series` APIs. 0 to disable.")
 	f.Var(&l.MaxQueryLength, "store.max-query-length", "Limit the query time range (end - start time). This limit is enforced in the query-frontend (on the received query) and in the querier (on the query possibly split by the query-frontend). 0 to disable.")
+	f.IntVar(&l.MaxQueryExpressionSizeBytes, "frontend.max-query-expression-size-bytes", 0, "Max size of the raw PromQL query expression accepted by the query-frontend, in bytes. 0 to disable the limit. Enforced before parsing to protect the query-frontend from pathological, deeply nested expressions.")
 	f.Var(&l.MaxQueryLookback, "querier.max-query-lookback", "Limit how long back data (series and metadata) can be queried, up until <lookback> duration ago. This limit is enforced in the query-frontend, querier and ruler. If the requested time range is outside the allowed range, the request will not fail but will be manipulated to only query data within the allowed time range. 0 to disable.")
 	f.IntVar(&l.MaxQueryParallelism, "querier.max-query-parallelism", 14, "Maximum number of split queries will be scheduled in parallel by the frontend.")
 	_ = l.MaxCacheFreshness.Set("1m")
@@ -422,6 +424,13 @@ func (o *Overrides) MaxQueryLookback(userID string) time.Duration {
 // MaxQueryLength returns the limit of the length (in time) of a query.
 func (o *Overrides) MaxQueryLength(userID string) time.Duration {
 	return time.Duration(o.getOverridesForUser(userID).MaxQueryLength)
+}
+
+// MaxQueryExpressionSizeBytes returns the max size, in bytes, of the raw PromQL
+// expression accepted by the query-frontend for the given tenant. A value of 0
+// means the limit is disabled.
+func (o *Overrides) MaxQueryExpressionSizeBytes(userID string) int {
+	return o.getOverridesForUser(userID).MaxQueryExpressionSizeBytes
 }
 
 // MaxCacheFreshness returns the period after which results are cacheable,
