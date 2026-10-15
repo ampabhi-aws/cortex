@@ -872,6 +872,18 @@ func (am *MultitenantAlertmanager) setConfig(cfg alertspb.AlertConfigDesc) error
 			// working configuration.
 			return fmt.Errorf("invalid Cortex configuration for %v: %v", cfg.User, err)
 		}
+		// Defense in depth: re-run the denylist that normally runs on the API
+		// submission path, so that configs loaded from the store (which may have
+		// been written before a new denylist rule was added) cannot bypass it.
+		if err == nil && userAmConfig != nil {
+			if vErr := validateAlertmanagerConfig(userAmConfig); vErr != nil {
+				if hasExisting {
+					return fmt.Errorf("invalid Cortex configuration for %v: %v", cfg.User, vErr)
+				}
+				level.Warn(am.logger).Log("msg", "rejecting stored Alertmanager configuration", "user", cfg.User, "err", vErr)
+				return fmt.Errorf("invalid Cortex configuration for %v: %v", cfg.User, vErr)
+			}
+		}
 	}
 
 	// We can have an empty configuration here if:
