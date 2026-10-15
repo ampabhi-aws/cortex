@@ -4,6 +4,7 @@
 package schedulerpb
 
 import (
+	bytes "bytes"
 	context "context"
 	fmt "fmt"
 	_ "github.com/gogo/protobuf/gogoproto"
@@ -139,6 +140,9 @@ type SchedulerToQuerier struct {
 	// Whether query statistics tracking should be enabled. The response will include
 	// statistics only when this option is enabled.
 	StatsEnabled bool `protobuf:"varint,5,opt,name=statsEnabled,proto3" json:"statsEnabled,omitempty"`
+	// Nonce is a per-query single-use token minted by the frontend and relayed by
+	// the scheduler. The querier must echo it in QueryResultRequest.nonce.
+	Nonce []byte `protobuf:"bytes,6,opt,name=nonce,proto3" json:"nonce,omitempty"`
 }
 
 func (m *SchedulerToQuerier) Reset()      { *m = SchedulerToQuerier{} }
@@ -208,6 +212,13 @@ func (m *SchedulerToQuerier) GetStatsEnabled() bool {
 	return false
 }
 
+func (m *SchedulerToQuerier) GetNonce() []byte {
+	if m != nil {
+		return m.Nonce
+	}
+	return nil
+}
+
 type FrontendToScheduler struct {
 	Type FrontendToSchedulerType `protobuf:"varint,1,opt,name=type,proto3,enum=schedulerpb.FrontendToSchedulerType" json:"type,omitempty"`
 	// Used by INIT message. Will be put into all requests passed to querier.
@@ -219,6 +230,9 @@ type FrontendToScheduler struct {
 	UserID       string                `protobuf:"bytes,4,opt,name=userID,proto3" json:"userID,omitempty"`
 	HttpRequest  *httpgrpc.HTTPRequest `protobuf:"bytes,5,opt,name=httpRequest,proto3" json:"httpRequest,omitempty"`
 	StatsEnabled bool                  `protobuf:"varint,6,opt,name=statsEnabled,proto3" json:"statsEnabled,omitempty"`
+	// Nonce is a per-query single-use token minted by the frontend (crypto/rand).
+	// The scheduler relays it to the chosen querier in SchedulerToQuerier.nonce.
+	Nonce []byte `protobuf:"bytes,7,opt,name=nonce,proto3" json:"nonce,omitempty"`
 }
 
 func (m *FrontendToScheduler) Reset()      { *m = FrontendToScheduler{} }
@@ -293,6 +307,13 @@ func (m *FrontendToScheduler) GetStatsEnabled() bool {
 		return m.StatsEnabled
 	}
 	return false
+}
+
+func (m *FrontendToScheduler) GetNonce() []byte {
+	if m != nil {
+		return m.Nonce
+	}
+	return nil
 }
 
 type SchedulerToFrontend struct {
@@ -554,6 +575,9 @@ func (this *SchedulerToQuerier) Equal(that interface{}) bool {
 	if this.StatsEnabled != that1.StatsEnabled {
 		return false
 	}
+	if !bytes.Equal(this.Nonce, that1.Nonce) {
+		return false
+	}
 	return true
 }
 func (this *FrontendToScheduler) Equal(that interface{}) bool {
@@ -591,6 +615,9 @@ func (this *FrontendToScheduler) Equal(that interface{}) bool {
 		return false
 	}
 	if this.StatsEnabled != that1.StatsEnabled {
+		return false
+	}
+	if !bytes.Equal(this.Nonce, that1.Nonce) {
 		return false
 	}
 	return true
@@ -690,6 +717,7 @@ func (this *SchedulerToQuerier) GoString() string {
 	s = append(s, "FrontendAddress: "+fmt.Sprintf("%#v", this.FrontendAddress)+",\n")
 	s = append(s, "UserID: "+fmt.Sprintf("%#v", this.UserID)+",\n")
 	s = append(s, "StatsEnabled: "+fmt.Sprintf("%#v", this.StatsEnabled)+",\n")
+	s = append(s, "Nonce: "+fmt.Sprintf("%#v", this.Nonce)+",\n")
 	s = append(s, "}")
 	return strings.Join(s, "")
 }
@@ -707,6 +735,7 @@ func (this *FrontendToScheduler) GoString() string {
 		s = append(s, "HttpRequest: "+fmt.Sprintf("%#v", this.HttpRequest)+",\n")
 	}
 	s = append(s, "StatsEnabled: "+fmt.Sprintf("%#v", this.StatsEnabled)+",\n")
+	s = append(s, "Nonce: "+fmt.Sprintf("%#v", this.Nonce)+",\n")
 	s = append(s, "}")
 	return strings.Join(s, "")
 }
@@ -1078,6 +1107,13 @@ func (m *SchedulerToQuerier) MarshalToSizedBuffer(dAtA []byte) (int, error) {
 	_ = i
 	var l int
 	_ = l
+	if len(m.Nonce) > 0 {
+		i -= len(m.Nonce)
+		copy(dAtA[i:], m.Nonce)
+		i = encodeVarintScheduler(dAtA, i, uint64(len(m.Nonce)))
+		i--
+		dAtA[i] = 0x32
+	}
 	if m.StatsEnabled {
 		i--
 		if m.StatsEnabled {
@@ -1142,6 +1178,13 @@ func (m *FrontendToScheduler) MarshalToSizedBuffer(dAtA []byte) (int, error) {
 	_ = i
 	var l int
 	_ = l
+	if len(m.Nonce) > 0 {
+		i -= len(m.Nonce)
+		copy(dAtA[i:], m.Nonce)
+		i = encodeVarintScheduler(dAtA, i, uint64(len(m.Nonce)))
+		i--
+		dAtA[i] = 0x3a
+	}
 	if m.StatsEnabled {
 		i--
 		if m.StatsEnabled {
@@ -1327,6 +1370,10 @@ func (m *SchedulerToQuerier) Size() (n int) {
 	if m.StatsEnabled {
 		n += 2
 	}
+	l = len(m.Nonce)
+	if l > 0 {
+		n += 1 + l + sovScheduler(uint64(l))
+	}
 	return n
 }
 
@@ -1356,6 +1403,10 @@ func (m *FrontendToScheduler) Size() (n int) {
 	}
 	if m.StatsEnabled {
 		n += 2
+	}
+	l = len(m.Nonce)
+	if l > 0 {
+		n += 1 + l + sovScheduler(uint64(l))
 	}
 	return n
 }
@@ -1734,6 +1785,40 @@ func (m *SchedulerToQuerier) Unmarshal(dAtA []byte) error {
 				}
 			}
 			m.StatsEnabled = bool(v != 0)
+		case 6:
+			if wireType != 2 {
+				return fmt.Errorf("proto: wrong wireType = %d for field Nonce", wireType)
+			}
+			var byteLen int
+			for shift := uint(0); ; shift += 7 {
+				if shift >= 64 {
+					return ErrIntOverflowScheduler
+				}
+				if iNdEx >= l {
+					return io.ErrUnexpectedEOF
+				}
+				b := dAtA[iNdEx]
+				iNdEx++
+				byteLen |= int(b&0x7F) << shift
+				if b < 0x80 {
+					break
+				}
+			}
+			if byteLen < 0 {
+				return ErrInvalidLengthScheduler
+			}
+			postIndex := iNdEx + byteLen
+			if postIndex < 0 {
+				return ErrInvalidLengthScheduler
+			}
+			if postIndex > l {
+				return io.ErrUnexpectedEOF
+			}
+			m.Nonce = append(m.Nonce[:0], dAtA[iNdEx:postIndex]...)
+			if m.Nonce == nil {
+				m.Nonce = []byte{}
+			}
+			iNdEx = postIndex
 		default:
 			iNdEx = preIndex
 			skippy, err := skipScheduler(dAtA[iNdEx:])
@@ -1945,6 +2030,40 @@ func (m *FrontendToScheduler) Unmarshal(dAtA []byte) error {
 				}
 			}
 			m.StatsEnabled = bool(v != 0)
+		case 7:
+			if wireType != 2 {
+				return fmt.Errorf("proto: wrong wireType = %d for field Nonce", wireType)
+			}
+			var byteLen int
+			for shift := uint(0); ; shift += 7 {
+				if shift >= 64 {
+					return ErrIntOverflowScheduler
+				}
+				if iNdEx >= l {
+					return io.ErrUnexpectedEOF
+				}
+				b := dAtA[iNdEx]
+				iNdEx++
+				byteLen |= int(b&0x7F) << shift
+				if b < 0x80 {
+					break
+				}
+			}
+			if byteLen < 0 {
+				return ErrInvalidLengthScheduler
+			}
+			postIndex := iNdEx + byteLen
+			if postIndex < 0 {
+				return ErrInvalidLengthScheduler
+			}
+			if postIndex > l {
+				return io.ErrUnexpectedEOF
+			}
+			m.Nonce = append(m.Nonce[:0], dAtA[iNdEx:postIndex]...)
+			if m.Nonce == nil {
+				m.Nonce = []byte{}
+			}
+			iNdEx = postIndex
 		default:
 			iNdEx = preIndex
 			skippy, err := skipScheduler(dAtA[iNdEx:])

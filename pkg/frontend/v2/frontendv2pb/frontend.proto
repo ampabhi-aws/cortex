@@ -21,6 +21,13 @@ message QueryResultRequest {
     httpgrpc.HTTPResponse httpResponse = 2;
     stats.Stats stats = 3;
 
+    // Nonce is a per-request single-use authentication token minted by the frontend
+    // when the query is enqueued (crypto/rand). The querier echoes the exact value
+    // it received from the scheduler in SchedulerToQuerier.nonce. The frontend verifies
+    // it with a constant-time comparison and consumes it on first use so that a peer
+    // that merely guesses a (userID, queryID) pair cannot inject forged responses.
+    bytes nonce = 4;
+
     // There is no userID field here, because Querier puts userID into the context when
     // calling QueryResult, and that is where Frontend expects to find it.
 }

@@ -79,7 +79,7 @@ func setupFrontend(t *testing.T, schedulerReplyFunc func(f *Frontend, msg *sched
 	return f, ms
 }
 
-func sendResponseWithDelay(f *Frontend, delay time.Duration, userID string, queryID uint64, resp *httpgrpc.HTTPResponse) {
+func sendResponseWithDelay(f *Frontend, delay time.Duration, userID string, queryID uint64, nonce []byte, resp *httpgrpc.HTTPResponse) {
 	if delay > 0 {
 		time.Sleep(delay)
 	}
@@ -89,6 +89,7 @@ func sendResponseWithDelay(f *Frontend, delay time.Duration, userID string, quer
 		QueryID:      queryID,
 		HttpResponse: resp,
 		Stats:        &stats.Stats{},
+		Nonce:        nonce,
 	})
 }
 
@@ -101,7 +102,7 @@ func TestFrontendBasicWorkflow(t *testing.T) {
 	f, _ := setupFrontend(t, func(f *Frontend, msg *schedulerpb.FrontendToScheduler) *schedulerpb.SchedulerToFrontend {
 		// We cannot call QueryResult directly, as Frontend is not yet waiting for the response.
 		// It first needs to be told that enqueuing has succeeded.
-		go sendResponseWithDelay(f, 100*time.Millisecond, userID, msg.QueryID, &httpgrpc.HTTPResponse{
+		go sendResponseWithDelay(f, 100*time.Millisecond, userID, msg.QueryID, msg.Nonce, &httpgrpc.HTTPResponse{
 			Code: 200,
 			Body: []byte(body),
 		})
@@ -129,7 +130,7 @@ func TestFrontendRetryEnqueue(t *testing.T) {
 			return &schedulerpb.SchedulerToFrontend{Status: schedulerpb.SHUTTING_DOWN}
 		}
 
-		go sendResponseWithDelay(f, 100*time.Millisecond, userID, msg.QueryID, &httpgrpc.HTTPResponse{
+		go sendResponseWithDelay(f, 100*time.Millisecond, userID, msg.QueryID, msg.Nonce, &httpgrpc.HTTPResponse{
 			Code: 200,
 			Body: []byte(body),
 		})

@@ -263,6 +263,7 @@ func (w *frontendSchedulerWorker) schedulerLoop(loop schedulerpb.SchedulerForFro
 				HttpRequest:     req.request,
 				FrontendAddress: w.frontendAddr,
 				StatsEnabled:    req.statsEnabled,
+				Nonce:           req.nonce,
 			})
 
 			if err != nil {
