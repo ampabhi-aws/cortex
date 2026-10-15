@@ -83,6 +83,21 @@ func (t *SingleResolver) TenantID(ctx context.Context) (string, error) {
 		return "", err
 	}
 
+	// Reject an empty tenant ID so that no request can resolve to "" and
+	// collapse onto the shared data directory / bucket root.
+	if id == "" {
+		return "", user.ErrNoOrgID
+	}
+
+	// Hold single-tenant requests to the same documented charset and
+	// 150-byte limit as federated requests. This prevents attacker-chosen
+	// delimiters (e.g. ':') from appearing in a tenant ID and colliding
+	// with downstream composite keys such as the query-frontend
+	// results cache key.
+	if err := ValidTenantID(id); err != nil {
+		return "", err
+	}
+
 	if containsUnsafePathSegments(id) {
 		return "", errInvalidTenantID
 	}
@@ -131,6 +146,10 @@ func (t *MultiResolver) TenantIDs(ctx context.Context) ([]string, error) {
 
 	orgIDs := strings.Split(orgID, tenantIDsLabelSeparator)
 	for _, orgID := range orgIDs {
+		// Reject empty tenant IDs so that no request can resolve to "".
+		if orgID == "" {
+			return nil, user.ErrNoOrgID
+		}
 		if err := ValidTenantID(orgID); err != nil {
 			return nil, err
 		}
