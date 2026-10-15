@@ -489,6 +489,15 @@ func (d *Distributor) checkSample(ctx context.Context, userID, cluster, replica 
 		return false, nil
 	}
 
+	// If cluster label is too long, don't use it. We accept the sample here,
+	// but it will fail validation later anyway. This prevents an unvalidated,
+	// attacker-controlled cluster string from being used as an HA-tracker KV
+	// key or as a permanent Prometheus label value on cortex_ha_tracker_*
+	// and cortex_distributor_deduped_samples_total.
+	if len(cluster) > d.limits.MaxLabelValueLength(userID) {
+		return false, nil
+	}
+
 	// At this point we know we have both HA labels, we should lookup
 	// the cluster/instance here to see if we want to accept this sample.
 	err := d.HATracker.checkReplica(ctx, userID, cluster, replica, time.Now())
