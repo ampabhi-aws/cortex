@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"net/http"
 	"sync"
+	"time"
 
 	"github.com/go-kit/log"
 	"github.com/go-kit/log/level"
@@ -123,6 +124,22 @@ func (r *DefaultMultiTenantManager) SyncRuleGroups(ctx context.Context, ruleGrou
 // syncRulesToManager maps the rule files to disk, detects any changes and will create/update the
 // the users Prometheus Rules Manager.
 func (r *DefaultMultiTenantManager) syncRulesToManager(ctx context.Context, user string, groups rulespb.RuleGroupList) {
+	// Defensively clamp any group interval below the configured minimum so that
+	// a group that was persisted before the lower-bound was enforced (or by a
+	// tenant bypassing the API validation) cannot drive a tight evaluation
+	// loop on the shared ruler.
+	if minInterval := r.cfg.minEvaluationInterval(); minInterval > 0 {
+		for _, g := range groups {
+			if g == nil {
+				continue
+			}
+			if g.Interval > 0 && g.Interval < minInterval {
+				level.Warn(r.logger).Log("msg", "clamping rule group interval below configured minimum", "user", user, "group", g.Name, "namespace", g.Namespace, "interval", g.Interval, "min_interval", minInterval)
+				g.Interval = minInterval
+			}
+		}
+	}
+
 	// Map the files to disk and return the file names to be passed to the users manager if they
 	// have been updated
 	update, files, err := r.mapper.MapRules(user, groups.Formatted())
@@ -267,7 +284,7 @@ func (r *DefaultMultiTenantManager) Stop() {
 	r.mapper.cleanup()
 }
 
-func (*DefaultMultiTenantManager) ValidateRuleGroup(g rulefmt.RuleGroup) []error {
+func (r *DefaultMultiTenantManager) ValidateRuleGroup(g rulefmt.RuleGroup) []error {
 	var errs []error
 
 	if g.Name == "" {
@@ -277,6 +294,15 @@ func (*DefaultMultiTenantManager) ValidateRuleGroup(g rulefmt.RuleGroup) []error
 
 	if len(g.Rules) == 0 {
 		errs = append(errs, fmt.Errorf("invalid rules config: rule group '%s' has no rules", g.Name))
+		return errs
+	}
+
+	// Reject tenant-supplied intervals below the operator-configured minimum.
+	// This prevents a tenant from driving the shared ruler at an arbitrarily
+	// high evaluation rate (e.g. `interval: 1ms`). A zero/unset interval is
+	// allowed because the ruler falls back to the configured default.
+	if minInterval := r.cfg.minEvaluationInterval(); minInterval > 0 && g.Interval > 0 && time.Duration(g.Interval) < minInterval {
+		errs = append(errs, fmt.Errorf("invalid rules config: rule group '%s' interval %s is below the minimum allowed evaluation interval of %s", g.Name, time.Duration(g.Interval), minInterval))
 		return errs
 	}
 

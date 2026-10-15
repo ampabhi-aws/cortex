@@ -7,11 +7,14 @@ import (
 
 	"github.com/go-kit/log"
 	"github.com/prometheus/client_golang/prometheus"
+	"github.com/prometheus/common/model"
 	"github.com/prometheus/prometheus/model/labels"
+	"github.com/prometheus/prometheus/model/rulefmt"
 	"github.com/prometheus/prometheus/notifier"
 	promRules "github.com/prometheus/prometheus/rules"
 	"github.com/stretchr/testify/require"
 	"go.uber.org/atomic"
+	"gopkg.in/yaml.v3"
 
 	"github.com/cortexproject/cortex/pkg/ruler/rulespb"
 	"github.com/cortexproject/cortex/pkg/util/test"
@@ -128,4 +131,84 @@ func (m *mockRulesManager) Update(_ time.Duration, _ []string, _ labels.Labels, 
 
 func (m *mockRulesManager) RuleGroups() []*promRules.Group {
 	return nil
+}
+
+func TestValidateRuleGroupMinInterval(t *testing.T) {
+	dir := t.TempDir()
+
+	cfg := Config{RulePath: dir, MinRuleEvaluationInterval: 10 * time.Second}
+	m, err := NewDefaultMultiTenantManager(cfg, factory, nil, log.NewNopLogger())
+	require.NoError(t, err)
+	t.Cleanup(m.Stop)
+
+	record := yaml.Node{}
+	record.SetString("up_rule")
+	expr := yaml.Node{}
+	expr.SetString("up")
+	validRules := []rulefmt.RuleNode{{Record: record, Expr: expr}}
+
+	// A group below the configured minimum must be rejected.
+	errs := m.ValidateRuleGroup(rulefmt.RuleGroup{
+		Name:     "spin",
+		Interval: model.Duration(time.Millisecond),
+		Rules:    validRules,
+	})
+	require.Len(t, errs, 1)
+	require.Contains(t, errs[0].Error(), "below the minimum allowed evaluation interval")
+
+	// A group at or above the minimum is accepted.
+	errs = m.ValidateRuleGroup(rulefmt.RuleGroup{
+		Name:     "ok",
+		Interval: model.Duration(30 * time.Second),
+		Rules:    validRules,
+	})
+	require.Empty(t, errs)
+
+	// A zero/unset interval is accepted because the ruler falls back to the
+	// configured default.
+	errs = m.ValidateRuleGroup(rulefmt.RuleGroup{
+		Name:  "default",
+		Rules: validRules,
+	})
+	require.Empty(t, errs)
+
+	// When the minimum is unset, any positive interval is permitted (preserves
+	// pre-fix behaviour for operators that have not opted in).
+	m2, err := NewDefaultMultiTenantManager(Config{RulePath: t.TempDir()}, factory, nil, log.NewNopLogger())
+	require.NoError(t, err)
+	t.Cleanup(m2.Stop)
+	errs = m2.ValidateRuleGroup(rulefmt.RuleGroup{
+		Name:     "spin",
+		Interval: model.Duration(time.Millisecond),
+		Rules:    validRules,
+	})
+	require.Empty(t, errs)
+}
+
+func TestSyncRulesClampsIntervalBelowMinimum(t *testing.T) {
+	dir := t.TempDir()
+
+	cfg := Config{RulePath: dir, MinRuleEvaluationInterval: 10 * time.Second}
+	m, err := NewDefaultMultiTenantManager(cfg, factory, nil, log.NewNopLogger())
+	require.NoError(t, err)
+	t.Cleanup(m.Stop)
+
+	groups := rulespb.RuleGroupList{
+		&rulespb.RuleGroupDesc{
+			Name:      "spin",
+			Namespace: "ns",
+			Interval:  time.Millisecond,
+			User:      "attacker",
+		},
+		&rulespb.RuleGroupDesc{
+			Name:      "ok",
+			Namespace: "ns",
+			Interval:  30 * time.Second,
+			User:      "attacker",
+		},
+	}
+	m.SyncRuleGroups(context.Background(), map[string]rulespb.RuleGroupList{"attacker": groups})
+
+	require.Equal(t, 10*time.Second, groups[0].Interval, "sub-minimum interval must be clamped")
+	require.Equal(t, 30*time.Second, groups[1].Interval, "intervals at or above the minimum are preserved")
 }
