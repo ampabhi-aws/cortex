@@ -5,6 +5,7 @@ import (
 	"crypto/tls"
 	"flag"
 	"fmt"
+	"strings"
 	"time"
 
 	"github.com/go-kit/log"
@@ -18,6 +19,11 @@ import (
 	"github.com/cortexproject/cortex/pkg/util/flagext"
 	cortextls "github.com/cortexproject/cortex/pkg/util/tls"
 )
+
+// ErrEtcdPasswordWithoutTLS is returned when etcd password authentication is
+// configured but TLS is not enabled and no https:// endpoint is configured,
+// which would send the credentials over an unencrypted connection.
+var ErrEtcdPasswordWithoutTLS = errors.New("etcd password is configured but TLS is not enabled; set -<prefix>etcd.tls-enabled=true (or use an https:// endpoint, or a tls_ca_path/tls_cert_path/tls_key_path) whenever -<prefix>etcd.password is used, otherwise the password would be sent in cleartext")
 
 // Config for a new etcd.Client.
 type Config struct {
@@ -58,13 +64,55 @@ func (cfg *Config) RegisterFlagsWithPrefix(f *flag.FlagSet, prefix string) {
 	f.IntVar(&cfg.MaxRetries, prefix+"etcd.max-retries", 10, "The maximum number of retries to do for failed ops.")
 	f.BoolVar(&cfg.EnableTLS, prefix+"etcd.tls-enabled", false, "Enable TLS.")
 	f.StringVar(&cfg.UserName, prefix+"etcd.username", "", "Etcd username.")
-	f.StringVar(&cfg.Password, prefix+"etcd.password", "", "Etcd password.")
+	f.StringVar(&cfg.Password, prefix+"etcd.password", "", "Etcd password. Setting this requires TLS to be enabled (via -<prefix>etcd.tls-enabled=true, an https:// endpoint, or TLS file paths) so the password is not sent in cleartext; prefer certificate-based client authentication (tls_cert_path/tls_key_path).")
 	cfg.TLS.RegisterFlagsWithPrefix(prefix+"etcd", f)
 }
 
-// GetTLS sets the TLS config field with certs
+// hasHTTPSEndpoint reports whether any configured endpoint uses the https://
+// (or unixs://) scheme, in which case the vendored etcd client requires TLS.
+func (cfg *Config) hasHTTPSEndpoint() bool {
+	for _, ep := range cfg.Endpoints {
+		if strings.HasPrefix(ep, "https://") || strings.HasPrefix(ep, "unixs://") {
+			return true
+		}
+	}
+	return false
+}
+
+// hasTLSPaths reports whether the operator has configured any TLS file path or
+// server-name override, which strongly implies TLS was intended.
+func (cfg *Config) hasTLSPaths() bool {
+	return cfg.TLS.CAPath != "" || cfg.TLS.CertPath != "" || cfg.TLS.KeyPath != "" || cfg.TLS.ServerName != ""
+}
+
+// shouldUseTLS returns true when TLS is explicitly enabled, or when the
+// configuration implies TLS (https:// endpoint, or any TLS file path /
+// server-name override). This prevents operator-supplied TLS material from
+// being silently discarded because the separate -<prefix>etcd.tls-enabled flag
+// was left at its default.
+func (cfg *Config) shouldUseTLS() bool {
+	return cfg.EnableTLS || cfg.hasHTTPSEndpoint() || cfg.hasTLSPaths()
+}
+
+// Validate verifies that the etcd configuration is self-consistent. In
+// particular it refuses to send password credentials over an unencrypted
+// connection: using -<prefix>etcd.password requires -<prefix>etcd.tls-enabled=true
+// (or an https:// endpoint, or TLS file paths that imply TLS). Prefer
+// certificate-based client authentication (tls_cert_path/tls_key_path) over
+// the username/password mechanism.
+func (cfg *Config) Validate() error {
+	if cfg.Password != "" && !cfg.shouldUseTLS() {
+		return ErrEtcdPasswordWithoutTLS
+	}
+	return nil
+}
+
+// GetTLS sets the TLS config field with certs. TLS is used whenever the
+// operator explicitly enabled it, configured an https:// (or unixs://)
+// endpoint, or supplied any TLS file path / server-name override; otherwise a
+// nil *tls.Config is returned and the etcd client dials in plaintext.
 func (cfg *Config) GetTLS() (*tls.Config, error) {
-	if !cfg.EnableTLS {
+	if !cfg.shouldUseTLS() {
 		return nil, nil
 	}
 	tlsInfo := &transport.TLSInfo{
@@ -79,9 +127,15 @@ func (cfg *Config) GetTLS() (*tls.Config, error) {
 
 // New makes a new Client.
 func New(cfg Config, codec codec.Codec, logger log.Logger) (*Client, error) {
+	if err := cfg.Validate(); err != nil {
+		return nil, errors.Wrap(err, "invalid etcd config")
+	}
 	tlsConfig, err := cfg.GetTLS()
 	if err != nil {
 		return nil, errors.Wrapf(err, "unable to initialise TLS configuration for etcd")
+	}
+	if cfg.Password != "" && cfg.TLS.CertPath != "" && cfg.TLS.KeyPath != "" {
+		level.Warn(logger).Log("msg", "etcd client is configured with both password and client certificate authentication; prefer certificate-based client auth over username/password")
 	}
 	cli, err := clientv3.New(clientv3.Config{
 		Endpoints:   cfg.Endpoints,
