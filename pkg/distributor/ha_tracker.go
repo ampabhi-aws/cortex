@@ -6,6 +6,7 @@ import (
 	"flag"
 	"fmt"
 	"math/rand"
+	"net/url"
 	"strings"
 	"sync"
 	"time"
@@ -33,6 +34,45 @@ type haTrackerLimits interface {
 	// MaxHAClusters returns max number of clusters that HA tracker should track for a user.
 	// Samples from additional clusters are rejected.
 	MaxHAClusters(user string) int
+}
+
+// maxHAClusterLabelLength caps the length of the HA `cluster` label value that is
+// allowed to flow into KV keys, in-memory maps and Prometheus metric children.
+// It is a defence-in-depth bound on top of the per-tenant MaxLabelValueLength
+// check performed in Distributor.checkSample, used in code paths that read
+// values from the shared KV store or that cannot easily access the per-tenant
+// limits (for example the WatchPrefix callback).
+const maxHAClusterLabelLength = 2048
+
+// haTrackerKey builds the KV / in-memory map key for a (userID, cluster)
+// pair. The cluster segment is percent-encoded so that it cannot contain a
+// "/" separator and so that a tenant cannot inject arbitrary bytes into the
+// shared KV key space. For conservative cluster values (letters, digits,
+// `-._~`) the encoding is the identity, preserving the historical key format.
+func haTrackerKey(userID, cluster string) string {
+	return fmt.Sprintf("%s/%s", userID, url.PathEscape(cluster))
+}
+
+// decodeHAClusterFromKey inverts haTrackerKey. If the key does not decode
+// cleanly the raw segment is returned so callers can still log/trace it; the
+// value is additionally truncated by truncateLabelValue before being used as
+// a Prometheus label value.
+func decodeHAClusterFromKey(encoded string) string {
+	if decoded, err := url.PathUnescape(encoded); err == nil {
+		return decoded
+	}
+	return encoded
+}
+
+// truncateLabelValue bounds the length of a tenant-supplied string before it
+// is used as a Prometheus metric label value. Oversized values are retained
+// forever by the Prometheus client (and re-serialized on every /metrics
+// scrape), so we never allow them in.
+func truncateLabelValue(v string) string {
+	if len(v) > maxHAClusterLabelLength {
+		return v[:maxHAClusterLabelLength]
+	}
+	return v
 }
 
 // ProtoReplicaDescFactory makes new InstanceDescs
@@ -230,10 +270,19 @@ func (c *haTracker) loop(ctx context.Context) error {
 		c.electedLock.Lock()
 		defer c.electedLock.Unlock()
 
+		// Decode the cluster segment back to its original (unescaped) value for
+		// use as a Prometheus metric label, and cap its length so that an
+		// oversized value sitting in the KV store cannot create a permanent
+		// huge-cardinality metric child.
+		cluster = truncateLabelValue(decodeHAClusterFromKey(cluster))
+
 		if replica.DeletedAt > 0 {
 			delete(c.elected, key)
 			c.electedReplicaChanges.DeleteLabelValues(user, cluster)
 			c.electedReplicaTimestamp.DeleteLabelValues(user, cluster)
+			// Also drop the kvCASCalls child so that cluster values which
+			// are removed from the KV store do not leak metric cardinality.
+			c.kvCASCalls.DeleteLabelValues(user, cluster)
 
 			userClusters := c.clusters[user]
 			if userClusters != nil {
@@ -374,7 +423,17 @@ func (c *haTracker) checkReplica(ctx context.Context, userID, cluster, replica s
 	if !c.cfg.EnableHATracker {
 		return nil
 	}
-	key := fmt.Sprintf("%s/%s", userID, cluster)
+	// Defence-in-depth: Distributor.checkSample enforces the per-tenant
+	// MaxLabelValueLength on both `cluster` and `replica`, but we cap again
+	// here so no caller can bypass the bound and so that the strings we use
+	// as KV keys / Prometheus label values are always small.
+	if len(cluster) > maxHAClusterLabelLength || len(replica) > maxHAClusterLabelLength {
+		return nil
+	}
+	key := haTrackerKey(userID, cluster)
+	// `cluster` is also used as a Prometheus label value below; cap its
+	// length (should normally be a no-op given checkSample).
+	metricCluster := truncateLabelValue(cluster)
 
 	c.electedLock.RLock()
 	entry, ok := c.elected[key]
@@ -396,7 +455,7 @@ func (c *haTracker) checkReplica(ctx context.Context, userID, cluster, replica s
 	}
 
 	err := c.checkKVStore(ctx, key, replica, now)
-	c.kvCASCalls.WithLabelValues(userID, cluster).Inc()
+	c.kvCASCalls.WithLabelValues(userID, metricCluster).Inc()
 	if err != nil {
 		// The callback within checkKVStore will return a replicasNotMatchError if the sample is being deduped,
 		// otherwise there may have been an actual error CAS'ing that we should log.
