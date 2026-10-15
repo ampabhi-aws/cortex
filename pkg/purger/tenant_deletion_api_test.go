@@ -20,23 +20,76 @@ func TestDeleteTenant(t *testing.T) {
 	bkt := objstore.NewInMemBucket()
 	api := newTenantDeletionAPI(bkt, nil, log.NewNopLogger())
 
+	// No tenant in context => Unauthorized.
 	{
 		resp := httptest.NewRecorder()
 		api.DeleteTenant(resp, &http.Request{})
 		require.Equal(t, http.StatusUnauthorized, resp.Code)
 	}
 
+	// Missing confirmation parameter => BadRequest (and nothing is written).
 	{
 		ctx := context.Background()
 		ctx = user.InjectOrgID(ctx, "fake")
 
-		req := &http.Request{}
+		req := httptest.NewRequest("POST", "/purger/delete_tenant", nil)
+		resp := httptest.NewRecorder()
+		api.DeleteTenant(resp, req.WithContext(ctx))
+
+		require.Equal(t, http.StatusBadRequest, resp.Code)
+		require.Nil(t, bkt.Objects()[path.Join("fake", tsdb.TenantDeletionMarkPath)])
+	}
+
+	// Mismatched confirmation parameter => BadRequest.
+	{
+		ctx := context.Background()
+		ctx = user.InjectOrgID(ctx, "fake")
+
+		req := httptest.NewRequest("POST", "/purger/delete_tenant?tenant=other", nil)
+		resp := httptest.NewRecorder()
+		api.DeleteTenant(resp, req.WithContext(ctx))
+
+		require.Equal(t, http.StatusBadRequest, resp.Code)
+		require.Nil(t, bkt.Objects()[path.Join("fake", tsdb.TenantDeletionMarkPath)])
+	}
+
+	// Matching confirmation parameter => OK, mark written.
+	{
+		ctx := context.Background()
+		ctx = user.InjectOrgID(ctx, "fake")
+
+		req := httptest.NewRequest("POST", "/purger/delete_tenant?tenant=fake", nil)
 		resp := httptest.NewRecorder()
 		api.DeleteTenant(resp, req.WithContext(ctx))
 
 		require.Equal(t, http.StatusOK, resp.Code)
 		objs := bkt.Objects()
 		require.NotNil(t, objs[path.Join("fake", tsdb.TenantDeletionMarkPath)])
+	}
+
+	// Undo (DELETE) with matching confirmation parameter => OK, mark removed.
+	{
+		ctx := context.Background()
+		ctx = user.InjectOrgID(ctx, "fake")
+
+		req := httptest.NewRequest("DELETE", "/purger/delete_tenant?tenant=fake", nil)
+		resp := httptest.NewRecorder()
+		api.UndoDeleteTenant(resp, req.WithContext(ctx))
+
+		require.Equal(t, http.StatusOK, resp.Code)
+		require.Nil(t, bkt.Objects()[path.Join("fake", tsdb.TenantDeletionMarkPath)])
+	}
+
+	// Undo without confirmation parameter => BadRequest.
+	{
+		ctx := context.Background()
+		ctx = user.InjectOrgID(ctx, "fake")
+
+		req := httptest.NewRequest("DELETE", "/purger/delete_tenant", nil)
+		resp := httptest.NewRecorder()
+		api.UndoDeleteTenant(resp, req.WithContext(ctx))
+
+		require.Equal(t, http.StatusBadRequest, resp.Code)
 	}
 }
 
