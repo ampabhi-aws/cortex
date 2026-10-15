@@ -90,6 +90,19 @@ func init() {
 	pageTemplate = template.Must(t.Parse(pageContent))
 }
 
+// hasInstance returns true if the given instance id currently exists in the
+// ring. It acquires the ring read lock itself and must not be called while
+// the caller already holds r.mtx.
+func (r *Ring) hasInstance(id string) bool {
+	r.mtx.RLock()
+	defer r.mtx.RUnlock()
+	if r.ringDesc == nil {
+		return false
+	}
+	_, ok := r.ringDesc.Ingesters[id]
+	return ok
+}
+
 func (r *Ring) forget(ctx context.Context, id string) error {
 	unregister := func(in interface{}) (out interface{}, retry bool, err error) {
 		if in == nil {
@@ -124,6 +137,23 @@ type httpResponse struct {
 func (r *Ring) ServeHTTP(w http.ResponseWriter, req *http.Request) {
 	if req.Method == http.MethodPost {
 		ingesterID := req.FormValue("forget")
+
+		// Return early (without a KV write) when the supplied instance ID is
+		// empty or not currently present in the ring. This prevents a
+		// no-op POST (e.g. `forget=`) from forcing a CAS write on the KV
+		// store, which with the memberlist backend amplifies into ~10s of
+		// retry work per request (errNoChangeDetected * maxCasRetries) and
+		// with the Consul backend bumps ModifyIndex and wakes every ring
+		// watcher in the cluster.
+		if ingesterID == "" || !r.hasInstance(ingesterID) {
+			if ingesterID != "" {
+				level.Warn(r.logger).Log("msg", "ignoring forget request for unknown instance", "instance", ingesterID)
+			}
+			w.Header().Set("Location", "#")
+			w.WriteHeader(http.StatusFound)
+			return
+		}
+
 		if err := r.forget(req.Context(), ingesterID); err != nil {
 			level.Error(r.logger).Log("msg", "error forgetting instance", "err", err)
 		}
