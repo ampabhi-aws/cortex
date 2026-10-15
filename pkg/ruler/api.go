@@ -288,7 +288,29 @@ var (
 	ErrNoRuleGroups = errors.New("no rule groups found")
 	// ErrBadRuleGroup is returned when the provided rule group can not be unmarshalled
 	ErrBadRuleGroup = errors.New("unable to decoded rule group")
+	// ErrInvalidNamespace signals that the namespace contains characters that
+	// cannot be safely used as a path component (path separators, or `.`/`..`
+	// segments). Rejecting these here protects every rule-store backend from
+	// path-traversal via a URL-encoded namespace.
+	ErrInvalidNamespace = errors.New("invalid namespace: must not contain path separators or be '.' or '..'")
 )
+
+// validatePathComponent rejects any value that cannot be safely used as a
+// single path component by a rule-store backend. Specifically it rejects empty
+// strings, values equal to `.` or `..`, and values that contain a forward or
+// backward slash or a NUL byte. This mirrors the guard that already exists for
+// alertmanager template filenames and prevents URL-encoded traversal payloads
+// (e.g. `..%2Fvictim%2Fns`) from escaping a tenant's rule directory in the
+// local rule-store backend.
+func validatePathComponent(v string) bool {
+	if v == "" || v == "." || v == ".." {
+		return false
+	}
+	if strings.ContainsAny(v, "/\\\x00") {
+		return false
+	}
+	return true
+}
 
 func marshalAndSend(output interface{}, w http.ResponseWriter, logger log.Logger) {
 	d, err := yaml.Marshal(&output)
@@ -324,7 +346,13 @@ func respondAccepted(w http.ResponseWriter, logger log.Logger) {
 }
 
 // parseNamespace parses the namespace from the provided set of params, in this
-// api these params are derived from the url path
+// api these params are derived from the url path.
+//
+// The gorilla mux router is configured with UseEncodedPath() (see
+// pkg/api/api.go), so this function receives the still percent-encoded path
+// segment. After decoding we reject any value that contains a path separator
+// or is a `.`/`..` segment, so a decoded value cannot be used as a traversal
+// payload by a backend that joins it into a filesystem path or object key.
 func parseNamespace(params map[string]string) (string, error) {
 	namespace, exists := params["namespace"]
 	if !exists {
@@ -336,11 +364,15 @@ func parseNamespace(params map[string]string) (string, error) {
 		return "", err
 	}
 
+	if !validatePathComponent(namespace) {
+		return "", ErrInvalidNamespace
+	}
+
 	return namespace, nil
 }
 
 // parseGroupName parses the group name from the provided set of params, in this
-// api these params are derived from the url path
+// api these params are derived from the url path.
 func parseGroupName(params map[string]string) (string, error) {
 	groupName, exists := params["groupName"]
 	if !exists {
@@ -395,7 +427,13 @@ func (a *API) ListRules(w http.ResponseWriter, req *http.Request) {
 	level.Debug(logger).Log("msg", "retrieving rule groups with namespace", "userID", userID, "namespace", namespace)
 	rgs, err := a.store.ListRuleGroupsForUserAndNamespace(req.Context(), userID, namespace)
 	if err != nil {
-		http.Error(w, err.Error(), http.StatusBadRequest)
+		// Do not echo the underlying error to the caller: with the local
+		// rule-store backend the wrapped error includes the resolved absolute
+		// path and a fragment of the file's YAML, which would leak server-side
+		// filesystem state to an untrusted tenant. Log the detail and return a
+		// generic message to the client.
+		level.Warn(logger).Log("msg", "unable to list rule groups", "userID", userID, "namespace", namespace, "err", err)
+		http.Error(w, "unable to list rule groups", http.StatusBadRequest)
 		return
 	}
 

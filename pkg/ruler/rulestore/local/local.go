@@ -5,6 +5,7 @@ import (
 	"flag"
 	"os"
 	"path/filepath"
+	"strings"
 
 	"github.com/pkg/errors"
 	promRules "github.com/prometheus/prometheus/rules"
@@ -168,11 +169,38 @@ func (l *Client) loadAllRulesGroupsForUser(ctx context.Context, userID string) (
 }
 
 func (l *Client) loadAllRulesGroupsForUserAndNamespace(_ context.Context, userID string, namespace string) (rulespb.RuleGroupList, error) {
-	filename := filepath.Join(l.cfg.Directory, userID, namespace)
+	if !isSafePathComponent(userID) || !isSafePathComponent(namespace) {
+		return nil, errors.New("invalid tenant or namespace")
+	}
+
+	userDir, err := filepath.Abs(filepath.Join(l.cfg.Directory, userID))
+	if err != nil {
+		return nil, errors.New("unable to resolve rule directory")
+	}
+
+	filename := filepath.Join(userDir, namespace)
+
+	// Defence-in-depth containment check: even though the central API-level
+	// validation rejects path separators and dot segments, make sure the
+	// resolved file still lives inside the tenant's directory before touching
+	// the filesystem. filepath.Rel returns a path starting with ".." when
+	// `filename` escapes `userDir`.
+	absFile, err := filepath.Abs(filename)
+	if err != nil {
+		return nil, errors.New("unable to resolve rule file path")
+	}
+	rel, err := filepath.Rel(userDir, absFile)
+	if err != nil || rel == ".." || strings.HasPrefix(rel, ".."+string(filepath.Separator)) || filepath.IsAbs(rel) {
+		return nil, errors.New("invalid namespace: escapes tenant rule directory")
+	}
 
 	rulegroups, allErrors := l.loader.Load(filename)
 	if len(allErrors) > 0 {
-		return nil, errors.Wrapf(allErrors[0], "error parsing %s", filename)
+		// Do not include the resolved absolute path or the wrapped parse error:
+		// the YAML type error includes a fragment of the file's content and the
+		// path reveals server-side filesystem layout. Both would otherwise be
+		// returned verbatim to an untrusted tenant via the HTTP handler.
+		return nil, errors.New("error parsing rule group")
 	}
 
 	var list rulespb.RuleGroupList
@@ -183,4 +211,19 @@ func (l *Client) loadAllRulesGroupsForUserAndNamespace(_ context.Context, userID
 	}
 
 	return list, nil
+}
+
+// isSafePathComponent returns true iff v can be safely used as a single path
+// component when joined into a tenant's rule directory. It mirrors the central
+// validation performed by pkg/ruler.parseNamespace and acts as defence in
+// depth for callers that reach the store without going through the HTTP API
+// (e.g. ListAllRuleGroups walking the on-disk layout).
+func isSafePathComponent(v string) bool {
+	if v == "" || v == "." || v == ".." {
+		return false
+	}
+	if strings.ContainsAny(v, "/\\\x00") {
+		return false
+	}
+	return true
 }
