@@ -7,6 +7,8 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"reflect"
+	"strings"
 	"testing"
 
 	"github.com/go-kit/log"
@@ -419,6 +421,35 @@ alertmanager_config: |
 			err: errors.Wrap(errVictorOpsAPIKeyFileNotAllowed, "error validating Alertmanager config"),
 		},
 		{
+			name: "Should return error if global opsgenie_api_key_file is set",
+			cfg: `
+alertmanager_config: |
+  global:
+    opsgenie_api_key_file: /secrets
+
+  receivers:
+    - name: default-receiver
+
+  route:
+    receiver: 'default-receiver'
+`,
+			err: errors.Wrap(errOpsGenieAPIKeyFileNotAllowed, "error validating Alertmanager config"),
+		},
+		{
+			name: "Should return error if OpsGenie api_key_file is set",
+			cfg: `
+alertmanager_config: |
+  receivers:
+    - name: default-receiver
+      opsgenie_configs:
+        - api_key_file: /secrets
+
+  route:
+    receiver: 'default-receiver'
+`,
+			err: errors.Wrap(errOpsGenieAPIKeyFileNotAllowed, "error validating Alertmanager config"),
+		},
+		{
 			name: "should return error if template is wrong",
 			cfg: `
 alertmanager_config: |
@@ -792,5 +823,75 @@ func TestValidateAlertmanagerConfig(t *testing.T) {
 			err := validateAlertmanagerConfig(testData.input)
 			assert.ErrorIs(t, err, testData.expected)
 		})
+	}
+}
+
+// TestValidateAlertmanagerConfig_FileFieldsCoverage reflects over the entire
+// Alertmanager config tree and fails if a new field whose yaml tag ends in
+// "_file" appears in the vendored Alertmanager without being covered by the
+// Cortex tenant-config denylist. This is a canary: whenever the vendored
+// Alertmanager adds a new *_file field (which lets a tenant make the shared
+// Cortex process read a local file), the author must either extend the denylist
+// or explicitly list the new field in knownFileFields below.
+func TestValidateAlertmanagerConfig_FileFieldsCoverage(t *testing.T) {
+	// Every yaml "*_file" tag reachable from config.Config that the denylist
+	// in pkg/alertmanager/api.go is known to reject. Any new entry MUST have
+	// a corresponding check in validateGlobalConfig / validateReceiverHTTPConfig /
+	// validateReceiverTLSConfig / validateSlackConfig / validateVictorOpsConfig /
+	// validateOpsGenieConfig (or a new validate* function wired into
+	// validateAlertmanagerConfig).
+	knownFileFields := map[string]struct{}{
+		"password_file":         {}, // commoncfg.BasicAuth
+		"credentials_file":      {}, // commoncfg.Authorization
+		"bearer_token_file":     {}, // commoncfg.HTTPClientConfig
+		"client_secret_file":    {}, // commoncfg.OAuth2
+		"ca_file":               {}, // commoncfg.TLSConfig
+		"cert_file":             {}, // commoncfg.TLSConfig
+		"key_file":              {}, // commoncfg.TLSConfig
+		"slack_api_url_file":    {}, // config.GlobalConfig
+		"opsgenie_api_key_file": {}, // config.GlobalConfig
+		"api_url_file":          {}, // config.SlackConfig
+		"api_key_file":          {}, // config.VictorOpsConfig and config.OpsGenieConfig
+	}
+
+	var found []string
+	seen := map[reflect.Type]struct{}{}
+	var walk func(t reflect.Type)
+	walk = func(ty reflect.Type) {
+		for ty.Kind() == reflect.Ptr || ty.Kind() == reflect.Slice || ty.Kind() == reflect.Array || ty.Kind() == reflect.Map {
+			if ty.Kind() == reflect.Map {
+				walk(ty.Key())
+			}
+			ty = ty.Elem()
+		}
+		if _, ok := seen[ty]; ok {
+			return
+		}
+		seen[ty] = struct{}{}
+		if ty.Kind() != reflect.Struct {
+			return
+		}
+		for i := 0; i < ty.NumField(); i++ {
+			f := ty.Field(i)
+			tag := f.Tag.Get("yaml")
+			if tag != "" && tag != "-" {
+				// Strip ",omitempty" / ",inline" etc.
+				name := tag
+				if idx := strings.Index(name, ","); idx >= 0 {
+					name = name[:idx]
+				}
+				if strings.HasSuffix(name, "_file") {
+					if _, ok := knownFileFields[name]; !ok {
+						found = append(found, fmt.Sprintf("%s.%s (yaml:%q)", ty.String(), f.Name, name))
+					}
+				}
+			}
+			walk(f.Type)
+		}
+	}
+	walk(reflect.TypeOf(config.Config{}))
+
+	if len(found) > 0 {
+		t.Fatalf("vendored Alertmanager exposes *_file config fields not covered by the Cortex tenant-config denylist; add a check in pkg/alertmanager/api.go (or update knownFileFields if the field is intentionally allowed): %v", found)
 	}
 }
