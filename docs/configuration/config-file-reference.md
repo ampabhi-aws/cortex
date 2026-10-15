@@ -1350,6 +1350,13 @@ ring:
 # Disable the rule_group label on exported metrics
 # CLI flag: -ruler.disable-rule-group-label
 [disable_rule_group_label: <boolean> | default = false]
+
+# Enable the operator-only GET /ruler/rule_groups endpoint, which lists every
+# tenant's rule groups. This endpoint is never tenant-scoped and is served
+# without authentication; it must be protected at a reverse proxy. Set to
+# false to disable it entirely (returns 404).
+# CLI flag: -ruler.list-all-rule-groups-enabled
+[list_all_rule_groups_enabled: <boolean> | default = true]
 ```
 
 ### `ruler_storage_config`

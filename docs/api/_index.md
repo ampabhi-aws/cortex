@@ -444,7 +444,9 @@ Displays a web page with the ruler hash ring status, including the state, health
 GET /ruler/rule_groups
 ```
 
-List all tenant rules. This endpoint is not part of ruler-API and is always available regardless of whether ruler-API is enabled or not. It should not be exposed to end users. This endpoint returns a YAML dictionary with all the rule groups for each tenant and `200` status code on success.
+List all tenant rules. This endpoint is not part of ruler-API and is available (by default) regardless of whether ruler-API is enabled or not. It should not be exposed to end users. This endpoint returns a YAML dictionary with all the rule groups for each tenant and `200` status code on success.
+
+The endpoint is never tenant-scoped and is served without authentication; Cortex trusts the caller-supplied `X-Scope-OrgID` header verbatim and does not authenticate requests. Operators **must** block this path (and other operator paths such as `/ruler/*`, `/ingester/*`, `/multitenant_alertmanager/*`, `/distributor/all_user_stats`, `/config`, `/runtime_config`) at the reverse proxy so that tenant traffic cannot reach it. Set `-ruler.list-all-rule-groups-enabled=false` to disable the endpoint entirely (it will return `404 Not Found`).
 
 ### List rules
 
