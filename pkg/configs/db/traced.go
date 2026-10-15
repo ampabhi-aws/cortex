@@ -10,7 +10,15 @@ import (
 	"github.com/go-kit/log/level"
 )
 
-// traced adds log trace lines on each db call
+// traced adds log trace lines on each db call.
+//
+// Trace lines intentionally exclude configuration bodies (userconfig.Config,
+// userconfig.View, userconfig.RulesConfig, etc.) because tenant Alertmanager
+// configurations and rule files can contain receiver credentials (Slack/
+// PagerDuty API keys, webhook URLs, SMTP passwords, bearer tokens). Logging
+// those verbatim would record them in cleartext in the shared process log.
+// Only non-sensitive identifiers (operation name, userID, counts, error) are
+// emitted here.
 type traced struct {
 	d DB
 }
@@ -20,22 +28,22 @@ func (t traced) trace(name string, args ...interface{}) {
 }
 
 func (t traced) GetConfig(ctx context.Context, userID string) (cfg userconfig.View, err error) {
-	defer func() { t.trace("GetConfig", userID, cfg, err) }()
+	defer func() { t.trace("GetConfig", userID, err) }()
 	return t.d.GetConfig(ctx, userID)
 }
 
 func (t traced) SetConfig(ctx context.Context, userID string, cfg userconfig.Config) (err error) {
-	defer func() { t.trace("SetConfig", userID, cfg, err) }()
+	defer func() { t.trace("SetConfig", userID, err) }()
 	return t.d.SetConfig(ctx, userID, cfg)
 }
 
 func (t traced) GetAllConfigs(ctx context.Context) (cfgs map[string]userconfig.View, err error) {
-	defer func() { t.trace("GetAllConfigs", cfgs, err) }()
+	defer func() { t.trace("GetAllConfigs", len(cfgs), err) }()
 	return t.d.GetAllConfigs(ctx)
 }
 
 func (t traced) GetConfigs(ctx context.Context, since userconfig.ID) (cfgs map[string]userconfig.View, err error) {
-	defer func() { t.trace("GetConfigs", since, cfgs, err) }()
+	defer func() { t.trace("GetConfigs", since, len(cfgs), err) }()
 	return t.d.GetConfigs(ctx, since)
 }
 
@@ -55,21 +63,21 @@ func (t traced) Close() (err error) {
 }
 
 func (t traced) GetRulesConfig(ctx context.Context, userID string) (cfg userconfig.VersionedRulesConfig, err error) {
-	defer func() { t.trace("GetRulesConfig", userID, cfg, err) }()
+	defer func() { t.trace("GetRulesConfig", userID, err) }()
 	return t.d.GetRulesConfig(ctx, userID)
 }
 
 func (t traced) SetRulesConfig(ctx context.Context, userID string, oldCfg, newCfg userconfig.RulesConfig) (updated bool, err error) {
-	defer func() { t.trace("SetRulesConfig", userID, oldCfg, newCfg, updated, err) }()
+	defer func() { t.trace("SetRulesConfig", userID, updated, err) }()
 	return t.d.SetRulesConfig(ctx, userID, oldCfg, newCfg)
 }
 
 func (t traced) GetAllRulesConfigs(ctx context.Context) (cfgs map[string]userconfig.VersionedRulesConfig, err error) {
-	defer func() { t.trace("GetAllRulesConfigs", cfgs, err) }()
+	defer func() { t.trace("GetAllRulesConfigs", len(cfgs), err) }()
 	return t.d.GetAllRulesConfigs(ctx)
 }
 
 func (t traced) GetRulesConfigs(ctx context.Context, since userconfig.ID) (cfgs map[string]userconfig.VersionedRulesConfig, err error) {
-	defer func() { t.trace("GetConfigs", since, cfgs, err) }()
+	defer func() { t.trace("GetRulesConfigs", since, len(cfgs), err) }()
 	return t.d.GetRulesConfigs(ctx, since)
 }
