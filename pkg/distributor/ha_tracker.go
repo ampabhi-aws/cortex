@@ -117,6 +117,13 @@ type haTracker struct {
 	elected     map[string]ReplicaDesc         // Replicas we are accepting samples from. Key = "user/cluster".
 	clusters    map[string]map[string]struct{} // Known clusters with elected replicas per user. First key = user, second key = cluster name.
 
+	// userLocksMu protects the userLocks map itself (lazy allocation of per-user locks).
+	// Per-user mutexes serialize new-cluster admission for a tenant on this distributor so that
+	// a burst of concurrent requests carrying distinct cluster labels cannot all pass the
+	// MaxHAClusters check against a stale, watch-populated cache.
+	userLocksMu sync.Mutex
+	userLocks   map[string]*sync.Mutex
+
 	electedReplicaChanges         *prometheus.CounterVec
 	electedReplicaTimestamp       *prometheus.GaugeVec
 	electedReplicaPropagationTime prometheus.Histogram
@@ -143,6 +150,7 @@ func newHATracker(cfg HATrackerConfig, limits haTrackerLimits, reg prometheus.Re
 		limits:              limits,
 		elected:             map[string]ReplicaDesc{},
 		clusters:            map[string]map[string]struct{}{},
+		userLocks:           map[string]*sync.Mutex{},
 
 		electedReplicaChanges: promauto.With(reg).NewCounterVec(prometheus.CounterOpts{
 			Name: "cortex_ha_tracker_elected_replica_changes_total",
@@ -378,6 +386,30 @@ func (c *haTracker) checkReplica(ctx context.Context, userID, cluster, replica s
 
 	c.electedLock.RLock()
 	entry, ok := c.elected[key]
+	c.electedLock.RUnlock()
+
+	if ok && now.Sub(timestamp.Time(entry.ReceivedAt)) < c.cfg.UpdateTimeout+c.updateTimeoutJitter {
+		if entry.Replica != replica {
+			return replicasNotMatchError{replica: replica, elected: entry.Replica}
+		}
+		return nil
+	}
+
+	// From here on we may either be electing a replica for a new cluster for this
+	// tenant, or refreshing/updating an existing one. Serialize per-tenant so that
+	// a burst of concurrent requests with distinct cluster labels cannot all pass
+	// the MaxHAClusters check against a stale cache populated by the (rate-limited,
+	// asynchronous) KV watch. This bounds the per-tenant concurrency to one in-flight
+	// new-cluster admission per distributor at a time.
+	userLock := c.getUserLock(userID)
+	userLock.Lock()
+	defer userLock.Unlock()
+
+	// Re-check the elected cache under the user lock: another request may have just
+	// created the entry for this cluster.
+	c.electedLock.RLock()
+	entry, ok = c.elected[key]
+	_, clusterKnown := c.clusters[userID][cluster]
 	clusters := len(c.clusters[userID])
 	c.electedLock.RUnlock()
 
@@ -388,26 +420,69 @@ func (c *haTracker) checkReplica(ctx context.Context, userID, cluster, replica s
 		return nil
 	}
 
-	if !ok {
+	if !ok && !clusterKnown {
 		// If we don't know about this cluster yet and we have reached the limit for number of clusters, we error out now.
 		if limit := c.limits.MaxHAClusters(userID); limit > 0 && clusters+1 > limit {
 			return tooManyClustersError{limit: limit}
 		}
 	}
 
-	err := c.checkKVStore(ctx, key, replica, now)
+	newCluster := !ok && !clusterKnown
+	err := c.checkKVStore(ctx, key, replica, now, func(desc *ReplicaDesc) error {
+		// Called from inside the CAS callback (while holding the per-user lock) only
+		// when the CAS would create or replace the entry for this (user, cluster).
+		// Re-evaluate the limit authoritatively against the local state the
+		// distributor is about to mutate, so concurrent new-cluster admissions on
+		// this distributor are counted even before the KV watch propagates.
+		if !newCluster {
+			return nil
+		}
+		c.electedLock.RLock()
+		_, already := c.clusters[userID][cluster]
+		count := len(c.clusters[userID])
+		c.electedLock.RUnlock()
+		if already {
+			return nil
+		}
+		if limit := c.limits.MaxHAClusters(userID); limit > 0 && count+1 > limit {
+			return tooManyClustersError{limit: limit}
+		}
+		// Record the cluster synchronously so a follow-up concurrent push observes it
+		// before the KV watch notification arrives. The watch callback is idempotent
+		// and will keep this entry when it propagates; the cleanup path removes it on
+		// delete.
+		c.electedLock.Lock()
+		if c.clusters[userID] == nil {
+			c.clusters[userID] = map[string]struct{}{}
+		}
+		c.clusters[userID][cluster] = struct{}{}
+		c.electedLock.Unlock()
+		return nil
+	})
 	c.kvCASCalls.WithLabelValues(userID, cluster).Inc()
 	if err != nil {
 		// The callback within checkKVStore will return a replicasNotMatchError if the sample is being deduped,
 		// otherwise there may have been an actual error CAS'ing that we should log.
-		if !errors.Is(err, replicasNotMatchError{}) {
+		if !errors.Is(err, replicasNotMatchError{}) && !errors.Is(err, tooManyClustersError{}) {
 			level.Error(c.logger).Log("msg", "rejecting sample", "err", err)
 		}
 	}
 	return err
 }
 
-func (c *haTracker) checkKVStore(ctx context.Context, key, replica string, now time.Time) error {
+// getUserLock returns the per-user admission lock, creating it lazily on first use.
+func (c *haTracker) getUserLock(userID string) *sync.Mutex {
+	c.userLocksMu.Lock()
+	defer c.userLocksMu.Unlock()
+	if l, ok := c.userLocks[userID]; ok {
+		return l
+	}
+	l := &sync.Mutex{}
+	c.userLocks[userID] = l
+	return l
+}
+
+func (c *haTracker) checkKVStore(ctx context.Context, key, replica string, now time.Time, onCreate func(*ReplicaDesc) error) error {
 	return c.client.CAS(ctx, key, func(in interface{}) (out interface{}, retry bool, err error) {
 		if desc, ok := in.(*ReplicaDesc); ok && desc.DeletedAt == 0 {
 			// We don't need to CAS and update the timestamp in the KV store if the timestamp we've received
@@ -426,11 +501,17 @@ func (c *haTracker) checkKVStore(ctx context.Context, key, replica string, now t
 		// There was either invalid or no data for the key, so we now accept samples
 		// from this replica. Invalid could mean that the timestamp in the KV store was
 		// out of date based on the update and failover timeouts when compared to now.
-		return &ReplicaDesc{
+		newDesc := &ReplicaDesc{
 			Replica:    replica,
 			ReceivedAt: timestamp.FromTime(now),
 			DeletedAt:  0,
-		}, true, nil
+		}
+		if onCreate != nil {
+			if err := onCreate(newDesc); err != nil {
+				return nil, false, err
+			}
+		}
+		return newDesc, true, nil
 	})
 }
 
@@ -467,6 +548,13 @@ func (e tooManyClustersError) Is(err error) bool {
 	_, ok1 := err.(tooManyClustersError)
 	_, ok2 := err.(*tooManyClustersError)
 	return ok1 || ok2
+}
+
+// IsOperationAborted lets the KV metrics layer treat a CAS aborted because the
+// per-tenant HA cluster limit was reached as a successful (non-error) operation
+// rather than a KV failure.
+func (e tooManyClustersError) IsOperationAborted() bool {
+	return true
 }
 
 func findHALabels(replicaLabel, clusterLabel string, labels []cortexpb.LabelAdapter) (string, string) {
