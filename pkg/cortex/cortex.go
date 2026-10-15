@@ -335,13 +335,16 @@ func New(cfg Config) (*Cortex, error) {
 		tenant.WithDefaultResolver(tenant.NewMultiResolver())
 	}
 
-	// Don't check auth header on TransferChunks, as we weren't originally
-	// sending it and this could cause transfers to fail on update.
+	// These gRPC methods are exempt from the X-Scope-OrgID header check: a
+	// single call multiplexes work for many tenants (frontend/scheduler/querier
+	// control-plane streams) or carries no tenant at all (health check). This
+	// header-extraction interceptor is a tenant propagator, not a credential
+	// check; peer authentication for the internal gRPC listener must be
+	// configured at the deployment layer (e.g. server.grpc-tls-client-auth and
+	// server.grpc-tls-config). See docs/guides/authentication-and-authorisation.md.
 	cfg.API.HTTPAuthMiddleware = fakeauth.SetupAuthMiddleware(&cfg.Server, cfg.AuthEnabled,
-		// Also don't check auth for these gRPC methods, since single call is used for multiple users (or no user like health check).
 		[]string{
 			"/grpc.health.v1.Health/Check",
-			"/cortex.Ingester/TransferChunks",
 			"/frontend.Frontend/Process",
 			"/frontend.Frontend/NotifyClientShutdown",
 			"/schedulerpb.SchedulerForFrontend/FrontendLoop",
