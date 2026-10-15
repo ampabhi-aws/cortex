@@ -80,6 +80,19 @@ type MultitenantAlertmanagerConfig struct {
 
 	EnableAPI bool `yaml:"enable_api"`
 
+	// EnableAllTenantsConfigsAPI controls whether the operator endpoint
+	// /multitenant_alertmanager/configs is allowed to return the Alertmanager
+	// configuration (including notification secrets) of every tenant.
+	// It is disabled by default because the endpoint shares the tenant-facing
+	// HTTP listener and must be explicitly opted into by operators who have
+	// an external allowlist or admin network path in place.
+	EnableAllTenantsConfigsAPI bool `yaml:"enable_all_tenants_configs_api"`
+
+	// AllTenantsConfigsAdminTenantID, when set, restricts the
+	// /multitenant_alertmanager/configs endpoint to callers whose
+	// X-Scope-OrgID header matches the configured admin tenant.
+	AllTenantsConfigsAdminTenantID string `yaml:"all_tenants_configs_admin_tenant_id"`
+
 	// For distributor.
 	AlertmanagerClient ClientConfig `yaml:"alertmanager_client"`
 
@@ -114,6 +127,8 @@ func (cfg *MultitenantAlertmanagerConfig) RegisterFlags(f *flag.FlagSet) {
 	f.DurationVar(&cfg.PollInterval, "alertmanager.configs.poll-interval", 15*time.Second, "How frequently to poll Cortex configs")
 
 	f.BoolVar(&cfg.EnableAPI, "experimental.alertmanager.enable-api", false, "Enable the experimental alertmanager config api.")
+	f.BoolVar(&cfg.EnableAllTenantsConfigsAPI, "alertmanager.enable-all-tenants-configs-api", false, "Enable the operator endpoint /multitenant_alertmanager/configs that returns every tenant's Alertmanager configuration. The endpoint shares the tenant-facing HTTP listener and returns raw YAML that typically contains notification secrets (Slack, PagerDuty, SMTP, webhook tokens). Keep disabled unless an external allowlist or admin network path restricts access.")
+	f.StringVar(&cfg.AllTenantsConfigsAdminTenantID, "alertmanager.all-tenants-configs-admin-tenant-id", "", "If set, /multitenant_alertmanager/configs is only served to callers whose X-Scope-OrgID header matches this tenant ID. Requires -alertmanager.enable-all-tenants-configs-api=true.")
 
 	f.BoolVar(&cfg.ShardingEnabled, "alertmanager.sharding-enabled", false, "Shard tenants across multiple alertmanager instances.")
 
