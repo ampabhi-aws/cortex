@@ -24,9 +24,37 @@ type Config struct {
 
 // RegisterFlags adds the flags required to configure this to the given FlagSet.
 func (cfg *Config) RegisterFlags(f *flag.FlagSet) {
-	f.StringVar(&cfg.URI, "configs.database.uri", "postgres://postgres@configs-db.weave.local/configs?sslmode=disable", "URI where the database can be found (for dev you can use memory://)")
+	f.StringVar(&cfg.URI, "configs.database.uri", "postgres://postgres@configs-db.weave.local/configs?sslmode=disable", "URI where the database can be found (for dev you can use memory://). To avoid embedding database credentials in the config tree, prefer -configs.database.password-file and specify only the username in the URI.")
 	f.StringVar(&cfg.MigrationsDir, "configs.database.migrations-dir", "", "Path where the database migration files can be found")
 	f.StringVar(&cfg.PasswordFile, "configs.database.password-file", "", "File containing password (username goes in URI)")
+}
+
+// MarshalYAML implements yaml.Marshaler. It redacts any password embedded in
+// the connection URI so that the credential is not leaked when the live
+// configuration is rendered (e.g. by the GET /config endpoint).
+func (cfg Config) MarshalYAML() (interface{}, error) {
+	type plain Config
+	c := plain(cfg)
+	c.URI = redactPasswordInURI(c.URI)
+	return c, nil
+}
+
+// redactPasswordInURI returns the URI with any userinfo password replaced by
+// "********". If the value does not parse as a URL, or does not contain a
+// password, it is returned unchanged.
+func redactPasswordInURI(uri string) string {
+	if uri == "" {
+		return uri
+	}
+	u, err := url.Parse(uri)
+	if err != nil || u.User == nil {
+		return uri
+	}
+	if _, set := u.User.Password(); !set {
+		return uri
+	}
+	u.User = url.UserPassword(u.User.Username(), "********")
+	return u.String()
 }
 
 // DB is the interface for the database.
