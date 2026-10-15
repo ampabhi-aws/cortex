@@ -22,6 +22,14 @@ type userMetricsMetadata struct {
 	metricToMetadata map[string]metricMetadataSet
 }
 
+// incDiscardedMetadata increments validation.DiscardedMetadata using the
+// declared label order (reason, userID). It wraps the positional
+// CounterVec.WithLabelValues call so the arguments are named at the call
+// site and cannot be swapped by accident.
+func incDiscardedMetadata(reason, userID string) {
+	validation.DiscardedMetadata.WithLabelValues(reason, userID).Inc()
+}
+
 func newMetadataMap(l *Limiter, m *ingesterMetrics, userID string) *userMetricsMetadata {
 	return &userMetricsMetadata{
 		metricToMetadata: map[string]metricMetadataSet{},
@@ -42,7 +50,7 @@ func (mm *userMetricsMetadata) add(metric string, metadata *cortexpb.MetricMetad
 	if !ok {
 		// Verify that the user can create more metric metadata given we don't have a set for that metric name.
 		if err := mm.limiter.AssertMaxMetricsWithMetadataPerUser(mm.userID, len(mm.metricToMetadata)); err != nil {
-			validation.DiscardedMetadata.WithLabelValues(mm.userID, perUserMetadataLimit).Inc()
+			incDiscardedMetadata(perUserMetadataLimit, mm.userID)
 			return makeLimitError(perUserMetadataLimit, mm.limiter.FormatError(mm.userID, err))
 		}
 		set = metricMetadataSet{}
@@ -50,7 +58,7 @@ func (mm *userMetricsMetadata) add(metric string, metadata *cortexpb.MetricMetad
 	}
 
 	if err := mm.limiter.AssertMaxMetadataPerMetric(mm.userID, len(set)); err != nil {
-		validation.DiscardedMetadata.WithLabelValues(mm.userID, perMetricMetadataLimit).Inc()
+		incDiscardedMetadata(perMetricMetadataLimit, mm.userID)
 		return makeMetricLimitError(perMetricMetadataLimit, labels.FromStrings(labels.MetricName, metric), mm.limiter.FormatError(mm.userID, err))
 	}
 
