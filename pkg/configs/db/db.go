@@ -24,9 +24,41 @@ type Config struct {
 
 // RegisterFlags adds the flags required to configure this to the given FlagSet.
 func (cfg *Config) RegisterFlags(f *flag.FlagSet) {
-	f.StringVar(&cfg.URI, "configs.database.uri", "postgres://postgres@configs-db.weave.local/configs?sslmode=disable", "URI where the database can be found (for dev you can use memory://)")
+	f.StringVar(&cfg.URI, "configs.database.uri", "postgres://postgres@configs-db.weave.local/configs?sslmode=disable", "URI where the database can be found (for dev you can use memory://). Prefer -configs.database.password-file over an in-URI password; any userinfo embedded here is redacted from the /config endpoint.")
 	f.StringVar(&cfg.MigrationsDir, "configs.database.migrations-dir", "", "Path where the database migration files can be found")
 	f.StringVar(&cfg.PasswordFile, "configs.database.password-file", "", "File containing password (username goes in URI)")
+}
+
+// MarshalYAML implements yaml.Marshaler. It strips any userinfo (username and
+// password) from the DSN before serialization so that credentials embedded in
+// -configs.database.uri are not leaked by the unauthenticated /config endpoint.
+// This matches the project's documented property that "Sensitive data is masked"
+// and the house pattern of flagext.Secret.
+func (cfg Config) MarshalYAML() (interface{}, error) {
+	type plain Config
+	out := plain(cfg)
+	out.URI = redactURIUserinfo(cfg.URI)
+	return out, nil
+}
+
+// redactURIUserinfo returns the given DSN with any embedded user:password
+// replaced by "xxx:xxx" when a password is present, or by "xxx" when only a
+// username is present. Values that do not parse as URLs or contain no
+// userinfo are returned unchanged.
+func redactURIUserinfo(raw string) string {
+	if raw == "" {
+		return raw
+	}
+	u, err := url.Parse(raw)
+	if err != nil || u.User == nil {
+		return raw
+	}
+	if _, hasPassword := u.User.Password(); hasPassword {
+		u.User = url.UserPassword("xxx", "xxx")
+	} else {
+		u.User = url.User("xxx")
+	}
+	return u.String()
 }
 
 // DB is the interface for the database.
