@@ -183,7 +183,21 @@ type Ingester struct {
 	// Rate of pushed samples. Only used by V2-ingester to limit global samples push rate.
 	ingestionRate        *util_math.EwmaRate
 	inflightPushRequests atomic.Int64
+
+	// Number of in-flight asynchronous flushHandler goroutines. Used to bound
+	// how many `go run()` instances flushHandler may spawn concurrently so
+	// repeated requests cannot accumulate goroutines blocked on the unbuffered
+	// forceCompactTrigger / shipTrigger channels.
+	inflightFlushRequests atomic.Int64
 }
+
+// maxInflightAsyncFlushRequests bounds the number of concurrent asynchronous
+// flushHandler goroutines (requests without wait=true). Synchronous requests
+// are not affected. The limit is intentionally small: flushHandler serialises
+// on an unbuffered channel and spawning unbounded goroutines serves no
+// purpose. Operator-driven scale-down automation typically issues a single
+// request at a time.
+const maxInflightAsyncFlushRequests = 8
 
 // Shipper interface is used to have an easy way to mock it in tests.
 type Shipper interface {
@@ -2549,7 +2563,22 @@ func (i *Ingester) flushHandler(w http.ResponseWriter, r *http.Request) {
 		// Run synchronously. This simplifies and speeds up tests.
 		run()
 	} else {
-		go run()
+		// Bound the number of concurrent asynchronous flush goroutines. Each
+		// `run()` blocks on the unbuffered forceCompactTrigger (and
+		// shipTrigger) channel while the previous flush is running, so an
+		// unbounded `go run()` loop would let repeated requests accumulate
+		// blocked goroutines. Reject with 429 once the limit is reached; the
+		// caller can retry (or pass wait=true to run synchronously).
+		if n := i.inflightFlushRequests.Inc(); n > maxInflightAsyncFlushRequests {
+			i.inflightFlushRequests.Dec()
+			level.Warn(logutil.WithContext(r.Context(), i.logger)).Log("msg", "rejecting async flush request: too many in flight", "inflight", n-1, "limit", maxInflightAsyncFlushRequests)
+			http.Error(w, "too many in-flight flush requests", http.StatusTooManyRequests)
+			return
+		}
+		go func() {
+			defer i.inflightFlushRequests.Dec()
+			run()
+		}()
 	}
 
 	w.WriteHeader(http.StatusNoContent)

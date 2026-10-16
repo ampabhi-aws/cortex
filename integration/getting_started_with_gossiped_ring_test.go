@@ -114,9 +114,11 @@ func TestGettingStartedWithGossipedRing(t *testing.T) {
 	require.NoError(t, cortex1.WaitSumMetrics(e2e.Equals(0), "cortex_bucket_store_blocks_loaded"))
 	require.NoError(t, cortex2.WaitSumMetrics(e2e.Equals(0), "cortex_bucket_store_blocks_loaded"))
 
-	// Flush blocks from ingesters to the store.
+	// Flush blocks from ingesters to the store. The /flush endpoint is
+	// registered under the configured legacy HTTP prefix (default
+	// -http.prefix=/api/prom), matching every other legacy ingester route.
 	for _, instance := range []*e2ecortex.CortexService{cortex1, cortex2} {
-		res, err = e2e.GetRequest("http://" + instance.HTTPEndpoint() + "/flush")
+		res, err = e2e.GetRequest("http://" + instance.HTTPEndpoint() + "/api/prom/flush")
 		require.NoError(t, err)
 		require.Equal(t, 204, res.StatusCode)
 	}

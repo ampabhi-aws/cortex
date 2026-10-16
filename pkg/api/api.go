@@ -269,9 +269,15 @@ func (a *API) RegisterIngester(i Ingester, pushConfig distributor.Config) {
 	a.RegisterRoute("/ingester/shutdown", http.HandlerFunc(i.ShutdownHandler), false, "GET", "POST")
 	a.RegisterRoute("/ingester/push", push.Handler(pushConfig.MaxRecvMsgSize, a.sourceIPs, i.Push), true, "POST") // For testing and debugging.
 
-	// Legacy Routes
-	a.RegisterRoute("/flush", http.HandlerFunc(i.FlushHandler), false, "GET", "POST")
-	a.RegisterRoute("/shutdown", http.HandlerFunc(i.ShutdownHandler), false, "GET", "POST")
+	// Legacy Routes. These are registered under the configured legacy HTTP
+	// prefix (same pattern used by every other legacy route in this file).
+	// Historically /flush and /shutdown were registered at the server root,
+	// which exposed state-changing ingester admin handlers on the tenant-
+	// facing path namespace. Prefixing them keeps them reachable for
+	// operators (via -http.prefix) while matching the convention used by
+	// other legacy routes such as /push, /rules, /api/v1/*.
+	a.RegisterRoute(path.Join(a.cfg.LegacyHTTPPrefix, "/flush"), http.HandlerFunc(i.FlushHandler), false, "GET", "POST")
+	a.RegisterRoute(path.Join(a.cfg.LegacyHTTPPrefix, "/shutdown"), http.HandlerFunc(i.ShutdownHandler), false, "GET", "POST")
 	a.RegisterRoute("/push", push.Handler(pushConfig.MaxRecvMsgSize, a.sourceIPs, i.Push), true, "POST") // For testing and debugging.
 }
 
