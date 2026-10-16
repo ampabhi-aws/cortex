@@ -3,6 +3,7 @@ package compactor
 import (
 	"context"
 	"fmt"
+	"sync"
 	"time"
 
 	"github.com/go-kit/log"
@@ -23,6 +24,10 @@ type ShuffleShardingPlanner struct {
 	blockVisitMarkerFileUpdateInterval time.Duration
 	blockVisitMarkerReadFailed         prometheus.Counter
 	blockVisitMarkerWriteFailed        prometheus.Counter
+
+	// heartbeatWG tracks all heartbeat goroutines started by Plan so the
+	// caller can drain them before the compaction run ends.
+	heartbeatWG sync.WaitGroup
 }
 
 func NewShuffleShardingPlanner(
@@ -51,7 +56,7 @@ func NewShuffleShardingPlanner(
 	}
 }
 
-func (p *ShuffleShardingPlanner) Plan(_ context.Context, metasByMinTime []*metadata.Meta) ([]*metadata.Meta, error) {
+func (p *ShuffleShardingPlanner) Plan(ctx context.Context, metasByMinTime []*metadata.Meta) ([]*metadata.Meta, error) {
 	// Ensure all blocks fits within the largest range. This is a double check
 	// to ensure there's no bug in the previous blocks grouping, given this Plan()
 	// is just a pass-through.
@@ -61,6 +66,13 @@ func (p *ShuffleShardingPlanner) Plan(_ context.Context, metasByMinTime []*metad
 	rangeEnd := rangeStart + largestRange
 	noCompactMarked := p.noCompBlocksFunc()
 	resultMetas := make([]*metadata.Meta, 0, len(metasByMinTime))
+
+	// Fall back to the planner's construction-time context if the caller did
+	// not supply one (e.g. older tests). In production Thanos' BucketCompactor
+	// always passes its per-iteration workCtx.
+	if ctx == nil {
+		ctx = p.ctx
+	}
 
 	for _, b := range metasByMinTime {
 		blockID := b.ULID.String()
@@ -72,7 +84,7 @@ func (p *ShuffleShardingPlanner) Plan(_ context.Context, metasByMinTime []*metad
 			return nil, fmt.Errorf("block %s with time range %d:%d is outside the largest expected range %d:%d", blockID, b.MinTime, b.MaxTime, rangeStart, rangeEnd)
 		}
 
-		blockVisitMarker, err := ReadBlockVisitMarker(p.ctx, p.bkt, p.logger, blockID, p.blockVisitMarkerReadFailed)
+		blockVisitMarker, err := ReadBlockVisitMarker(ctx, p.bkt, p.logger, blockID, p.blockVisitMarkerReadFailed)
 		if err != nil {
 			// shuffle_sharding_grouper should put visit marker file for blocks ready for
 			// compaction. So error should be returned if visit marker file does not exist.
@@ -89,7 +101,25 @@ func (p *ShuffleShardingPlanner) Plan(_ context.Context, metasByMinTime []*metad
 		return nil, nil
 	}
 
-	go markBlocksVisitedHeartBeat(p.ctx, p.bkt, p.logger, resultMetas, p.ringLifecyclerID, p.blockVisitMarkerFileUpdateInterval, p.blockVisitMarkerWriteFailed)
+	// Scope the heartbeat to the compaction group it protects. We derive a
+	// child context from the Plan ctx (which is Thanos' per-iteration workCtx
+	// passed through Group.Compact), so when the compaction for this group
+	// returns and the work loop iteration completes, the heartbeat exits.
+	// Track the goroutine so Close() can drain all heartbeats before the
+	// per-tenant compaction run ends.
+	p.heartbeatWG.Add(1)
+	go func() {
+		defer p.heartbeatWG.Done()
+		markBlocksVisitedHeartBeat(ctx, p.bkt, p.logger, resultMetas, p.ringLifecyclerID, p.blockVisitMarkerFileUpdateInterval, p.blockVisitMarkerWriteFailed)
+	}()
 
 	return resultMetas, nil
+}
+
+// Close blocks until every heartbeat goroutine previously started by Plan
+// has returned. It must be called by the owner of the planner (typically
+// Compactor.compactUser) after the per-tenant context has been cancelled,
+// so that no leaked heartbeat survives the compaction run.
+func (p *ShuffleShardingPlanner) Close() {
+	p.heartbeatWG.Wait()
 }

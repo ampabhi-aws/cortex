@@ -791,12 +791,23 @@ func (c *Compactor) compactUser(ctx context.Context, userID string) error {
 	}
 
 	currentCtx, cancel := context.WithCancel(ctx)
-	defer cancel()
+	planner := c.blocksPlannerFactory(currentCtx, bucket, ulogger, c.compactorCfg, noCompactMarkerFilter, c.ringLifecycler, c.blockVisitMarkerReadFailed, c.blockVisitMarkerWriteFailed)
+	// Ensure the per-tenant compaction context is cancelled, and if the planner
+	// tracks background goroutines (e.g. the shuffle-sharding planner's
+	// visit-marker heartbeats), drain them before compactUser returns so no
+	// heartbeat survives the run and keeps rewriting visit-mark.json for
+	// already-finished groups.
+	defer func() {
+		cancel()
+		if closer, ok := planner.(interface{ Close() }); ok {
+			closer.Close()
+		}
+	}()
 	compactor, err := compact.NewBucketCompactor(
 		ulogger,
 		syncer,
 		c.blocksGrouperFactory(currentCtx, c.compactorCfg, bucket, ulogger, reg, c.blocksMarkedForDeletion, c.blocksMarkedForNoCompaction, c.garbageCollectedBlocks, c.remainingPlannedCompactions, c.blockVisitMarkerReadFailed, c.blockVisitMarkerWriteFailed, c.ring, c.ringLifecycler, c.limits, userID),
-		c.blocksPlannerFactory(currentCtx, bucket, ulogger, c.compactorCfg, noCompactMarkerFilter, c.ringLifecycler, c.blockVisitMarkerReadFailed, c.blockVisitMarkerWriteFailed),
+		planner,
 		c.blocksCompactor,
 		path.Join(c.compactorCfg.DataDir, "compact"),
 		bucket,

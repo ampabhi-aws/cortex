@@ -394,6 +394,31 @@ func (c *BlocksCleaner) cleanUserPartialBlocks(ctx context.Context, partials map
 		// We can safely delete only partial blocks with a deletion mark.
 		err := metadata.ReadMarker(ctx, userLogger, userBucket, blockID.String(), &metadata.DeletionMark{})
 		if errors.Is(err, metadata.ErrorMarkerNotFound) {
+			// A block prefix with no deletion mark can still be reclaimed if it
+			// contains nothing but compactor-owned metadata (e.g. visit-mark.json
+			// resurrected by a leaked heartbeat after block.Delete removed the
+			// real block). Without this escape hatch such prefixes would be
+			// counted forever in cortex_bucket_blocks_partials_count.
+			hasOnlyCompactorMetadata, checkErr := blockContainsOnlyCompactorMetadata(ctx, userBucket, blockID)
+			if checkErr != nil {
+				level.Warn(userLogger).Log("msg", "error inspecting partial block contents", "block", blockID, "err", checkErr)
+				continue
+			}
+			if !hasOnlyCompactorMetadata {
+				continue
+			}
+
+			if delErr := block.Delete(ctx, userLogger, userBucket, blockID); delErr != nil {
+				c.blocksFailedTotal.Inc()
+				level.Warn(userLogger).Log("msg", "error deleting partial block containing only compactor metadata", "block", blockID, "err", delErr)
+				continue
+			}
+
+			idx.RemoveBlock(blockID)
+			delete(partials, blockID)
+
+			c.blocksCleanedTotal.Inc()
+			level.Info(userLogger).Log("msg", "deleted partial block containing only compactor metadata", "block", blockID)
 			continue
 		}
 		if err != nil {
@@ -417,6 +442,43 @@ func (c *BlocksCleaner) cleanUserPartialBlocks(ctx context.Context, partials map
 		level.Info(userLogger).Log("msg", "deleted partial block marked for deletion", "block", blockID)
 	}
 }
+
+// compactorOwnedMetadataFiles enumerates files that are produced by the
+// compactor itself (not by block ingestion). A partial block whose prefix
+// contains nothing but these files is safe to reclaim because no TSDB
+// payload exists there.
+var compactorOwnedMetadataFiles = map[string]struct{}{
+	BlockVisitMarkerFile: {},
+}
+
+// blockContainsOnlyCompactorMetadata reports whether the given block prefix
+// contains at least one object and every object is a compactor-owned metadata
+// file. If the prefix is empty or contains any non-compactor-owned file
+// (meta.json, index, chunks/*, deletion-mark.json, no-compact-mark.json, …)
+// it returns false so the caller does not delete legitimate data.
+func blockContainsOnlyCompactorMetadata(ctx context.Context, bkt objstore.InstrumentedBucket, blockID ulid.ULID) (bool, error) {
+	prefix := blockID.String() + "/"
+	found := false
+	onlyCompactorOwned := true
+	err := bkt.Iter(ctx, prefix, func(name string) error {
+		found = true
+		// Iter returns full object names relative to the bucket root; strip
+		// the block prefix to get the file name within the block directory.
+		rel := name
+		if len(rel) > len(prefix) && rel[:len(prefix)] == prefix {
+			rel = rel[len(prefix):]
+		}
+		if _, ok := compactorOwnedMetadataFiles[rel]; !ok {
+			onlyCompactorOwned = false
+		}
+		return nil
+	})
+	if err != nil {
+		return false, err
+	}
+	return found && onlyCompactorOwned, nil
+}
+
 
 // applyUserRetentionPeriod marks blocks for deletion which have aged past the retention period.
 func (c *BlocksCleaner) applyUserRetentionPeriod(ctx context.Context, idx *bucketindex.Index, retention time.Duration, userBucket objstore.Bucket, userLogger log.Logger) {
