@@ -130,7 +130,7 @@ func newTooManyLabelsError(series []cortexpb.LabelAdapter, limit int) Validation
 func (e *tooManyLabelsError) Error() string {
 	return fmt.Sprintf(
 		"series has too many labels (actual: %d, limit: %d) series: '%s'",
-		len(e.series), e.limit, cortexpb.FromLabelAdaptersToMetric(e.series).String())
+		len(e.series), e.limit, truncateErrLabelString(cortexpb.FromLabelAdaptersToMetric(e.series).String()))
 }
 
 type noMetricNameError struct{}
@@ -193,7 +193,9 @@ type exemplarValidationError struct {
 }
 
 func (e *exemplarValidationError) Error() string {
-	return fmt.Sprintf(e.message, e.timestamp, cortexpb.FromLabelAdaptersToLabels(e.seriesLabels).String(), cortexpb.FromLabelAdaptersToLabels(e.exemplarLabels).String())
+	return fmt.Sprintf(e.message, e.timestamp,
+		truncateErrLabelString(cortexpb.FromLabelAdaptersToLabels(e.seriesLabels).String()),
+		truncateErrLabelString(cortexpb.FromLabelAdaptersToLabels(e.exemplarLabels).String()))
 }
 
 func newExemplarEmtpyLabelsError(seriesLabels []cortexpb.LabelAdapter, exemplarLabels []cortexpb.LabelAdapter, timestamp int64) ValidationError {
@@ -223,6 +225,22 @@ func newExemplarLabelLengthError(seriesLabels []cortexpb.LabelAdapter, exemplarL
 		exemplarLabels: exemplarLabels,
 		timestamp:      timestamp,
 	}
+}
+
+// maxErrLabelSetLen is the maximum number of bytes of a label set that is included
+// in validation error messages. It matches the clamp applied by the %.200q format
+// specifier used by the sibling validation errors in this file, and bounds the size
+// of the error strings produced from attacker-controlled label data.
+const maxErrLabelSetLen = 200
+
+// truncateErrLabelString clamps the rendered label set that is embedded in an
+// error message so that attacker-controlled label values cannot amplify a single
+// request into a huge error string, log line and HTTP response body.
+func truncateErrLabelString(s string) string {
+	if len(s) <= maxErrLabelSetLen {
+		return s
+	}
+	return s[:maxErrLabelSetLen] + "..."
 }
 
 // formatLabelSet formats label adapters as a metric name with labels, while preserving
