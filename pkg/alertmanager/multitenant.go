@@ -961,28 +961,44 @@ func (am *MultitenantAlertmanager) newAlertmanager(userID string, amConfig *amco
 
 // GetPositionForUser returns the position this Alertmanager instance holds in the ring related to its other replicas for an specific user.
 func (am *MultitenantAlertmanager) GetPositionForUser(userID string) int {
+	position, _ := am.PositionInReplicationSet(userID)
+	return position
+}
+
+// PositionInReplicationSet returns the position of this instance in the
+// tenant's ring replication set together with a boolean that is false when
+// the instance is not actually in the set (or when the ring cannot be read).
+// GetPositionForUser deliberately returns 0 for "unknown" so notifications
+// fail open with a possible duplicate; callers that must only act on
+// authoritative ownership (e.g. the state persister, which must not
+// overwrite durable per-tenant state from a non-owning instance) should use
+// this method instead.
+func (am *MultitenantAlertmanager) PositionInReplicationSet(userID string) (int, bool) {
 	// If we have a replication factor of 1 or less we don't need to do any work and can immediately return.
 	if am.ring == nil || am.ring.ReplicationFactor() <= 1 {
-		return 0
+		return 0, true
 	}
 
 	set, err := am.ring.Get(shardByUser(userID), RingOp, nil, nil, nil)
 	if err != nil {
 		level.Error(am.logger).Log("msg", "unable to read the ring while trying to determine the alertmanager position", "err", err)
-		// If we're  unable to determine the position, we don't want a tenant to miss out on the notification - instead,
+		// If we're unable to determine the position, we don't want a tenant to miss out on the notification - instead,
 		// just assume we're the first in line and run the risk of a double notification.
-		return 0
+		return 0, false
 	}
 
-	var position int
 	for i, instance := range set.Instances {
 		if instance.Addr == am.ringLifecycler.GetInstanceAddr() {
-			position = i
-			break
+			return i, true
 		}
 	}
 
-	return position
+	// Instance is not in the replication set for this tenant (e.g. JOINING/LEAVING,
+	// or an instance that built a per-tenant Alertmanager without owning the
+	// tenant). Report position 0 so GetPositionForUser preserves its "first in
+	// line" fallback for notifications, but signal that this is not an
+	// authoritative position.
+	return 0, false
 }
 
 // ServeHTTP serves the Alertmanager's web UI and API.

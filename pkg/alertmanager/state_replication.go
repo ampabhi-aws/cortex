@@ -45,6 +45,14 @@ type state struct {
 	mtx    sync.Mutex
 	states map[string]cluster.State
 
+	// settled is true only when the initial sync completed with a known-good
+	// outcome (merged from a peer replica, merged from object storage, or
+	// confirmed to have no persisted state yet). It stays false after a
+	// syncFailed outcome, so the state persister can refuse to overwrite the
+	// durable per-tenant fullState object with empty in-memory state.
+	settledMtx sync.RWMutex
+	settled    bool
+
 	replicationFactor int
 	replicator        Replicator
 	store             alertstore.AlertStore
@@ -163,8 +171,41 @@ func (s *state) MergePartialState(p *clusterpb.Part) error {
 }
 
 // Position helps in determining how long should we wait before sending a notification based on the number of replicas.
+//
+// Position() preserves the existing behavior of returning 0 when the ring is
+// unavailable or the instance is not in the tenant's replication set so that
+// notification wait timing is unaffected. Callers that need an authoritative
+// "is this instance in the replication set?" answer (e.g. the state
+// persister, which must not overwrite durable storage from a non-owning
+// instance) should use PositionInReplicationSet below.
 func (s *state) Position() int {
 	return s.replicator.GetPositionForUser(s.userID)
+}
+
+// PositionInReplicationSet returns the position of this instance in the
+// tenant's replication set together with a boolean that is false when the
+// instance is not in the set (or the ring could not be read). Unlike
+// Position(), this does not silently return 0 for "unknown" and is suitable
+// for guarding destructive writes.
+func (s *state) PositionInReplicationSet() (int, bool) {
+	return s.replicator.PositionInReplicationSet(s.userID)
+}
+
+// Settled reports whether the initial state sync completed with a known-good
+// outcome. It is false while the state service is still starting and remains
+// false if the initial sync could not read peer or object-store state (the
+// syncFailed outcome). The state persister uses this to avoid overwriting a
+// tenant's durable fullState object with empty in-memory state.
+func (s *state) Settled() bool {
+	s.settledMtx.RLock()
+	defer s.settledMtx.RUnlock()
+	return s.settled
+}
+
+func (s *state) setSettled(v bool) {
+	s.settledMtx.Lock()
+	s.settled = v
+	s.settledMtx.Unlock()
 }
 
 // GetFullState returns the full internal state.
@@ -199,6 +240,7 @@ func (s *state) starting(ctx context.Context) error {
 	// If the replication factor is <= 1, there is nowhere to obtain the state from.
 	if s.replicationFactor <= 1 {
 		level.Info(s.logger).Log("msg", "skipping settling (no replicas)")
+		s.setSettled(true)
 		return nil
 	}
 
@@ -212,6 +254,7 @@ func (s *state) starting(ctx context.Context) error {
 		if err = s.mergeFullStates(fullStates); err == nil {
 			level.Info(s.logger).Log("msg", "state settled; proceeding")
 			s.initialSyncCompleted.WithLabelValues(syncFromReplica).Inc()
+			s.setSettled(true)
 			return nil
 		}
 	}
@@ -227,17 +270,25 @@ func (s *state) starting(ctx context.Context) error {
 	if errors.Is(err, alertspb.ErrNotFound) {
 		level.Info(s.logger).Log("msg", "no state for user in storage; proceeding", "user", s.userID)
 		s.initialSyncCompleted.WithLabelValues(syncUserNotFound).Inc()
+		s.setSettled(true)
 		return nil
 	}
 	if err == nil {
 		if err = s.mergeFullStates([]*clusterpb.FullState{fullState.State}); err == nil {
 			level.Info(s.logger).Log("msg", "state read from storage; proceeding")
 			s.initialSyncCompleted.WithLabelValues(syncFromStorage).Inc()
+			s.setSettled(true)
 			return nil
 		}
 	}
 
-	level.Warn(s.logger).Log("msg", "failed to read state from storage; continuing anyway", "err", err)
+	// We intentionally still return nil here so that the per-tenant Alertmanager
+	// becomes Running and can serve requests (silences/nflog are soft state and
+	// local snapshots may still rehydrate on an in-place restart). However we
+	// leave settled=false so that statePersister.persist() will not overwrite
+	// the durable tenant fullState object with the empty in-memory state we
+	// have at this point.
+	level.Warn(s.logger).Log("msg", "failed to read state from storage; continuing anyway, state persister will not overwrite durable state until a successful sync", "err", err)
 	s.initialSyncCompleted.WithLabelValues(syncFailed).Inc()
 
 	return nil

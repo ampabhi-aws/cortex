@@ -43,6 +43,19 @@ func (cfg *PersisterConfig) Validate() error {
 type PersistableState interface {
 	State
 	GetFullState() (*clusterpb.FullState, error)
+	// Settled reports whether the initial state sync completed with a known-good
+	// outcome (merged from a peer replica, merged from object storage, or
+	// confirmed to have no persisted state yet). persist() refuses to overwrite
+	// durable storage until Settled() is true, so a replica that came up with
+	// empty in-memory state after a failed initial sync will not destroy the
+	// tenant's silences / notification log.
+	Settled() bool
+	// PositionInReplicationSet returns the position of this instance in the
+	// tenant's ring replication set together with a boolean that is false when
+	// the instance is not in the set. persist() uses this (instead of the
+	// fail-open Position()) to avoid persisting from an instance that does not
+	// own the tenant.
+	PositionInReplicationSet() (int, bool)
 }
 
 // statePersister periodically writes the alertmanager state to persistent storage.
@@ -98,8 +111,29 @@ func (s *statePersister) iteration(ctx context.Context) error {
 }
 
 func (s *statePersister) persist(ctx context.Context) (err error) {
-	// Only the replica at position zero should write the state.
-	if s.state.Position() != 0 {
+	// Only the replica at position zero in the tenant's replication set
+	// should write the state. Use the authoritative PositionInReplicationSet
+	// (not Position(), which defaults to 0 for "unknown") so that an
+	// instance that is not in the tenant's replication set - e.g. because
+	// the ring could not be read or the instance is JOINING/LEAVING - does
+	// not persist state for a tenant it does not own.
+	position, inSet := s.state.PositionInReplicationSet()
+	if !inSet {
+		level.Debug(s.logger).Log("msg", "skipping state persist: instance is not in the tenant's replication set", "user", s.userID)
+		return nil
+	}
+	if position != 0 {
+		return nil
+	}
+
+	// Refuse to persist until the initial sync has settled with a known-good
+	// outcome. Without this guard a replica that failed to load the tenant's
+	// state at startup (transient object-store error or peer unavailability)
+	// would unconditionally upload its empty in-memory state over the
+	// durable fullState object, permanently destroying the tenant's silences
+	// and notification log.
+	if !s.state.Settled() {
+		level.Warn(s.logger).Log("msg", "skipping state persist: initial state sync has not settled; refusing to overwrite durable state with empty in-memory state", "user", s.userID)
 		return nil
 	}
 

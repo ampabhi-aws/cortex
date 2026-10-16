@@ -144,6 +144,14 @@ type Replicator interface {
 	// The alertmanager replication protocol relies on a position related to other replicas.
 	// This position is then used to identify who should notify about the alert first.
 	GetPositionForUser(userID string) int
+	// PositionInReplicationSet returns the position of this instance in the
+	// tenant's replication set, along with a boolean that is false when the
+	// instance is not in the replication set (or when the ring could not be
+	// read). Unlike GetPositionForUser, which deliberately defaults to 0 for
+	// "unknown" so that notification timing fails open, this method is
+	// authoritative and is meant to guard destructive writes (e.g. persisting
+	// the full state to object storage from a non-owning instance).
+	PositionInReplicationSet(userID string) (int, bool)
 	// ReadFullStateForUser obtains the full state from other replicas in the cluster.
 	ReadFullStateForUser(context.Context, string) ([]*clusterpb.FullState, error)
 }
