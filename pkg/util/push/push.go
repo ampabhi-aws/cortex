@@ -13,6 +13,19 @@ import (
 	"github.com/cortexproject/cortex/pkg/util/log"
 )
 
+// maxErrMsgLen caps the length of error messages logged and returned to the
+// client, so that a single malformed request cannot produce a huge log line
+// or HTTP response body (e.g. a remote-write request carrying millions of
+// labels whose rendered form would otherwise be echoed verbatim).
+const maxErrMsgLen = 1024
+
+func truncateErrMsg(s string) string {
+	if len(s) <= maxErrMsgLen {
+		return s
+	}
+	return s[:maxErrMsgLen] + "... (truncated)"
+}
+
 // Func defines the type of the push. It is similar to http.HandlerFunc.
 type Func func(context.Context, *cortexpb.WriteRequest) (*cortexpb.WriteResponse, error)
 
@@ -48,9 +61,9 @@ func Handler(maxRecvMsgSize int, sourceIPs *middleware.SourceIPExtractor, push F
 				return
 			}
 			if resp.GetCode() != 202 {
-				level.Error(logger).Log("msg", "push error", "err", err)
+				level.Error(logger).Log("msg", "push error", "err", truncateErrMsg(err.Error()))
 			}
-			http.Error(w, string(resp.Body), int(resp.Code))
+			http.Error(w, truncateErrMsg(string(resp.Body)), int(resp.Code))
 		}
 	})
 }
