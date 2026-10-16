@@ -187,7 +187,13 @@ func (a *API) RegisterAlertmanager(am *alertmanager.MultitenantAlertmanager, tar
 	a.indexPage.AddLink(SectionAdminEndpoints, "/multitenant_alertmanager/ring", "Alertmanager Ring Status")
 	// Ensure this route is registered before the prefixed AM route
 	a.RegisterRoute("/multitenant_alertmanager/status", am.GetStatusHandler(), false, "GET")
-	a.RegisterRoute("/multitenant_alertmanager/configs", http.HandlerFunc(am.ListAllConfigs), false, "GET")
+	// This endpoint streams every tenant's Alertmanager configuration (including
+	// notification secrets embedded in the raw YAML). It is an operator/admin
+	// endpoint that must not be exposed to end users. Register it with auth=true
+	// so the standard auth middleware is applied, matching the per-tenant
+	// /api/v1/alerts route and preventing accidental exposure through gateways
+	// that forward requests without the auth middleware in the chain.
+	a.RegisterRoute("/multitenant_alertmanager/configs", http.HandlerFunc(am.ListAllConfigs), true, "GET")
 	a.RegisterRoute("/multitenant_alertmanager/ring", http.HandlerFunc(am.RingHandler), false, "GET", "POST")
 	a.RegisterRoute("/multitenant_alertmanager/delete_tenant_config", http.HandlerFunc(am.DeleteUserConfig), true, "POST")
 
@@ -291,8 +297,11 @@ func (a *API) RegisterRuler(r *ruler.Ruler) {
 	// Legacy Ring Route
 	a.RegisterRoute("/ruler_ring", r, false, "GET", "POST")
 
-	// List all user rule groups
-	a.RegisterRoute("/ruler/rule_groups", http.HandlerFunc(r.ListAllRules), false, "GET")
+	// List all user rule groups. This is an operator/admin endpoint that streams
+	// every tenant's rule groups and must not be exposed to end users. Register it
+	// with auth=true so the standard auth middleware is applied, matching the
+	// per-tenant /api/v1/rules route.
+	a.RegisterRoute("/ruler/rule_groups", http.HandlerFunc(r.ListAllRules), true, "GET")
 
 	ruler.RegisterRulerServer(a.server.GRPC, r)
 }
