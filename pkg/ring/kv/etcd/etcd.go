@@ -77,8 +77,29 @@ func (cfg *Config) GetTLS() (*tls.Config, error) {
 	return tlsInfo.ClientConfig()
 }
 
+// Validate inspects the etcd client Config and emits warnings when the
+// combination of options could cause credentials or TLS material to be
+// silently dropped - for example a username/password or TLS cert/CA path
+// configured while tls_enabled is false, which would transmit the etcd
+// credentials to the server over an unencrypted connection.
+func (cfg *Config) Validate(logger log.Logger) error {
+	if cfg.EnableTLS {
+		return nil
+	}
+	if cfg.UserName != "" || cfg.Password != "" {
+		level.Warn(logger).Log("msg", "etcd username/password is configured but tls_enabled is false; credentials will be sent over an unencrypted connection. Set etcd.tls-enabled=true to protect them.")
+	}
+	if cfg.TLS.CertPath != "" || cfg.TLS.KeyPath != "" || cfg.TLS.CAPath != "" || cfg.TLS.ServerName != "" {
+		level.Warn(logger).Log("msg", "etcd TLS settings (tls_cert_path/tls_key_path/tls_ca_path/tls_server_name) are configured but tls_enabled is false; the TLS settings will be ignored. Set etcd.tls-enabled=true to use them.")
+	}
+	return nil
+}
+
 // New makes a new Client.
 func New(cfg Config, codec codec.Codec, logger log.Logger) (*Client, error) {
+	if err := cfg.Validate(logger); err != nil {
+		return nil, errors.Wrap(err, "invalid etcd config")
+	}
 	tlsConfig, err := cfg.GetTLS()
 	if err != nil {
 		return nil, errors.Wrapf(err, "unable to initialise TLS configuration for etcd")
