@@ -3,6 +3,7 @@ package configdb
 import (
 	"context"
 	"errors"
+	"sync"
 
 	"github.com/cortexproject/cortex/pkg/configs/client"
 	"github.com/cortexproject/cortex/pkg/configs/userconfig"
@@ -15,7 +16,14 @@ const (
 
 // ConfigRuleStore is a concrete implementation of RuleStore that sources rules from the config service
 type ConfigRuleStore struct {
-	configClient  client.Client
+	configClient client.Client
+
+	// mtx guards since and ruleGroupList. It must be held for the whole
+	// ListAllRuleGroups body (GetRules + cache mutation + since update) so
+	// that concurrent callers (poll goroutines and HTTP handler goroutines)
+	// do not race on the shared map or cursor. Callers receive a snapshot
+	// copy of the cache and must not share the internal map.
+	mtx           sync.Mutex
 	since         userconfig.ID
 	ruleGroupList map[string]rulespb.RuleGroupList
 }
@@ -47,6 +55,9 @@ func (c *ConfigRuleStore) ListAllUsers(ctx context.Context) ([]string, error) {
 
 // ListAllRuleGroups implements RuleStore
 func (c *ConfigRuleStore) ListAllRuleGroups(ctx context.Context) (map[string]rulespb.RuleGroupList, error) {
+	c.mtx.Lock()
+	defer c.mtx.Unlock()
+
 	configs, err := c.configClient.GetRules(ctx, c.since)
 
 	if err != nil {
@@ -73,7 +84,13 @@ func (c *ConfigRuleStore) ListAllRuleGroups(ctx context.Context) (map[string]rul
 
 	c.since = getLatestConfigID(configs, c.since)
 
-	return c.ruleGroupList, nil
+	// Return a copy so callers can read the result without holding the lock.
+	snapshot := make(map[string]rulespb.RuleGroupList, len(c.ruleGroupList))
+	for user, rules := range c.ruleGroupList {
+		snapshot[user] = rules
+	}
+
+	return snapshot, nil
 }
 
 // getLatestConfigID gets the latest configs ID.
