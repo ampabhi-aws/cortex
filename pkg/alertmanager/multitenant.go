@@ -814,6 +814,17 @@ func (am *MultitenantAlertmanager) setConfig(cfg alertspb.AlertConfigDesc) error
 	var userTemplateDir = filepath.Join(am.getTenantDirectory(cfg.User), templatesDir)
 	var pathsToRemove = make(map[string]struct{})
 
+	// Validate template filenames supplied by the alertstore before touching
+	// disk. The Cortex policy requires template names to be a plain filename
+	// (no path components); this is a defence-in-depth check on top of
+	// safeTemplateFilepath so that an alertstore backend which bypasses the
+	// SetUserConfig handler cannot plant templates in unexpected locations.
+	for _, tmpl := range cfg.Templates {
+		if err := validateTemplateFilename(tmpl.GetFilename()); err != nil {
+			return fmt.Errorf("invalid Cortex configuration for %v: %v", cfg.User, err)
+		}
+	}
+
 	// List existing files to keep track the ones to be removed
 	if oldTemplateFiles, err := os.ReadDir(userTemplateDir); err == nil {
 		for _, file := range oldTemplateFiles {
@@ -870,6 +881,19 @@ func (am *MultitenantAlertmanager) setConfig(cfg alertspb.AlertConfigDesc) error
 			// This means that if a user has a working config and
 			// they submit a broken one, the Manager will keep running the last known
 			// working configuration.
+			return fmt.Errorf("invalid Cortex configuration for %v: %v", cfg.User, err)
+		}
+	}
+
+	// Enforce the Cortex-level policy (the *_file blocklist and template-name
+	// restrictions) on configurations arriving from the alertstore. This must
+	// happen at the point of use because some alertstore backends (notably
+	// configdb, which is fed by the legacy configs service) can deliver
+	// configurations that never pass through the SetUserConfig handler. Refuse
+	// to start or update a tenant's Alertmanager when the policy check fails
+	// so that no backend can bypass it.
+	if userAmConfig != nil {
+		if err := validateAlertmanagerConfigPolicy(userAmConfig, cfg.Templates); err != nil {
 			return fmt.Errorf("invalid Cortex configuration for %v: %v", cfg.User, err)
 		}
 	}
@@ -1325,8 +1349,10 @@ func safeTemplateFilepath(dir, templateName string) (string, error) {
 
 	// Ensure the actual path of the template is within the expected directory.
 	// This check is a counter-measure to make sure the tenant is not trying to
-	// escape its own directory on disk.
-	if !strings.HasPrefix(actualPath, containerDir) {
+	// escape its own directory on disk. We compare against containerDir with a
+	// trailing path separator so that sibling directories which merely share
+	// the prefix (e.g. "/data/tenantX" vs. "/data/tenant") are rejected.
+	if actualPath != containerDir && !strings.HasPrefix(actualPath, containerDir+string(os.PathSeparator)) {
 		return "", fmt.Errorf("invalid template name %q: the template filepath is escaping the per-tenant local directory", templateName)
 	}
 

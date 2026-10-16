@@ -185,16 +185,11 @@ func validateUserConfig(logger log.Logger, cfg alertspb.AlertConfigDesc, limits 
 		return err
 	}
 
-	// Validate the config recursively scanning it.
-	if err := validateAlertmanagerConfig(amCfg); err != nil {
+	// Run the shared Cortex policy checks (*_file blocklist and template-name
+	// restrictions) that must be enforced for every ingress path - both the
+	// user-facing config API and the alertstore sync in setConfig.
+	if err := validateAlertmanagerConfigPolicy(amCfg, cfg.Templates); err != nil {
 		return err
-	}
-
-	// Validate templates referenced in the alertmanager config.
-	for _, name := range amCfg.Templates {
-		if err := validateTemplateFilename(name); err != nil {
-			return err
-		}
 	}
 
 	// Check template limits.
@@ -207,13 +202,6 @@ func validateUserConfig(logger log.Logger, cfg alertspb.AlertConfigDesc, limits 
 			if size := len(tmpl.GetBody()); size > maxSize {
 				return fmt.Errorf(errTemplateTooBig, tmpl.GetFilename(), size, maxSize)
 			}
-		}
-	}
-
-	// Validate template files.
-	for _, tmpl := range cfg.Templates {
-		if err := validateTemplateFilename(tmpl.Filename); err != nil {
-			return err
 		}
 	}
 
@@ -302,6 +290,55 @@ func (am *MultitenantAlertmanager) ListAllConfigs(w http.ResponseWriter, r *http
 	}
 	close(iter)
 	<-done
+}
+
+// ValidateAlertmanagerConfigPolicy applies the Cortex-level policy checks
+// (the *_file blocklist and template-name restrictions) on an
+// already-parsed Alertmanager configuration. It is exported so other
+// ingress paths - most notably the legacy configs service in
+// pkg/configs/api - can enforce the same policy before persisting a
+// configuration that will later be applied by MultitenantAlertmanager.
+func ValidateAlertmanagerConfigPolicy(amCfg *config.Config) error {
+	return validateAlertmanagerConfigPolicy(amCfg, nil)
+}
+
+// ValidateTemplateFilename is the exported wrapper around the Cortex
+// template-filename policy check. It mirrors the restriction applied by
+// MultitenantAlertmanager so that other ingress paths (for example the
+// legacy configs service) can reject disallowed template filenames
+// before they are persisted.
+func ValidateTemplateFilename(filename string) error {
+	return validateTemplateFilename(filename)
+}
+
+// validateAlertmanagerConfigPolicy applies the Cortex-level policy checks on
+// an already-parsed Alertmanager configuration and the associated template
+// descriptors. It is the single shared entry point for both the user-facing
+// config API handler (SetUserConfig) and the alertstore sync path
+// (MultitenantAlertmanager.setConfig) so the two cannot drift and no
+// alertstore backend can deliver a configuration that escapes the *_file or
+// template-name policy.
+func validateAlertmanagerConfigPolicy(amCfg *config.Config, templates []*alertspb.TemplateDesc) error {
+	// Validate the config recursively scanning it (the *_file blocklist).
+	if err := validateAlertmanagerConfig(amCfg); err != nil {
+		return err
+	}
+
+	// Validate template filenames referenced in the alertmanager config.
+	for _, name := range amCfg.Templates {
+		if err := validateTemplateFilename(name); err != nil {
+			return err
+		}
+	}
+
+	// Validate template filenames supplied alongside the config.
+	for _, tmpl := range templates {
+		if err := validateTemplateFilename(tmpl.GetFilename()); err != nil {
+			return err
+		}
+	}
+
+	return nil
 }
 
 // validateAlertmanagerConfig recursively scans the input config looking for data types for which
