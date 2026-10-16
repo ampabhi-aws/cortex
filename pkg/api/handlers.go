@@ -134,6 +134,9 @@ func DefaultConfigHandler(actualCfg interface{}, defaultCfg interface{}) http.Ha
 				return
 			}
 
+			util.RedactSecretsInYAMLMap(defaultCfgObj)
+			util.RedactSecretsInYAMLMap(actualCfgObj)
+
 			diff, err := util.DiffConfig(defaultCfgObj, actualCfgObj)
 			if err != nil {
 				http.Error(w, err.Error(), http.StatusInternalServerError)
@@ -142,9 +145,21 @@ func DefaultConfigHandler(actualCfg interface{}, defaultCfg interface{}) http.Ha
 			output = diff
 
 		case "defaults":
-			output = defaultCfg
+			defaultCfgObj, err := util.YAMLMarshalUnmarshal(defaultCfg)
+			if err != nil {
+				http.Error(w, err.Error(), http.StatusInternalServerError)
+				return
+			}
+			util.RedactSecretsInYAMLMap(defaultCfgObj)
+			output = defaultCfgObj
 		default:
-			output = actualCfg
+			actualCfgObj, err := util.YAMLMarshalUnmarshal(actualCfg)
+			if err != nil {
+				http.Error(w, err.Error(), http.StatusInternalServerError)
+				return
+			}
+			util.RedactSecretsInYAMLMap(actualCfgObj)
+			output = actualCfgObj
 		}
 
 		util.WriteYAMLResponse(w, output)
