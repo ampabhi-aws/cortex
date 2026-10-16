@@ -681,7 +681,19 @@ receivers:
 
 	router := mux.NewRouter()
 	router.Path("/multitenant_alertmanager/configs").Methods(http.MethodGet).HandlerFunc(am.ListAllConfigs)
+
+	// Without an authenticated tenant, ListAllConfigs must reject the request.
+	{
+		req := httptest.NewRequest("GET", "https://localhost:8080/multitenant_alertmanager/configs", nil)
+		w := httptest.NewRecorder()
+		router.ServeHTTP(w, req)
+		require.Equal(t, http.StatusUnauthorized, w.Result().StatusCode)
+	}
+
+	// With an authenticated tenant, the handler returns every tenant's config
+	// with receiver secrets redacted by the alertmanager config.Secret marshaler.
 	req := httptest.NewRequest("GET", "https://localhost:8080/multitenant_alertmanager/configs", nil)
+	req = req.WithContext(user.InjectOrgID(req.Context(), "operator"))
 	w := httptest.NewRecorder()
 	router.ServeHTTP(w, req)
 
@@ -690,9 +702,34 @@ receivers:
 	require.Equal(t, "application/yaml", resp.Header.Get("Content-Type"))
 	body, err := io.ReadAll(resp.Body)
 	require.NoError(t, err)
-	old, err := yaml.Marshal(testCases)
+
+	// Build the expected redacted payload the same way the handler does.
+	expected := map[string]*UserConfig{}
+	for u, cfg := range testCases {
+		redacted, err := redactAlertmanagerConfigSecrets(cfg.AlertmanagerConfig)
+		require.NoError(t, err)
+		expected[u] = &UserConfig{AlertmanagerConfig: redacted}
+	}
+	old, err := yaml.Marshal(expected)
 	require.NoError(t, err)
 	require.YAMLEq(t, string(old), string(body))
+
+	// If an admin tenant allowlist is configured, only those tenants may call it.
+	am.cfg.AdminTenants = []string{"operator"}
+	{
+		req := httptest.NewRequest("GET", "https://localhost:8080/multitenant_alertmanager/configs", nil)
+		req = req.WithContext(user.InjectOrgID(req.Context(), "user1"))
+		w := httptest.NewRecorder()
+		router.ServeHTTP(w, req)
+		require.Equal(t, http.StatusForbidden, w.Result().StatusCode)
+	}
+	{
+		req := httptest.NewRequest("GET", "https://localhost:8080/multitenant_alertmanager/configs", nil)
+		req = req.WithContext(user.InjectOrgID(req.Context(), "operator"))
+		w := httptest.NewRecorder()
+		router.ServeHTTP(w, req)
+		require.Equal(t, http.StatusOK, w.Result().StatusCode)
+	}
 }
 
 func TestValidateAlertmanagerConfig(t *testing.T) {

@@ -261,6 +261,23 @@ func validateUserConfig(logger log.Logger, cfg alertspb.AlertConfigDesc, limits 
 
 func (am *MultitenantAlertmanager) ListAllConfigs(w http.ResponseWriter, r *http.Request) {
 	logger := util_log.WithContext(r.Context(), am.logger)
+
+	// This endpoint exposes every tenant's Alertmanager configuration and must
+	// not be reachable by regular tenants. Require an authenticated identity
+	// (an X-Scope-OrgID header injected by the auth middleware). If an admin
+	// tenant allowlist is configured, further restrict access to those IDs.
+	userID, err := tenant.TenantID(r.Context())
+	if err != nil {
+		level.Warn(logger).Log("msg", "rejecting ListAllConfigs: no tenant identity", "err", err.Error())
+		http.Error(w, fmt.Sprintf("%s: %s", errNoOrgID, err.Error()), http.StatusUnauthorized)
+		return
+	}
+	if len(am.cfg.AdminTenants) > 0 && !containsString(am.cfg.AdminTenants, userID) {
+		level.Warn(logger).Log("msg", "rejecting ListAllConfigs: caller is not an admin tenant", "user", userID)
+		http.Error(w, "forbidden", http.StatusForbidden)
+		return
+	}
+
 	userIDs, err := am.store.ListAllUsers(r.Context())
 	if err != nil {
 		level.Error(logger).Log("msg", "failed to list users of alertmanager", "err", err)
@@ -283,10 +300,24 @@ func (am *MultitenantAlertmanager) ListAllConfigs(w http.ResponseWriter, r *http
 		} else if err != nil {
 			return errors.Wrapf(err, "failed to fetch alertmanager config for user %s", userID)
 		}
+
+		// Redact receiver secrets (webhook/Slack/PagerDuty/OpsGenie/VictorOps/SMTP
+		// passwords, HTTP basic/bearer/OAuth2 credentials, etc.) from the returned
+		// RawConfig. Secrets are modeled as the alertmanager config.Secret type,
+		// which masks itself on YAML marshaling, so loading and re-marshaling the
+		// config is sufficient to strip inline credentials.
+		redacted, redactErr := redactAlertmanagerConfigSecrets(cfg.RawConfig)
+		if redactErr != nil {
+			// Fall back to omitting the raw config entirely rather than leaking
+			// unredacted secrets if the config cannot be re-serialized.
+			level.Warn(logger).Log("msg", "failed to redact alertmanager config, omitting raw config", "user", userID, "err", redactErr)
+			redacted = ""
+		}
+
 		data := map[string]*UserConfig{
 			userID: {
 				TemplateFiles:      alertspb.ParseTemplates(cfg),
-				AlertmanagerConfig: cfg.RawConfig,
+				AlertmanagerConfig: redacted,
 			},
 		}
 
@@ -302,6 +333,37 @@ func (am *MultitenantAlertmanager) ListAllConfigs(w http.ResponseWriter, r *http
 	}
 	close(iter)
 	<-done
+}
+
+// redactAlertmanagerConfigSecrets parses the supplied Alertmanager RawConfig and
+// re-marshals it. The alertmanager config.Secret type masks itself when
+// marshaled, so inline receiver credentials are replaced with <secret> in the
+// returned YAML. If the config is empty or cannot be parsed, the input is
+// returned unchanged (empty) or the parse error is returned so the caller can
+// decide whether to drop the field.
+func redactAlertmanagerConfigSecrets(raw string) (string, error) {
+	if raw == "" {
+		return raw, nil
+	}
+	parsed, err := config.Load(raw)
+	if err != nil {
+		return "", err
+	}
+	out, err := yaml.Marshal(parsed)
+	if err != nil {
+		return "", err
+	}
+	return string(out), nil
+}
+
+// containsString reports whether needle is present in haystack.
+func containsString(haystack []string, needle string) bool {
+	for _, s := range haystack {
+		if s == needle {
+			return true
+		}
+	}
+	return false
 }
 
 // validateAlertmanagerConfig recursively scans the input config looking for data types for which
