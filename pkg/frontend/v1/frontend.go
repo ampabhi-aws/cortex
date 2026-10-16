@@ -14,6 +14,10 @@ import (
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/promauto"
 	"github.com/weaveworks/common/httpgrpc"
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/credentials"
+	"google.golang.org/grpc/peer"
+	"google.golang.org/grpc/status"
 
 	"github.com/cortexproject/cortex/pkg/frontend/v1/frontendv1pb"
 	"github.com/cortexproject/cortex/pkg/querier/stats"
@@ -195,6 +199,15 @@ func (f *Frontend) Process(server frontendv1pb.Frontend_ProcessServer) error {
 		return err
 	}
 
+	// Authenticate the querier worker. Reject empty client IDs and, when the
+	// gRPC server is configured with verified mTLS client certificates, require
+	// that the self-reported ClientID matches the authenticated peer identity.
+	// This prevents an unauthenticated peer from registering as a querier and
+	// receiving other tenants' queued requests. See CWE-306.
+	if err := authenticateQuerier(server.Context(), querierID); err != nil {
+		return err
+	}
+
 	f.requestQueue.RegisterQuerierConnection(querierID)
 	defer f.requestQueue.UnregisterQuerierConnection(querierID)
 
@@ -285,7 +298,13 @@ func (f *Frontend) Process(server frontendv1pb.Frontend_ProcessServer) error {
 	}
 }
 
-func (f *Frontend) NotifyClientShutdown(_ context.Context, req *frontendv1pb.NotifyClientShutdownRequest) (*frontendv1pb.NotifyClientShutdownResponse, error) {
+func (f *Frontend) NotifyClientShutdown(ctx context.Context, req *frontendv1pb.NotifyClientShutdownRequest) (*frontendv1pb.NotifyClientShutdownResponse, error) {
+	// Authenticate the shutdown notification against the peer identity so an
+	// untrusted caller cannot de-register another querier's connection state.
+	if err := authenticateQuerier(ctx, req.GetClientID()); err != nil {
+		return nil, err
+	}
+
 	level.Info(f.log).Log("msg", "received shutdown notification from querier", "querier", req.GetClientID())
 	f.requestQueue.NotifyQuerierShutdown(req.GetClientID())
 
@@ -308,11 +327,70 @@ func getQuerierID(server frontendv1pb.Frontend_ProcessServer) (string, error) {
 	}
 
 	resp, err := server.Recv()
+	if err != nil {
+		return "", err
+	}
 
-	// Old queriers will return empty string, which is fine. All old queriers will be
-	// treated as single querier with lot of connections.
-	// (Note: if resp is nil, GetClientID() returns "")
-	return resp.GetClientID(), err
+	// Reject queriers that do not identify themselves. Historically Cortex
+	// tolerated an empty ClientID (treating all such workers as a single
+	// synthetic querier) which allowed any gRPC peer to attach to the Process
+	// stream and receive queued requests belonging to arbitrary tenants.
+	clientID := resp.GetClientID()
+	if clientID == "" {
+		return "", status.Error(codes.Unauthenticated, "querier did not report a ClientID")
+	}
+	return clientID, nil
+}
+
+// authenticatedPeerIdentity returns a stable identity derived from the
+// verified mTLS client certificate presented by the gRPC peer, or an empty
+// string when the connection is not authenticated with a verified client
+// certificate. The identity is taken from the certificate CommonName, falling
+// back to the first DNS SAN or URI SAN when CommonName is empty. Only chains
+// that gRPC has already verified (TLSInfo.State.VerifiedChains) are considered.
+func authenticatedPeerIdentity(ctx context.Context) string {
+	p, ok := peer.FromContext(ctx)
+	if !ok || p == nil || p.AuthInfo == nil {
+		return ""
+	}
+	tlsInfo, ok := p.AuthInfo.(credentials.TLSInfo)
+	if !ok {
+		return ""
+	}
+	if len(tlsInfo.State.VerifiedChains) == 0 || len(tlsInfo.State.VerifiedChains[0]) == 0 {
+		return ""
+	}
+	cert := tlsInfo.State.VerifiedChains[0][0]
+	if cert.Subject.CommonName != "" {
+		return cert.Subject.CommonName
+	}
+	if len(cert.DNSNames) > 0 {
+		return cert.DNSNames[0]
+	}
+	for _, u := range cert.URIs {
+		if u != nil {
+			return u.String()
+		}
+	}
+	return ""
+}
+
+// authenticateQuerier verifies that the self-reported querier/client ID is
+// non-empty and, when the gRPC server is terminating verified mTLS, that it
+// matches the authenticated peer identity. If no verified client certificate
+// is presented (e.g. mTLS is not configured, which is the historical default),
+// only the non-empty requirement is enforced; operators relying on this code
+// path must still provide perimeter authentication / network isolation and
+// should enable `-server.grpc-tls-client-auth=RequireAndVerifyClientCert` to
+// obtain cryptographic peer authentication.
+func authenticateQuerier(ctx context.Context, reportedID string) error {
+	if reportedID == "" {
+		return status.Error(codes.Unauthenticated, "querier did not report a ClientID")
+	}
+	if peerID := authenticatedPeerIdentity(ctx); peerID != "" && peerID != reportedID {
+		return status.Errorf(codes.PermissionDenied, "querier ClientID %q does not match authenticated peer identity", reportedID)
+	}
+	return nil
 }
 
 func (f *Frontend) queueRequest(ctx context.Context, req *request) error {
