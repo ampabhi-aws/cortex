@@ -159,6 +159,8 @@ func (d *Distributor) GetIngestersForMetadata(ctx context.Context) (ring.Replica
 
 // queryIngesters queries the ingesters via the older, sample-based API.
 func (d *Distributor) queryIngesters(ctx context.Context, replicationSet ring.ReplicationSet, req *ingester_client.QueryRequest) (model.Matrix, error) {
+	queryLimiter := limiter.QueryLimiterFromContextWithFallback(ctx)
+
 	// Fetch samples from multiple ingesters in parallel, using the replicationSet
 	// to deal with consistency.
 	results, err := replicationSet.Do(ctx, d.cfg.ExtraQueryDelay, func(ctx context.Context, ing *ring.InstanceDesc) (interface{}, error) {
@@ -172,6 +174,18 @@ func (d *Distributor) queryIngesters(ctx context.Context, replicationSet ring.Re
 		if err != nil {
 			d.ingesterQueryFailures.WithLabelValues(ing.Addr).Inc()
 			return nil, err
+		}
+
+		// Enforce the max data bytes per query limit.
+		if dataBytesLimitErr := queryLimiter.AddDataBytes(resp.Size()); dataBytesLimitErr != nil {
+			return nil, validation.LimitError(dataBytesLimitErr.Error())
+		}
+
+		// Enforce the max fetched series per query limit.
+		for _, ts := range resp.Timeseries {
+			if limitErr := queryLimiter.AddSeries(ts.Labels); limitErr != nil {
+				return nil, validation.LimitError(limitErr.Error())
+			}
 		}
 
 		return ingester_client.FromQueryResponse(resp), nil
@@ -230,6 +244,8 @@ func mergeExemplarSets(a, b []cortexpb.Exemplar) []cortexpb.Exemplar {
 
 // queryIngestersExemplars queries the ingesters for exemplars.
 func (d *Distributor) queryIngestersExemplars(ctx context.Context, replicationSet ring.ReplicationSet, req *ingester_client.ExemplarQueryRequest) (*ingester_client.ExemplarQueryResponse, error) {
+	queryLimiter := limiter.QueryLimiterFromContextWithFallback(ctx)
+
 	// Fetch exemplars from multiple ingesters in parallel, using the replicationSet
 	// to deal with consistency.
 	results, err := replicationSet.Do(ctx, d.cfg.ExtraQueryDelay, func(ctx context.Context, ing *ring.InstanceDesc) (interface{}, error) {
@@ -243,6 +259,18 @@ func (d *Distributor) queryIngestersExemplars(ctx context.Context, replicationSe
 		if err != nil {
 			d.ingesterQueryFailures.WithLabelValues(ing.Addr).Inc()
 			return nil, err
+		}
+
+		// Enforce the max data bytes per query limit.
+		if dataBytesLimitErr := queryLimiter.AddDataBytes(resp.Size()); dataBytesLimitErr != nil {
+			return nil, validation.LimitError(dataBytesLimitErr.Error())
+		}
+
+		// Enforce the max fetched series per query limit.
+		for _, ts := range resp.Timeseries {
+			if limitErr := queryLimiter.AddSeries(ts.Labels); limitErr != nil {
+				return nil, validation.LimitError(limitErr.Error())
+			}
 		}
 
 		return resp, nil
