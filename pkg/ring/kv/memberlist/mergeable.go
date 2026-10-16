@@ -49,3 +49,21 @@ type Mergeable interface {
 	// Clone should return a deep copy of the state.
 	Clone() Mergeable
 }
+
+// Validatable is an optional extension to Mergeable. Values decoded from an
+// untrusted source (such as a gossip message or a push/pull sync blob) that
+// implement this interface will have Validate() invoked before being merged
+// into the KV store. If Validate returns an error, the value is rejected
+// and the KV store mutex is never taken for it.
+type Validatable interface {
+	Validate() error
+}
+
+// Normalizable is an optional extension to Mergeable. If an incoming value
+// implements this interface, the KV store will call Normalize() before
+// acquiring its store mutex, so that expensive canonicalisation work (such
+// as sorting and de-duplicating token lists) does not block other ring
+// readers on the node.
+type Normalizable interface {
+	Normalize()
+}

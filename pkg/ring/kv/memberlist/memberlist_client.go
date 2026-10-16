@@ -1186,7 +1186,19 @@ func (m *KV) MergeRemoteState(data []byte, join bool) {
 	}
 }
 
+// defaultMaxMergeableValueSizeBytes caps the size of a single incoming
+// gossip/push-pull KV value that mergeBytesValueForKey will accept. A few
+// megabytes is well above anything a legitimate ring.Desc produces (even
+// large deployments with thousands of instances); larger values are rejected
+// before decode so an attacker-controlled, highly-compressible payload cannot
+// force expensive work inside the KV store critical section.
+const defaultMaxMergeableValueSizeBytes = 8 * 1024 * 1024 // 8 MiB
+
 func (m *KV) mergeBytesValueForKey(key string, incomingData []byte, codec codec.Codec) (Mergeable, uint, error) {
+	if n := len(incomingData); n > defaultMaxMergeableValueSizeBytes {
+		return nil, 0, fmt.Errorf("incoming value for key %q is too large: %d > %d bytes", key, n, defaultMaxMergeableValueSizeBytes)
+	}
+
 	decodedValue, err := codec.Decode(incomingData)
 	if err != nil {
 		return nil, 0, fmt.Errorf("failed to decode value: %v", err)
@@ -1195,6 +1207,20 @@ func (m *KV) mergeBytesValueForKey(key string, incomingData []byte, codec codec.
 	incomingValue, ok := decodedValue.(Mergeable)
 	if !ok {
 		return nil, 0, fmt.Errorf("expected Mergeable, got: %T", decodedValue)
+	}
+
+	// Validate and normalise the incoming value *before* taking the store
+	// mutex. This stops a hostile peer from pinning a CPU inside the KV
+	// critical section (which is shared with every Get / CAS / WatchKey /
+	// LocalState call on the node) via a crafted value with an unreasonable
+	// number of entries or duplicated tokens.
+	if v, ok := incomingValue.(Validatable); ok {
+		if err := v.Validate(); err != nil {
+			return nil, 0, fmt.Errorf("rejected invalid value for key %q: %v", key, err)
+		}
+	}
+	if n, ok := incomingValue.(Normalizable); ok {
+		n.Normalize()
 	}
 
 	return m.mergeValueForKey(key, incomingValue, 0, codec)

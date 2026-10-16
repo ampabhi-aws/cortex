@@ -281,9 +281,62 @@ func (d *Desc) MergeContent() []string {
 	return result
 }
 
+// MaxIngestersPerDesc is the hard upper bound on how many instances a single
+// gossiped/CAS-merged ring.Desc may contain. Values larger than this are
+// treated as hostile input (a crafted gossip message could otherwise force
+// expensive per-instance work while the memberlist KV store mutex is held).
+const MaxIngestersPerDesc = 10000
+
+// MaxTokensPerIngester is the hard upper bound on how many tokens a single
+// instance in a gossiped ring.Desc may declare. The reference implementation
+// uses O(100-1000) tokens per instance; anything significantly larger is
+// treated as hostile input.
+const MaxTokensPerIngester = 1 << 16 // 65536
+
+// Validate performs cheap structural checks on an untrusted *Desc (e.g. one
+// decoded from a gossip message) before it is merged into the local store.
+// It rejects values whose instance count or per-instance token count exceeds
+// the hard-coded safety limits above. This is intended to be called before
+// the KV store mutex is acquired, so a hostile payload cannot pin a CPU
+// while blocking all ring readers.
+func (d *Desc) Validate() error {
+	if d == nil {
+		return nil
+	}
+	if n := len(d.Ingesters); n > MaxIngestersPerDesc {
+		return fmt.Errorf("ring.Desc has too many instances: %d > %d", n, MaxIngestersPerDesc)
+	}
+	for name, ing := range d.Ingesters {
+		if n := len(ing.Tokens); n > MaxTokensPerIngester {
+			return fmt.Errorf("ring.Desc instance %q has too many tokens: %d > %d", name, n, MaxTokensPerIngester)
+		}
+	}
+	return nil
+}
+
+// Normalize canonicalises the ring in place: it sorts the token list of every
+// instance and removes duplicate tokens. It is safe to call on untrusted data
+// after Validate has succeeded. The implementation is O(T log T) in the total
+// number of tokens and uses a single linear compaction pass per instance (no
+// quadratic slice-shift).
+//
+// This implements the memberlist.Normalizable optional interface so the KV
+// store can run it outside of its critical section.
+func (d *Desc) Normalize() {
+	if d == nil {
+		return
+	}
+	normalizeIngestersMap(d)
+}
+
 // normalizeIngestersMap will do the following:
 // - sorts tokens and removes duplicates (only within single ingester)
 // - modifies the input ring
+//
+// The dedup step runs in a single linear pass that writes unique tokens into
+// the same backing array (compaction), avoiding the previous O(N^2) slice
+// shift that made a crafted ring.Desc with many duplicate tokens an easy DoS
+// vector when called under the memberlist KV store mutex.
 func normalizeIngestersMap(inputRing *Desc) {
 	// Make sure LEFT ingesters have no tokens
 	for n, ing := range inputRing.Ingesters {
@@ -301,16 +354,23 @@ func normalizeIngestersMap(inputRing *Desc) {
 			sort.Sort(Tokens(ing.Tokens))
 		}
 
-		// tokens are sorted now, we can easily remove duplicates.
+		// Tokens are sorted now; compact in place in a single linear pass.
+		// write is the index of the next slot to receive a unique token;
+		// the slice is truncated to len = write when we're done.
+		write := 1
 		prev := ing.Tokens[0]
-		for ix := 1; ix < len(ing.Tokens); {
-			if ing.Tokens[ix] == prev {
-				ing.Tokens = append(ing.Tokens[:ix], ing.Tokens[ix+1:]...)
-			} else {
-				prev = ing.Tokens[ix]
-				ix++
+		for ix := 1; ix < len(ing.Tokens); ix++ {
+			t := ing.Tokens[ix]
+			if t == prev {
+				continue
 			}
+			if write != ix {
+				ing.Tokens[write] = t
+			}
+			prev = t
+			write++
 		}
+		ing.Tokens = ing.Tokens[:write]
 
 		// write updated value back to map
 		inputRing.Ingesters[n] = ing
