@@ -520,12 +520,21 @@ func (r *Ruler) listRules(ctx context.Context) (result map[string]rulespb.RuleGr
 		return
 	}
 
-	for userID := range result {
+	// Filter out disallowed tenants into a freshly allocated map rather
+	// than mutating the map returned by the store. Some rule store
+	// backends (notably configdb) share state across callers, and deleting
+	// from a returned live map races the ruler sync loop and the HTTP
+	// handlers that read the same cache. Building a new map is also
+	// cheap: result only holds tenants we care about.
+	filtered := make(map[string]rulespb.RuleGroupList, len(result))
+	for userID, groups := range result {
 		if !r.allowedTenants.IsAllowed(userID) {
 			level.Debug(r.logger).Log("msg", "ignoring rule groups for user, not allowed", "user", userID)
-			delete(result, userID)
+			continue
 		}
+		filtered[userID] = groups
 	}
+	result = filtered
 	return
 }
 
