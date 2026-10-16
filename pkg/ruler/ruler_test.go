@@ -502,10 +502,10 @@ func TestSharding(t *testing.T) {
 	user3Group1 := &rulespb.RuleGroupDesc{User: user3, Namespace: "namespace", Name: "first"}
 
 	// Must be distinct for test to work.
-	user1Group1Token := tokenForGroup(user1Group1)
-	user1Group2Token := tokenForGroup(user1Group2)
-	user2Group1Token := tokenForGroup(user2Group1)
-	user3Group1Token := tokenForGroup(user3Group1)
+	user1Group1Token := tokenForGroup(user1Group1, nil)
+	user1Group2Token := tokenForGroup(user1Group2, nil)
+	user2Group1Token := tokenForGroup(user2Group1, nil)
+	user3Group1Token := tokenForGroup(user3Group1, nil)
 
 	noRules := map[string]rulespb.RuleGroupList{}
 	allRules := map[string]rulespb.RuleGroupList{
@@ -1054,7 +1054,7 @@ func generateTokenForGroups(groups []*rulespb.RuleGroupDesc, offset uint32) []ui
 	var tokens []uint32
 
 	for _, g := range groups {
-		tokens = append(tokens, tokenForGroup(g)+offset)
+		tokens = append(tokens, tokenForGroup(g, nil)+offset)
 	}
 
 	return tokens
