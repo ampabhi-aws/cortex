@@ -2,6 +2,8 @@
 
 ## master / unreleased
 
+* [CHANGE] Query-frontend: `-frontend.default-validity` now defaults to `24h` instead of `0s`. This bounds how long tenant data cached in the query-frontend results cache can outlive a `POST /purger/delete_tenant` tenant deletion (there is no gen-number invalidation path for the blocks storage results cache). Operators who need the previous behavior can explicitly set `-frontend.default-validity=0` and should refuse to re-assign a deleted tenant ID until at least the configured TTL has elapsed.
+
   **This release removes support for chunks storage. See below for more.**
 * [CHANGE] Remove support for chunks storage entirely. If you are using chunks storage on a previous version, you must [migrate your data](https://github.com/cortexproject/cortex/blob/v1.11.1/docs/blocks-storage/migrate-from-chunks-to-blocks.md) on version 1.12 or earlier. Before upgrading to this release, you should also remove any deprecated chunks-related configuration, as this release will no longer accept that. The following flags are gone:
   - `-dynamodb.*`

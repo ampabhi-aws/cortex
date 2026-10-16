@@ -98,7 +98,8 @@ These components will unload blocks once they are deleted from the object store 
 
 While query-frontend could use the tenant blocks deletion marker to clean up the cache, we don’t suggest to do that due to additional complexity.
 Instead we will only rely on eventual eviction of cached query results from the cache.
-It is possible to configure Cortex to set TTL for items in the frontend cache by using `-frontend.default-validity` option.
+Cortex sets a bounded TTL for items in the frontend cache by default via `-frontend.default-validity` (24h); operators can override it, but setting it to 0 is not recommended because it lets cached tenant data outlive deletions.
+Operators must additionally refuse to re-assign a deleted tenant ID until at least the configured TTL has elapsed, otherwise the next owner of that ID could be served the previous owner's cached range-query results.
 
 #### Ingester
 
