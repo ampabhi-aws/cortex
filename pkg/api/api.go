@@ -5,6 +5,7 @@ import (
 	"flag"
 	"net/http"
 	"path"
+	"strconv"
 	"strings"
 
 	"github.com/NYTimes/gziphandler"
@@ -219,7 +220,49 @@ func (a *API) RegisterAPI(httpPathPrefix string, actualCfg interface{}, defaultC
 
 	a.RegisterRoute("/config", a.cfg.configHandler(actualCfg, defaultCfg), false, "GET")
 	a.RegisterRoute("/", indexHandler(httpPathPrefix, a.indexPage), false, "GET")
-	a.RegisterRoute("/debug/fgprof", fgprof.Handler(), false, "GET")
+	// /debug/fgprof runs runtime.GoroutineProfile at 99Hz for the entire
+	// requested duration, which stops the world on every sample. Require the
+	// auth middleware, clamp the attacker-controlled `seconds` parameter to a
+	// small maximum, and allow only one profiling session at a time so this
+	// debug surface cannot be used to cause CPU/latency denial of service.
+	a.RegisterRoute("/debug/fgprof", boundedFgprofHandler(fgprof.Handler()), true, "GET")
+}
+
+// maxFgprofSeconds caps the attacker-controlled `seconds` query parameter of
+// the /debug/fgprof handler. Go's net/http/pprof uses a 30s default; we allow
+// a modest headroom while preventing arbitrarily long stop-the-world sampling.
+const maxFgprofSeconds = 60
+
+// fgprofSessionGuard serialises concurrent /debug/fgprof requests so that at
+// most one profiling session runs at a time.
+var fgprofSessionGuard = make(chan struct{}, 1)
+
+// boundedFgprofHandler wraps the vendored fgprof handler to clamp the
+// `seconds` query parameter and reject concurrent profiling sessions. The
+// underlying handler is still responsible for producing the profile output.
+func boundedFgprofHandler(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if s := r.URL.Query().Get("seconds"); s != "" {
+			n, err := strconv.Atoi(s)
+			if err == nil && n > maxFgprofSeconds {
+				q := r.URL.Query()
+				q.Set("seconds", strconv.Itoa(maxFgprofSeconds))
+				r2 := r.Clone(r.Context())
+				r2.URL.RawQuery = q.Encode()
+				r = r2
+			}
+		}
+
+		select {
+		case fgprofSessionGuard <- struct{}{}:
+			defer func() { <-fgprofSessionGuard }()
+		default:
+			http.Error(w, "another fgprof profiling session is already in progress", http.StatusTooManyRequests)
+			return
+		}
+
+		next.ServeHTTP(w, r)
+	})
 }
 
 // RegisterRuntimeConfig registers the endpoints associates with the runtime configuration
