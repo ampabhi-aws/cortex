@@ -81,29 +81,57 @@ func (a *API) admin(w http.ResponseWriter, r *http.Request) {
 `)
 }
 
-// RegisterRoutes registers the configs API HTTP routes with the provided Router.
-func (a *API) RegisterRoutes(r *mux.Router) {
-	for _, route := range []struct {
-		name, method, path string
-		handler            http.HandlerFunc
-	}{
-		{"root", "GET", "/", a.admin},
+// Route describes a single configs API HTTP route and whether it should be
+// wrapped by the configured HTTP auth middleware when mounted on the main
+// Cortex server. Per-tenant routes resolve the tenant from the request and
+// therefore require the auth middleware so the X-Scope-OrgID header is
+// propagated into the request context. The "/private/..." routes are the
+// internal all-tenant polling API consumed by the ruler/alertmanager configs
+// client and must not require a tenant header; following the upstream pattern
+// used by other cross-tenant admin endpoints (/multitenant_alertmanager/configs,
+// /ruler/rule_groups, /distributor/all_user_stats) they are registered with
+// auth=false and are expected to be protected by the operator's deployment
+// (reverse proxy / network policy / separate internal listener).
+type Route struct {
+	Name, Method, Path string
+	Handler            http.HandlerFunc
+	Auth               bool
+}
+
+// Routes returns the HTTP routes exposed by the configs API together with
+// their desired auth-middleware wrapping, so that callers (notably the Cortex
+// pkg/api helper) can mount them through API.RegisterRoute and apply the
+// configured HTTPAuthMiddleware consistently.
+func (a *API) Routes() []Route {
+	return []Route{
+		{"root", "GET", "/", a.admin, false},
 		// Dedicated APIs for updating rules config. In the future, these *must*
 		// be used.
-		{"get_rules", "GET", "/api/prom/configs/rules", a.getConfig},
-		{"set_rules", "POST", "/api/prom/configs/rules", a.setConfig},
-		{"get_templates", "GET", "/api/prom/configs/templates", a.getConfig},
-		{"set_templates", "POST", "/api/prom/configs/templates", a.setConfig},
-		{"get_alertmanager_config", "GET", "/api/prom/configs/alertmanager", a.getConfig},
-		{"set_alertmanager_config", "POST", "/api/prom/configs/alertmanager", a.setConfig},
-		{"validate_alertmanager_config", "POST", "/api/prom/configs/alertmanager/validate", a.validateAlertmanagerConfig},
-		{"deactivate_config", "DELETE", "/api/prom/configs/deactivate", a.deactivateConfig},
-		{"restore_config", "POST", "/api/prom/configs/restore", a.restoreConfig},
-		// Internal APIs.
-		{"private_get_rules", "GET", "/private/api/prom/configs/rules", a.getConfigs},
-		{"private_get_alertmanager_config", "GET", "/private/api/prom/configs/alertmanager", a.getConfigs},
-	} {
-		r.Handle(route.path, route.handler).Methods(route.method).Name(route.name)
+		{"get_rules", "GET", "/api/prom/configs/rules", a.getConfig, true},
+		{"set_rules", "POST", "/api/prom/configs/rules", a.setConfig, true},
+		{"get_templates", "GET", "/api/prom/configs/templates", a.getConfig, true},
+		{"set_templates", "POST", "/api/prom/configs/templates", a.setConfig, true},
+		{"get_alertmanager_config", "GET", "/api/prom/configs/alertmanager", a.getConfig, true},
+		{"set_alertmanager_config", "POST", "/api/prom/configs/alertmanager", a.setConfig, true},
+		{"validate_alertmanager_config", "POST", "/api/prom/configs/alertmanager/validate", a.validateAlertmanagerConfig, true},
+		{"deactivate_config", "DELETE", "/api/prom/configs/deactivate", a.deactivateConfig, true},
+		{"restore_config", "POST", "/api/prom/configs/restore", a.restoreConfig, true},
+		// Internal all-tenant polling APIs consumed by pkg/configs/client. See
+		// the Route docs above for the auth-flag rationale.
+		{"private_get_rules", "GET", "/private/api/prom/configs/rules", a.getConfigs, false},
+		{"private_get_alertmanager_config", "GET", "/private/api/prom/configs/alertmanager", a.getConfigs, false},
+	}
+}
+
+// RegisterRoutes registers the configs API HTTP routes directly on the
+// provided Router without any auth-middleware wrapping. This is used by the
+// in-package test harness (see New) which exercises handlers through a
+// self-contained mux. Production code paths mount these routes through
+// pkg/api.API.RegisterConfigAPI so the configured HTTP auth middleware is
+// applied to per-tenant endpoints.
+func (a *API) RegisterRoutes(r *mux.Router) {
+	for _, route := range a.Routes() {
+		r.Handle(route.Path, route.Handler).Methods(route.Method).Name(route.Name)
 	}
 }
 
