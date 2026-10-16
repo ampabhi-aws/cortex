@@ -143,6 +143,14 @@ func (cfg *MultitenantAlertmanagerConfig) Validate(storageCfg alertstore.Config)
 		return err
 	}
 
+	// Fail closed when alertmanager client TLS material is set but the TLS
+	// gate is off, otherwise alertmanager->alertmanager state replication
+	// (which carries tenant Alertmanager configs embedding third-party
+	// credentials) would silently fall back to plaintext.
+	if err := cfg.AlertmanagerClient.Validate(); err != nil {
+		return err
+	}
+
 	if cfg.ShardingEnabled {
 		if !storageCfg.IsFullStateSupported() {
 			return errShardingUnsupportedStorage

@@ -21,6 +21,16 @@ type ClientConfig struct {
 	InsecureSkipVerify bool   `yaml:"tls_insecure_skip_verify"`
 }
 
+// IsConfigured reports whether any TLS material (certificate/key/CA/server
+// name) or the insecure-skip-verify override has been set on this
+// ClientConfig. It is used by callers that need to detect misconfigurations
+// such as TLS material being supplied while the matching -tls-enabled gate
+// is left at its default (false), which would otherwise silently fall back
+// to a plaintext connection and discard the configured credentials.
+func (cfg *ClientConfig) IsConfigured() bool {
+	return cfg.CertPath != "" || cfg.KeyPath != "" || cfg.CAPath != "" || cfg.ServerName != "" || cfg.InsecureSkipVerify
+}
+
 var (
 	errKeyMissing  = errors.New("certificate given but no key configured")
 	errCertMissing = errors.New("key given but no certificate configured")
@@ -32,12 +42,13 @@ func (cfg *ClientConfig) RegisterFlagsWithPrefix(prefix string, f *flag.FlagSet)
 	f.StringVar(&cfg.KeyPath, prefix+".tls-key-path", "", "Path to the key file for the client certificate. Also requires the client certificate to be configured.")
 	f.StringVar(&cfg.CAPath, prefix+".tls-ca-path", "", "Path to the CA certificates file to validate server certificate against. If not set, the host's root CA certificates are used.")
 	f.StringVar(&cfg.ServerName, prefix+".tls-server-name", "", "Override the expected name on the server certificate.")
-	f.BoolVar(&cfg.InsecureSkipVerify, prefix+".tls-insecure-skip-verify", false, "Skip validating server certificate.")
+	f.BoolVar(&cfg.InsecureSkipVerify, prefix+".tls-insecure-skip-verify", false, "Skip validating server certificate. For testing use only; enabling this disables server identity verification and is not safe for production.")
 }
 
 // GetTLSConfig initialises tls.Config from config options
 func (cfg *ClientConfig) GetTLSConfig() (*tls.Config, error) {
 	config := &tls.Config{
+		MinVersion:         tls.VersionTLS12,
 		InsecureSkipVerify: cfg.InsecureSkipVerify,
 		ServerName:         cfg.ServerName,
 	}

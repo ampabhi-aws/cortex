@@ -5,6 +5,7 @@ import (
 	"time"
 
 	"github.com/go-kit/log"
+	"github.com/go-kit/log/level"
 	middleware "github.com/grpc-ecosystem/go-grpc-middleware"
 	"github.com/pkg/errors"
 	"google.golang.org/grpc"
@@ -15,6 +16,14 @@ import (
 	"github.com/cortexproject/cortex/pkg/util/grpcencoding/snappy"
 	"github.com/cortexproject/cortex/pkg/util/tls"
 )
+
+// ErrTLSMaterialWithoutTLSEnabled is returned by Config.Validate when TLS
+// client material (certificate/key/CA/server name/insecure-skip-verify) has
+// been configured on the embedded tls.ClientConfig while the top-level
+// tls_enabled gate is false. Previously this misconfiguration silently
+// resulted in a plaintext gRPC dial that discarded the operator-supplied
+// credentials; it now fails closed at startup.
+var ErrTLSMaterialWithoutTLSEnabled = errors.New("TLS client material is configured (tls_cert_path/tls_key_path/tls_ca_path/tls_server_name/tls_insecure_skip_verify) but tls_enabled is false; set tls_enabled=true (or remove the TLS material) to avoid a silent plaintext fallback")
 
 // Config for a gRPC client.
 type Config struct {
@@ -58,6 +67,23 @@ func (cfg *Config) Validate(log log.Logger) error {
 	default:
 		return errors.Errorf("unsupported compression type: %s", cfg.GRPCCompression)
 	}
+
+	// Fail closed when TLS material is supplied but the TLS gate is off: in
+	// that case GetGRPCDialOptions would silently return insecure credentials
+	// and discard the configured certificates, so operators who intend TLS
+	// (but forgot the enable flag) would send intra-cluster tenant traffic in
+	// cleartext without any warning.
+	if !cfg.TLSEnabled && cfg.TLS.IsConfigured() {
+		return ErrTLSMaterialWithoutTLSEnabled
+	}
+
+	// Log a startup warning whenever a gRPC client is going to be built with
+	// insecure (plaintext) transport credentials, so operators have a chance
+	// to notice an unintended plaintext deployment.
+	if !cfg.TLSEnabled && log != nil {
+		level.Warn(log).Log("msg", "gRPC client configured without TLS; intra-cluster traffic (including X-Scope-OrgID tenant metadata) will be sent in cleartext")
+	}
+
 	return nil
 }
 
