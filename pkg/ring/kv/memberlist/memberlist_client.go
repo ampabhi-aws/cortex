@@ -28,6 +28,13 @@ import (
 const (
 	maxCasRetries              = 10          // max retries in CAS operation
 	noChangeDetectedRetrySleep = time.Second // how long to sleep after no change was detected in CAS
+
+	// maxIncomingKVValueSize caps the length of KeyValuePair.Value accepted from
+	// a remote peer before we hand it to codec.Decode. Legitimate ring/KV
+	// values are small (ring descriptors, HA tracker entries, etc.); this cap
+	// bounds the compressed payload a peer can force us to process and stops a
+	// peer from targeting the snappy decompression allocation.
+	maxIncomingKVValueSize = 16 * 1024 * 1024
 )
 
 // Client implements kv.Client interface, by using memberlist.KV
@@ -985,6 +992,12 @@ func (m *KV) NotifyMsg(msg []byte) {
 		return
 	}
 
+	if len(kvPair.Value) > maxIncomingKVValueSize {
+		m.numberOfInvalidReceivedMessages.Inc()
+		level.Warn(m.logger).Log("msg", "received KV Pair with oversized value, dropping", "key", kvPair.Key, "value_length", len(kvPair.Value), "max", maxIncomingKVValueSize)
+		return
+	}
+
 	// we have a ring update! Let's merge it with our version of the ring for given key
 	mod, version, err := m.mergeBytesValueForKey(kvPair.Key, kvPair.Value, codec)
 
@@ -1154,6 +1167,11 @@ func (m *KV) MergeRemoteState(data []byte, join bool) {
 		codec := m.GetCodec(kvPair.GetCodec())
 		if codec == nil {
 			level.Error(m.logger).Log("msg", "failed to parse remote state: unknown codec for key", "codec", kvPair.GetCodec(), "key", kvPair.GetKey())
+			continue
+		}
+
+		if len(kvPair.Value) > maxIncomingKVValueSize {
+			level.Warn(m.logger).Log("msg", "skipping remote-state KV Pair with oversized value", "key", kvPair.Key, "value_length", len(kvPair.Value), "max", maxIncomingKVValueSize)
 			continue
 		}
 

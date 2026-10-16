@@ -35,6 +35,14 @@ const (
 
 const zeroZeroZeroZero = "0.0.0.0"
 
+// maxPacketPayloadSize caps the per-connection bytes `handleConnection` will
+// buffer for a `packet` message before handing it to memberlist. It matches
+// `UDPBufferSize` (10 MiB) in `buildMemberlistConfig` plus headroom for the
+// trailing md5 digest and envelope. Without this cap `io.ReadAll(conn)` is
+// unbounded, so any peer that can reach the gossip port can force the process
+// to buffer arbitrary amounts of memory per connection.
+const maxPacketPayloadSize = 10*1024*1024 + 1024
+
 // TCPTransportConfig is a configuration structure for creating new TCPTransport.
 type TCPTransportConfig struct {
 	// BindAddrs is a list of addresses to bind to.
@@ -280,11 +288,21 @@ func (t *TCPTransport) handleConnection(conn net.Conn) {
 			return
 		}
 
-		// read the rest to buffer -- this is the "packet" itself
-		buf, err := io.ReadAll(conn)
+		// read the rest to buffer -- this is the "packet" itself. Cap the
+		// amount of memory we are willing to buffer so a peer cannot force the
+		// process to allocate indefinitely on a single connection. We read one
+		// extra byte so that we can detect (and reject) oversized payloads
+		// rather than silently truncating them.
+		limited := &io.LimitedReader{R: conn, N: int64(maxPacketPayloadSize) + 1}
+		buf, err := io.ReadAll(limited)
 		if err != nil {
 			t.receivedPacketsErrors.Inc()
 			level.Warn(t.logger).Log("msg", "error while reading packet data", "err", err, "remote", conn.RemoteAddr())
+			return
+		}
+		if len(buf) > maxPacketPayloadSize {
+			t.receivedPacketsErrors.Inc()
+			level.Warn(t.logger).Log("msg", "packet exceeds maximum size, dropping", "max", maxPacketPayloadSize, "remote", conn.RemoteAddr())
 			return
 		}
 
