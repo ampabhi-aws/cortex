@@ -144,15 +144,19 @@ func (s *state) AddState(key string, cs cluster.State, _ prometheus.Registerer) 
 
 // MergePartialState merges a received partial message with an internal state.
 func (s *state) MergePartialState(p *clusterpb.Part) error {
-	s.partialStateMergesTotal.WithLabelValues(p.Key).Inc()
-
 	s.mtx.Lock()
 	defer s.mtx.Unlock()
 	st, ok := s.states[p.Key]
 	if !ok {
-		s.partialStateMergesFailed.WithLabelValues(p.Key).Inc()
+		// Do not record a metric for an unrecognised key: p.Key is
+		// attacker-controlled over the gRPC UpdateState path, and using it
+		// as a Prometheus label value would create unbounded cardinality
+		// (and potentially panic on non-UTF-8 input) in the per-tenant
+		// registry. Only the keys pre-registered via AddState are valid.
 		return fmt.Errorf("key not found while merging")
 	}
+
+	s.partialStateMergesTotal.WithLabelValues(p.Key).Inc()
 
 	if err := st.Merge(p.Data); err != nil {
 		s.partialStateMergesFailed.WithLabelValues(p.Key).Inc()
