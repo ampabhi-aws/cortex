@@ -366,13 +366,13 @@ func prepare(t *testing.T, numAM, numHappyAM, replicationFactor int, responseBod
 	)
 	require.NoError(t, err)
 
-	amRing, err := ring.New(ring.Config{
+	amRing, err := ring.NewWithStoreClientAndStrategy(ring.Config{
 		KVStore: kv.Config{
 			Mock: kvStore,
 		},
 		HeartbeatTimeout:  60 * time.Minute,
 		ReplicationFactor: replicationFactor,
-	}, RingNameForServer, RingKey, nil, nil)
+	}, RingNameForServer, RingKey, kvStore, ring.NewIgnoreUnhealthyInstancesReplicationStrategy(), nil, nil)
 	require.NoError(t, err)
 	require.NoError(t, services.StartAndAwaitRunning(context.Background(), amRing))
 	test.Poll(t, time.Second, numAM, func() interface{} {
