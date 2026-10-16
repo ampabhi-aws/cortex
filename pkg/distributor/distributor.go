@@ -1199,14 +1199,23 @@ type UserIDStats struct {
 	UserStats
 }
 
-// AllUserStats returns statistics about all users.
+// AllUserStats returns statistics for the caller's tenant.
+//
+// The ingester RPC used to walk every tenant hosted on the ingester regardless
+// of the request context; this function hard-coded a fake "1" org-ID on the
+// outbound gRPC call because the ingester did not care which tenant was
+// claimed. That let any unauthenticated client reaching the HTTP route
+// enumerate every tenant's usage (CWE-1220). AllUserStats on the ingester is
+// now tenant-scoped, and the HTTP route is registered with auth=true, so the
+// caller's X-Scope-OrgID is required and is forwarded unchanged to the
+// ingesters here. The name is kept for backwards compatibility with existing
+// admin tooling and the registered URL path.
 // Note it does not divide by the ReplicationFactor like UserStats()
 func (d *Distributor) AllUserStats(ctx context.Context) ([]UserIDStats, error) {
 	// Add up by user, across all responses from ingesters
 	perUserTotals := make(map[string]UserStats)
 
 	req := &ingester_client.UserStatsRequest{}
-	ctx = user.InjectOrgID(ctx, "1") // fake: ingester insists on having an org ID
 	// Not using d.ForReplicationSet(), so we can fail after first error.
 	replicationSet, err := d.ingestersRing.GetAllHealthy(ring.Read)
 	if err != nil {

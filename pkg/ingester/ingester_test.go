@@ -3181,9 +3181,27 @@ func Test_Ingester_AllUserStats(t *testing.T) {
 		db.ingestedRuleSamples.Tick()
 	}
 
-	// Get label names
-	res, err := i.AllUserStats(context.Background(), &client.UserStatsRequest{})
+	// Get label names. AllUserStats is now tenant-scoped: it returns only the
+	// caller's own tenant stats (and nothing if the tenant has no TSDB). We
+	// query per-user and merge the responses to assert the same aggregate.
+	res := &client.UsersStatsResponse{}
+	for _, u := range []string{"user-1", "user-2"} {
+		ctx := user.InjectOrgID(context.Background(), u)
+		part, err := i.AllUserStats(ctx, &client.UserStatsRequest{})
+		require.NoError(t, err)
+		res.Stats = append(res.Stats, part.Stats...)
+	}
+
+	// A caller without any X-Scope-OrgID must be rejected: the method now
+	// resolves tenant.TenantID(ctx) and no longer leaks every tenant's usage.
+	_, err = i.AllUserStats(context.Background(), &client.UserStatsRequest{})
+	require.Error(t, err)
+
+	// A tenant that has no TSDB on this ingester gets an empty response, not
+	// stats about other tenants.
+	other, err := i.AllUserStats(user.InjectOrgID(context.Background(), "user-unknown"), &client.UserStatsRequest{})
 	require.NoError(t, err)
+	require.Empty(t, other.Stats)
 
 	expect := []*client.UserIDStatsResponse{
 		{
