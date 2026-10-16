@@ -259,12 +259,22 @@ func validateUserConfig(logger log.Logger, cfg alertspb.AlertConfigDesc, limits 
 	return nil
 }
 
+// ListAllConfigs returns the Alertmanager configuration of the tenant
+// identified in the request context. Historically this endpoint streamed every
+// tenant's configuration (including embedded notifier credentials such as
+// SMTP passwords, Slack/PagerDuty/OpsGenie/VictorOps keys and private webhook
+// URLs) with no authentication or tenant scoping. That is a cross-tenant
+// information disclosure, so the handler now resolves the caller via
+// tenant.TenantID and only returns that tenant's own configuration. The route
+// is also registered with auth=true (see pkg/api/api.go), so a tenant
+// identifier must be supplied by the configured auth middleware.
 func (am *MultitenantAlertmanager) ListAllConfigs(w http.ResponseWriter, r *http.Request) {
 	logger := util_log.WithContext(r.Context(), am.logger)
-	userIDs, err := am.store.ListAllUsers(r.Context())
+
+	userID, err := tenant.TenantID(r.Context())
 	if err != nil {
-		level.Error(logger).Log("msg", "failed to list users of alertmanager", "err", err)
-		http.Error(w, fmt.Sprintf("%s: %s", errListAllUser, err.Error()), http.StatusInternalServerError)
+		level.Error(logger).Log("msg", errNoOrgID, "err", err.Error())
+		http.Error(w, fmt.Sprintf("%s: %s", errNoOrgID, err.Error()), http.StatusUnauthorized)
 		return
 	}
 
@@ -276,7 +286,7 @@ func (am *MultitenantAlertmanager) ListAllConfigs(w http.ResponseWriter, r *http
 		close(done)
 	}()
 
-	err = concurrency.ForEachUser(r.Context(), userIDs, fetchConcurrency, func(ctx context.Context, userID string) error {
+	err = concurrency.ForEachUser(r.Context(), []string{userID}, fetchConcurrency, func(ctx context.Context, userID string) error {
 		cfg, err := am.store.GetAlertConfig(ctx, userID)
 		if errors.Is(err, alertspb.ErrNotFound) {
 			return nil
@@ -298,7 +308,7 @@ func (am *MultitenantAlertmanager) ListAllConfigs(w http.ResponseWriter, r *http
 		return nil
 	})
 	if err != nil {
-		level.Error(logger).Log("msg", "failed to list all alertmanager configs", "err", err)
+		level.Error(logger).Log("msg", "failed to list alertmanager config", "err", err, "user", userID)
 	}
 	close(iter)
 	<-done
