@@ -154,8 +154,11 @@ func testBlocksCleanerWithOptions(t *testing.T, options testBlocksCleanerOptions
 		{path: path.Join("user-3", block10.String(), "index"), expectedExists: false},
 		// Tenant deletion mark is not removed.
 		{path: path.Join("user-3", tsdb.TenantDeletionMarkPath), expectedExists: true},
-		// User-4 is removed fully.
-		{path: path.Join("user-4", tsdb.TenantDeletionMarkPath), expectedExists: options.user4FilesExist},
+		// User-4: blocks and debug files are cleaned up after TenantCleanupDelay,
+		// but the tenant deletion mark itself is preserved as a persistent
+		// tombstone so the tenant cannot be silently re-activated by the
+		// cleaner removing it.
+		{path: path.Join("user-4", tsdb.TenantDeletionMarkPath), expectedExists: true},
 		{path: path.Join("user-4", block.DebugMetas, "meta.json"), expectedExists: options.user4FilesExist},
 	} {
 		exists, err := bucketClient.Exists(ctx, tc.path)
