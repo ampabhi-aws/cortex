@@ -416,5 +416,9 @@ func (a *API) RegisterServiceMapHandler(handler http.Handler) {
 
 func (a *API) RegisterMemberlistKV(handler http.Handler) {
 	a.indexPage.AddLink(SectionAdminEndpoints, "/memberlist", "Memberlist Status")
-	a.RegisterRoute("/memberlist", handler, false, "GET")
+	// GET serves the status page and read-only view/download actions.
+	// POST is required for the destructive deleteMessages action so that it cannot
+	// be triggered by a cross-site GET (e.g. an <img src> loaded in an operator's
+	// browser) and so that it is not a side-effecting GET.
+	a.RegisterRoute("/memberlist", handler, false, "GET", "POST")
 }
