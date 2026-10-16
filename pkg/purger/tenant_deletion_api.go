@@ -42,6 +42,16 @@ func newTenantDeletionAPI(bkt objstore.Bucket, cfgProvider bucket.TenantConfigPr
 	}
 }
 
+// DeleteTenant handles POST /purger/delete_tenant.
+//
+// Scope: this endpoint is intentionally limited to the tenant's blocks
+// (TSDB) object store. It writes a tenant deletion marker that causes the
+// compactor's blocks cleaner to delete the tenant's blocks and causes
+// ingesters to stop shipping new blocks for the tenant. It does NOT remove
+// the tenant's ruler configuration or Alertmanager configuration (which may
+// contain webhook URLs and chat/paging/SMTP secrets); those must be removed
+// via POST /ruler/delete_tenant_config and
+// POST /multitenant_alertmanager/delete_tenant_config respectively.
 func (api *TenantDeletionAPI) DeleteTenant(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
 	userID, err := tenant.TenantID(ctx)
@@ -60,11 +70,19 @@ func (api *TenantDeletionAPI) DeleteTenant(w http.ResponseWriter, r *http.Reques
 		return
 	}
 
-	level.Info(api.logger).Log("msg", "tenant deletion mark in blocks storage created", "user", userID)
+	level.Info(api.logger).Log("msg", "tenant deletion mark in blocks storage created; ruler and alertmanager data are not touched by this endpoint", "user", userID)
 
 	w.WriteHeader(http.StatusOK)
 }
 
+// DeleteTenantStatusResponse is the JSON body returned by
+// GET /purger/delete_tenant_status.
+//
+// BlocksDeleted reports only whether the tenant's blocks (ULID-named objects)
+// have been removed from the blocks object store. It does not indicate
+// whether the tenant's ruler or Alertmanager configuration have been removed
+// (those must be verified via their own admin endpoints), nor whether
+// ingesters still hold un-shipped data for the tenant.
 type DeleteTenantStatusResponse struct {
 	TenantID      string `json:"tenant_id"`
 	BlocksDeleted bool   `json:"blocks_deleted"`
@@ -89,6 +107,17 @@ func (api *TenantDeletionAPI) DeleteTenantStatus(w http.ResponseWriter, r *http.
 	util.WriteJSONResponse(w, result)
 }
 
+// isBlocksForUserDeleted reports whether no blocks (ULID-named top-level
+// entries) remain under the tenant's prefix in the blocks object store.
+//
+// Scope: this check is intentionally limited to blocks storage and does not
+// consider the tenant's ruler configuration, Alertmanager configuration or
+// un-shipped data still held by ingesters. Non-block entries that may remain
+// under the tenant prefix after blocks deletion -- the tenant's own
+// "markers/tenant-deletion-mark.json", any "debug/" objects, the
+// "bucket-index.json.gz", etc. -- are ignored on purpose: callers that need
+// a full tenant-offboarding confirmation must additionally verify ruler and
+// Alertmanager deletion through their own admin endpoints.
 func (api *TenantDeletionAPI) isBlocksForUserDeleted(ctx context.Context, userID string) (bool, error) {
 	var errBlockFound = errors.New("block found")
 

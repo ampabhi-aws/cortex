@@ -795,7 +795,22 @@ The Purger service provides APIs for requesting deletion of tenants.
 POST /purger/delete_tenant
 ```
 
-Request deletion of ALL tenant data. Only works with blocks storage. Experimental.
+Request deletion of a tenant's **blocks storage** data. Experimental.
+
+This endpoint only writes a tenant deletion marker in the blocks (TSDB) object
+store. The marker causes the compactor's blocks cleaner to delete the tenant's
+blocks, and causes ingesters to stop shipping new blocks for the tenant. It
+**does not** delete the tenant's recording/alerting rules or Alertmanager
+configuration. To remove those, call the dedicated endpoints:
+
+- [`POST /ruler/delete_tenant_config`](#delete-tenant-configuration) removes the
+  tenant's rule groups.
+- [`POST /multitenant_alertmanager/delete_tenant_config`](#alertmanager-delete-tenant-configuration)
+  removes the tenant's Alertmanager configuration (which may contain webhook
+  URLs, chat/paging API keys and SMTP passwords).
+
+For a complete tenant offboarding or data-subject-erasure workflow, all three
+endpoints must be called.
 
 _Requires [authentication](#authentication)._
 
@@ -805,7 +820,21 @@ _Requires [authentication](#authentication)._
 GET /purger/delete_tenant_status
 ```
 
-Returns status of tenant deletion. Output format to be defined. Experimental.
+Returns the status of a tenant's **blocks storage** deletion. Experimental.
+
+The response is a JSON object of the form:
+
+```json
+{ "tenant_id": "<tenant>", "blocks_deleted": true }
+```
+
+`blocks_deleted` is `true` once no blocks (ULID-named objects) remain under the
+tenant's prefix in the blocks object store. It does **not** indicate whether
+the tenant's rule groups or Alertmanager configuration have been removed, nor
+whether ingesters still hold un-shipped data for the tenant. Ruler and
+Alertmanager state must be removed and verified via their own admin endpoints
+(see `POST /ruler/delete_tenant_config` and
+`POST /multitenant_alertmanager/delete_tenant_config`).
 
 _Requires [authentication](#authentication)._
 
