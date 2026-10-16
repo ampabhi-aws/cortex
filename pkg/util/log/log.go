@@ -21,6 +21,17 @@ const (
 	headerMapContextKey contextKey = 0
 
 	HeaderPropagationStringForRequestLogging string = "x-http-header-forwarding-logging"
+
+	// maxForwardedHeaderValueLen caps the per-value length of headers propagated
+	// via gRPC metadata before they are placed into the per-request header map.
+	// This prevents a client from using the forwarding feature to blow up every
+	// log line of the request to an arbitrary size.
+	maxForwardedHeaderValueLen = 1024
+
+	// maxForwardedHeaderEntries caps the number of entries in the propagated
+	// header map. The map is bounded by the operator allow-list in practice,
+	// but this provides defense in depth against an inflated metadata slice.
+	maxForwardedHeaderEntries = 32
 )
 
 var (
@@ -156,16 +167,74 @@ func InjectHeadersIntoHTTPRequest(headerMap map[string]string, request *http.Req
 	}
 }
 
-func ContextWithHeaderMapFromMetadata(ctx context.Context, md metadata.MD) context.Context {
+// ContextWithHeaderMapFromMetadata extracts the forwarded header map carried by
+// the gRPC metadata key HeaderPropagationStringForRequestLogging and places it
+// into the context. Only entries whose key matches (case-insensitively) one of
+// the operator-configured targetHeaders are kept; keys that are not valid HTTP
+// tokens are rejected and values are truncated to a safe length. The entry
+// count is additionally capped. This mirrors the allow-list enforced on the
+// HTTP ingress path (see pkg/api/middlewares.go) so that an attacker cannot
+// use gRPC metadata to inject arbitrary log fields or outgoing HTTP headers.
+func ContextWithHeaderMapFromMetadata(ctx context.Context, md metadata.MD, targetHeaders []string) context.Context {
 	headersSlice, ok := md[HeaderPropagationStringForRequestLogging]
 	if !ok || len(headersSlice)%2 == 1 {
 		return ctx
 	}
 
+	// Build a case-insensitive lookup of allowed header names. If the operator
+	// has not configured any target headers, nothing is allowed through. The
+	// map value preserves the operator's configured casing so the log-field
+	// and outgoing-header names match the HTTP ingress path exactly.
+	allowed := make(map[string]string, len(targetHeaders))
+	for _, h := range targetHeaders {
+		if h == "" {
+			continue
+		}
+		allowed[http.CanonicalHeaderKey(h)] = h
+	}
+
 	headerMap := make(map[string]string)
-	for i := 0; i < len(headersSlice); i += 2 {
-		headerMap[headersSlice[i]] = headersSlice[i+1]
+	for i := 0; i+1 < len(headersSlice); i += 2 {
+		if len(headerMap) >= maxForwardedHeaderEntries {
+			break
+		}
+		key := headersSlice[i]
+		if key == "" || !isValidHTTPTokenName(key) {
+			continue
+		}
+		name, ok := allowed[http.CanonicalHeaderKey(key)]
+		if !ok {
+			continue
+		}
+		val := headersSlice[i+1]
+		if len(val) > maxForwardedHeaderValueLen {
+			val = val[:maxForwardedHeaderValueLen]
+		}
+		headerMap[name] = val
 	}
 
 	return ContextWithHeaderMap(ctx, headerMap)
+}
+
+// isValidHTTPTokenName reports whether s is a non-empty HTTP token (RFC 7230).
+// It is used to reject attacker-chosen metadata keys before they are used as
+// log field names or re-added as HTTP header names.
+func isValidHTTPTokenName(s string) bool {
+	if s == "" {
+		return false
+	}
+	for i := 0; i < len(s); i++ {
+		c := s[i]
+		switch {
+		case c >= 'a' && c <= 'z':
+		case c >= 'A' && c <= 'Z':
+		case c >= '0' && c <= '9':
+		case c == '!' || c == '#' || c == '$' || c == '%' || c == '&' ||
+			c == '\'' || c == '*' || c == '+' || c == '-' || c == '.' ||
+			c == '^' || c == '_' || c == '`' || c == '|' || c == '~':
+		default:
+			return false
+		}
+	}
+	return true
 }
