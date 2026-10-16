@@ -20,6 +20,7 @@ import (
 	amconfig "github.com/prometheus/alertmanager/config"
 	amtemplate "github.com/prometheus/alertmanager/template"
 
+	"github.com/cortexproject/cortex/pkg/alertmanager"
 	"github.com/cortexproject/cortex/pkg/configs/db"
 	"github.com/cortexproject/cortex/pkg/configs/userconfig"
 	"github.com/cortexproject/cortex/pkg/tenant"
@@ -227,6 +228,16 @@ func (a *API) validateAlertmanagerConfig(w http.ResponseWriter, r *http.Request)
 func validateAlertmanagerConfig(cfg string, noCfg NotificationsConfig) error {
 	amCfg, err := amconfig.Load(cfg)
 	if err != nil {
+		return err
+	}
+
+	// Enforce the Cortex *_file deny list (password_file, bearer_token_file,
+	// credentials_file, OAuth2 client_secret_file, TLS *_file, Slack api_url_file,
+	// VictorOps api_key_file, ...) so the legacy configs write path applies the same
+	// rules as the SetUserConfig HTTP handler. Without this check, a tenant posting
+	// through POST /api/prom/configs/alertmanager could re-introduce the
+	// CVE-2021-31232 local-file-disclosure primitive.
+	if err := alertmanager.ValidateAlertmanagerConfig(cfg); err != nil {
 		return err
 	}
 

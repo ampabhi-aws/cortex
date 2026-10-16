@@ -304,6 +304,21 @@ func (am *MultitenantAlertmanager) ListAllConfigs(w http.ResponseWriter, r *http
 	<-done
 }
 
+// ValidateAlertmanagerConfig loads the provided raw Alertmanager YAML and runs the Cortex
+// Alertmanager restrictions on it (the same deny list enforced by the SetUserConfig HTTP
+// handler: no password_file / bearer_token_file / credentials_file, no OAuth2
+// client_secret_file, no TLS *_file, no Slack api_url_file, no VictorOps api_key_file).
+// It is intended to be reused by alternative writers of the alert store (for example the
+// legacy configs service POST /api/prom/configs/alertmanager handler) so that the same
+// rules are applied regardless of which API wrote the config.
+func ValidateAlertmanagerConfig(rawConfig string) error {
+	amCfg, err := config.Load(rawConfig)
+	if err != nil {
+		return err
+	}
+	return validateAlertmanagerConfig(amCfg)
+}
+
 // validateAlertmanagerConfig recursively scans the input config looking for data types for which
 // we have a specific validation and, whenever encountered, it runs their validation. Returns the
 // first error or nil if validation succeeds.
