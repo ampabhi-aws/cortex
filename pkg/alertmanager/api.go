@@ -304,6 +304,21 @@ func (am *MultitenantAlertmanager) ListAllConfigs(w http.ResponseWriter, r *http
 	<-done
 }
 
+// ValidateAlertmanagerConfig parses and validates a raw Alertmanager
+// configuration using the same safety checks (TLS files, password files,
+// Slack/VictorOps file-based credentials, etc.) applied by the Alertmanager
+// user-config API. It is intended to be used by alternative write paths such
+// as the legacy configs module (pkg/configs/api) so that configuration
+// delivered through them cannot drive Alertmanager.ApplyConfig into a failing
+// buildIntegrationsMap state.
+func ValidateAlertmanagerConfig(rawCfg string) error {
+	amCfg, err := config.Load(rawCfg)
+	if err != nil {
+		return err
+	}
+	return validateAlertmanagerConfig(amCfg)
+}
+
 // validateAlertmanagerConfig recursively scans the input config looking for data types for which
 // we have a specific validation and, whenever encountered, it runs their validation. Returns the
 // first error or nil if validation succeeds.

@@ -20,6 +20,7 @@ import (
 	amconfig "github.com/prometheus/alertmanager/config"
 	amtemplate "github.com/prometheus/alertmanager/template"
 
+	"github.com/cortexproject/cortex/pkg/alertmanager"
 	"github.com/cortexproject/cortex/pkg/configs/db"
 	"github.com/cortexproject/cortex/pkg/configs/userconfig"
 	"github.com/cortexproject/cortex/pkg/tenant"
@@ -237,6 +238,15 @@ func validateAlertmanagerConfig(cfg string, noCfg NotificationsConfig) error {
 		if noCfg.DisableWebHook && len(recv.WebhookConfigs) > 0 {
 			return ErrWebhookNotificationsAreDisabled
 		}
+	}
+
+	// Also apply the receiver-level safety checks used by the Alertmanager
+	// user-config API (TLS files, password files, etc.) so that a config
+	// delivered through the legacy configs module cannot later cause
+	// Alertmanager.ApplyConfig to fail at buildIntegrationsMap and leave the
+	// tenant's Alertmanager without a running dispatcher.
+	if err := alertmanager.ValidateAlertmanagerConfig(cfg); err != nil {
+		return err
 	}
 
 	return nil
