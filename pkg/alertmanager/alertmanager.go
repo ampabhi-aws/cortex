@@ -262,6 +262,12 @@ func New(cfg *Config, reg *prometheus.Registry) (*Alertmanager, error) {
 		Registry: am.registry,
 		Logger:   log.With(am.logger, "component", "api"),
 		GroupFunc: func(f1 func(*dispatch.Route) bool, f2 func(*types.Alert, time.Time) bool) (dispatch.AlertGroups, map[model.Fingerprint][]string) {
+			// Guard against the dispatcher being nil, e.g. because ApplyConfig has
+			// not yet successfully built a pipeline for this tenant. Returning
+			// empty results avoids a nil pointer dereference in the API handler.
+			if am.dispatcher == nil {
+				return dispatch.AlertGroups{}, map[model.Fingerprint][]string{}
+			}
 			return am.dispatcher.Groups(f1, f2)
 		},
 	})
@@ -326,20 +332,6 @@ func (am *Alertmanager) ApplyConfig(userID string, conf *config.Config, rawCfg s
 	}
 	tmpl.ExternalURL = am.cfg.ExternalURL
 
-	am.api.Update(conf, func(_ model.LabelSet) {})
-
-	// Ensure inhibitor is set before being called
-	if am.inhibitor != nil {
-		am.inhibitor.Stop()
-	}
-
-	// Ensure dispatcher is set before being called
-	if am.dispatcher != nil {
-		am.dispatcher.Stop()
-	}
-
-	am.inhibitor = inhibit.NewInhibitor(am.alerts, conf.InhibitRules, am.marker, log.With(am.logger, "component", "inhibitor"))
-
 	waitFunc := clusterWait(am.state.Position, am.cfg.PeerTimeout)
 
 	timeoutFunc := func(d time.Duration) time.Duration {
@@ -352,6 +344,10 @@ func (am *Alertmanager) ApplyConfig(userID string, conf *config.Config, rawCfg s
 	// Create a firewall binded to the per-tenant config.
 	firewallDialer := util_net.NewFirewallDialer(newFirewallDialerConfigProvider(userID, am.cfg.Limits))
 
+	// Build the receiver integrations before touching the running inhibitor /
+	// dispatcher so that a config that fails to build does not leave the tenant
+	// Alertmanager with a stopped (or nil) pipeline while still being reported
+	// as a successful reload by the caller.
 	integrationsMap, err := buildIntegrationsMap(conf.Receivers, tmpl, firewallDialer, am.logger, func(integrationName string, notifier notify.Notifier) notify.Notifier {
 		if am.cfg.Limits != nil {
 			rl := &tenantRateLimits{
@@ -365,8 +361,25 @@ func (am *Alertmanager) ApplyConfig(userID string, conf *config.Config, rawCfg s
 		return notifier
 	})
 	if err != nil {
-		return nil
+		return err
 	}
+
+	// At this point the new integrations have been built successfully; it is
+	// safe to swap the running config and tear down the previous inhibitor and
+	// dispatcher.
+	am.api.Update(conf, func(_ model.LabelSet) {})
+
+	// Ensure inhibitor is set before being called
+	if am.inhibitor != nil {
+		am.inhibitor.Stop()
+	}
+
+	// Ensure dispatcher is set before being called
+	if am.dispatcher != nil {
+		am.dispatcher.Stop()
+	}
+
+	am.inhibitor = inhibit.NewInhibitor(am.alerts, conf.InhibitRules, am.marker, log.With(am.logger, "component", "inhibitor"))
 
 	muteTimes := make(map[string][]timeinterval.TimeInterval, len(conf.MuteTimeIntervals))
 	for _, ti := range conf.MuteTimeIntervals {
