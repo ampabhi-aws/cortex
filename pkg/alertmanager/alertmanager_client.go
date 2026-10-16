@@ -46,6 +46,16 @@ func (cfg *ClientConfig) RegisterFlagsWithPrefix(prefix string, f *flag.FlagSet)
 	cfg.TLS.RegisterFlagsWithPrefix(prefix, f)
 }
 
+// Validate the alertmanager client config and fail closed when TLS material
+// has been supplied without the matching tls_enabled gate; the previous
+// behaviour was to silently discard the credentials and dial in plaintext.
+func (cfg *ClientConfig) Validate() error {
+	if !cfg.TLSEnabled && cfg.TLS.IsConfigured() {
+		return grpcclient.ErrTLSMaterialWithoutTLSEnabled
+	}
+	return nil
+}
+
 type alertmanagerClientsPool struct {
 	pool *client.Pool
 }

@@ -104,3 +104,13 @@ func (cfg *ClientConfig) RegisterFlagsWithPrefix(prefix string, f *flag.FlagSet)
 	f.BoolVar(&cfg.TLSEnabled, prefix+".tls-enabled", cfg.TLSEnabled, "Enable TLS for gRPC client connecting to store-gateway.")
 	cfg.TLS.RegisterFlagsWithPrefix(prefix, f)
 }
+
+// Validate the store-gateway client config and fail closed when TLS material
+// has been supplied without the matching tls_enabled gate; the previous
+// behaviour was to silently discard the credentials and dial in plaintext.
+func (cfg *ClientConfig) Validate() error {
+	if !cfg.TLSEnabled && cfg.TLS.IsConfigured() {
+		return grpcclient.ErrTLSMaterialWithoutTLSEnabled
+	}
+	return nil
+}

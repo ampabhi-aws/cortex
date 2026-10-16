@@ -118,6 +118,12 @@ func (cfg *Config) Validate() error {
 		}
 	}
 
+	// Fail closed when store-gateway TLS material is set but the TLS gate is
+	// off, otherwise the client would silently fall back to plaintext.
+	if err := cfg.StoreGatewayClient.Validate(); err != nil {
+		return err
+	}
+
 	return nil
 }
 
