@@ -241,13 +241,18 @@ func (a *API) RegisterDistributor(d *distributor.Distributor, pushConfig distrib
 	a.indexPage.AddLink(SectionAdminEndpoints, "/distributor/ha_tracker", "HA Tracking Status")
 
 	a.RegisterRoute("/distributor/ring", d, false, "GET", "POST")
-	a.RegisterRoute("/distributor/all_user_stats", http.HandlerFunc(d.AllUserStatsHandler), false, "GET")
-	a.RegisterRoute("/distributor/ha_tracker", d.HATracker, false, "GET")
+	// Require authentication so the handlers can scope their output to the
+	// caller's tenant. Without this these cross-tenant admin views were
+	// reachable unauthenticated on the same listener as /api/v1/push and
+	// leaked every tenant's ID plus their HA cluster/replica label values
+	// and ingest metadata.
+	a.RegisterRoute("/distributor/all_user_stats", http.HandlerFunc(d.AllUserStatsHandler), true, "GET")
+	a.RegisterRoute("/distributor/ha_tracker", d.HATracker, true, "GET")
 
 	// Legacy Routes
 	a.RegisterRoute(path.Join(a.cfg.LegacyHTTPPrefix, "/push"), push.Handler(pushConfig.MaxRecvMsgSize, a.sourceIPs, a.cfg.wrapDistributorPush(d)), true, "POST")
-	a.RegisterRoute("/all_user_stats", http.HandlerFunc(d.AllUserStatsHandler), false, "GET")
-	a.RegisterRoute("/ha-tracker", d.HATracker, false, "GET")
+	a.RegisterRoute("/all_user_stats", http.HandlerFunc(d.AllUserStatsHandler), true, "GET")
+	a.RegisterRoute("/ha-tracker", d.HATracker, true, "GET")
 }
 
 // Ingester is defined as an interface to allow for alternative implementations
