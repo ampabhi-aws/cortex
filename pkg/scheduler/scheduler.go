@@ -170,6 +170,16 @@ func (s *Scheduler) FrontendLoop(frontend schedulerpb.SchedulerForFrontend_Front
 	}
 	defer s.frontendDisconnected(frontendAddress)
 
+	// Track query IDs that were enqueued on *this* stream. We only honour
+	// CANCEL messages for query IDs enqueued on the same stream, as defence
+	// in depth against a caller that opens an unauthenticated FrontendLoop
+	// stream, claims a victim frontend's address in INIT, and tries to
+	// cancel the victim's in-flight queries (CWE-306 on this endpoint).
+	// The in-tree frontend worker is updated to route a request's CANCEL to
+	// the same stream that performed the ENQUEUE, so legitimate traffic is
+	// unaffected.
+	enqueuedQueryIDs := map[uint64]struct{}{}
+
 	// Response to INIT. If scheduler is not running, we skip for-loop, send SHUTTING_DOWN and exit this method.
 	if s.State() == services.Running {
 		if err := frontend.Send(&schedulerpb.SchedulerToFrontend{Status: schedulerpb.OK}); err != nil {
@@ -200,6 +210,7 @@ func (s *Scheduler) FrontendLoop(frontend schedulerpb.SchedulerForFrontend_Front
 			err = s.enqueueRequest(frontendCtx, frontendAddress, msg)
 			switch {
 			case err == nil:
+				enqueuedQueryIDs[msg.QueryID] = struct{}{}
 				resp = &schedulerpb.SchedulerToFrontend{Status: schedulerpb.OK}
 			case err == queue.ErrTooManyRequests:
 				resp = &schedulerpb.SchedulerToFrontend{Status: schedulerpb.TOO_MANY_REQUESTS_PER_TENANT}
@@ -208,7 +219,18 @@ func (s *Scheduler) FrontendLoop(frontend schedulerpb.SchedulerForFrontend_Front
 			}
 
 		case schedulerpb.CANCEL:
-			s.cancelRequestAndRemoveFromPending(frontendAddress, msg.QueryID)
+			// Only honour CANCEL for a (frontendAddr, queryID) pair that was
+			// enqueued on this same stream. Any other combination either
+			// belongs to a different stream (potentially a different, legitimate
+			// frontend) or was never enqueued at all; silently ignore it so
+			// that an unauthenticated peer cannot cancel other frontends'
+			// in-flight queries by sweeping or guessing query IDs.
+			if _, ok := enqueuedQueryIDs[msg.QueryID]; ok {
+				s.cancelRequestAndRemoveFromPending(frontendAddress, msg.QueryID)
+				delete(enqueuedQueryIDs, msg.QueryID)
+			} else {
+				level.Warn(s.log).Log("msg", "ignoring CANCEL for query ID not enqueued on this stream", "frontend", frontendAddress, "queryID", msg.QueryID)
+			}
 			resp = &schedulerpb.SchedulerToFrontend{Status: schedulerpb.OK}
 
 		default:

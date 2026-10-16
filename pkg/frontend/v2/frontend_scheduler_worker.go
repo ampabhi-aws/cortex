@@ -158,9 +158,10 @@ type frontendSchedulerWorker struct {
 	// Shared between all frontend workers.
 	requestCh <-chan *frontendRequest
 
-	// Cancellation requests for this scheduler are received via this channel. It is passed to frontend after
-	// query has been enqueued to scheduler.
-	cancelCh chan uint64
+	// Cancellation requests for this scheduler are received via per-goroutine
+	// channels created in runOne. The scheduler only honours CANCEL for
+	// query IDs enqueued on the same gRPC stream, so a request's
+	// cancellation must be routed back on the same stream that enqueued it.
 }
 
 func newFrontendSchedulerWorker(conn *grpc.ClientConn, schedulerAddr string, frontendAddr string, requestCh <-chan *frontendRequest, concurrency int, log log.Logger) *frontendSchedulerWorker {
@@ -171,7 +172,6 @@ func newFrontendSchedulerWorker(conn *grpc.ClientConn, schedulerAddr string, fro
 		schedulerAddr: schedulerAddr,
 		frontendAddr:  frontendAddr,
 		requestCh:     requestCh,
-		cancelCh:      make(chan uint64),
 	}
 	w.ctx, w.cancel = context.WithCancel(context.Background())
 
@@ -203,6 +203,15 @@ func (w *frontendSchedulerWorker) runOne(ctx context.Context, client schedulerpb
 		MaxBackoff: 1 * time.Second,
 	}
 
+	// Per-stream cancellation channel. The scheduler only honours CANCEL
+	// messages for query IDs that were enqueued on the same gRPC stream (as
+	// defence in depth against unauthenticated FrontendLoop callers), so a
+	// request's cancellation must be sent back on the same stream that
+	// enqueued it. Using one cancel channel per goroutine/stream guarantees
+	// that: the frontend hands this channel to the caller in enqueueResult
+	// and only this goroutine reads from it.
+	cancelCh := make(chan uint64)
+
 	backoff := backoff.New(ctx, backoffConfig)
 	for backoff.Ongoing() {
 		loop, loopErr := client.FrontendLoop(ctx)
@@ -212,7 +221,7 @@ func (w *frontendSchedulerWorker) runOne(ctx context.Context, client schedulerpb
 			continue
 		}
 
-		loopErr = w.schedulerLoop(loop)
+		loopErr = w.schedulerLoop(loop, cancelCh)
 		if closeErr := loop.CloseSend(); closeErr != nil {
 			level.Debug(w.log).Log("msg", "failed to close frontend loop", "err", loopErr, "addr", w.schedulerAddr)
 		}
@@ -227,7 +236,7 @@ func (w *frontendSchedulerWorker) runOne(ctx context.Context, client schedulerpb
 	}
 }
 
-func (w *frontendSchedulerWorker) schedulerLoop(loop schedulerpb.SchedulerForFrontend_FrontendLoopClient) error {
+func (w *frontendSchedulerWorker) schedulerLoop(loop schedulerpb.SchedulerForFrontend_FrontendLoopClient, cancelCh chan uint64) error {
 	if err := loop.Send(&schedulerpb.FrontendToScheduler{
 		Type:            schedulerpb.INIT,
 		FrontendAddress: w.frontendAddr,
@@ -278,7 +287,10 @@ func (w *frontendSchedulerWorker) schedulerLoop(loop schedulerpb.SchedulerForFro
 
 			switch resp.Status {
 			case schedulerpb.OK:
-				req.enqueue <- enqueueResult{status: waitForResponse, cancelCh: w.cancelCh}
+				// Hand the caller this stream's own cancel channel. The scheduler
+				// only honours CANCEL for query IDs enqueued on the same stream,
+				// so cancellation has to go back on the same stream that enqueued.
+				req.enqueue <- enqueueResult{status: waitForResponse, cancelCh: cancelCh}
 				// Response will come from querier.
 
 			case schedulerpb.SHUTTING_DOWN:
@@ -305,7 +317,7 @@ func (w *frontendSchedulerWorker) schedulerLoop(loop schedulerpb.SchedulerForFro
 				}
 			}
 
-		case reqID := <-w.cancelCh:
+		case reqID := <-cancelCh:
 			err := loop.Send(&schedulerpb.FrontendToScheduler{
 				Type:    schedulerpb.CANCEL,
 				QueryID: reqID,
