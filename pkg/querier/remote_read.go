@@ -1,20 +1,41 @@
 package querier
 
 import (
+	"fmt"
 	"net/http"
 
 	"github.com/go-kit/log"
 	"github.com/go-kit/log/level"
 	"github.com/prometheus/prometheus/storage"
+	"github.com/prometheus/prometheus/util/gate"
 
 	"github.com/cortexproject/cortex/pkg/cortexpb"
 	"github.com/cortexproject/cortex/pkg/ingester/client"
 	"github.com/cortexproject/cortex/pkg/util"
+	"github.com/cortexproject/cortex/pkg/util/limiter"
 	util_log "github.com/cortexproject/cortex/pkg/util/log"
 )
 
 // Queries are a set of matchers with time ranges - should not get into megabytes
 const maxRemoteReadQuerySize = 1024 * 1024
+
+// maxRemoteReadQueries is the maximum number of sub-queries allowed in a single
+// remote-read request. Prometheus's native remote-read handler fans out one
+// goroutine per sub-query behind a concurrency gate, but Cortex sits in front
+// of shared ingesters and store-gateways, so a request with tens of thousands
+// of sub-queries would otherwise amplify a 1 MiB HTTP body into tens of
+// thousands of concurrent gRPC calls to every ingester and store-gateway in
+// the tenant's shard. The limit matches the order of magnitude of what a
+// Prometheus server configured with the default remote-read concurrency
+// would ever send in one body.
+const maxRemoteReadQueries = 128
+
+// maxRemoteReadQueryConcurrency bounds the number of sub-queries from a single
+// remote-read request that execute concurrently. It mirrors the role of
+// Prometheus's -storage.remote.read-concurrent-limit and prevents a single
+// authenticated request from spawning an unbounded number of goroutines, each
+// of which fans out to every ingester and store-gateway in the tenant's shard.
+const maxRemoteReadQueryConcurrency = 10
 
 // RemoteReadHandler handles Prometheus remote read requests.
 func RemoteReadHandler(q storage.Queryable, logger log.Logger) http.Handler {
@@ -28,13 +49,50 @@ func RemoteReadHandler(q storage.Queryable, logger log.Logger) http.Handler {
 			return
 		}
 
-		// Fetch samples for all queries in parallel.
+		// Reject requests whose sub-query count would allow a single HTTP
+		// request to schedule an unbounded amount of fan-out work.
+		if len(req.Queries) > maxRemoteReadQueries {
+			err := fmt.Errorf("too many queries in remote read request: %d (limit: %d)", len(req.Queries), maxRemoteReadQueries)
+			level.Warn(logger).Log("msg", "rejected remote read request", "err", err.Error())
+			http.Error(w, err.Error(), http.StatusBadRequest)
+			return
+		}
+
+		// Attach a single shared QueryLimiter holder to the context so that
+		// every sub-query of this HTTP request accounts against the same
+		// per-query budget rather than each getting a fresh limiter and
+		// effectively multiplying the per-query ceilings by the number of
+		// sub-queries.
+		ctx, _ = limiter.AddSharedQueryLimiterToContext(ctx)
+
+		// Fetch samples for all queries using a bounded worker pool so a
+		// single request cannot spawn arbitrarily many concurrent Select
+		// calls on shared ingesters and store-gateways. Cancel outstanding
+		// work as soon as the HTTP context is cancelled.
 		resp := client.ReadResponse{
 			Results: make([]*client.QueryResponse, len(req.Queries)),
 		}
-		errors := make(chan error)
+		concurrency := maxRemoteReadQueryConcurrency
+		if n := len(req.Queries); n > 0 && n < concurrency {
+			concurrency = n
+		}
+		remoteReadGate := gate.New(concurrency)
+		errors := make(chan error, len(req.Queries))
 		for i, qr := range req.Queries {
 			go func(i int, qr *client.QueryRequest) {
+				if err := remoteReadGate.Start(ctx); err != nil {
+					errors <- err
+					return
+				}
+				defer remoteReadGate.Done()
+
+				// Abort if the client has gone away or another sub-query has
+				// already caused the request to be cancelled.
+				if err := ctx.Err(); err != nil {
+					errors <- err
+					return
+				}
+
 				from, to, matchers, err := client.FromQueryRequest(qr)
 				if err != nil {
 					errors <- err

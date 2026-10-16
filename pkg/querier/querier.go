@@ -221,7 +221,7 @@ func NewQueryable(distributor QueryableWithFilter, stores []QueryableWithFilter,
 			return nil, err
 		}
 
-		ctx = limiter.AddQueryLimiterToContext(ctx, limiter.NewQueryLimiter(limits.MaxFetchedSeriesPerQuery(userID), limits.MaxFetchedChunkBytesPerQuery(userID), limits.MaxChunksPerQuery(userID), limits.MaxFetchedDataBytesPerQuery(userID)))
+		ctx = limiter.AddQueryLimiterToContext(ctx, getOrCreateRequestQueryLimiter(ctx, userID, limits))
 
 		mint, maxt, err = validateQueryTimeRange(ctx, userID, mint, maxt, limits, cfg.MaxQueryIntoFuture)
 		if err == errEmptyTimeRange {
@@ -284,6 +284,30 @@ type querier struct {
 	limits              *validation.Overrides
 	maxQueryIntoFuture  time.Duration
 	queryStoreForLabels bool
+}
+
+// getOrCreateRequestQueryLimiter returns a *QueryLimiter configured from the
+// per-tenant limits. If a SharedQueryLimiter has been attached to the context
+// (as RemoteReadHandler does for a single HTTP request that spans several
+// sub-queries), the limiter is created lazily on the first call and reused
+// by every subsequent call so the per-query ceilings
+// (max_fetched_chunks_per_query, max_fetched_series_per_query, byte limits)
+// apply to the whole request rather than being multiplied by the number of
+// sub-queries. Otherwise a fresh per-call limiter is returned, preserving
+// the previous behaviour.
+func getOrCreateRequestQueryLimiter(ctx context.Context, userID string, limits *validation.Overrides) *limiter.QueryLimiter {
+	factory := func() *limiter.QueryLimiter {
+		return limiter.NewQueryLimiter(
+			limits.MaxFetchedSeriesPerQuery(userID),
+			limits.MaxFetchedChunkBytesPerQuery(userID),
+			limits.MaxChunksPerQuery(userID),
+			limits.MaxFetchedDataBytesPerQuery(userID),
+		)
+	}
+	if shared, ok := limiter.SharedQueryLimiterFromContext(ctx); ok {
+		return shared.GetOrCreate(factory)
+	}
+	return factory()
 }
 
 // Select implements storage.Querier interface.

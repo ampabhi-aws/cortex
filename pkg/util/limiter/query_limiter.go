@@ -13,9 +13,11 @@ import (
 )
 
 type queryLimiterCtxKey struct{}
+type sharedQueryLimiterCtxKey struct{}
 
 var (
 	ctxKey                    = &queryLimiterCtxKey{}
+	sharedCtxKey              = &sharedQueryLimiterCtxKey{}
 	ErrMaxSeriesHit           = "the query hit the max number of series limit (limit: %d series)"
 	ErrMaxChunkBytesHit       = "the query hit the aggregated chunks size limit (limit: %d bytes)"
 	ErrMaxDataBytesHit        = "the query hit the aggregated data size limit (limit: %d bytes)"
@@ -63,6 +65,46 @@ func QueryLimiterFromContextWithFallback(ctx context.Context) *QueryLimiter {
 		ql = NewQueryLimiter(0, 0, 0, 0)
 	}
 	return ql
+}
+
+// SharedQueryLimiter is a lazily-populated holder for a single *QueryLimiter
+// that must be shared across multiple sub-queries that belong to the same
+// logical request (e.g. a single remote-read HTTP request that contains
+// several QueryRequest entries). The first caller fills it by calling
+// GetOrCreate; subsequent callers receive the same instance so that
+// per-query limits (max_fetched_chunks_per_query, max_fetched_series_per_query,
+// byte limits, ...) are enforced across the whole request rather than being
+// multiplied by the number of sub-queries.
+type SharedQueryLimiter struct {
+	mu      sync.Mutex
+	limiter *QueryLimiter
+}
+
+// GetOrCreate returns the shared *QueryLimiter, creating it with the supplied
+// factory on the first call.
+func (s *SharedQueryLimiter) GetOrCreate(factory func() *QueryLimiter) *QueryLimiter {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.limiter == nil {
+		s.limiter = factory()
+	}
+	return s.limiter
+}
+
+// AddSharedQueryLimiterToContext attaches a fresh SharedQueryLimiter holder to
+// the context and returns both the derived context and the holder. Callers
+// that fan out multiple sub-queries should attach a single holder per
+// request so that all sub-queries see the same QueryLimiter instance.
+func AddSharedQueryLimiterToContext(ctx context.Context) (context.Context, *SharedQueryLimiter) {
+	shared := &SharedQueryLimiter{}
+	return context.WithValue(ctx, sharedCtxKey, shared), shared
+}
+
+// SharedQueryLimiterFromContext returns the SharedQueryLimiter attached to the
+// context, if any.
+func SharedQueryLimiterFromContext(ctx context.Context) (*SharedQueryLimiter, bool) {
+	s, ok := ctx.Value(sharedCtxKey).(*SharedQueryLimiter)
+	return s, ok
 }
 
 // AddSeries adds the input series and returns an error if the limit is reached.

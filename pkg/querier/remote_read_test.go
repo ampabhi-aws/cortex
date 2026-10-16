@@ -86,6 +86,28 @@ func TestRemoteReadHandler(t *testing.T) {
 	require.Equal(t, expected, response)
 }
 
+func TestRemoteReadHandler_TooManyQueries(t *testing.T) {
+	q := storage.QueryableFunc(func(ctx context.Context, mint, maxt int64) (storage.Querier, error) {
+		return mockQuerier{}, nil
+	})
+	handler := RemoteReadHandler(q, log.NewNopLogger())
+
+	queries := make([]*client.QueryRequest, maxRemoteReadQueries+1)
+	for i := range queries {
+		queries[i] = &client.QueryRequest{StartTimestampMs: 0, EndTimestampMs: 10}
+	}
+	requestBody, err := proto.Marshal(&client.ReadRequest{Queries: queries})
+	require.NoError(t, err)
+	requestBody = snappy.Encode(nil, requestBody)
+	request, err := http.NewRequest("POST", "/query", bytes.NewReader(requestBody))
+	require.NoError(t, err)
+
+	recorder := httptest.NewRecorder()
+	handler.ServeHTTP(recorder, request)
+
+	require.Equal(t, http.StatusBadRequest, recorder.Result().StatusCode)
+}
+
 type mockQuerier struct {
 	matrix model.Matrix
 }
