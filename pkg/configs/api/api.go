@@ -20,6 +20,7 @@ import (
 	amconfig "github.com/prometheus/alertmanager/config"
 	amtemplate "github.com/prometheus/alertmanager/template"
 
+	"github.com/cortexproject/cortex/pkg/alertmanager"
 	"github.com/cortexproject/cortex/pkg/configs/db"
 	"github.com/cortexproject/cortex/pkg/configs/userconfig"
 	"github.com/cortexproject/cortex/pkg/tenant"
@@ -239,6 +240,20 @@ func validateAlertmanagerConfig(cfg string, noCfg NotificationsConfig) error {
 		}
 	}
 
+	// Share the Alertmanager security validation so tenant-supplied configs written
+	// through this legacy endpoint cannot bypass the restrictions enforced on the
+	// native Alertmanager API (e.g. the ban on *_file receiver options and template
+	// name/path checks). Without this, a config stored here could be applied by the
+	// Alertmanager via the configdb backend without ever being validated.
+	if err := alertmanager.ValidateAlertmanagerConfig(amCfg); err != nil {
+		return err
+	}
+	for _, name := range amCfg.Templates {
+		if err := alertmanager.ValidateTemplateFilename(name); err != nil {
+			return err
+		}
+	}
+
 	return nil
 }
 
@@ -249,6 +264,9 @@ func validateRulesFiles(c userconfig.Config) error {
 
 func validateTemplateFiles(c userconfig.Config) error {
 	for fn, content := range c.TemplateFiles {
+		if err := alertmanager.ValidateTemplateFilename(fn); err != nil {
+			return err
+		}
 		if _, err := template.New(fn).Funcs(template.FuncMap(amtemplate.DefaultFuncs)).Parse(content); err != nil {
 			return err
 		}
