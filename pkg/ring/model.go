@@ -13,6 +13,22 @@ import (
 	"github.com/cortexproject/cortex/pkg/ring/kv/memberlist"
 )
 
+// MaxTokensPerInstance is the maximum number of tokens allowed in a single
+// InstanceDesc.Tokens list received from an untrusted peer. A legitimate ring
+// instance uses on the order of a few hundred tokens; anything beyond this cap
+// is treated as a malformed/malicious descriptor and rejected before expensive
+// processing (sort/dedup) and before taking the memberlist KV store lock.
+const MaxTokensPerInstance = 1 << 16 // 65536
+
+// MaxInstancesPerDesc is the maximum number of InstanceDesc entries allowed in
+// a single ring.Desc received from an untrusted peer.
+const MaxInstancesPerDesc = 1 << 16 // 65536
+
+// tokenMapPoolMaxSize caps how big a map returned to tokenMapPool is allowed to
+// grow before it is discarded rather than put back. Keeping maps grown by
+// untrusted input in the pool would permanently inflate the heap.
+const tokenMapPoolMaxSize = 1 << 15 // 32768
+
 // ByAddr is a sortable list of InstanceDesc.
 type ByAddr []InstanceDesc
 
@@ -201,6 +217,14 @@ func (d *Desc) mergeWithTime(mergeable memberlist.Mergeable, localCAS bool, now 
 		return nil, nil
 	}
 
+	// Reject oversized/malformed descriptors before doing any expensive work.
+	// This defends against a malicious peer sending a Desc with an impossibly
+	// large InstanceDesc.Tokens list that would otherwise cause a CPU-bound
+	// dedup pass while the KV store lock is held.
+	if err := other.Validate(); err != nil {
+		return nil, err
+	}
+
 	normalizeIngestersMap(other)
 
 	thisIngesterMap := d.Ingesters
@@ -281,6 +305,26 @@ func (d *Desc) MergeContent() []string {
 	return result
 }
 
+// Validate performs cheap input-validation on a Desc that may have been built
+// from an untrusted source (e.g. a gossip message decoded by the memberlist
+// client). It is intended to be called before taking any locks or doing any
+// O(n) / O(n log n) work on the Desc contents, so that a malformed descriptor
+// is rejected cheaply.
+func (d *Desc) Validate() error {
+	if d == nil {
+		return nil
+	}
+	if len(d.Ingesters) > MaxInstancesPerDesc {
+		return fmt.Errorf("ring.Desc has too many instances: %d > %d", len(d.Ingesters), MaxInstancesPerDesc)
+	}
+	for name, ing := range d.Ingesters {
+		if len(ing.Tokens) > MaxTokensPerInstance {
+			return fmt.Errorf("instance %q has too many tokens: %d > %d", name, len(ing.Tokens), MaxTokensPerInstance)
+		}
+	}
+	return nil
+}
+
 // normalizeIngestersMap will do the following:
 // - sorts tokens and removes duplicates (only within single ingester)
 // - modifies the input ring
@@ -301,16 +345,19 @@ func normalizeIngestersMap(inputRing *Desc) {
 			sort.Sort(Tokens(ing.Tokens))
 		}
 
-		// tokens are sorted now, we can easily remove duplicates.
-		prev := ing.Tokens[0]
-		for ix := 1; ix < len(ing.Tokens); {
-			if ing.Tokens[ix] == prev {
-				ing.Tokens = append(ing.Tokens[:ix], ing.Tokens[ix+1:]...)
-			} else {
-				prev = ing.Tokens[ix]
-				ix++
+		// Tokens are sorted now, remove duplicates with a single linear
+		// compaction pass (write index over the sorted slice). This is O(n)
+		// even for pathological input where every element is a duplicate,
+		// unlike the previous in-place `append(..., [ix+1:]...)` shift which
+		// was O(n^2) in the number of duplicates.
+		w := 1
+		for r := 1; r < len(ing.Tokens); r++ {
+			if ing.Tokens[r] != ing.Tokens[w-1] {
+				ing.Tokens[w] = ing.Tokens[r]
+				w++
 			}
 		}
+		ing.Tokens = ing.Tokens[:w]
 
 		// write updated value back to map
 		inputRing.Ingesters[n] = ing
@@ -335,6 +382,12 @@ var tokenMapPool = sync.Pool{New: func() interface{} { return make(map[uint32]st
 func conflictingTokensExist(normalizedIngesters map[string]InstanceDesc) bool {
 	tokensMap := tokenMapPool.Get().(map[uint32]struct{})
 	defer func() {
+		// Do not return oversized maps to the pool. Go's runtime does not shrink
+		// map backing storage on delete, so a single large (potentially
+		// adversarial) Desc would otherwise permanently inflate the pool/heap.
+		if len(tokensMap) > tokenMapPoolMaxSize {
+			return
+		}
 		for k := range tokensMap {
 			delete(tokensMap, k)
 		}
