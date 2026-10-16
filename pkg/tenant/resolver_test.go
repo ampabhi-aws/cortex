@@ -54,9 +54,10 @@ var commonResolverTestCases = []resolverTestCase{
 		errTenantIDs: user.ErrNoOrgID,
 	},
 	{
-		name:        "empty",
-		headerValue: strptr(""),
-		tenantIDs:   []string{""},
+		name:         "empty",
+		headerValue:  strptr(""),
+		errTenantID:  user.ErrNoOrgID,
+		errTenantIDs: user.ErrNoOrgID,
 	},
 	{
 		name:        "single-tenant",

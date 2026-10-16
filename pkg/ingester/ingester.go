@@ -872,6 +872,27 @@ func (i *Ingester) checkRunning() error {
 	return status.Error(codes.Unavailable, s.String())
 }
 
+// errEmptyTenantID is returned when a request reaches the ingester with an
+// empty tenant ID. tenant.TenantID() now rejects empty strings, but we also
+// enforce the invariant explicitly at every ingester trust boundary (see
+// pkg/storegateway/bucket_stores.go and pkg/scheduler/queue/user_queues.go
+// for the equivalent guards in sibling components).
+var errEmptyTenantID = status.Error(codes.InvalidArgument, "empty tenant ID")
+
+// resolveTenantID returns the single tenant ID from the context, rejecting an
+// empty tenant ID with codes.InvalidArgument. It is the single entry point for
+// tenant resolution on ingester gRPC endpoints.
+func resolveTenantID(ctx context.Context) (string, error) {
+	userID, err := tenant.TenantID(ctx)
+	if err != nil {
+		return "", err
+	}
+	if userID == "" {
+		return "", errEmptyTenantID
+	}
+	return userID, nil
+}
+
 // GetRef() is an extra method added to TSDB to let Cortex check before calling Add()
 type extendedAppender interface {
 	storage.Appender
@@ -901,7 +922,7 @@ func (i *Ingester) Push(ctx context.Context, req *cortexpb.WriteRequest) (*corte
 	// retain anything from `req` past the call to ReuseSlice
 	defer cortexpb.ReuseSlice(req.Timeseries)
 
-	userID, err := tenant.TenantID(ctx)
+	userID, err := resolveTenantID(ctx)
 	if err != nil {
 		return nil, err
 	}
@@ -1165,7 +1186,7 @@ func (i *Ingester) Query(ctx context.Context, req *client.QueryRequest) (*client
 		return nil, err
 	}
 
-	userID, err := tenant.TenantID(ctx)
+	userID, err := resolveTenantID(ctx)
 	if err != nil {
 		return nil, err
 	}
@@ -1236,7 +1257,7 @@ func (i *Ingester) QueryExemplars(ctx context.Context, req *client.ExemplarQuery
 		return nil, err
 	}
 
-	userID, err := tenant.TenantID(ctx)
+	userID, err := resolveTenantID(ctx)
 	if err != nil {
 		return nil, err
 	}
@@ -1293,7 +1314,7 @@ func (i *Ingester) LabelValues(ctx context.Context, req *client.LabelValuesReque
 		return nil, err
 	}
 
-	userID, err := tenant.TenantID(ctx)
+	userID, err := resolveTenantID(ctx)
 	if err != nil {
 		return nil, err
 	}
@@ -1354,7 +1375,7 @@ func (i *Ingester) LabelNames(ctx context.Context, req *client.LabelNamesRequest
 		return nil, err
 	}
 
-	userID, err := tenant.TenantID(ctx)
+	userID, err := resolveTenantID(ctx)
 	if err != nil {
 		return nil, err
 	}
@@ -1416,7 +1437,7 @@ func (i *Ingester) MetricsForLabelMatchers(ctx context.Context, req *client.Metr
 		return nil, err
 	}
 
-	userID, err := tenant.TenantID(ctx)
+	userID, err := resolveTenantID(ctx)
 	if err != nil {
 		return nil, err
 	}
@@ -1514,7 +1535,7 @@ func (i *Ingester) MetricsMetadata(ctx context.Context, _ *client.MetricsMetadat
 	}
 	i.stoppedMtx.RUnlock()
 
-	userID, err := tenant.TenantID(ctx)
+	userID, err := resolveTenantID(ctx)
 	if err != nil {
 		return nil, err
 	}
@@ -1543,7 +1564,7 @@ func (i *Ingester) UserStats(ctx context.Context, req *client.UserStatsRequest) 
 		return nil, err
 	}
 
-	userID, err := tenant.TenantID(ctx)
+	userID, err := resolveTenantID(ctx)
 	if err != nil {
 		return nil, err
 	}
@@ -1602,7 +1623,7 @@ func (i *Ingester) QueryStream(req *client.QueryRequest, stream client.Ingester_
 	spanlog, ctx := spanlogger.New(stream.Context(), "QueryStream")
 	defer spanlog.Finish()
 
-	userID, err := tenant.TenantID(ctx)
+	userID, err := resolveTenantID(ctx)
 	if err != nil {
 		return err
 	}
@@ -1801,10 +1822,43 @@ func (i *Ingester) getOrCreateTSDB(userID string, force bool) (*userTSDB, error)
 	return db, nil
 }
 
+// validateTSDBDir ensures udir is a strict subdirectory of rootDir. This
+// prevents a malformed or empty tenant ID from collapsing the per-tenant TSDB
+// directory onto the shared root (which holds every tenant's TSDB) via
+// filepath.Join. udir is accepted when, after cleaning, it equals
+// filepath.Join(rootDir, child) for some non-empty child that is not "." or
+// ".." and that does not escape rootDir.
+func validateTSDBDir(rootDir, udir string) error {
+	cleanRoot := filepath.Clean(rootDir)
+	cleanUdir := filepath.Clean(udir)
+	if cleanUdir == cleanRoot {
+		return errors.Errorf("refusing to open TSDB on the shared root directory %q", cleanRoot)
+	}
+	rel, err := filepath.Rel(cleanRoot, cleanUdir)
+	if err != nil {
+		return errors.Wrapf(err, "invalid TSDB directory %q", udir)
+	}
+	if rel == "." || rel == "" || strings.HasPrefix(rel, "..") {
+		return errors.Errorf("TSDB directory %q is not a strict child of %q", udir, cleanRoot)
+	}
+	return nil
+}
+
 // createTSDB creates a TSDB for a given userID, and returns the created db.
 func (i *Ingester) createTSDB(userID string) (*userTSDB, error) {
 	tsdbPromReg := prometheus.NewRegistry()
-	udir := i.cfg.BlocksStorageConfig.TSDB.BlocksDir(userID)
+	udir, err := i.cfg.BlocksStorageConfig.TSDB.BlocksDir(userID)
+	if err != nil {
+		return nil, err
+	}
+
+	// Defense in depth: ensure the per-tenant directory is a strict child of
+	// cfg.Dir. BlocksDir already rejects an empty userID, but any future
+	// change (or an unexpected userID value such as ".") must not be allowed
+	// to collapse the per-tenant TSDB onto the shared root directory.
+	if err := validateTSDBDir(i.cfg.BlocksStorageConfig.TSDB.Dir, udir); err != nil {
+		return nil, err
+	}
 	userLogger := logutil.WithUserID(userID, i.logger)
 
 	blockRanges := i.cfg.BlocksStorageConfig.TSDB.BlockRanges.ToMilliseconds()

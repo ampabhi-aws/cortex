@@ -83,6 +83,14 @@ func (t *SingleResolver) TenantID(ctx context.Context) (string, error) {
 		return "", err
 	}
 
+	// Reject empty tenant IDs. gRPC/HTTP2 allow empty metadata values and the
+	// vendored user.ExtractFromGRPCRequest accepts them, so without this check
+	// an empty string could flow into downstream components that treat the
+	// tenant ID as a trusted path segment or map key.
+	if id == "" {
+		return "", user.ErrNoOrgID
+	}
+
 	if containsUnsafePathSegments(id) {
 		return "", errInvalidTenantID
 	}
@@ -131,6 +139,12 @@ func (t *MultiResolver) TenantIDs(ctx context.Context) ([]string, error) {
 
 	orgIDs := strings.Split(orgID, tenantIDsLabelSeparator)
 	for _, orgID := range orgIDs {
+		// Reject empty tenant IDs; see SingleResolver.TenantID for rationale.
+		// This also prevents inputs such as `X-Scope-OrgID: |` from resolving
+		// to one or more empty tenants.
+		if orgID == "" {
+			return nil, user.ErrNoOrgID
+		}
 		if err := ValidTenantID(orgID); err != nil {
 			return nil, err
 		}
