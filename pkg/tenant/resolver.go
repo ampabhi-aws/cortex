@@ -87,6 +87,15 @@ func (t *SingleResolver) TenantID(ctx context.Context) (string, error) {
 		return "", errInvalidTenantID
 	}
 
+	// Reject tenant IDs that exceed the maximum length. Even though
+	// SingleResolver intentionally allows a wider character set than
+	// MultiResolver, the length cap must still be enforced here so
+	// that unvalidated X-Scope-OrgID header values cannot be used as
+	// unbounded map keys (and metric label values) downstream.
+	if len(id) > maxTenantIDLength {
+		return "", errTenantIDTooLong
+	}
+
 	return id, nil
 }
 

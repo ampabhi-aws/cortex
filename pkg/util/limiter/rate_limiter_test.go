@@ -65,6 +65,43 @@ func TestRateLimiter_AllowN(t *testing.T) {
 	assert.Equal(t, true, limiter.AllowN(now.Add(time.Second), "tenant-2", 2))
 }
 
+func TestRateLimiter_RemoveTenant(t *testing.T) {
+	strategy := &staticLimitStrategy{tenants: map[string]struct {
+		limit float64
+		burst int
+	}{
+		"tenant-1": {limit: 10, burst: 20},
+	}}
+
+	limiter := NewRateLimiter(strategy, 10*time.Second)
+	now := time.Now()
+
+	// Prime a per-tenant entry.
+	assert.Equal(t, true, limiter.AllowN(now, "tenant-1", 1))
+	limiter.tenantsLock.RLock()
+	_, exists := limiter.tenants["tenant-1"]
+	limiter.tenantsLock.RUnlock()
+	assert.True(t, exists, "entry should be present after use")
+
+	// Remove it; the map entry must be gone.
+	limiter.RemoveTenant("tenant-1")
+	limiter.tenantsLock.RLock()
+	_, exists = limiter.tenants["tenant-1"]
+	limiter.tenantsLock.RUnlock()
+	assert.False(t, exists, "entry should be removed after RemoveTenant")
+
+	// Removing a non-existent tenant is a safe no-op.
+	limiter.RemoveTenant("never-seen")
+
+	// After removal, the limiter can be reused and a fresh entry is
+	// created on next use.
+	assert.Equal(t, true, limiter.AllowN(now, "tenant-1", 1))
+	limiter.tenantsLock.RLock()
+	_, exists = limiter.tenants["tenant-1"]
+	limiter.tenantsLock.RUnlock()
+	assert.True(t, exists, "entry should be re-created after use post-removal")
+}
+
 func BenchmarkRateLimiter_CustomMultiTenant(b *testing.B) {
 	strategy := &increasingLimitStrategy{}
 	limiter := NewRateLimiter(strategy, 10*time.Second)

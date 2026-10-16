@@ -398,6 +398,13 @@ func (d *Distributor) cleanupInactiveUser(userID string) {
 
 	d.HATracker.cleanupHATrackerMetricsForUser(userID)
 
+	// Release the per-tenant ingestion rate limiter entry so that an
+	// inactive tenant does not retain memory (map key plus limiter)
+	// for the lifetime of the process. Without this, every distinct
+	// X-Scope-OrgID value seen on the write path would leak until the
+	// distributor is restarted.
+	d.ingestionRateLimiter.RemoveTenant(userID)
+
 	d.receivedSamples.DeleteLabelValues(userID)
 	d.receivedExemplars.DeleteLabelValues(userID)
 	d.receivedMetadata.DeleteLabelValues(userID)

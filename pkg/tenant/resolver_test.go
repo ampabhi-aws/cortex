@@ -2,6 +2,7 @@ package tenant
 
 import (
 	"context"
+	"strings"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
@@ -98,6 +99,18 @@ func TestSingleResolver(t *testing.T) {
 			headerValue:  strptr(`backward\slash`),
 			errTenantID:  errInvalidTenantID,
 			errTenantIDs: errInvalidTenantID,
+		},
+		{
+			name:         "too-long",
+			headerValue:  strptr(strings.Repeat("a", maxTenantIDLength+1)),
+			errTenantID:  errTenantIDTooLong,
+			errTenantIDs: errTenantIDTooLong,
+		},
+		{
+			name:        "at-max-length",
+			headerValue: strptr(strings.Repeat("a", maxTenantIDLength)),
+			tenantID:    strings.Repeat("a", maxTenantIDLength),
+			tenantIDs:   []string{strings.Repeat("a", maxTenantIDLength)},
 		},
 	}...) {
 		t.Run(tc.name, tc.test(r))
