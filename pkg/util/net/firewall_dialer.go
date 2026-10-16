@@ -13,6 +13,22 @@ import (
 var errBlockedAddress = errors.New("blocked address")
 var errInvalidAddress = errors.New("invalid address")
 
+// IsIPBlocked returns true when the given IP would be rejected by a firewall
+// configured with the given policy. Exposed so other packages (e.g. the
+// Alertmanager config validator) can enforce the same firewall rules on
+// destinations that are not dialed through FirewallDialer.
+func IsIPBlocked(ip net.IP, blockPrivateAddresses bool, blockCIDRNetworks []flagext.CIDR) bool {
+	if blockPrivateAddresses && (isPrivate(ip) || isLocal(ip)) {
+		return true
+	}
+	for _, cidr := range blockCIDRNetworks {
+		if cidr.Value.Contains(ip) {
+			return true
+		}
+	}
+	return false
+}
+
 type FirewallDialerConfigProvider interface {
 	BlockCIDRNetworks() []flagext.CIDR
 	BlockPrivateAddresses() bool
@@ -54,14 +70,8 @@ func (d *FirewallDialer) control(_, address string, _ syscall.RawConn) error {
 		return errBlockedAddress
 	}
 
-	if blockPrivateAddresses && (isPrivate(ip) || isLocal(ip)) {
+	if IsIPBlocked(ip, blockPrivateAddresses, blockCIDRNetworks) {
 		return errBlockedAddress
-	}
-
-	for _, cidr := range blockCIDRNetworks {
-		if cidr.Value.Contains(ip) {
-			return errBlockedAddress
-		}
 	}
 
 	return nil
