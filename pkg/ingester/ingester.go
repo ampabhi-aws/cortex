@@ -1756,6 +1756,13 @@ func (i *Ingester) getTSDBUsers() []string {
 }
 
 func (i *Ingester) getOrCreateTSDB(userID string, force bool) (*userTSDB, error) {
+	// Defensive: never allow an empty tenant ID to reach the TSDB. An
+	// empty userID would resolve to the shared blocks root directory and
+	// to the bucket root key prefix, breaking per-tenant isolation.
+	if userID == "" {
+		return nil, errors.New("empty tenant ID is not allowed")
+	}
+
 	db := i.getTSDB(userID)
 	if db != nil {
 		return db, nil

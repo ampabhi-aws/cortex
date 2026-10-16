@@ -13,6 +13,10 @@ func TestValidTenantIDs(t *testing.T) {
 		err  *string
 	}{
 		{
+			name: "",
+			err:  strptr("empty tenant ID is not allowed"),
+		},
+		{
 			name: "tenant-a",
 		},
 		{

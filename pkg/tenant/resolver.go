@@ -83,6 +83,13 @@ func (t *SingleResolver) TenantID(ctx context.Context) (string, error) {
 		return "", err
 	}
 
+	// Reject an empty tenant ID: upstream weaveworks gRPC/HTTP extractors
+	// accept an empty org ID coming through gRPC metadata, and an empty
+	// tenant ID collapses per-tenant storage isolation to the shared root.
+	if id == "" {
+		return "", user.ErrNoOrgID
+	}
+
 	if containsUnsafePathSegments(id) {
 		return "", errInvalidTenantID
 	}
@@ -131,6 +138,11 @@ func (t *MultiResolver) TenantIDs(ctx context.Context) ([]string, error) {
 
 	orgIDs := strings.Split(orgID, tenantIDsLabelSeparator)
 	for _, orgID := range orgIDs {
+		// Reject empty segments (e.g. "|", "a|", "|a", "a||b") so the
+		// empty tenant ID cannot be injected into any tenant list.
+		if orgID == "" {
+			return nil, user.ErrNoOrgID
+		}
 		if err := ValidTenantID(orgID); err != nil {
 			return nil, err
 		}
