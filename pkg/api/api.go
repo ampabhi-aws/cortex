@@ -416,5 +416,10 @@ func (a *API) RegisterServiceMapHandler(handler http.Handler) {
 
 func (a *API) RegisterMemberlistKV(handler http.Handler) {
 	a.indexPage.AddLink(SectionAdminEndpoints, "/memberlist", "Memberlist Status")
-	a.RegisterRoute("/memberlist", handler, false, "GET")
+	// The /memberlist page is an operator/debug endpoint that exposes raw cluster
+	// state and allows destructive actions (clearing gossip message history). It
+	// must therefore be served behind the deployment's authentication/authorization
+	// middleware, and the handler is registered for both GET (status page / view
+	// actions) and POST (CSRF-protected deleteMessages action).
+	a.RegisterRoute("/memberlist", handler, true, "GET", "POST")
 }

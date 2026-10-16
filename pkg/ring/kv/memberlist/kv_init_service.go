@@ -2,6 +2,9 @@ package memberlist
 
 import (
 	"context"
+	"crypto/rand"
+	"crypto/subtle"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"html/template"
@@ -19,6 +22,37 @@ import (
 
 	"github.com/cortexproject/cortex/pkg/util/services"
 )
+
+// csrfToken is a per-process random token used to protect the state-changing
+// POST /memberlist?deleteMessages=true action from CSRF. It is embedded in the
+// rendered HTML form and must be echoed back in the POST body for the action
+// to be accepted. The token is generated once on first access.
+var (
+	csrfTokenOnce  sync.Once
+	csrfTokenValue string
+)
+
+func getCSRFToken() string {
+	csrfTokenOnce.Do(func() {
+		buf := make([]byte, 32)
+		if _, err := rand.Read(buf); err != nil {
+			// Fall back to a time-derived value; this should essentially
+			// never happen on a working system but keeps the service alive.
+			csrfTokenValue = fmt.Sprintf("fallback-%d", time.Now().UnixNano())
+			return
+		}
+		csrfTokenValue = hex.EncodeToString(buf)
+	})
+	return csrfTokenValue
+}
+
+func validCSRFToken(got string) bool {
+	want := getCSRFToken()
+	if len(got) != len(want) {
+		return false
+	}
+	return subtle.ConstantTimeCompare([]byte(got), []byte(want)) == 1
+}
 
 // KVInitService initializes a memberlist.KV on first call to GetMemberlistKV, and starts it. On stop,
 // KV is stopped too. If KV fails, error is reported from the service.
@@ -141,6 +175,20 @@ func (kvs *KVInitService) ServeHTTP(w http.ResponseWriter, req *http.Request) {
 		}
 
 		if len(req.Form[deleteMessagesParam]) > 0 && req.Form[deleteMessagesParam][0] == "true" {
+			// Destructive action: require POST + a valid CSRF token. Returning
+			// 405 for GET prevents trivial cross-site triggering (e.g. an
+			// <img>/<a> tag loaded in an operator's browser) and rejects any
+			// unauthenticated form POST that cannot read the current page.
+			if req.Method != http.MethodPost {
+				w.Header().Set("Allow", http.MethodPost)
+				http.Error(w, "deleteMessages requires POST", http.StatusMethodNotAllowed)
+				return
+			}
+			if !validCSRFToken(req.PostForm.Get("csrf_token")) {
+				http.Error(w, "invalid or missing CSRF token", http.StatusForbidden)
+				return
+			}
+
 			kv.deleteSentReceivedMessages()
 
 			// Redirect back.
@@ -164,6 +212,7 @@ func (kvs *KVInitService) ServeHTTP(w http.ResponseWriter, req *http.Request) {
 		Store:            kv.storeCopy(),
 		SentMessages:     sent,
 		ReceivedMessages: received,
+		CSRFToken:        getCSRFToken(),
 	}
 
 	accept := req.Header.Get("Accept")
@@ -226,8 +275,10 @@ func viewKey(w http.ResponseWriter, store map[string]valueDesc, key string, form
 
 func formatValue(w http.ResponseWriter, val interface{}, format string) {
 
+	// Headers must be set before WriteHeader is called; afterwards they are
+	// silently dropped and the response is returned with a sniffed content type.
+	w.Header().Set("content-type", "text/plain")
 	w.WriteHeader(200)
-	w.Header().Add("content-type", "text/plain")
 
 	switch format {
 	case "json", "json-pretty":
@@ -283,6 +334,10 @@ type pageData struct {
 	Store            map[string]valueDesc
 	SentMessages     []message
 	ReceivedMessages []message
+	// CSRFToken is the per-process token embedded in the deleteMessages form
+	// so that a POST submitted from this page can be distinguished from a
+	// cross-site forged request.
+	CSRFToken string
 }
 
 var pageTemplate = template.Must(template.New("webpage").Funcs(template.FuncMap{
@@ -360,7 +415,11 @@ const pageContent = `
 
 		<h2>Received Messages</h2>
 
-		<a href="?deleteMessages=true">Delete All Messages (received and sent)</a>
+		<form action="" method="POST">
+			<input type="hidden" name="deleteMessages" value="true">
+			<input type="hidden" name="csrf_token" value="{{ .CSRFToken }}">
+			<button type="submit">Delete All Messages (received and sent)</button>
+		</form>
 
 		<table width="100%" border="1">
 			<thead>
@@ -396,7 +455,11 @@ const pageContent = `
 
 		<h2>Sent Messages</h2>
 
-		<a href="?deleteMessages=true">Delete All Messages (received and sent)</a>
+		<form action="" method="POST">
+			<input type="hidden" name="deleteMessages" value="true">
+			<input type="hidden" name="csrf_token" value="{{ .CSRFToken }}">
+			<button type="submit">Delete All Messages (received and sent)</button>
+		</form>
 
 		<table width="100%" border="1">
 			<thead>
