@@ -149,12 +149,25 @@ func Test_GetAllConfigs_Empty(t *testing.T) {
 	defer cleanup(t)
 
 	for _, c := range allClients {
-		w := request(t, "GET", c.PrivateEndpoint, nil)
+		w := requestAsUser(t, "operator", "GET", c.PrivateEndpoint, "", nil)
 		assert.Equal(t, http.StatusOK, w.Code)
 		var found ConfigsView
 		err := json.Unmarshal(w.Body.Bytes(), &found)
 		assert.NoError(t, err, "Could not unmarshal JSON")
 		assert.Equal(t, ConfigsView{Configs: map[string]userconfig.View{}}, found)
+	}
+}
+
+// Private endpoints require an authenticated operator identity: unauthenticated
+// callers must not be able to retrieve every tenant's rules or alertmanager
+// configuration (which embeds notification secrets).
+func Test_GetAllConfigs_Unauthenticated(t *testing.T) {
+	setup(t)
+	defer cleanup(t)
+
+	for _, c := range allClients {
+		w := request(t, "GET", c.PrivateEndpoint, nil)
+		assert.Equal(t, http.StatusUnauthorized, w.Code)
 	}
 }
 
@@ -168,7 +181,7 @@ func Test_GetAllConfigs(t *testing.T) {
 
 	for _, c := range allClients {
 		view := c.post(t, userID, config)
-		w := request(t, "GET", c.PrivateEndpoint, nil)
+		w := requestAsUser(t, "operator", "GET", c.PrivateEndpoint, "", nil)
 		assert.Equal(t, http.StatusOK, w.Code)
 		var found ConfigsView
 		err := json.Unmarshal(w.Body.Bytes(), &found)
@@ -191,7 +204,7 @@ func Test_GetAllConfigs_Newest(t *testing.T) {
 		c.post(t, userID, makeConfig())
 		lastCreated := c.post(t, userID, makeConfig())
 
-		w := request(t, "GET", c.PrivateEndpoint, nil)
+		w := requestAsUser(t, "operator", "GET", c.PrivateEndpoint, "", nil)
 		assert.Equal(t, http.StatusOK, w.Code)
 		var found ConfigsView
 		err := json.Unmarshal(w.Body.Bytes(), &found)
@@ -212,7 +225,7 @@ func Test_GetConfigs_IncludesNewerConfigsAndExcludesOlder(t *testing.T) {
 		userID3 := makeUserID()
 		config3 := c.post(t, userID3, makeConfig())
 
-		w := request(t, "GET", fmt.Sprintf("%s?since=%d", c.PrivateEndpoint, config2.ID), nil)
+		w := requestAsUser(t, "operator", "GET", fmt.Sprintf("%s?since=%d", c.PrivateEndpoint, config2.ID), "", nil)
 		assert.Equal(t, http.StatusOK, w.Code)
 		var found ConfigsView
 		err := json.Unmarshal(w.Body.Bytes(), &found)
