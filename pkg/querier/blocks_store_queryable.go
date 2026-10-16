@@ -28,7 +28,6 @@ import (
 	"github.com/thanos-io/thanos/pkg/strutil"
 	"go.uber.org/atomic"
 	"golang.org/x/sync/errgroup"
-	grpc_metadata "google.golang.org/grpc/metadata"
 
 	"github.com/cortexproject/cortex/pkg/cortexpb"
 	"github.com/cortexproject/cortex/pkg/querier/series"
@@ -566,8 +565,7 @@ func (q *blocksStoreQuerier) fetchSeriesFromStores(
 	leftChunksLimit int,
 ) ([]storage.SeriesSet, []ulid.ULID, storage.Warnings, int, error) {
 	var (
-		reqCtx        = grpc_metadata.AppendToOutgoingContext(ctx, cortex_tsdb.TenantIDExternalLabel, q.userID)
-		g, gCtx       = errgroup.WithContext(reqCtx)
+		g, gCtx       = errgroup.WithContext(ctx)
 		mtx           = sync.Mutex{}
 		seriesSets    = []storage.SeriesSet(nil)
 		warnings      = storage.Warnings(nil)
@@ -732,8 +730,7 @@ func (q *blocksStoreQuerier) fetchLabelNamesFromStore(
 	matchers []storepb.LabelMatcher,
 ) ([][]string, storage.Warnings, []ulid.ULID, error) {
 	var (
-		reqCtx        = grpc_metadata.AppendToOutgoingContext(ctx, cortex_tsdb.TenantIDExternalLabel, q.userID)
-		g, gCtx       = errgroup.WithContext(reqCtx)
+		g, gCtx       = errgroup.WithContext(ctx)
 		mtx           = sync.Mutex{}
 		nameSets      = [][]string{}
 		warnings      = storage.Warnings(nil)
@@ -813,8 +810,7 @@ func (q *blocksStoreQuerier) fetchLabelValuesFromStore(
 	matchers ...*labels.Matcher,
 ) ([][]string, storage.Warnings, []ulid.ULID, error) {
 	var (
-		reqCtx        = grpc_metadata.AppendToOutgoingContext(ctx, cortex_tsdb.TenantIDExternalLabel, q.userID)
-		g, gCtx       = errgroup.WithContext(reqCtx)
+		g, gCtx       = errgroup.WithContext(ctx)
 		mtx           = sync.Mutex{}
 		valueSets     = [][]string{}
 		warnings      = storage.Warnings(nil)
