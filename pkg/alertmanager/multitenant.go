@@ -1062,8 +1062,18 @@ func (am *MultitenantAlertmanager) alertmanagerFromFallbackConfig(userID string)
 func (am *MultitenantAlertmanager) ReplicateStateForUser(ctx context.Context, userID string, part *clusterpb.Part) error {
 	level.Debug(am.logger).Log("msg", "message received for replication", "user", userID, "key", part.Key)
 
+	// Give ring.DoBatch a bounded, cancellable context so that any peer RPCs
+	// spawned by its callback do not outlive the batch itself. DoBatch may
+	// return as soon as `minSuccess` callbacks succeed (which, with the
+	// ignore-unhealthy strategy used by the alertmanager ring, happens
+	// instantly on the self instance). Cancelling batchCtx here ensures that
+	// any still-pending c.UpdateState goroutines are unblocked rather than
+	// leaking.
+	batchCtx, batchCancel := context.WithCancel(ctx)
+	defer batchCancel()
+
 	selfAddress := am.ringLifecycler.GetInstanceAddr()
-	err := ring.DoBatch(ctx, RingOp, am.ring, []uint32{shardByUser(userID)}, func(desc ring.InstanceDesc, _ []int) error {
+	err := ring.DoBatch(batchCtx, RingOp, am.ring, []uint32{shardByUser(userID)}, func(desc ring.InstanceDesc, _ []int) error {
 		if desc.GetAddr() == selfAddress {
 			return nil
 		}
@@ -1073,7 +1083,12 @@ func (am *MultitenantAlertmanager) ReplicateStateForUser(ctx context.Context, us
 			return err
 		}
 
-		resp, err := c.UpdateState(user.InjectOrgID(ctx, userID), part)
+		// Bound every peer RPC so an unresponsive replica cannot keep a
+		// replication goroutine alive forever (mirrors Distributor.doRequest).
+		callCtx, cancel := context.WithTimeout(batchCtx, am.cfg.AlertmanagerClient.RemoteTimeout)
+		defer cancel()
+
+		resp, err := c.UpdateState(user.InjectOrgID(callCtx, userID), part)
 		if err != nil {
 			return err
 		}
