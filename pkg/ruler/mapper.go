@@ -2,6 +2,7 @@ package ruler
 
 import (
 	"crypto/md5"
+	"fmt"
 	"net/url"
 	"path/filepath"
 	"sort"
@@ -34,6 +35,10 @@ func newMapper(path string, logger log.Logger) *mapper {
 }
 
 func (m *mapper) cleanupUser(userID string) {
+	if userID == "" {
+		level.Warn(m.logger).Log("msg", "refusing to clean up user directory for empty tenant ID")
+		return
+	}
 	dirPath := filepath.Join(m.Path, userID)
 	err := m.FS.RemoveAll(dirPath)
 	if err != nil {
@@ -72,6 +77,10 @@ func (m *mapper) users() ([]string, error) {
 func (m *mapper) MapRules(user string, ruleConfigs map[string][]rulefmt.RuleGroup) (bool, []string, error) {
 	anyUpdated := false
 	filenames := []string{}
+
+	if user == "" {
+		return false, nil, fmt.Errorf("mapper: empty tenant ID is not allowed")
+	}
 
 	// user rule files will be stored as `/<path>/<userid>/<encoded filename>`
 	path := filepath.Join(m.Path, user)

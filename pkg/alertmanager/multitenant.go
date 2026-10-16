@@ -920,6 +920,11 @@ func (am *MultitenantAlertmanager) setConfig(cfg alertspb.AlertConfigDesc) error
 }
 
 func (am *MultitenantAlertmanager) getTenantDirectory(userID string) string {
+	// Defensive: an empty tenant ID would collapse the per-tenant directory
+	// to the shared data-directory root, breaking per-tenant isolation.
+	if userID == "" {
+		panic("MultitenantAlertmanager.getTenantDirectory: empty tenant ID is not allowed")
+	}
 	return filepath.Join(am.cfg.DataDir, userID)
 }
 
