@@ -128,9 +128,18 @@ func newTooManyLabelsError(series []cortexpb.LabelAdapter, limit int) Validation
 }
 
 func (e *tooManyLabelsError) Error() string {
+	// The label slice passed to this error is by definition oversized (that is
+	// why the error exists), and may be arbitrarily large on an attacker-
+	// controlled remote-write request. Only render the first `limit` labels and
+	// cap the formatted output at 200 characters (same bound used by every other
+	// label-rendering error in this file) so we never materialise the full set.
+	truncated := e.series
+	if e.limit >= 0 && len(truncated) > e.limit {
+		truncated = truncated[:e.limit]
+	}
 	return fmt.Sprintf(
-		"series has too many labels (actual: %d, limit: %d) series: '%s'",
-		len(e.series), e.limit, cortexpb.FromLabelAdaptersToMetric(e.series).String())
+		"series has too many labels (actual: %d, limit: %d) series: %.200q",
+		len(e.series), e.limit, formatLabelSet(truncated))
 }
 
 type noMetricNameError struct{}
