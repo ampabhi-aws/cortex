@@ -1,6 +1,7 @@
 package api
 
 import (
+	"crypto/subtle"
 	"database/sql"
 	"encoding/json"
 	"errors"
@@ -35,6 +36,14 @@ var (
 // Config configures Configs API
 type Config struct {
 	Notifications NotificationsConfig `yaml:"notifications"`
+
+	// PrivateAuthToken is the shared service credential required to call the
+	// cross-tenant `/private/api/prom/configs/{rules,alertmanager}` endpoints.
+	// It is checked by `getConfigs` only; when it is empty the private
+	// endpoints are disabled (fail-closed) so an unconfigured deployment
+	// cannot leak every tenant's config and receiver secrets to anyone with
+	// network access to the HTTP port.
+	PrivateAuthToken string `yaml:"private_auth_token"`
 }
 
 // NotificationsConfig configures Alertmanager notifications method.
@@ -47,6 +56,7 @@ type NotificationsConfig struct {
 func (cfg *Config) RegisterFlags(f *flag.FlagSet) {
 	f.BoolVar(&cfg.Notifications.DisableEmail, "configs.notifications.disable-email", false, "Disable Email notifications for Alertmanager.")
 	f.BoolVar(&cfg.Notifications.DisableWebHook, "configs.notifications.disable-webhook", false, "Disable WebHook notifications for Alertmanager.")
+	f.StringVar(&cfg.PrivateAuthToken, "configs.private-auth-token", "", "Shared service credential (bearer token) required by the cross-tenant `/private/api/prom/configs/{rules,alertmanager}` endpoints that the ruler and alertmanager configdb clients use. When empty, those endpoints return 401 Unauthorized.")
 }
 
 // API implements the configs api.
@@ -263,10 +273,45 @@ type ConfigsView struct {
 	Configs map[string]userconfig.View `json:"configs"`
 }
 
+// authorizedForAllTenants reports whether the given request presents the
+// configured shared service credential for the cross-tenant private configs
+// endpoints. It fails closed: if no token has been configured, no request is
+// authorized. The credential is accepted as `Authorization: Bearer <token>`
+// to match the ruler/alertmanager configdb client. The comparison uses a
+// constant-time check to avoid leaking the token via timing.
+func (a *API) authorizedForAllTenants(r *http.Request) bool {
+	expected := a.cfg.PrivateAuthToken
+	if expected == "" {
+		return false
+	}
+	const prefix = "Bearer "
+	auth := r.Header.Get("Authorization")
+	if !strings.HasPrefix(auth, prefix) {
+		return false
+	}
+	presented := auth[len(prefix):]
+	if len(presented) != len(expected) {
+		return false
+	}
+	return subtle.ConstantTimeCompare([]byte(presented), []byte(expected)) == 1
+}
+
 func (a *API) getConfigs(w http.ResponseWriter, r *http.Request) {
+	logger := util_log.WithContext(r.Context(), util_log.Logger)
+
+	// `getConfigs` serves every tenant's rules / alertmanager config and
+	// embedded receiver secrets. It never calls `tenant.ExtractTenantIDFromHTTPRequest`
+	// (by design: the ruler/alertmanager configdb clients are tenant-less
+	// service-to-service callers). Gate it on a shared service credential so
+	// it is not reachable by arbitrary clients that can hit the HTTP port.
+	if !a.authorizedForAllTenants(r) {
+		level.Warn(logger).Log("msg", "rejected unauthorized request to private configs endpoint", "path", r.URL.Path)
+		http.Error(w, "Unauthorized", http.StatusUnauthorized)
+		return
+	}
+
 	var cfgs map[string]userconfig.View
 	var cfgErr error
-	logger := util_log.WithContext(r.Context(), util_log.Logger)
 	rawSince := r.FormValue("since")
 	if rawSince == "" {
 		cfgs, cfgErr = a.db.GetAllConfigs(r.Context())

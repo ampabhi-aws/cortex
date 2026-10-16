@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"net/http"
+	"net/http/httptest"
 	"os"
 	"path"
 	"strings"
@@ -149,7 +150,7 @@ func Test_GetAllConfigs_Empty(t *testing.T) {
 	defer cleanup(t)
 
 	for _, c := range allClients {
-		w := request(t, "GET", c.PrivateEndpoint, nil)
+		w := requestPrivate(t, "GET", c.PrivateEndpoint, nil)
 		assert.Equal(t, http.StatusOK, w.Code)
 		var found ConfigsView
 		err := json.Unmarshal(w.Body.Bytes(), &found)
@@ -168,7 +169,7 @@ func Test_GetAllConfigs(t *testing.T) {
 
 	for _, c := range allClients {
 		view := c.post(t, userID, config)
-		w := request(t, "GET", c.PrivateEndpoint, nil)
+		w := requestPrivate(t, "GET", c.PrivateEndpoint, nil)
 		assert.Equal(t, http.StatusOK, w.Code)
 		var found ConfigsView
 		err := json.Unmarshal(w.Body.Bytes(), &found)
@@ -191,7 +192,7 @@ func Test_GetAllConfigs_Newest(t *testing.T) {
 		c.post(t, userID, makeConfig())
 		lastCreated := c.post(t, userID, makeConfig())
 
-		w := request(t, "GET", c.PrivateEndpoint, nil)
+		w := requestPrivate(t, "GET", c.PrivateEndpoint, nil)
 		assert.Equal(t, http.StatusOK, w.Code)
 		var found ConfigsView
 		err := json.Unmarshal(w.Body.Bytes(), &found)
@@ -199,6 +200,31 @@ func Test_GetAllConfigs_Newest(t *testing.T) {
 		assert.Equal(t, ConfigsView{Configs: map[string]userconfig.View{
 			userID: lastCreated,
 		}}, found)
+	}
+}
+
+// The private all-tenant endpoints reject requests that do not present the
+// configured shared service credential.
+func Test_GetAllConfigs_RejectsUnauthenticated(t *testing.T) {
+	setup(t)
+	defer cleanup(t)
+
+	// Store a config so there is something that could leak if the
+	// authorization check regressed.
+	rulesClient.post(t, makeUserID(), makeConfig())
+
+	for _, c := range allClients {
+		// No credential at all.
+		w := request(t, "GET", c.PrivateEndpoint, nil)
+		assert.Equal(t, http.StatusUnauthorized, w.Code, c.PrivateEndpoint)
+
+		// Wrong credential.
+		wr := httptest.NewRecorder()
+		r, err := http.NewRequest("GET", c.PrivateEndpoint, nil)
+		require.NoError(t, err)
+		r.Header.Set("Authorization", "Bearer not-the-token")
+		app.ServeHTTP(wr, r)
+		assert.Equal(t, http.StatusUnauthorized, wr.Code, c.PrivateEndpoint)
 	}
 }
 
@@ -212,7 +238,7 @@ func Test_GetConfigs_IncludesNewerConfigsAndExcludesOlder(t *testing.T) {
 		userID3 := makeUserID()
 		config3 := c.post(t, userID3, makeConfig())
 
-		w := request(t, "GET", fmt.Sprintf("%s?since=%d", c.PrivateEndpoint, config2.ID), nil)
+		w := requestPrivate(t, "GET", fmt.Sprintf("%s?since=%d", c.PrivateEndpoint, config2.ID), nil)
 		assert.Equal(t, http.StatusOK, w.Code)
 		var found ConfigsView
 		err := json.Unmarshal(w.Body.Bytes(), &found)
