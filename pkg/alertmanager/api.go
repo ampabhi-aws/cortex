@@ -304,6 +304,22 @@ func (am *MultitenantAlertmanager) ListAllConfigs(w http.ResponseWriter, r *http
 	<-done
 }
 
+// ValidateAlertmanagerConfig recursively scans the input Alertmanager config looking for
+// data types for which Cortex has a specific validation (e.g. the ban on *_file receiver
+// options). It is exported so other packages that accept tenant-supplied Alertmanager
+// configs (for example the legacy configs service) can enforce the same restrictions
+// before persisting the config.
+func ValidateAlertmanagerConfig(cfg interface{}) error {
+	return validateAlertmanagerConfig(cfg)
+}
+
+// ValidateTemplateFilename validates a template filename using the same rules enforced on
+// the native Alertmanager tenant API. It is exported so other write paths (e.g. the
+// legacy configs service) can share the check.
+func ValidateTemplateFilename(filename string) error {
+	return validateTemplateFilename(filename)
+}
+
 // validateAlertmanagerConfig recursively scans the input config looking for data types for which
 // we have a specific validation and, whenever encountered, it runs their validation. Returns the
 // first error or nil if validation succeeds.

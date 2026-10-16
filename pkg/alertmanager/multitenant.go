@@ -814,6 +814,32 @@ func (am *MultitenantAlertmanager) setConfig(cfg alertspb.AlertConfigDesc) error
 	var userTemplateDir = filepath.Join(am.getTenantDirectory(cfg.User), templatesDir)
 	var pathsToRemove = make(map[string]struct{})
 
+	// Re-run Cortex's security validation on the stored config before applying it.
+	// Configs may have been written through a non-validating path (e.g. the legacy
+	// configs service / configdb backend) or by tooling with direct store access,
+	// so we must enforce the *_file ban, template-name safety and other restrictions
+	// here rather than trusting the producer.
+	if cfg.RawConfig != "" {
+		if storedAmCfg, loadErr := amconfig.Load(cfg.RawConfig); loadErr == nil && storedAmCfg != nil {
+			if err := validateAlertmanagerConfig(storedAmCfg); err != nil {
+				level.Warn(am.logger).Log("msg", "refusing to apply stored Alertmanager config: validation failed", "user", cfg.User, "err", err)
+				return fmt.Errorf("invalid Alertmanager configuration for %v: %v", cfg.User, err)
+			}
+			for _, name := range storedAmCfg.Templates {
+				if err := validateTemplateFilename(name); err != nil {
+					level.Warn(am.logger).Log("msg", "refusing to apply stored Alertmanager config: invalid template name in config", "user", cfg.User, "err", err)
+					return fmt.Errorf("invalid Alertmanager configuration for %v: %v", cfg.User, err)
+				}
+			}
+		}
+	}
+	for _, tmpl := range cfg.Templates {
+		if err := validateTemplateFilename(tmpl.Filename); err != nil {
+			level.Warn(am.logger).Log("msg", "refusing to apply stored Alertmanager config: invalid template filename", "user", cfg.User, "err", err)
+			return fmt.Errorf("invalid Alertmanager configuration for %v: %v", cfg.User, err)
+		}
+	}
+
 	// List existing files to keep track the ones to be removed
 	if oldTemplateFiles, err := os.ReadDir(userTemplateDir); err == nil {
 		for _, file := range oldTemplateFiles {
