@@ -5,11 +5,13 @@ import (
 	"context"
 	"crypto/rand"
 	"encoding/binary"
+	"encoding/hex"
 	"errors"
 	"flag"
 	"fmt"
 	"math"
 	mathrand "math/rand"
+	"os"
 	"strings"
 	"sync"
 	"time"
@@ -157,6 +159,14 @@ type KVConfig struct {
 	// How much space to use to keep received and sent messages in memory (for troubleshooting).
 	MessageHistoryBufferBytes int `yaml:"message_history_buffer_bytes"`
 
+	// Shared secret used to encrypt and authenticate gossip messages between
+	// members. When set, memberlist drops any packet that is not encrypted or
+	// does not authenticate with one of the configured keys. Accepts either a
+	// path to a file containing the key, or an inline hex-encoded value. The
+	// decoded key must be 16, 24, or 32 bytes long (AES-128, AES-192, AES-256).
+	GossipSecretKey     string `yaml:"gossip_secret_key"`
+	GossipSecretKeyFile string `yaml:"gossip_secret_key_file"`
+
 	TCPTransport TCPTransportConfig `yaml:",inline"`
 
 	// Where to put custom metrics. Metrics are not registered, if this is nil.
@@ -193,6 +203,8 @@ func (cfg *KVConfig) RegisterFlagsWithPrefix(f *flag.FlagSet, prefix string) {
 	f.BoolVar(&cfg.EnableCompression, prefix+"memberlist.compression-enabled", mlDefaults.EnableCompression, "Enable message compression. This can be used to reduce bandwidth usage at the cost of slightly more CPU utilization.")
 	f.StringVar(&cfg.AdvertiseAddr, prefix+"memberlist.advertise-addr", mlDefaults.AdvertiseAddr, "Gossip address to advertise to other members in the cluster. Used for NAT traversal.")
 	f.IntVar(&cfg.AdvertisePort, prefix+"memberlist.advertise-port", mlDefaults.AdvertisePort, "Gossip port to advertise to other members in the cluster. Used for NAT traversal.")
+	f.StringVar(&cfg.GossipSecretKey, prefix+"memberlist.gossip-secret-key", "", "Hex-encoded shared secret (16, 24, or 32 bytes after decoding) used to encrypt and authenticate gossip. When set, memberlist drops any gossip message that is not encrypted with a key on the local keyring. Mutually exclusive with -memberlist.gossip-secret-key-file.")
+	f.StringVar(&cfg.GossipSecretKeyFile, prefix+"memberlist.gossip-secret-key-file", "", "Path to a file containing the hex-encoded shared gossip secret. Takes precedence over -memberlist.gossip-secret-key.")
 
 	cfg.TCPTransport.RegisterFlagsWithPrefix(f, prefix)
 }
@@ -366,6 +378,34 @@ func defaultMemberlistConfig() *memberlist.Config {
 	return memberlist.DefaultLANConfig()
 }
 
+// loadGossipSecretKey returns the raw gossip secret key, if any is configured.
+// It accepts a key either inline as a hex string (GossipSecretKey) or via a
+// file (GossipSecretKeyFile, which takes precedence). The decoded key must be
+// 16, 24, or 32 bytes long - the three AES key sizes accepted by memberlist.
+func (cfg *KVConfig) loadGossipSecretKey() ([]byte, error) {
+	raw := strings.TrimSpace(cfg.GossipSecretKey)
+	if cfg.GossipSecretKeyFile != "" {
+		data, err := os.ReadFile(cfg.GossipSecretKeyFile)
+		if err != nil {
+			return nil, fmt.Errorf("failed to read memberlist gossip secret key file %q: %w", cfg.GossipSecretKeyFile, err)
+		}
+		raw = strings.TrimSpace(string(data))
+	}
+	if raw == "" {
+		return nil, nil
+	}
+	key, err := hex.DecodeString(raw)
+	if err != nil {
+		return nil, fmt.Errorf("memberlist gossip secret key must be hex-encoded: %w", err)
+	}
+	switch len(key) {
+	case 16, 24, 32:
+		return key, nil
+	default:
+		return nil, fmt.Errorf("memberlist gossip secret key must decode to 16, 24, or 32 bytes (got %d)", len(key))
+	}
+}
+
 func (m *KV) buildMemberlistConfig() (*memberlist.Config, error) {
 	tr, err := NewTCPTransport(m.cfg.TCPTransport, m.logger)
 	if err != nil {
@@ -374,6 +414,22 @@ func (m *KV) buildMemberlistConfig() (*memberlist.Config, error) {
 
 	mlCfg := defaultMemberlistConfig()
 	mlCfg.Delegate = m
+
+	// Authenticate gossip at the message layer when a shared secret has been
+	// configured. Memberlist will refuse any unencrypted/unauthenticated packet
+	// and will not deliver it to NotifyMsg/MergeRemoteState, which is the only
+	// way callers merge attacker-supplied ring.Desc protobufs into shared ring
+	// state. Operators are expected to also network-isolate the gossip port.
+	if secret, err := m.cfg.loadGossipSecretKey(); err != nil {
+		return nil, err
+	} else if len(secret) > 0 {
+		mlCfg.SecretKey = secret
+		mlCfg.GossipVerifyIncoming = true
+		mlCfg.GossipVerifyOutgoing = true
+		level.Info(m.logger).Log("msg", "memberlist gossip encryption and authentication enabled")
+	} else {
+		level.Warn(m.logger).Log("msg", "memberlist gossip secret key is not set; gossip messages are not authenticated. Set -memberlist.gossip-secret-key(-file) and/or require mutual TLS, and network-isolate the gossip port.")
+	}
 
 	mlCfg.TCPTimeout = m.cfg.StreamTimeout
 	mlCfg.RetransmitMult = m.cfg.RetransmitMult

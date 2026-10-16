@@ -186,6 +186,19 @@ func (d *Desc) Merge(mergeable memberlist.Mergeable, localCAS bool) (memberlist.
 	return d.mergeWithTime(mergeable, localCAS, time.Now())
 }
 
+// maxIngestersPerGossipMerge bounds the number of ingester entries accepted
+// from a single incoming gossip merge. A compromised or malicious peer could
+// otherwise flood the ring with unlimited unhealthy token owners (the merge
+// never removes stale non-LEFT entries automatically). The limit is well
+// above realistic cluster sizes so legitimate deployments are unaffected.
+const maxIngestersPerGossipMerge = 10000
+
+// maxTokensPerIngesterGossipMerge bounds the number of tokens accepted per
+// instance from a single gossip merge. 10x the default token count (128) and
+// well above any sane configuration, but low enough to prevent a tiny message
+// from allocating tens of megabytes of attacker-chosen tokens.
+const maxTokensPerIngesterGossipMerge = 10000
+
 func (d *Desc) mergeWithTime(mergeable memberlist.Mergeable, localCAS bool, now time.Time) (memberlist.Mergeable, error) {
 	if mergeable == nil {
 		return nil, nil
@@ -199,6 +212,15 @@ func (d *Desc) mergeWithTime(mergeable memberlist.Mergeable, localCAS bool, now 
 
 	if other == nil {
 		return nil, nil
+	}
+
+	if len(other.Ingesters) > maxIngestersPerGossipMerge {
+		return nil, fmt.Errorf("gossip ring message contains %d ingesters, exceeding limit of %d", len(other.Ingesters), maxIngestersPerGossipMerge)
+	}
+	for name, ing := range other.Ingesters {
+		if len(ing.Tokens) > maxTokensPerIngesterGossipMerge {
+			return nil, fmt.Errorf("gossip ring entry %q contains %d tokens, exceeding limit of %d", name, len(ing.Tokens), maxTokensPerIngesterGossipMerge)
+		}
 	}
 
 	normalizeIngestersMap(other)

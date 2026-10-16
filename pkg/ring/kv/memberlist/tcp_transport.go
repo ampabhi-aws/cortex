@@ -4,10 +4,12 @@ import (
 	"bytes"
 	"crypto/md5"
 	"crypto/tls"
+	"crypto/x509"
 	"flag"
 	"fmt"
 	"io"
 	"net"
+	"os"
 	"strings"
 	"sync"
 	"time"
@@ -59,6 +61,16 @@ type TCPTransportConfig struct {
 
 	TLSEnabled bool                   `yaml:"tls_enabled"`
 	TLS        cortextls.ClientConfig `yaml:",inline"`
+
+	// Server-side TLS material. When TLSEnabled is set and a server certificate
+	// is provided here, the memberlist listener will use it (instead of the
+	// client TLS material) to terminate TLS from peers. ClientCAPath enables
+	// authentication of peer certificates (mutual TLS); without it the TLS
+	// listener encrypts but does not identify its peers.
+	TLSServerCertPath string `yaml:"tls_server_cert_path"`
+	TLSServerKeyPath  string `yaml:"tls_server_key_path"`
+	TLSClientCAPath   string `yaml:"tls_client_ca_path"`
+	TLSRequireClientCert bool `yaml:"tls_require_client_cert"`
 }
 
 func (cfg *TCPTransportConfig) RegisterFlags(f *flag.FlagSet) {
@@ -75,6 +87,10 @@ func (cfg *TCPTransportConfig) RegisterFlagsWithPrefix(f *flag.FlagSet, prefix s
 	f.BoolVar(&cfg.TransportDebug, prefix+"memberlist.transport-debug", false, "Log debug transport messages. Note: global log.level must be at debug level as well.")
 
 	f.BoolVar(&cfg.TLSEnabled, prefix+"memberlist.tls-enabled", false, "Enable TLS on the memberlist transport layer.")
+	f.StringVar(&cfg.TLSServerCertPath, prefix+"memberlist.tls-server-cert-path", "", "Path to the server certificate used by the memberlist TLS listener. If empty, the client certificate is reused.")
+	f.StringVar(&cfg.TLSServerKeyPath, prefix+"memberlist.tls-server-key-path", "", "Path to the server private key used by the memberlist TLS listener. If empty, the client key is reused.")
+	f.StringVar(&cfg.TLSClientCAPath, prefix+"memberlist.tls-client-ca-path", "", "Path to the CA bundle used to authenticate peer certificates on the memberlist TLS listener. Required to enable mutual TLS.")
+	f.BoolVar(&cfg.TLSRequireClientCert, prefix+"memberlist.tls-require-client-cert", false, "If true (and -memberlist.tls-enabled is set), require every incoming TLS connection to present a certificate signed by -memberlist.tls-client-ca-path. Prevents unauthenticated peers from injecting gossip even when they can reach the gossip port.")
 	cfg.TLS.RegisterFlagsWithPrefix(prefix+"memberlist", f)
 }
 
@@ -89,6 +105,7 @@ type TCPTransport struct {
 	wg           sync.WaitGroup
 	tcpListeners []net.Listener
 	tlsConfig    *tls.Config
+	serverTLSConfig *tls.Config
 
 	shutdown atomic.Int32
 
@@ -107,6 +124,50 @@ type TCPTransport struct {
 	sentPacketsBytes      prometheus.Counter
 	sentPacketsErrors     prometheus.Counter
 	unknownConnections    prometheus.Counter
+}
+
+// buildServerTLSConfig derives the tls.Config used to terminate incoming
+// gossip connections. When memberlist.tls-client-ca-path is set we enforce
+// mutual TLS (or VerifyClientCertIfGiven), which is the only authentication
+// hook available on the listener - the client-only tls.Config returned by
+// cortextls.ClientConfig does not populate ClientCAs or ClientAuth and
+// therefore accepts any anonymous peer. Operators who do not configure a
+// server certificate fall back to the client certificate (compatible with
+// the previous behavior) with a loud warning.
+func buildServerTLSConfig(cfg TCPTransportConfig, baseline *tls.Config) (*tls.Config, error) {
+	serverCfg := baseline.Clone()
+
+	if cfg.TLSServerCertPath != "" || cfg.TLSServerKeyPath != "" {
+		if cfg.TLSServerCertPath == "" || cfg.TLSServerKeyPath == "" {
+			return nil, errors.New("both -memberlist.tls-server-cert-path and -memberlist.tls-server-key-path must be set together")
+		}
+		cert, err := tls.LoadX509KeyPair(cfg.TLSServerCertPath, cfg.TLSServerKeyPath)
+		if err != nil {
+			return nil, errors.Wrap(err, "failed to load memberlist server TLS keypair")
+		}
+		serverCfg.Certificates = []tls.Certificate{cert}
+	}
+
+	if cfg.TLSClientCAPath != "" {
+		caData, err := os.ReadFile(cfg.TLSClientCAPath)
+		if err != nil {
+			return nil, errors.Wrapf(err, "failed to read memberlist TLS client CA %q", cfg.TLSClientCAPath)
+		}
+		pool := x509.NewCertPool()
+		if !pool.AppendCertsFromPEM(caData) {
+			return nil, fmt.Errorf("failed to parse any PEM certificates from %q", cfg.TLSClientCAPath)
+		}
+		serverCfg.ClientCAs = pool
+		if cfg.TLSRequireClientCert {
+			serverCfg.ClientAuth = tls.RequireAndVerifyClientCert
+		} else {
+			serverCfg.ClientAuth = tls.VerifyClientCertIfGiven
+		}
+	} else if cfg.TLSRequireClientCert {
+		return nil, errors.New("-memberlist.tls-require-client-cert requires -memberlist.tls-client-ca-path")
+	}
+
+	return serverCfg, nil
 }
 
 // NewTCPTransport returns a new tcp-based transport with the given configuration. On
@@ -131,6 +192,11 @@ func NewTCPTransport(config TCPTransportConfig, logger log.Logger) (*TCPTranspor
 		if err != nil {
 			return nil, errors.Wrap(err, "unable to create TLS config")
 		}
+
+		t.serverTLSConfig, err = buildServerTLSConfig(config, t.tlsConfig)
+		if err != nil {
+			return nil, errors.Wrap(err, "unable to create server TLS config")
+		}
 	}
 
 	t.registerMetrics(config.MetricsRegisterer)
@@ -151,7 +217,7 @@ func NewTCPTransport(config TCPTransportConfig, logger log.Logger) (*TCPTranspor
 
 		var tcpLn net.Listener
 		if config.TLSEnabled {
-			tcpLn, err = tls.Listen("tcp", tcpAddr.String(), t.tlsConfig)
+			tcpLn, err = tls.Listen("tcp", tcpAddr.String(), t.serverTLSConfig)
 			if err != nil {
 				return nil, errors.Wrapf(err, "failed to start TLS TCP listener on %q port %d", addr, port)
 			}
