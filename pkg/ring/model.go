@@ -209,7 +209,18 @@ func (d *Desc) mergeWithTime(mergeable memberlist.Mergeable, localCAS bool, now 
 	var updated []string
 	tokensChanged := false
 
-	maxFutureLimit := now.Add(30 * time.Minute).Unix()
+	// maxFutureLimit bounds how far in the future a peer-supplied Timestamp may
+	// be relative to local time. The previous value of 30 minutes let a malicious
+	// or compromised peer forge an InstanceDesc with Timestamp = now+29m that
+	// won conflict resolution against every genuine heartbeat for the whole
+	// 30-minute window; the resulting entry (attacker address, attacker tokens)
+	// then redirected cluster traffic until it timed out. One minute preserves
+	// tolerance for ordinary clock skew between well-synchronised NTP peers
+	// while giving an attacker a vanishingly short window to persist a forged
+	// entry — real heartbeats (every few seconds) will overwrite it almost
+	// immediately. Operators that cannot keep clocks closer than one minute
+	// have deeper correctness problems than ring timestamps.
+	maxFutureLimit := now.Add(1 * time.Minute).Unix()
 	for name, oing := range otherIngesterMap {
 		if oing.Timestamp > maxFutureLimit {
 			return nil, fmt.Errorf("ingester %s timestamp in the future, expected max of %d, got %d", name, maxFutureLimit, oing.Timestamp)

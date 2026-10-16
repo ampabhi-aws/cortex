@@ -5,11 +5,13 @@ import (
 	"context"
 	"crypto/rand"
 	"encoding/binary"
+	"encoding/hex"
 	"errors"
 	"flag"
 	"fmt"
 	"math"
 	mathrand "math/rand"
+	"os"
 	"strings"
 	"sync"
 	"time"
@@ -159,6 +161,19 @@ type KVConfig struct {
 
 	TCPTransport TCPTransportConfig `yaml:",inline"`
 
+	// GossipSecretKey is the pre-shared symmetric key used to encrypt and
+	// authenticate gossip payloads. If set, every incoming gossip packet must be
+	// encrypted with this key or it will be dropped (GossipVerifyIncoming is
+	// true by default in the vendored memberlist). Operators are strongly
+	// encouraged to either enable TLS with client-cert verification
+	// (-memberlist.tls-client-auth) OR set a non-empty gossip secret key, in
+	// addition to network-isolating the gossip port.
+	GossipSecretKey string `yaml:"gossip_secret_key"`
+
+	// GossipSecretKeyPath is a path to a file whose contents are the gossip
+	// secret key. Takes precedence over GossipSecretKey if both are set.
+	GossipSecretKeyPath string `yaml:"gossip_secret_key_path"`
+
 	// Where to put custom metrics. Metrics are not registered, if this is nil.
 	MetricsRegisterer prometheus.Registerer `yaml:"-"`
 	MetricsNamespace  string                `yaml:"-"`
@@ -193,6 +208,8 @@ func (cfg *KVConfig) RegisterFlagsWithPrefix(f *flag.FlagSet, prefix string) {
 	f.BoolVar(&cfg.EnableCompression, prefix+"memberlist.compression-enabled", mlDefaults.EnableCompression, "Enable message compression. This can be used to reduce bandwidth usage at the cost of slightly more CPU utilization.")
 	f.StringVar(&cfg.AdvertiseAddr, prefix+"memberlist.advertise-addr", mlDefaults.AdvertiseAddr, "Gossip address to advertise to other members in the cluster. Used for NAT traversal.")
 	f.IntVar(&cfg.AdvertisePort, prefix+"memberlist.advertise-port", mlDefaults.AdvertisePort, "Gossip port to advertise to other members in the cluster. Used for NAT traversal.")
+	f.StringVar(&cfg.GossipSecretKey, prefix+"memberlist.gossip-secret-key", "", "Hex-encoded pre-shared key used to encrypt and authenticate gossip payloads. Must be 16, 24 or 32 bytes long after hex decoding (AES-128/192/256). When set, memberlist will drop any gossip packet that is not encrypted with this key. Prefer -memberlist.gossip-secret-key-path for secret material.")
+	f.StringVar(&cfg.GossipSecretKeyPath, prefix+"memberlist.gossip-secret-key-path", "", "Path to a file containing the hex-encoded gossip secret key. Takes precedence over -memberlist.gossip-secret-key.")
 
 	cfg.TCPTransport.RegisterFlagsWithPrefix(f, prefix)
 }
@@ -386,6 +403,16 @@ func (m *KV) buildMemberlistConfig() (*memberlist.Config, error) {
 
 	mlCfg.AdvertiseAddr = m.cfg.AdvertiseAddr
 	mlCfg.AdvertisePort = m.cfg.AdvertisePort
+
+	// Plumb pre-shared gossip encryption key, if configured. This is independent
+	// of memberlist TLS and provides authenticated encryption of gossip payloads
+	// at the memberlist layer. GossipVerifyIncoming defaults to true in
+	// memberlist, so once SecretKey is set, unencrypted inbound gossip is dropped.
+	if secretKey, err := m.cfg.resolveGossipSecretKey(); err != nil {
+		return nil, fmt.Errorf("failed to load memberlist gossip secret key: %v", err)
+	} else if len(secretKey) > 0 {
+		mlCfg.SecretKey = secretKey
+	}
 
 	if m.cfg.NodeName != "" {
 		mlCfg.Name = m.cfg.NodeName
@@ -1335,4 +1362,34 @@ func addMessageToBuffer(msgs []message, size int, limit int, msg message) ([]mes
 	}
 
 	return msgs, size
+}
+
+// resolveGossipSecretKey returns the pre-shared symmetric key configured for
+// gossip-layer authenticated encryption, or (nil, nil) if none is configured.
+// A key read from GossipSecretKeyPath takes precedence over the inline
+// GossipSecretKey value. The returned slice is the raw key bytes (hex-decoded
+// from configuration); its length must be 16, 24 or 32 to be accepted by
+// memberlist (AES-128/192/256), and that is enforced here with a clear error.
+func (cfg *KVConfig) resolveGossipSecretKey() ([]byte, error) {
+	hexKey := strings.TrimSpace(cfg.GossipSecretKey)
+	if cfg.GossipSecretKeyPath != "" {
+		raw, err := os.ReadFile(cfg.GossipSecretKeyPath)
+		if err != nil {
+			return nil, fmt.Errorf("reading %q: %v", cfg.GossipSecretKeyPath, err)
+		}
+		hexKey = strings.TrimSpace(string(raw))
+	}
+	if hexKey == "" {
+		return nil, nil
+	}
+	key, err := hex.DecodeString(hexKey)
+	if err != nil {
+		return nil, fmt.Errorf("invalid hex-encoded gossip secret key: %v", err)
+	}
+	switch len(key) {
+	case 16, 24, 32:
+		return key, nil
+	default:
+		return nil, fmt.Errorf("gossip secret key must decode to 16, 24 or 32 bytes (got %d)", len(key))
+	}
 }
