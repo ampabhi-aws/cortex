@@ -591,7 +591,12 @@ func (t *Cortex) initConfig() (serv services.Service, err error) {
 	}
 
 	t.ConfigAPI = configAPI.New(t.ConfigDB, t.Cfg.Configs.API)
-	t.ConfigAPI.RegisterRoutes(t.Server.HTTP)
+	// Register the configs routes through the API wrapper so the configured
+	// HTTPAuthMiddleware is applied. Attaching the router directly to
+	// t.Server.HTTP would bypass authentication entirely and let any caller
+	// that reaches the port act on any tenant's configuration by naming the
+	// tenant in an X-Scope-OrgID header.
+	t.API.RegisterConfigAPI(t.ConfigAPI)
 	return services.NewIdleService(nil, func(_ error) error {
 		t.ConfigDB.Close()
 		return nil
