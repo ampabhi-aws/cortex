@@ -29,6 +29,12 @@ type DefaultMultiTenantManager struct {
 
 	mapper *mapper
 
+	// Per-tenant limits used to clamp attacker-controlled rule group inputs
+	// (e.g. the minimum rule-group evaluation interval). May be nil in tests;
+	// enforcement is skipped when nil or when the limit returns a non-positive
+	// value, preserving existing behaviour.
+	limits RulesLimits
+
 	// Structs for holding per-user Prometheus rules Managers
 	// and a corresponding metrics struct
 	userManagerMtx     sync.Mutex
@@ -47,7 +53,7 @@ type DefaultMultiTenantManager struct {
 	logger                        log.Logger
 }
 
-func NewDefaultMultiTenantManager(cfg Config, managerFactory ManagerFactory, reg prometheus.Registerer, logger log.Logger) (*DefaultMultiTenantManager, error) {
+func NewDefaultMultiTenantManager(cfg Config, managerFactory ManagerFactory, limits RulesLimits, reg prometheus.Registerer, logger log.Logger) (*DefaultMultiTenantManager, error) {
 	ncfg, err := buildNotifierConfig(&cfg)
 	if err != nil {
 		return nil, err
@@ -62,6 +68,7 @@ func NewDefaultMultiTenantManager(cfg Config, managerFactory ManagerFactory, reg
 		cfg:                cfg,
 		notifierCfg:        ncfg,
 		managerFactory:     managerFactory,
+		limits:             limits,
 		notifiers:          map[string]*rulerNotifier{},
 		mapper:             newMapper(cfg.RulePath, logger),
 		userManagers:       map[string]RulesManager{},
@@ -123,6 +130,26 @@ func (r *DefaultMultiTenantManager) SyncRuleGroups(ctx context.Context, ruleGrou
 // syncRulesToManager maps the rule files to disk, detects any changes and will create/update the
 // the users Prometheus Rules Manager.
 func (r *DefaultMultiTenantManager) syncRulesToManager(ctx context.Context, user string, groups rulespb.RuleGroupList) {
+	// Defence-in-depth: clamp any already-stored rule group whose evaluation
+	// interval is below the per-tenant minimum before mapping it to disk, so
+	// a group written when no floor was configured cannot keep the shared
+	// ruler busy. The write-time check in API.CreateRuleGroup is the primary
+	// enforcement; this handles persisted / legacy groups on load.
+	if r.limits != nil {
+		min := r.limits.RulerMinRuleEvaluationInterval(user)
+		if min > 0 {
+			for _, g := range groups {
+				if g == nil {
+					continue
+				}
+				if g.Interval > 0 && g.Interval < min {
+					level.Warn(r.logger).Log("msg", "clamping rule group evaluation interval below per-tenant minimum", "user", user, "group", g.Name, "namespace", g.Namespace, "configured", g.Interval.String(), "min", min.String())
+					g.Interval = min
+				}
+			}
+		}
+	}
+
 	// Map the files to disk and return the file names to be passed to the users manager if they
 	// have been updated
 	update, files, err := r.mapper.MapRules(user, groups.Formatted())

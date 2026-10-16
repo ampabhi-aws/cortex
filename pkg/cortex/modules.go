@@ -547,14 +547,14 @@ func (t *Cortex) initRuler() (serv services.Service, err error) {
 		})
 
 		managerFactory := ruler.DefaultTenantManagerFactory(t.Cfg.Ruler, t.Cfg.ExternalPusher, t.Cfg.ExternalQueryable, engine, t.Overrides, prometheus.DefaultRegisterer)
-		manager, err = ruler.NewDefaultMultiTenantManager(t.Cfg.Ruler, managerFactory, prometheus.DefaultRegisterer, util_log.Logger)
+		manager, err = ruler.NewDefaultMultiTenantManager(t.Cfg.Ruler, managerFactory, t.Overrides, prometheus.DefaultRegisterer, util_log.Logger)
 	} else {
 		rulerRegisterer := prometheus.WrapRegistererWith(prometheus.Labels{"engine": "ruler"}, prometheus.DefaultRegisterer)
 		// TODO: Consider wrapping logger to differentiate from querier module logger
 		queryable, _, engine := querier.New(t.Cfg.Querier, t.Overrides, t.Distributor, t.StoreQueryables, t.TombstonesLoader, rulerRegisterer, util_log.Logger)
 
 		managerFactory := ruler.DefaultTenantManagerFactory(t.Cfg.Ruler, t.Distributor, queryable, engine, t.Overrides, prometheus.DefaultRegisterer)
-		manager, err = ruler.NewDefaultMultiTenantManager(t.Cfg.Ruler, managerFactory, prometheus.DefaultRegisterer, util_log.Logger)
+		manager, err = ruler.NewDefaultMultiTenantManager(t.Cfg.Ruler, managerFactory, t.Overrides, prometheus.DefaultRegisterer, util_log.Logger)
 	}
 
 	if err != nil {
