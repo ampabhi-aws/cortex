@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"net/http"
 	"os"
+	"strings"
 
 	"github.com/go-kit/log"
 	kitlog "github.com/go-kit/log"
@@ -156,15 +157,42 @@ func InjectHeadersIntoHTTPRequest(headerMap map[string]string, request *http.Req
 	}
 }
 
-func ContextWithHeaderMapFromMetadata(ctx context.Context, md metadata.MD) context.Context {
+// ContextWithHeaderMapFromMetadata extracts the forwarded header map from the
+// incoming gRPC metadata key HeaderPropagationStringForRequestLogging and
+// stores it on the context. Only names present in the configured allowlist
+// (typically -api.http-request-headers-to-log) are accepted; any other
+// name/value pair is silently dropped. This mirrors the allowlist enforcement
+// performed on the HTTP ingress path (see HTTPHeaderMiddleware) and prevents a
+// gRPC peer from injecting arbitrary structured-log fields.
+//
+// Matching against the allowlist is case-insensitive, and the canonical name
+// used in the resulting map is the one configured by the operator so that
+// downstream log fields have stable, operator-controlled names.
+func ContextWithHeaderMapFromMetadata(ctx context.Context, md metadata.MD, allowlist []string) context.Context {
 	headersSlice, ok := md[HeaderPropagationStringForRequestLogging]
 	if !ok || len(headersSlice)%2 == 1 {
 		return ctx
 	}
 
+	// Build a case-insensitive lookup from the allowlist so metadata-supplied
+	// names are normalised to the operator-configured spelling.
+	canonical := make(map[string]string, len(allowlist))
+	for _, name := range allowlist {
+		canonical[strings.ToLower(name)] = name
+	}
+
 	headerMap := make(map[string]string)
 	for i := 0; i < len(headersSlice); i += 2 {
-		headerMap[headersSlice[i]] = headersSlice[i+1]
+		name := headersSlice[i]
+		configured, allowed := canonical[strings.ToLower(name)]
+		if !allowed {
+			// Drop any pair whose name is not in the operator-configured
+			// allowlist. This closes the gap between the HTTP ingress path
+			// (which already enforces the allowlist) and the gRPC
+			// propagation path.
+			continue
+		}
+		headerMap[configured] = headersSlice[i+1]
 	}
 
 	return ContextWithHeaderMap(ctx, headerMap)
