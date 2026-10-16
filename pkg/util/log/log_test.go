@@ -15,7 +15,7 @@ func TestHeaderMapFromMetadata(t *testing.T) {
 
 	ctx := context.Background()
 
-	ctx = ContextWithHeaderMapFromMetadata(ctx, md)
+	ctx = ContextWithHeaderMapFromMetadata(ctx, md, []string{"TestHeader1", "TestHeader2"})
 
 	headerMap := HeaderMapFromContext(ctx)
 
@@ -31,10 +31,46 @@ func TestHeaderMapFromMetadataWithImproperLength(t *testing.T) {
 
 	ctx := context.Background()
 
-	ctx = ContextWithHeaderMapFromMetadata(ctx, md)
+	ctx = ContextWithHeaderMapFromMetadata(ctx, md, []string{"TestHeader1", "TestHeader2", "Test3"})
 
 	headerMap := HeaderMapFromContext(ctx)
 	require.Nil(t, headerMap)
+}
+
+func TestHeaderMapFromMetadataEnforcesAllowlist(t *testing.T) {
+	md := metadata.New(nil)
+	md.Append(HeaderPropagationStringForRequestLogging,
+		"X-Scope-OrgID", "tenant-1",
+		"level", "debug",
+		"attacker_field", "anything",
+	)
+
+	ctx := ContextWithHeaderMapFromMetadata(context.Background(), md, []string{"X-Scope-OrgID"})
+
+	headerMap := HeaderMapFromContext(ctx)
+	require.Equal(t, map[string]string{"X-Scope-OrgID": "tenant-1"}, headerMap)
+}
+
+func TestHeaderMapFromMetadataAllowlistIsCaseInsensitive(t *testing.T) {
+	md := metadata.New(nil)
+	md.Append(HeaderPropagationStringForRequestLogging,
+		"x-scope-orgid", "tenant-1",
+	)
+
+	ctx := ContextWithHeaderMapFromMetadata(context.Background(), md, []string{"X-Scope-OrgID"})
+
+	headerMap := HeaderMapFromContext(ctx)
+	// Allowlisted names are normalised to the operator-configured spelling.
+	require.Equal(t, map[string]string{"X-Scope-OrgID": "tenant-1"}, headerMap)
+}
+
+func TestHeaderMapFromMetadataEmptyAllowlistDropsEverything(t *testing.T) {
+	md := metadata.New(nil)
+	md.Append(HeaderPropagationStringForRequestLogging, "TestHeader1", "SomeInformation")
+
+	ctx := ContextWithHeaderMapFromMetadata(context.Background(), md, nil)
+
+	require.Empty(t, HeaderMapFromContext(ctx))
 }
 
 func TestInjectHeadersIntoHTTPRequest(t *testing.T) {
