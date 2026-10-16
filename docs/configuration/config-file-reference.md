@@ -2471,6 +2471,22 @@ The `memberlist_config` configures the Gossip memberlist.
 # CLI flag: -memberlist.message-history-buffer-bytes
 [message_history_buffer_bytes: <int> | default = 0]
 
+# Maximum allowed length of a KV pair key received over gossip. KV pairs with
+# longer keys are dropped. 0 to disable the check.
+# CLI flag: -memberlist.message-max-key-length
+[message_max_key_length: <int> | default = 128]
+
+# Maximum number of distinct keys that this node will keep in its memberlist KV
+# store. New keys received over gossip beyond this limit are dropped. 0 to
+# disable the cap.
+# CLI flag: -memberlist.message-max-keys
+[message_max_keys: <int> | default = 1024]
+
+# Maximum size (in bytes) of a single KV pair value received over gossip. KV
+# pairs with a larger encoded value are dropped. 0 to disable the check.
+# CLI flag: -memberlist.message-max-value-size
+[message_max_value_size: <int> | default = 4194304]
+
 # IP address to listen on for gossip messages. Multiple addresses may be
 # specified. Defaults to 0.0.0.0
 # CLI flag: -memberlist.bind-addr
