@@ -2,6 +2,7 @@ package queue
 
 import (
 	"context"
+	"strings"
 	"sync"
 	"time"
 
@@ -9,6 +10,7 @@ import (
 	"github.com/prometheus/client_golang/prometheus"
 	"go.uber.org/atomic"
 
+	"github.com/cortexproject/cortex/pkg/tenant"
 	"github.com/cortexproject/cortex/pkg/util/services"
 )
 
@@ -20,7 +22,13 @@ const (
 var (
 	ErrTooManyRequests = errors.New("too many outstanding requests")
 	ErrStopped         = errors.New("queue is stopped")
+	errInvalidTenantID = errors.New("invalid tenant ID")
 )
+
+// tenantIDJoinSeparator mirrors tenant.JoinTenantIDs: multi-tenant requests arrive at
+// the queue with each tenant ID separated by this character, so we must validate each
+// component independently.
+const tenantIDJoinSeparator = "|"
 
 // UserIndex is opaque type that allows to resume iteration over users between successive calls
 // of RequestQueue.GetNextRequestForQuerier method.
@@ -57,14 +65,32 @@ type RequestQueue struct {
 	queues  *queues
 	stopped bool
 
+	// Aggregate cap on the total number of queued (outstanding) requests across all
+	// per-tenant queues. 0 disables the cap. This protects against a caller rotating
+	// the tenant string to bypass the per-tenant MaxOutstandingPerTenant allowance.
+	maxOutstandingTotal int
+	outstandingTotal    int
+
 	queueLength       *prometheus.GaugeVec   // Per user and reason.
 	discardedRequests *prometheus.CounterVec // Per user.
 }
 
 func NewRequestQueue(maxOutstandingPerTenant int, forgetDelay time.Duration, queueLength *prometheus.GaugeVec, discardedRequests *prometheus.CounterVec) *RequestQueue {
+	return NewRequestQueueWithLimits(maxOutstandingPerTenant, forgetDelay, 0, 0, queueLength, discardedRequests)
+}
+
+// NewRequestQueueWithLimits creates a RequestQueue with the aggregate (non per-tenant) caps.
+// maxTenantQueues bounds the number of simultaneously live tenant queues, and
+// maxOutstandingTotal bounds the number of outstanding (queued) requests across all tenants.
+// Zero (or negative) means the corresponding aggregate cap is disabled.
+func NewRequestQueueWithLimits(maxOutstandingPerTenant int, forgetDelay time.Duration, maxTenantQueues int, maxOutstandingTotal int, queueLength *prometheus.GaugeVec, discardedRequests *prometheus.CounterVec) *RequestQueue {
+	if maxOutstandingTotal < 0 {
+		maxOutstandingTotal = 0
+	}
 	q := &RequestQueue{
-		queues:                  newUserQueues(maxOutstandingPerTenant, forgetDelay),
+		queues:                  newUserQueuesWithLimits(maxOutstandingPerTenant, forgetDelay, maxTenantQueues),
 		connectedQuerierWorkers: atomic.NewInt32(0),
+		maxOutstandingTotal:     maxOutstandingTotal,
 		queueLength:             queueLength,
 		discardedRequests:       discardedRequests,
 	}
@@ -81,6 +107,14 @@ func NewRequestQueue(maxOutstandingPerTenant int, forgetDelay time.Duration, que
 //
 // If request is successfully enqueued, successFn is called with the lock held, before any querier can receive the request.
 func (q *RequestQueue) EnqueueRequest(userID string, req Request, maxQueriers int, successFn func()) error {
+	// Reject caller-supplied tenant identities that fail the documented tenant-ID
+	// character/length rules (tenant.ValidTenantID) before taking any locks, creating
+	// a queue or emitting per-tenant metric labels. This prevents a client that controls
+	// X-Scope-OrgID (or FrontendLoop UserID) from minting arbitrary queue identities.
+	if err := validateTenantID(userID); err != nil {
+		return err
+	}
+
 	q.mtx.Lock()
 	defer q.mtx.Unlock()
 
@@ -88,14 +122,26 @@ func (q *RequestQueue) EnqueueRequest(userID string, req Request, maxQueriers in
 		return ErrStopped
 	}
 
+	// Enforce the aggregate outstanding-request cap before touching per-tenant state,
+	// so a caller rotating the tenant string cannot multiply the per-tenant allowance.
+	if q.maxOutstandingTotal > 0 && q.outstandingTotal >= q.maxOutstandingTotal {
+		q.discardedRequests.WithLabelValues(userID).Inc()
+		return ErrTooManyRequests
+	}
+
 	queue := q.queues.getOrAddQueue(userID, maxQueriers)
 	if queue == nil {
-		// This can only happen if userID is "".
-		return errors.New("no queue found")
+		// Either userID is "" or we have hit the aggregate per-tenant-queue cap.
+		if userID == "" {
+			return errors.New("no queue found")
+		}
+		q.discardedRequests.WithLabelValues(userID).Inc()
+		return ErrTooManyRequests
 	}
 
 	select {
 	case queue <- req:
+		q.outstandingTotal++
 		q.queueLength.WithLabelValues(userID).Inc()
 		q.cond.Broadcast()
 		// Call this function while holding a lock. This guarantees that no querier can fetch the request before function returns.
@@ -107,6 +153,24 @@ func (q *RequestQueue) EnqueueRequest(userID string, req Request, maxQueriers in
 		q.discardedRequests.WithLabelValues(userID).Inc()
 		return ErrTooManyRequests
 	}
+}
+
+// validateTenantID enforces the tenant ID character and length rules on the
+// value used to key the queue. It accepts the multi-tenant joined form (`a|b|c`)
+// produced by tenant.JoinTenantIDs by validating each component.
+func validateTenantID(userID string) error {
+	if userID == "" {
+		return errInvalidTenantID
+	}
+	for _, id := range strings.Split(userID, tenantIDJoinSeparator) {
+		if id == "" {
+			return errInvalidTenantID
+		}
+		if err := tenant.ValidTenantID(id); err != nil {
+			return errInvalidTenantID
+		}
+	}
+	return nil
 }
 
 // GetNextRequestForQuerier find next user queue and takes the next request off of it. Will block if there are no requests.
@@ -147,6 +211,9 @@ FindQueue:
 				q.queues.deleteQueue(userID)
 			}
 
+			if q.outstandingTotal > 0 {
+				q.outstandingTotal--
+			}
 			q.queueLength.WithLabelValues(userID).Dec()
 
 			// Tell close() we've processed a request.

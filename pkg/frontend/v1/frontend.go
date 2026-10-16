@@ -32,12 +32,16 @@ var (
 // Config for a Frontend.
 type Config struct {
 	MaxOutstandingPerTenant int           `yaml:"max_outstanding_per_tenant"`
+	MaxTenantQueues         int           `yaml:"max_tenant_queues"`
+	MaxOutstandingRequests  int           `yaml:"max_outstanding_requests"`
 	QuerierForgetDelay      time.Duration `yaml:"querier_forget_delay"`
 }
 
 // RegisterFlags adds the flags required to config this to the given FlagSet.
 func (cfg *Config) RegisterFlags(f *flag.FlagSet) {
 	f.IntVar(&cfg.MaxOutstandingPerTenant, "querier.max-outstanding-requests-per-tenant", 100, "Maximum number of outstanding requests per tenant per frontend; requests beyond this error with HTTP 429.")
+	f.IntVar(&cfg.MaxTenantQueues, "query-frontend.max-tenant-queues", 0, "Aggregate cap on the number of simultaneously live tenant queues on the frontend. Requests whose tenant ID would create a new queue beyond this limit are rejected with HTTP 429. 0 to disable.")
+	f.IntVar(&cfg.MaxOutstandingRequests, "query-frontend.max-outstanding-requests", 0, "Aggregate cap on the total number of outstanding (queued) requests across all tenants on the frontend. Requests above this limit are rejected with HTTP 429. 0 to disable.")
 	f.DurationVar(&cfg.QuerierForgetDelay, "query-frontend.querier-forget-delay", 0, "If a querier disconnects without sending notification about graceful shutdown, the query-frontend will keep the querier in the tenant's shard until the forget delay has passed. This feature is useful to reduce the blast radius when shuffle-sharding is enabled.")
 }
 
@@ -100,7 +104,7 @@ func New(cfg Config, limits Limits, log log.Logger, registerer prometheus.Regist
 		}),
 	}
 
-	f.requestQueue = queue.NewRequestQueue(cfg.MaxOutstandingPerTenant, cfg.QuerierForgetDelay, f.queueLength, f.discardedRequests)
+	f.requestQueue = queue.NewRequestQueueWithLimits(cfg.MaxOutstandingPerTenant, cfg.QuerierForgetDelay, cfg.MaxTenantQueues, cfg.MaxOutstandingRequests, f.queueLength, f.discardedRequests)
 	f.activeUsers = util.NewActiveUsersCleanupWithDefaultValues(f.cleanupInactiveUserMetrics)
 
 	var err error
