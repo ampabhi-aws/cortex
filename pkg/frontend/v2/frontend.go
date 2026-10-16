@@ -2,9 +2,10 @@ package v2
 
 import (
 	"context"
+	cryptorand "crypto/rand"
+	"encoding/binary"
 	"flag"
 	"fmt"
-	"math/rand"
 	"net/http"
 	"sync"
 	"time"
@@ -63,8 +64,6 @@ type Frontend struct {
 	cfg Config
 	log log.Logger
 
-	lastQueryID atomic.Uint64
-
 	// frontend workers will read from this channel, and send request to scheduler.
 	requestsCh chan *frontendRequest
 
@@ -82,6 +81,12 @@ type frontendRequest struct {
 
 	enqueue  chan enqueueResult
 	response chan *frontendv2pb.QueryResultRequest
+
+	// delivered is set the first time a result for this request is accepted,
+	// so subsequent QueryResult calls for the same queryID (from the real
+	// querier delivering late or from a forged peer) are rejected rather
+	// than racing to overwrite the already-latched result.
+	delivered atomic.Bool
 }
 
 type enqueueStatus int
@@ -116,10 +121,6 @@ func NewFrontend(cfg Config, log log.Logger, reg prometheus.Registerer) (*Fronte
 		schedulerWorkers: schedulerWorkers,
 		requests:         newRequestsInProgress(),
 	}
-	// Randomize to avoid getting responses from queries sent before restart, which could lead to mixing results
-	// between different queries. Note that frontend verifies the user, so it cannot leak results between tenants.
-	// This isn't perfect, but better than nothing.
-	f.lastQueryID.Store(rand.Uint64())
 
 	promauto.With(reg).NewGaugeFunc(prometheus.GaugeOpts{
 		Name: "cortex_query_frontend_queries_in_progress",
@@ -172,7 +173,6 @@ func (f *Frontend) RoundTripGRPC(ctx context.Context, req *httpgrpc.HTTPRequest)
 	defer cancel()
 
 	freq := &frontendRequest{
-		queryID:      f.lastQueryID.Inc(),
 		request:      req,
 		userID:       userID,
 		statsEnabled: stats.IsEnabled(ctx),
@@ -185,7 +185,18 @@ func (f *Frontend) RoundTripGRPC(ctx context.Context, req *httpgrpc.HTTPRequest)
 		response: make(chan *frontendv2pb.QueryResultRequest, 1),
 	}
 
-	f.requests.put(freq)
+	// Pick an unguessable, unique queryID. The queryID doubles as the
+	// capability token that authorises a querier to deliver this query's
+	// result via QueryResult: because the previous counter-based scheme was
+	// predictable to any peer that observed one in-flight ID, a forged peer
+	// could enumerate IDs and inject responses into other queries. Draw the
+	// value from crypto/rand instead and reject the (vanishingly rare) case
+	// of a collision with another in-flight query.
+	queryID, err := f.requests.putWithRandomID(freq)
+	if err != nil {
+		return nil, err
+	}
+	freq.queryID = queryID
 	defer f.requests.delete(freq.queryID)
 
 	retries := f.cfg.WorkerConcurrency + 1 // To make sure we hit at least two different schedulers.
@@ -249,16 +260,36 @@ func (f *Frontend) QueryResult(ctx context.Context, qrReq *frontendv2pb.QueryRes
 	userID := tenant.JoinTenantIDs(tenantIDs)
 
 	req := f.requests.get(qrReq.QueryID)
-	// It is possible that some old response belonging to different user was received, if frontend has restarted.
-	// To avoid leaking query results between users, we verify the user here.
-	// To avoid mixing results from different queries, we randomize queryID counter on start.
-	if req != nil && req.userID == userID {
-		select {
-		case req.response <- qrReq:
-			// Should always be possible, unless QueryResult is called multiple times with the same queryID.
-		default:
-			level.Warn(f.log).Log("msg", "failed to write query result to the response channel", "queryID", qrReq.QueryID, "user", userID)
-		}
+	// Authorisation for result delivery is a conjunction of three checks:
+	//
+	//   1. The queryID must identify an in-flight request on this frontend.
+	//      queryIDs are drawn from crypto/rand (see RoundTripGRPC), so a peer
+	//      that has not been dispatched this query cannot guess the ID of a
+	//      victim's in-flight query by enumerating a counter.
+	//   2. The tenant resolved from the gRPC metadata must match the tenant
+	//      of the dispatched request. This defends against stale responses
+	//      received after a frontend restart and against a different tenant's
+	//      querier being told to deliver to the wrong query.
+	//   3. Only the first result for a given queryID is accepted; a second
+	//      delivery (whether a legitimate retry or a forgery racing the real
+	//      querier) is rejected with a warning instead of silently
+	//      overwriting the already-latched response via the buffered channel.
+	if req == nil || req.userID != userID {
+		level.Warn(f.log).Log("msg", "rejecting QueryResult: unknown queryID or tenant mismatch", "queryID", qrReq.QueryID, "user", userID)
+		return &frontendv2pb.QueryResultResponse{}, nil
+	}
+	if !req.delivered.CAS(false, true) {
+		level.Warn(f.log).Log("msg", "rejecting duplicate QueryResult for already-delivered query", "queryID", qrReq.QueryID, "user", userID)
+		return &frontendv2pb.QueryResultResponse{}, nil
+	}
+	select {
+	case req.response <- qrReq:
+		// First (and only) accepted delivery for this queryID.
+	default:
+		// The response channel is buffered to 1 and we just claimed the
+		// single delivery slot via `delivered`, so this branch is
+		// unreachable in practice.
+		level.Warn(f.log).Log("msg", "failed to write query result to the response channel", "queryID", qrReq.QueryID, "user", userID)
 	}
 
 	return &frontendv2pb.QueryResultResponse{}, nil
@@ -302,6 +333,33 @@ func (r *requestsInProgress) put(req *frontendRequest) {
 	defer r.mu.Unlock()
 
 	r.requests[req.queryID] = req
+}
+
+// putWithRandomID installs req under a freshly generated, cryptographically
+// random queryID, retrying on the astronomically unlikely event of a collision
+// with another in-flight request. The chosen ID is returned to the caller so
+// it can also be used as the key for later lookup/delete and for cancellation.
+func (r *requestsInProgress) putWithRandomID(req *frontendRequest) (uint64, error) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+
+	var buf [8]byte
+	for i := 0; i < 10; i++ {
+		if _, err := cryptorand.Read(buf[:]); err != nil {
+			return 0, errors.Wrap(err, "failed to generate queryID")
+		}
+		id := binary.BigEndian.Uint64(buf[:])
+		if id == 0 {
+			continue
+		}
+		if _, exists := r.requests[id]; exists {
+			continue
+		}
+		req.queryID = id
+		r.requests[id] = req
+		return id, nil
+	}
+	return 0, errors.New("failed to allocate a unique queryID after multiple attempts")
 }
 
 func (r *requestsInProgress) delete(queryID uint64) {
