@@ -139,10 +139,28 @@ func (c *RedisClient) MGet(ctx context.Context, keys []string) ([][]byte, error)
 			return nil, err
 		}
 
-		for i, val := range cmd.Val() {
-			if val != nil {
-				ret[i] = StringToBytes(val.(string))
+		// Defensively validate the reply shape before indexing/converting.
+		// A conforming Redis server returns exactly len(keys) bulk-string/nil
+		// elements for MGET, but a hostile or on-path-tampered endpoint could
+		// return a different length or non-string elements. Avoid panicking
+		// (index-out-of-range / interface-conversion) in that case.
+		vals := cmd.Val()
+		n := len(vals)
+		if n > len(ret) {
+			n = len(ret)
+		}
+		for i := 0; i < n; i++ {
+			val := vals[i]
+			if val == nil {
+				continue
 			}
+			s, ok := val.(string)
+			if !ok {
+				// Skip unexpected element types (int64, []interface{},
+				// proto.RedisError, ...) instead of panicking.
+				continue
+			}
+			ret[i] = StringToBytes(s)
 		}
 	}
 
