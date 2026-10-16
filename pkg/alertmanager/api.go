@@ -210,6 +210,22 @@ func validateUserConfig(logger log.Logger, cfg alertspb.AlertConfigDesc, limits 
 		}
 	}
 
+	// Enforce a static complexity bound on tenant-authored templates
+	// (both uploaded template files and inline notifier template strings
+	// such as slack_configs[].text or email_configs[].html). This caps
+	// the structural nesting of range/with/template actions at config
+	// validation time so a tenant cannot ship a tiny config whose
+	// rendering is O(M^N) in the number of alerts.
+	if maxDepth := limits.AlertmanagerMaxTemplateNestingDepth(user); maxDepth > 0 {
+		bodies := make([]templateWithBody, 0, len(cfg.Templates))
+		for _, tmpl := range cfg.Templates {
+			bodies = append(bodies, templateWithBody{name: tmpl.GetFilename(), body: tmpl.GetBody()})
+		}
+		if err := enforceTemplateComplexity(amCfg, bodies, maxDepth); err != nil {
+			return err
+		}
+	}
+
 	// Validate template files.
 	for _, tmpl := range cfg.Templates {
 		if err := validateTemplateFilename(tmpl.Filename); err != nil {
