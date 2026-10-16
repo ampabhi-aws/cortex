@@ -446,6 +446,8 @@ GET /ruler/rule_groups
 
 List all tenant rules. This endpoint is not part of ruler-API and is always available regardless of whether ruler-API is enabled or not. It should not be exposed to end users. This endpoint returns a YAML dictionary with all the rule groups for each tenant and `200` status code on success.
 
+Because the endpoint streams every tenant's rule configuration (PromQL expressions, labels and annotations), it is now disabled by default and gated by both authentication and an explicit administrative allow-list. Callers must authenticate (`X-Scope-OrgID` header; set `-auth.enabled=true` and terminate real authentication at your gateway) and their tenant ID must be included in `-ruler.api-admin-tenants` (or the equivalent `ruler.api_admin_tenants` YAML field). Requests without a tenant are rejected with `401`; requests from tenants not in the admin list, or any request when the admin list is empty, are rejected with `403`. Operators should additionally deny `/ruler/rule_groups` at their gateway/ingress for untrusted clients.
+
 ### List rules
 
 ```

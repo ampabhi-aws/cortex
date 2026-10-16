@@ -119,6 +119,11 @@ type Config struct {
 	EnabledTenants  flagext.StringSliceCSV `yaml:"enabled_tenants"`
 	DisabledTenants flagext.StringSliceCSV `yaml:"disabled_tenants"`
 
+	// APIAdminTenants is the list of tenant IDs that are allowed to access the
+	// administrative /ruler/rule_groups endpoint, which otherwise exposes every
+	// tenant's rule configuration. When empty, the endpoint is disabled.
+	APIAdminTenants flagext.StringSliceCSV `yaml:"api_admin_tenants"`
+
 	RingCheckPeriod time.Duration `yaml:"-"`
 
 	EnableQueryStats      bool `yaml:"query_stats_enabled"`
@@ -180,6 +185,7 @@ func (cfg *Config) RegisterFlags(f *flag.FlagSet) {
 
 	f.Var(&cfg.EnabledTenants, "ruler.enabled-tenants", "Comma separated list of tenants whose rules this ruler can evaluate. If specified, only these tenants will be handled by ruler, otherwise this ruler can process rules from all tenants. Subject to sharding.")
 	f.Var(&cfg.DisabledTenants, "ruler.disabled-tenants", "Comma separated list of tenants whose rules this ruler cannot evaluate. If specified, a ruler that would normally pick the specified tenant(s) for processing will ignore them instead. Subject to sharding.")
+	f.Var(&cfg.APIAdminTenants, "ruler.api-admin-tenants", "Comma separated list of tenant IDs allowed to access the administrative /ruler/rule_groups endpoint that lists rule groups for every tenant. If empty (the default) the endpoint is disabled and returns 403. Callers that are not in this list are also rejected with 403.")
 
 	f.BoolVar(&cfg.EnableQueryStats, "ruler.query-stats-enabled", false, "Report the wall time for ruler queries to complete as a per user metric and as an info level log message.")
 	f.BoolVar(&cfg.DisableRuleGroupLabel, "ruler.disable-rule-group-label", false, "Disable the rule_group label on exported metrics")
@@ -862,6 +868,34 @@ func (r *Ruler) DeleteTenantConfiguration(w http.ResponseWriter, req *http.Reque
 
 func (r *Ruler) ListAllRules(w http.ResponseWriter, req *http.Request) {
 	logger := util_log.WithContext(req.Context(), r.logger)
+
+	// This endpoint exposes every tenant's rule configuration (PromQL
+	// expressions, labels, annotations), so it must only be served to
+	// authenticated administrative callers. The route is registered with
+	// auth=true in pkg/api/api.go, so the AuthMiddleware will have populated the
+	// tenant ID from X-Scope-OrgID (operators are expected to terminate real
+	// authentication at their gateway, per docs/guides/security.md). We still
+	// verify a tenant is present and that it is listed as an admin tenant
+	// before returning any data.
+	userID, err := tenant.TenantID(req.Context())
+	if err != nil {
+		// Mirror the behavior of other ruler admin handlers (e.g.
+		// DeleteTenantConfiguration): if the auth middleware did not inject a
+		// tenant we respond with 401 for consistency.
+		http.Error(w, err.Error(), http.StatusUnauthorized)
+		return
+	}
+
+	if len(r.cfg.APIAdminTenants) == 0 {
+		level.Warn(logger).Log("msg", "rejected request to /ruler/rule_groups because no admin tenants are configured", "user", userID)
+		http.Error(w, "the /ruler/rule_groups endpoint is disabled: set -ruler.api-admin-tenants to the list of tenant IDs allowed to access it", http.StatusForbidden)
+		return
+	}
+	if !util.StringsContain(r.cfg.APIAdminTenants, userID) {
+		level.Warn(logger).Log("msg", "rejected request to /ruler/rule_groups from non-admin tenant", "user", userID)
+		http.Error(w, "forbidden: tenant is not permitted to list all tenants' rule groups", http.StatusForbidden)
+		return
+	}
 
 	userIDs, err := r.store.ListAllUsers(req.Context())
 	if err != nil {
