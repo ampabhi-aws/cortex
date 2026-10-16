@@ -1108,31 +1108,56 @@ func TestRuler_ListAllRules(t *testing.T) {
 	router := mux.NewRouter()
 	router.Path("/ruler/rule_groups").Methods(http.MethodGet).HandlerFunc(r.ListAllRules)
 
-	req := requestFor(t, http.MethodGet, "https://localhost:8080/ruler/rule_groups", nil, "")
-	w := httptest.NewRecorder()
-	router.ServeHTTP(w, req)
+	// The handler is tenant-scoped: it only returns the caller's rule groups.
+	// Exercise it for every tenant in the mock store and verify the response
+	// only contains that tenant's rule groups.
+	for callerID := range mockRules {
+		callerID := callerID
+		t.Run(callerID, func(t *testing.T) {
+			req := requestFor(t, http.MethodGet, "https://localhost:8080/ruler/rule_groups", nil, callerID)
+			w := httptest.NewRecorder()
+			router.ServeHTTP(w, req)
 
-	resp := w.Result()
-	body, _ := io.ReadAll(resp.Body)
+			resp := w.Result()
+			body, _ := io.ReadAll(resp.Body)
 
-	// Check status code and header
-	require.Equal(t, http.StatusOK, resp.StatusCode)
-	require.Equal(t, "application/yaml", resp.Header.Get("Content-Type"))
+			// Check status code and header
+			require.Equal(t, http.StatusOK, resp.StatusCode)
+			require.Equal(t, "application/yaml", resp.Header.Get("Content-Type"))
 
-	gs := make(map[string]map[string][]rulefmt.RuleGroup) // user:namespace:[]rulefmt.RuleGroup
-	for userID := range mockRules {
-		gs[userID] = mockRules[userID].Formatted()
+			gs := map[string]map[string][]rulefmt.RuleGroup{
+				callerID: mockRules[callerID].Formatted(),
+			}
+
+			// check for unnecessary fields
+			unnecessaryFields := []string{"kind", "style", "tag", "value", "anchor", "alias", "content", "headcomment", "linecomment", "footcomment", "line", "column"}
+			for _, word := range unnecessaryFields {
+				require.NotContains(t, string(body), word)
+			}
+
+			expectedResponse, err := yaml.Marshal(gs)
+			require.NoError(t, err)
+			require.YAMLEq(t, string(expectedResponse), string(body))
+
+			// Other tenants' identifiers must not appear in the body.
+			for otherID := range mockRules {
+				if otherID == callerID {
+					continue
+				}
+				require.NotContains(t, string(body), otherID)
+			}
+		})
 	}
 
-	// check for unnecessary fields
-	unnecessaryFields := []string{"kind", "style", "tag", "value", "anchor", "alias", "content", "headcomment", "linecomment", "footcomment", "line", "column"}
-	for _, word := range unnecessaryFields {
-		require.NotContains(t, string(body), word)
-	}
-
-	expectedResponse, err := yaml.Marshal(gs)
-	require.NoError(t, err)
-	require.YAMLEq(t, string(expectedResponse), string(body))
+	// Without a tenant in context the handler must refuse the request rather
+	// than fall back to dumping every tenant.
+	t.Run("no tenant", func(t *testing.T) {
+		req := httptest.NewRequest(http.MethodGet, "https://localhost:8080/ruler/rule_groups", nil)
+		w := httptest.NewRecorder()
+		router.ServeHTTP(w, req)
+		resp := w.Result()
+		require.Equal(t, http.StatusUnauthorized, resp.StatusCode)
+	})
 }
 
 type senderFunc func(alerts ...*notifier.Alert)
