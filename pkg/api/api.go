@@ -18,6 +18,7 @@ import (
 	"github.com/cortexproject/cortex/pkg/alertmanager"
 	"github.com/cortexproject/cortex/pkg/alertmanager/alertmanagerpb"
 	"github.com/cortexproject/cortex/pkg/compactor"
+	configsapi "github.com/cortexproject/cortex/pkg/configs/api"
 	"github.com/cortexproject/cortex/pkg/cortexpb"
 	"github.com/cortexproject/cortex/pkg/distributor"
 	"github.com/cortexproject/cortex/pkg/distributor/distributorpb"
@@ -209,6 +210,19 @@ func (a *API) RegisterAlertmanager(am *alertmanager.MultitenantAlertmanager, tar
 		// WARNING: If LegacyHTTPPrefix is an empty string, any other paths added after this point will be
 		// silently ignored by the HTTP service. Therefore, this must be the last route to be configured.
 		a.RegisterRoutesWithPrefix(a.cfg.LegacyHTTPPrefix, am, true)
+	}
+}
+
+// RegisterConfigAPI registers the legacy configs API HTTP routes on the
+// shared Cortex HTTP server. Routes that return per-tenant or cross-tenant
+// configuration (which includes each tenant's raw alertmanager_config YAML,
+// embedding SMTP/Slack/PagerDuty/webhook credentials) are wrapped with the
+// configured HTTPAuthMiddleware so anonymous callers can never retrieve them
+// and the handler is guaranteed to see an authenticated tenant/operator
+// identity in the request context.
+func (a *API) RegisterConfigAPI(c *configsapi.API) {
+	for _, route := range c.Routes() {
+		a.RegisterRoute(route.Path, route.Handler, route.RequiresAuth, route.Method)
 	}
 }
 
