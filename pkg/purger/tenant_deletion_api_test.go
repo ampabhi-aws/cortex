@@ -27,16 +27,82 @@ func TestDeleteTenant(t *testing.T) {
 	}
 
 	{
+		// Missing confirm_tenant parameter must be rejected.
 		ctx := context.Background()
 		ctx = user.InjectOrgID(ctx, "fake")
 
-		req := &http.Request{}
+		req, err := http.NewRequest("POST", "/purger/delete_tenant", nil)
+		require.NoError(t, err)
+		resp := httptest.NewRecorder()
+		api.DeleteTenant(resp, req.WithContext(ctx))
+
+		require.Equal(t, http.StatusBadRequest, resp.Code)
+		require.Empty(t, bkt.Objects())
+	}
+
+	{
+		// Mismatched confirm_tenant must be rejected.
+		ctx := context.Background()
+		ctx = user.InjectOrgID(ctx, "fake")
+
+		req, err := http.NewRequest("POST", "/purger/delete_tenant?confirm_tenant=other", nil)
+		require.NoError(t, err)
+		resp := httptest.NewRecorder()
+		api.DeleteTenant(resp, req.WithContext(ctx))
+
+		require.Equal(t, http.StatusBadRequest, resp.Code)
+		require.Empty(t, bkt.Objects())
+	}
+
+	{
+		// Matching confirm_tenant writes the deletion marker.
+		ctx := context.Background()
+		ctx = user.InjectOrgID(ctx, "fake")
+
+		req, err := http.NewRequest("POST", "/purger/delete_tenant?confirm_tenant=fake", nil)
+		require.NoError(t, err)
 		resp := httptest.NewRecorder()
 		api.DeleteTenant(resp, req.WithContext(ctx))
 
 		require.Equal(t, http.StatusOK, resp.Code)
 		objs := bkt.Objects()
 		require.NotNil(t, objs[path.Join("fake", tsdb.TenantDeletionMarkPath)])
+	}
+
+	{
+		// DeleteTenantDeletionMark removes the marker (recovery path).
+		ctx := context.Background()
+		ctx = user.InjectOrgID(ctx, "fake")
+
+		req, err := http.NewRequest("DELETE", "/purger/delete_tenant", nil)
+		require.NoError(t, err)
+		resp := httptest.NewRecorder()
+		api.DeleteTenantDeletionMark(resp, req.WithContext(ctx))
+
+		require.Equal(t, http.StatusOK, resp.Code)
+		objs := bkt.Objects()
+		_, exists := objs[path.Join("fake", tsdb.TenantDeletionMarkPath)]
+		require.False(t, exists)
+	}
+
+	{
+		// DeleteTenantDeletionMark is idempotent: removing an absent marker is OK.
+		ctx := context.Background()
+		ctx = user.InjectOrgID(ctx, "fake")
+
+		req, err := http.NewRequest("DELETE", "/purger/delete_tenant", nil)
+		require.NoError(t, err)
+		resp := httptest.NewRecorder()
+		api.DeleteTenantDeletionMark(resp, req.WithContext(ctx))
+
+		require.Equal(t, http.StatusOK, resp.Code)
+	}
+
+	{
+		// DeleteTenantDeletionMark requires a tenant id.
+		resp := httptest.NewRecorder()
+		api.DeleteTenantDeletionMark(resp, &http.Request{})
+		require.Equal(t, http.StatusUnauthorized, resp.Code)
 	}
 }
 

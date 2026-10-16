@@ -792,12 +792,24 @@ The Purger service provides APIs for requesting deletion of tenants.
 ### Tenant Delete Request
 
 ```
-POST /purger/delete_tenant
+POST /purger/delete_tenant?confirm_tenant=<tenant-id>
 ```
 
-Request deletion of ALL tenant data. Only works with blocks storage. Experimental.
+Request deletion of ALL tenant data. Only works with blocks storage. Experimental, administrative, destructive and irreversible.
 
-_Requires [authentication](#authentication)._
+This endpoint writes a tenant-deletion marker that the compactor subsequently uses to permanently delete every block of the tenant from object storage, and causes ingesters to drop the tenant's in-memory TSDB. It is intended as an internal, administrative API and **must not** be exposed to tenants: the authenticating gateway in front of Cortex is responsible for blocking `/purger/*` paths for tenant traffic, matching the design in [docs/proposals/tenant-deletion.md](https://github.com/cortexproject/cortex/blob/master/docs/proposals/tenant-deletion.md). The caller must repeat the tenant id in the `confirm_tenant` query parameter so that a stray or forged `POST` cannot trigger the destructive cleanup. The endpoint is only registered when the operator opts in with `-experimental.purger.enable-api=true`.
+
+_Requires [authentication](#authentication) (treated as operator credential; see note above)._
+
+### Tenant Delete Cancel
+
+```
+DELETE /purger/delete_tenant
+```
+
+Remove a previously-written tenant-deletion marker, cancelling the destructive cleanup before the compactor has finished. The call is idempotent: it succeeds whether or not a marker is present. Experimental, administrative. Only registered when `-experimental.purger.enable-api=true`.
+
+_Requires [authentication](#authentication) (treated as operator credential; see note above)._
 
 ### Tenant Delete Status
 
@@ -805,9 +817,9 @@ _Requires [authentication](#authentication)._
 GET /purger/delete_tenant_status
 ```
 
-Returns status of tenant deletion. Output format to be defined. Experimental.
+Returns status of tenant deletion. Output format to be defined. Experimental, administrative. Only registered when `-experimental.purger.enable-api=true`.
 
-_Requires [authentication](#authentication)._
+_Requires [authentication](#authentication) (treated as operator credential; see note above)._
 
 ## Store-gateway
 

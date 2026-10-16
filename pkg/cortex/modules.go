@@ -678,7 +678,11 @@ func (t *Cortex) initTenantDeletionAPI() (services.Service, error) {
 		return nil, err
 	}
 
-	t.API.RegisterTenantDeletion(tenantDeletionAPI)
+	// The tenant-deletion endpoints are only registered when the operator
+	// explicitly opts in via -experimental.purger.enable-api. They are
+	// administrative and permanently destroy tenant data; see
+	// pkg/purger.Config and docs/proposals/tenant-deletion.md.
+	t.API.RegisterTenantDeletion(tenantDeletionAPI, t.Cfg.Purger.EnableAPI)
 	return nil, nil
 }
 
