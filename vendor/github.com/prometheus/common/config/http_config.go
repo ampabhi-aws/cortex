@@ -679,6 +679,16 @@ func (rt *oauth2RoundTripper) RoundTrip(req *http.Request) (*http.Response, erro
 			return nil, err
 		}
 
+		// The oauth2 token request must go through the same DialContext as
+		// the main transport so that any firewall / dial hook installed via
+		// WithDialContextFunc (e.g. Cortex's per-tenant FirewallDialer) is
+		// honored. Without this, oauth2.token_url would bypass the firewall
+		// and allow SSRF to internal endpoints.
+		var oauth2DialContext func(ctx context.Context, network, addr string) (net.Conn, error)
+		if rt.opts != nil && rt.opts.dialContextFunc != nil {
+			oauth2DialContext = (func(context.Context, string, string) (net.Conn, error))(rt.opts.dialContextFunc)
+		}
+
 		tlsTransport := func(tlsConfig *tls.Config) (http.RoundTripper, error) {
 			return &http.Transport{
 				TLSClientConfig:       tlsConfig,
@@ -689,6 +699,7 @@ func (rt *oauth2RoundTripper) RoundTrip(req *http.Request) (*http.Response, erro
 				IdleConnTimeout:       10 * time.Second,
 				TLSHandshakeTimeout:   10 * time.Second,
 				ExpectContinueTimeout: 1 * time.Second,
+				DialContext:           oauth2DialContext,
 			}, nil
 		}
 
