@@ -19,7 +19,6 @@ import (
 	"github.com/stretchr/testify/require"
 	"github.com/thanos-io/objstore"
 	"github.com/weaveworks/common/user"
-	"gopkg.in/yaml.v2"
 
 	"github.com/cortexproject/cortex/pkg/alertmanager/alertspb"
 	"github.com/cortexproject/cortex/pkg/alertmanager/alertstore/bucketclient"
@@ -686,13 +685,14 @@ receivers:
 	router.ServeHTTP(w, req)
 
 	resp := w.Result()
-	require.Equal(t, http.StatusOK, resp.StatusCode)
-	require.Equal(t, "application/yaml", resp.Header.Get("Content-Type"))
+	// The bulk cross-tenant endpoint has been removed; the handler now refuses
+	// to serve data and returns 410 Gone so that operators migrate to the
+	// tenant-scoped GET /api/v1/alerts endpoint.
+	require.Equal(t, http.StatusGone, resp.StatusCode)
 	body, err := io.ReadAll(resp.Body)
 	require.NoError(t, err)
-	old, err := yaml.Marshal(testCases)
-	require.NoError(t, err)
-	require.YAMLEq(t, string(old), string(body))
+	require.NotContains(t, string(body), "user1")
+	require.NotContains(t, string(body), "user2")
 }
 
 func TestValidateAlertmanagerConfig(t *testing.T) {

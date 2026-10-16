@@ -187,7 +187,12 @@ func (a *API) RegisterAlertmanager(am *alertmanager.MultitenantAlertmanager, tar
 	a.indexPage.AddLink(SectionAdminEndpoints, "/multitenant_alertmanager/ring", "Alertmanager Ring Status")
 	// Ensure this route is registered before the prefixed AM route
 	a.RegisterRoute("/multitenant_alertmanager/status", am.GetStatusHandler(), false, "GET")
-	a.RegisterRoute("/multitenant_alertmanager/configs", http.HandlerFunc(am.ListAllConfigs), false, "GET")
+	// The bulk `/multitenant_alertmanager/configs` endpoint used to stream every
+	// tenant's raw Alertmanager configuration (including receiver secrets) and
+	// was registered without authentication, which exposed cross-tenant data to
+	// any caller able to reach the Cortex HTTP listener. It has been removed in
+	// favour of the per-tenant `GET /api/v1/alerts` endpoint, which resolves the
+	// tenant from the authenticated request context.
 	a.RegisterRoute("/multitenant_alertmanager/ring", http.HandlerFunc(am.RingHandler), false, "GET", "POST")
 	a.RegisterRoute("/multitenant_alertmanager/delete_tenant_config", http.HandlerFunc(am.DeleteUserConfig), true, "POST")
 
