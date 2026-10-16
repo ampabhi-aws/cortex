@@ -767,6 +767,14 @@ instance_limits:
 # max-global-series-per-metric limits.
 # CLI flag: -ingester.ignore-series-limit-for-metric-names
 [ignore_series_limit_for_metric_names: <string> | default = ""]
+
+# Expose the destructive admin HTTP endpoints (/ingester/flush,
+# /ingester/shutdown and their legacy /flush, /shutdown aliases). When enabled,
+# these routes are registered as POST-only and require an authenticated tenant
+# (X-Scope-OrgID header); the operator is expected to additionally restrict
+# access to them in the reverse proxy / auth gateway.
+# CLI flag: -ingester.enable-admin-endpoints
+[enable_admin_endpoints: <boolean> | default = false]
 ```
 
 ### `querier_config`
