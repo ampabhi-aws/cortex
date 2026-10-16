@@ -28,6 +28,20 @@ import (
 const (
 	maxCasRetries              = 10          // max retries in CAS operation
 	noChangeDetectedRetrySleep = time.Second // how long to sleep after no change was detected in CAS
+
+	// maxKVKeyLength caps the size of KV store keys accepted from gossip
+	// messages. The locally used keys ("ring", "collectors/ring",
+	// "alertmanager", "compactor", ...) are all well below this limit, so this
+	// only drops attacker-chosen oversized keys that would otherwise be stored
+	// forever and emitted as unbounded Prometheus label values.
+	maxKVKeyLength = 512
+
+	// maxKVStoreEntries caps the number of distinct keys that gossip is allowed
+	// to introduce into the local KV store. Local components only ever use a
+	// handful of keys (one per ring/service), so this leaves generous head room
+	// while preventing an attacker from inflating the store without bound by
+	// gossiping unique keys.
+	maxKVStoreEntries = 1024
 )
 
 // Client implements kv.Client interface, by using memberlist.KV
@@ -235,6 +249,16 @@ type KV struct {
 	storeMu sync.Mutex
 	store   map[string]valueDesc
 
+	// Set of keys/prefixes used by locally running components. Keys gossiped by
+	// remote peers are only treated as "known" (and therefore allowed to grow
+	// the store beyond maxKVStoreEntries or to be emitted as a Prometheus label
+	// value) if they were previously registered here through a local KV
+	// operation (Get/CAS/WatchKey/WatchPrefix/List). This is the allowlist
+	// referenced in the hardening of NotifyMsg/MergeRemoteState.
+	localKeysMu   sync.Mutex
+	localKeys     map[string]struct{}
+	localPrefixes []string
+
 	// Codec registry
 	codecs map[string]codec.Codec
 
@@ -345,6 +369,7 @@ func NewKV(cfg KVConfig, logger log.Logger, dnsProvider DNSProvider, registerer 
 		provider:   dnsProvider,
 
 		store:          make(map[string]valueDesc),
+		localKeys:      make(map[string]struct{}),
 		codecs:         make(map[string]codec.Codec),
 		watchers:       make(map[string][]chan string),
 		prefixWatchers: make(map[string][]chan string),
@@ -640,6 +665,8 @@ func (m *KV) stopping(_ error) error {
 // List returns all known keys under a given prefix.
 // No communication with other nodes in the cluster is done here.
 func (m *KV) List(prefix string) []string {
+	m.registerLocalPrefix(prefix)
+
 	m.storeMu.Lock()
 	defer m.storeMu.Unlock()
 
@@ -655,6 +682,7 @@ func (m *KV) List(prefix string) []string {
 // Get returns current value associated with given key.
 // No communication with other nodes in the cluster is done here.
 func (m *KV) Get(key string, codec codec.Codec) (interface{}, error) {
+	m.registerLocalKey(key)
 	val, _, err := m.get(key, codec)
 	return val, err
 }
@@ -679,6 +707,8 @@ func (m *KV) get(key string, codec codec.Codec) (out interface{}, version uint, 
 //
 // Watching ends when 'f' returns false, context is done, or this client is shut down.
 func (m *KV) WatchKey(ctx context.Context, key string, codec codec.Codec, f func(interface{}) bool) {
+	m.registerLocalKey(key)
+
 	// keep one extra notification, to avoid missing notification if we're busy running the function
 	w := make(chan string, 1)
 
@@ -726,6 +756,8 @@ func (m *KV) WatchKey(ctx context.Context, key string, codec codec.Codec, f func
 //
 // Watching ends when 'f' returns false, context is done, or this client is shut down.
 func (m *KV) WatchPrefix(ctx context.Context, prefix string, codec codec.Codec, f func(string, interface{}) bool) {
+	m.registerLocalPrefix(prefix)
+
 	// we use bigger buffer here, since keys are interesting and we don't want to lose them.
 	w := make(chan string, 16)
 
@@ -825,6 +857,8 @@ func (m *KV) notifyWatchers(key string) {
 // detect removals. If Merge doesn't result in any change (returns nil), then operation fails and is retried again.
 // After too many failed retries, this method returns error.
 func (m *KV) CAS(ctx context.Context, key string, codec codec.Codec, f func(in interface{}) (out interface{}, retry bool, err error)) error {
+	m.registerLocalKey(key)
+
 	var lastError error
 
 outer:
@@ -956,6 +990,92 @@ func (m *KV) NodeMeta(limit int) []byte {
 	return nil
 }
 
+// registerLocalKey records that a KV key is used by a locally running
+// component, so gossip updates for the same key are not treated as
+// attacker-chosen input (allowed to use the key as a Prometheus label value
+// and to bypass the per-process cap on the number of distinct store
+// entries).
+func (m *KV) registerLocalKey(key string) {
+	if key == "" {
+		return
+	}
+	m.localKeysMu.Lock()
+	defer m.localKeysMu.Unlock()
+	m.localKeys[key] = struct{}{}
+}
+
+// registerLocalPrefix records a prefix used by a locally running component.
+// Any key matching one of these prefixes is treated as a known-local key.
+// WatchPrefix / List with the empty prefix is deliberately not recorded: the
+// empty prefix would match any attacker-chosen key and defeat the purpose
+// of the allowlist.
+func (m *KV) registerLocalPrefix(prefix string) {
+	if prefix == "" {
+		return
+	}
+	m.localKeysMu.Lock()
+	defer m.localKeysMu.Unlock()
+	for _, p := range m.localPrefixes {
+		if p == prefix {
+			return
+		}
+	}
+	m.localPrefixes = append(m.localPrefixes, prefix)
+}
+
+// isLocalKey reports whether a KV key was registered by a locally running
+// component (directly or via a registered prefix).
+func (m *KV) isLocalKey(key string) bool {
+	m.localKeysMu.Lock()
+	defer m.localKeysMu.Unlock()
+	if _, ok := m.localKeys[key]; ok {
+		return true
+	}
+	for _, p := range m.localPrefixes {
+		if strings.HasPrefix(key, p) {
+			return true
+		}
+	}
+	return false
+}
+
+// validateGossipKey enforces size/count bounds on a KV key received from an
+// (unauthenticated) gossip message. It returns a non-nil error if the key
+// should be rejected. The caller is responsible for incrementing
+// numberOfInvalidReceivedMessages and logging.
+func (m *KV) validateGossipKey(key string) error {
+	if len(key) == 0 {
+		return errors.New("empty key")
+	}
+	if len(key) > maxKVKeyLength {
+		return fmt.Errorf("key length %d exceeds limit %d", len(key), maxKVKeyLength)
+	}
+	// For keys that are not used by any local component, make sure we don't
+	// grow the store beyond maxKVStoreEntries. Existing entries are always
+	// allowed through so that repeated updates for a key already present can
+	// still be merged.
+	//
+	// Lock order: storeMu must always be acquired before localKeysMu to avoid
+	// deadlocks with mergeValueForKey (which holds storeMu and then checks
+	// isLocalKey). We acquire storeMu first, release it before calling
+	// isLocalKey, and the final decision does not require holding both locks
+	// simultaneously.
+	m.storeMu.Lock()
+	_, exists := m.store[key]
+	size := len(m.store)
+	m.storeMu.Unlock()
+	if exists {
+		return nil
+	}
+	if m.isLocalKey(key) {
+		return nil
+	}
+	if size >= maxKVStoreEntries {
+		return fmt.Errorf("KV store entry limit %d reached, rejecting new key", maxKVStoreEntries)
+	}
+	return nil
+}
+
 // NotifyMsg is method from Memberlist Delegate interface
 // Called when single message is received, i.e. what our broadcastNewValue has sent.
 func (m *KV) NotifyMsg(msg []byte) {
@@ -972,8 +1092,8 @@ func (m *KV) NotifyMsg(msg []byte) {
 		return
 	}
 
-	if len(kvPair.Key) == 0 {
-		level.Warn(m.logger).Log("msg", "received an invalid KV Pair (empty key)")
+	if err := m.validateGossipKey(kvPair.Key); err != nil {
+		level.Warn(m.logger).Log("msg", "received an invalid KV Pair", "err", err)
 		m.numberOfInvalidReceivedMessages.Inc()
 		return
 	}
@@ -1157,6 +1277,12 @@ func (m *KV) MergeRemoteState(data []byte, join bool) {
 			continue
 		}
 
+		if verr := m.validateGossipKey(kvPair.Key); verr != nil {
+			level.Warn(m.logger).Log("msg", "ignoring invalid KV Pair in remote state", "err", verr)
+			m.numberOfInvalidReceivedMessages.Inc()
+			continue
+		}
+
 		// we have both key and value, try to merge it with our state
 		change, newver, err := m.mergeBytesValueForKey(kvPair.Key, kvPair.Value, codec)
 
@@ -1211,10 +1337,20 @@ func (m *KV) mergeValueForKey(key string, incomingValue Mergeable, casVersion ui
 	// Note that we do not take a deep copy of curr.value here, it is modified in-place.
 	// This is safe because the entire function runs under the store lock; we do not return
 	// the full state anywhere as is done elsewhere (i.e. Get/WatchKey/CAS).
-	curr := m.store[key]
+	curr, exists := m.store[key]
 	// if casVersion is 0, then there was no previous value, so we will just do normal merge, without localCAS flag set.
 	if casVersion > 0 && curr.version != casVersion {
 		return nil, 0, errVersionMismatch
+	}
+
+	// Defense-in-depth cap on the number of distinct keys the KV store can
+	// hold. Local keys (registered through Get/CAS/WatchKey/WatchPrefix/List)
+	// are always allowed; gossip is only allowed to introduce new keys up to
+	// maxKVStoreEntries. validateGossipKey enforces this up-front, but we
+	// re-check under storeMu to close the TOCTOU window between the two
+	// locks.
+	if !exists && len(m.store) >= maxKVStoreEntries && !m.isLocalKey(key) {
+		return nil, 0, fmt.Errorf("KV store entry limit %d reached, rejecting new key", maxKVStoreEntries)
 	}
 	result, change, err := computeNewValue(incomingValue, curr.value, casVersion > 0)
 	if err != nil {
@@ -1229,8 +1365,14 @@ func (m *KV) mergeValueForKey(key string, incomingValue Mergeable, casVersion ui
 	if m.cfg.LeftIngestersTimeout > 0 {
 		limit := time.Now().Add(-m.cfg.LeftIngestersTimeout)
 		total, removed := result.RemoveTombstones(limit)
-		m.storeTombstones.WithLabelValues(key).Set(float64(total))
-		m.storeRemovedTombstones.WithLabelValues(key).Add(float64(removed))
+		// Only emit per-key metrics for keys registered by local components.
+		// Using an attacker-chosen gossip key as a Prometheus label value would
+		// permanently inflate /metrics cardinality (and output size for very
+		// long keys), so skip the WithLabelValues call for unknown keys.
+		if m.isLocalKey(key) {
+			m.storeTombstones.WithLabelValues(key).Set(float64(total))
+			m.storeRemovedTombstones.WithLabelValues(key).Add(float64(removed))
+		}
 
 		// Remove tombstones from change too. If change turns out to be empty after this,
 		// we don't need to gossip the change. However, the local value will be always be updated.
