@@ -1197,6 +1197,16 @@ func (m *KV) mergeBytesValueForKey(key string, incomingData []byte, codec codec.
 		return nil, 0, fmt.Errorf("expected Mergeable, got: %T", decodedValue)
 	}
 
+	// Validate the decoded value (if it supports validation) BEFORE taking the
+	// store lock. This ensures a malformed/oversized value received from an
+	// untrusted gossip peer cannot block all KV operations by pinning the lock
+	// while expensive per-element work runs under it.
+	if v, ok := incomingValue.(interface{ Validate() error }); ok {
+		if err := v.Validate(); err != nil {
+			return nil, 0, fmt.Errorf("invalid value for key %q: %v", key, err)
+		}
+	}
+
 	return m.mergeValueForKey(key, incomingValue, 0, codec)
 }
 

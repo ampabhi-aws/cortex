@@ -1,9 +1,19 @@
 package codec
 
 import (
+	"fmt"
+
 	"github.com/gogo/protobuf/proto"
 	"github.com/golang/snappy"
 )
+
+// MaxDecodedSize caps the uncompressed size of a value decoded by the proto
+// codec. A legitimate ring/KV value is well under this limit; anything larger
+// is treated as a malformed/malicious payload (e.g. a snappy decompression
+// bomb crafted from highly redundant protobuf fields) and rejected before any
+// per-element processing. The cap is applied against snappy.DecodedLen so the
+// decoder does not even allocate for oversized inputs.
+const MaxDecodedSize = 64 * 1024 * 1024 // 64 MiB
 
 // Codec allows KV clients to serialise and deserialise values.
 type Codec interface {
@@ -32,7 +42,14 @@ func (p Proto) CodecID() string {
 // Decode implements Codec
 func (p Proto) Decode(bytes []byte) (interface{}, error) {
 	out := p.factory()
-	bytes, err := snappy.Decode(nil, bytes)
+	decodedLen, err := snappy.DecodedLen(bytes)
+	if err != nil {
+		return nil, err
+	}
+	if decodedLen > MaxDecodedSize {
+		return nil, fmt.Errorf("snappy-decoded value too large: %d > %d bytes", decodedLen, MaxDecodedSize)
+	}
+	bytes, err = snappy.Decode(nil, bytes)
 	if err != nil {
 		return nil, err
 	}
