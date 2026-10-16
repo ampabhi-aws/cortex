@@ -323,6 +323,26 @@ func respondAccepted(w http.ResponseWriter, logger log.Logger) {
 	}
 }
 
+// isValidPathComponent returns an error if the decoded value is not a safe
+// single filesystem path component. It rejects empty strings, the special
+// "." and ".." entries, and any value containing a path separator or a NUL
+// byte. This mirrors the tenant-ID hardening in
+// pkg/tenant/resolver.go (CVE-2021-36157) and prevents the decoded value
+// from escaping its parent directory when later joined into a filesystem
+// path.
+func isValidPathComponent(v string) error {
+	if v == "" {
+		return errors.New("empty value")
+	}
+	if v == "." || v == ".." {
+		return errors.Errorf("invalid value %q", v)
+	}
+	if strings.ContainsAny(v, "/\\\x00") {
+		return errors.Errorf("invalid value %q: must not contain '/', '\\\\' or NUL", v)
+	}
+	return nil
+}
+
 // parseNamespace parses the namespace from the provided set of params, in this
 // api these params are derived from the url path
 func parseNamespace(params map[string]string) (string, error) {
@@ -334,6 +354,10 @@ func parseNamespace(params map[string]string) (string, error) {
 	namespace, err := url.PathUnescape(namespace)
 	if err != nil {
 		return "", err
+	}
+
+	if err := isValidPathComponent(namespace); err != nil {
+		return "", errors.Wrap(err, "invalid namespace")
 	}
 
 	return namespace, nil
@@ -350,6 +374,10 @@ func parseGroupName(params map[string]string) (string, error) {
 	groupName, err := url.PathUnescape(groupName)
 	if err != nil {
 		return "", err
+	}
+
+	if err := isValidPathComponent(groupName); err != nil {
+		return "", errors.Wrap(err, "invalid group name")
 	}
 
 	return groupName, nil
