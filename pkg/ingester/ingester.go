@@ -959,8 +959,18 @@ func (i *Ingester) Push(ctx context.Context, req *cortexpb.WriteRequest) (*corte
 	// Walk the samples, appending them to the users database
 	app := db.Appender(ctx).(extendedAppender)
 	for _, ts := range req.Timeseries {
-		// The labels must be sorted (in our case, it's guaranteed a write request
-		// has sorted labels once hit the ingester).
+		// Ingester.Push is reachable directly via the /ingester/push and /push
+		// debug routes without going through the distributor, so we cannot rely
+		// on the distributor having sorted and de-duplicated the label set.
+		// An unsorted or duplicated label set would make lset.Hash() split a
+		// single logical series into multiple memSeries and persist a slice
+		// that violates the TSDB block index ordering invariant. Reject these
+		// series here with a 400-class error before they reach GetRef/Append.
+		if err := validateLabelsOrder(ts.Labels); err != nil {
+			failedSamplesCount += len(ts.Samples)
+			updateFirstPartial(func() error { return err })
+			continue
+		}
 
 		// Look up a reference for this series.
 		ref, copiedLabels := app.GetRef(cortexpb.FromLabelAdaptersToLabels(ts.Labels))
@@ -2588,6 +2598,40 @@ func wrappedTSDBIngestErr(ingestErr error, timestamp model.Time, labels []cortex
 	}
 
 	return fmt.Errorf(errTSDBIngest, ingestErr, timestamp.Time().UTC().Format(time.RFC3339Nano), cortexpb.FromLabelAdaptersToLabels(labels).String())
+}
+
+// validateLabelsOrder enforces the sorted/no-duplicate label-name invariant that
+// Ingester.Push would otherwise trust to the caller. It is a defense-in-depth
+// check for callers that reach Ingester.Push without going through the
+// distributor (e.g. the /ingester/push and /push debug routes). On failure it
+// returns a *validationError so Ingester.Push surfaces it as an HTTP 400.
+func validateLabelsOrder(ls []cortexpb.LabelAdapter) error {
+	last := ""
+	for i, l := range ls {
+		if i == 0 {
+			last = l.Name
+			continue
+		}
+		cmp := strings.Compare(last, l.Name)
+		if cmp == 0 {
+			return &validationError{
+				errorType: "duplicate_label_names",
+				err:       fmt.Errorf("duplicate label name: %q", l.Name),
+				code:      http.StatusBadRequest,
+				labels:    cortexpb.FromLabelAdaptersToLabels(ls),
+			}
+		}
+		if cmp > 0 {
+			return &validationError{
+				errorType: "labels_not_sorted",
+				err:       fmt.Errorf("label name %q is not in sorted order", l.Name),
+				code:      http.StatusBadRequest,
+				labels:    cortexpb.FromLabelAdaptersToLabels(ls),
+			}
+		}
+		last = l.Name
+	}
+	return nil
 }
 
 func wrappedTSDBIngestExemplarErr(ingestErr error, timestamp model.Time, seriesLabels, exemplarLabels []cortexpb.LabelAdapter) error {
