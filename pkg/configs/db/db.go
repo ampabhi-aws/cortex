@@ -22,6 +22,37 @@ type Config struct {
 	Mock DB `yaml:"-"`
 }
 
+// MarshalYAML implements yaml.Marshaler. It redacts the password in the
+// URI's userinfo so that credentials supplied inline via
+// -configs.database.uri=postgres://user:password@host/... are not disclosed
+// by the (unauthenticated) /config endpoint. The in-memory value of URI is
+// left untouched; only the marshalled representation is redacted.
+func (cfg Config) MarshalYAML() (interface{}, error) {
+	// Use an alias type with the same yaml tags to avoid infinite recursion.
+	type plain Config
+	redacted := plain(cfg)
+	redacted.URI = redactPasswordInURI(cfg.URI)
+	return redacted, nil
+}
+
+// redactPasswordInURI returns rawURI with any userinfo password replaced by
+// "********". If rawURI does not parse as a URL, or has no inline password,
+// it is returned unchanged.
+func redactPasswordInURI(rawURI string) string {
+	if rawURI == "" {
+		return rawURI
+	}
+	u, err := url.Parse(rawURI)
+	if err != nil || u.User == nil {
+		return rawURI
+	}
+	if _, hasPassword := u.User.Password(); !hasPassword {
+		return rawURI
+	}
+	u.User = url.UserPassword(u.User.Username(), "********")
+	return u.String()
+}
+
 // RegisterFlags adds the flags required to configure this to the given FlagSet.
 func (cfg *Config) RegisterFlags(f *flag.FlagSet) {
 	f.StringVar(&cfg.URI, "configs.database.uri", "postgres://postgres@configs-db.weave.local/configs?sslmode=disable", "URI where the database can be found (for dev you can use memory://)")
