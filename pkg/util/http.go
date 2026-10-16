@@ -193,6 +193,17 @@ func decompressRequest(reader io.Reader, expectedSize, maxSize int, compression 
 	return
 }
 
+// maxDecompressPreallocBytes caps the up-front allocation performed by
+// decompressFromReader. The caller-supplied expectedSize is derived from the
+// client's Content-Length header, which is attacker-controlled on the push /
+// remote_read paths: pre-sizing the buffer to that value lets a tenant make
+// the server reserve up to -distributor.max-recv-msg-size bytes of heap per
+// request before any body byte has actually arrived (CWE-770). Clamping the
+// pre-allocation to a small constant keeps buf.Grow a useful optimisation for
+// legitimate small/medium requests while making the memory cost of a request
+// track the bytes that have actually been received, not the declared size.
+const maxDecompressPreallocBytes = 64 << 10 // 64 KiB
+
 func decompressFromReader(reader io.Reader, expectedSize, maxSize int, compression CompressionType, sp opentracing.Span) ([]byte, error) {
 	var (
 		buf  bytes.Buffer
@@ -200,7 +211,11 @@ func decompressFromReader(reader io.Reader, expectedSize, maxSize int, compressi
 		err  error
 	)
 	if expectedSize > 0 {
-		buf.Grow(expectedSize + bytes.MinRead) // extra space guarantees no reallocation
+		prealloc := expectedSize
+		if prealloc > maxDecompressPreallocBytes {
+			prealloc = maxDecompressPreallocBytes
+		}
+		buf.Grow(prealloc + bytes.MinRead)
 	}
 	// Read from LimitReader with limit max+1. So if the underlying
 	// reader is over limit, the result will be bigger than max.
