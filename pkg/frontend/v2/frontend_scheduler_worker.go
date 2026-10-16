@@ -291,7 +291,7 @@ func (w *frontendSchedulerWorker) schedulerLoop(loop schedulerpb.SchedulerForFro
 				req.response <- &frontendv2pb.QueryResultRequest{
 					HttpResponse: &httpgrpc.HTTPResponse{
 						Code: http.StatusInternalServerError,
-						Body: []byte(err.Error()),
+						Body: []byte(resp.Error),
 					},
 				}
 
@@ -303,6 +303,10 @@ func (w *frontendSchedulerWorker) schedulerLoop(loop schedulerpb.SchedulerForFro
 						Body: []byte("too many outstanding requests"),
 					},
 				}
+
+			default:
+				req.enqueue <- enqueueResult{status: failed}
+				level.Error(w.log).Log("msg", "unknown response status from scheduler", "resp", resp, "queryID", req.queryID)
 			}
 
 		case reqID := <-w.cancelCh:
