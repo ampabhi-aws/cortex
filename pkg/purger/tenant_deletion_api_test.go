@@ -18,7 +18,7 @@ import (
 
 func TestDeleteTenant(t *testing.T) {
 	bkt := objstore.NewInMemBucket()
-	api := newTenantDeletionAPI(bkt, nil, log.NewNopLogger())
+	api := newTenantDeletionAPI(Config{EnableTenantDeletion: true}, bkt, nil, log.NewNopLogger())
 
 	{
 		resp := httptest.NewRecorder()
@@ -37,6 +37,40 @@ func TestDeleteTenant(t *testing.T) {
 		require.Equal(t, http.StatusOK, resp.Code)
 		objs := bkt.Objects()
 		require.NotNil(t, objs[path.Join("fake", tsdb.TenantDeletionMarkPath)])
+	}
+
+	// When the opt-in flag is false and the caller does not supply a 'tenant'
+	// parameter, the handler must refuse to delete the caller's own tenant.
+	{
+		bkt := objstore.NewInMemBucket()
+		disabled := newTenantDeletionAPI(Config{EnableTenantDeletion: false}, bkt, nil, log.NewNopLogger())
+
+		ctx := user.InjectOrgID(context.Background(), "fake")
+		req := &http.Request{}
+		resp := httptest.NewRecorder()
+		disabled.DeleteTenant(resp, req.WithContext(ctx))
+
+		require.Equal(t, http.StatusForbidden, resp.Code)
+		require.Empty(t, bkt.Objects())
+	}
+
+	// With the opt-in flag disabled, an explicit 'tenant' parameter still
+	// drives deletion of the named tenant (operator path through an
+	// admin-scoped route).
+	{
+		bkt := objstore.NewInMemBucket()
+		disabled := newTenantDeletionAPI(Config{EnableTenantDeletion: false}, bkt, nil, log.NewNopLogger())
+
+		ctx := user.InjectOrgID(context.Background(), "admin-principal")
+		req, err := http.NewRequestWithContext(ctx, "POST", "/purger/delete_tenant?tenant=target-tenant", nil)
+		require.NoError(t, err)
+		resp := httptest.NewRecorder()
+		disabled.DeleteTenant(resp, req)
+
+		require.Equal(t, http.StatusOK, resp.Code)
+		objs := bkt.Objects()
+		require.NotNil(t, objs[path.Join("target-tenant", tsdb.TenantDeletionMarkPath)])
+		require.Nil(t, objs[path.Join("admin-principal", tsdb.TenantDeletionMarkPath)])
 	}
 }
 
@@ -80,7 +114,7 @@ func TestDeleteTenantStatus(t *testing.T) {
 				require.NoError(t, bkt.Upload(context.Background(), objName, bytes.NewReader(data)))
 			}
 
-			api := newTenantDeletionAPI(bkt, nil, log.NewNopLogger())
+			api := newTenantDeletionAPI(Config{}, bkt, nil, log.NewNopLogger())
 
 			res, err := api.isBlocksForUserDeleted(context.Background(), username)
 			require.NoError(t, err)
