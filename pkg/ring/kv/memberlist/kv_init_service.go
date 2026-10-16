@@ -141,6 +141,15 @@ func (kvs *KVInitService) ServeHTTP(w http.ResponseWriter, req *http.Request) {
 		}
 
 		if len(req.Form[deleteMessagesParam]) > 0 && req.Form[deleteMessagesParam][0] == "true" {
+			// deleteMessages mutates in-process state, so require a non-GET
+			// request. This prevents a cross-site GET (e.g. <img src=...>)
+			// triggered in an operator's browser from clearing the gossip
+			// message history and makes the action a non-side-effecting GET.
+			if req.Method != http.MethodPost {
+				w.Header().Set("Allow", http.MethodPost)
+				http.Error(w, "deleteMessages requires POST", http.StatusMethodNotAllowed)
+				return
+			}
 			kv.deleteSentReceivedMessages()
 
 			// Redirect back.
@@ -360,7 +369,7 @@ const pageContent = `
 
 		<h2>Received Messages</h2>
 
-		<a href="?deleteMessages=true">Delete All Messages (received and sent)</a>
+		<form method="POST" action="?deleteMessages=true" style="display:inline"><button type="submit">Delete All Messages (received and sent)</button></form>
 
 		<table width="100%" border="1">
 			<thead>
@@ -396,7 +405,7 @@ const pageContent = `
 
 		<h2>Sent Messages</h2>
 
-		<a href="?deleteMessages=true">Delete All Messages (received and sent)</a>
+		<form method="POST" action="?deleteMessages=true" style="display:inline"><button type="submit">Delete All Messages (received and sent)</button></form>
 
 		<table width="100%" border="1">
 			<thead>
