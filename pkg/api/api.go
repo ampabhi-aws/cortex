@@ -259,20 +259,35 @@ type Ingester interface {
 	Push(context.Context, *cortexpb.WriteRequest) (*cortexpb.WriteResponse, error)
 }
 
-// RegisterIngester registers the ingesters HTTP and GRPC service
-func (a *API) RegisterIngester(i Ingester, pushConfig distributor.Config) {
+// RegisterIngester registers the ingesters HTTP and GRPC service.
+//
+// enableDebugPush controls whether the /ingester/push (and legacy /push) HTTP
+// debug routes are registered. These routes invoke Ingester.Push directly and
+// therefore bypass the distributor's per-tenant validation and rate limiting,
+// so they are disabled by default and should only be enabled on an operator-
+// restricted listener. The gRPC Push service is always registered because it
+// is required for intra-cluster communication between the distributor and the
+// ingester.
+func (a *API) RegisterIngester(i Ingester, pushConfig distributor.Config, enableDebugPush bool) {
 	client.RegisterIngesterServer(a.server.GRPC, i)
 
 	a.indexPage.AddLink(SectionDangerous, "/ingester/flush", "Trigger a Flush of data from Ingester to storage")
 	a.indexPage.AddLink(SectionDangerous, "/ingester/shutdown", "Trigger Ingester Shutdown (Dangerous)")
 	a.RegisterRoute("/ingester/flush", http.HandlerFunc(i.FlushHandler), false, "GET", "POST")
 	a.RegisterRoute("/ingester/shutdown", http.HandlerFunc(i.ShutdownHandler), false, "GET", "POST")
-	a.RegisterRoute("/ingester/push", push.Handler(pushConfig.MaxRecvMsgSize, a.sourceIPs, i.Push), true, "POST") // For testing and debugging.
 
 	// Legacy Routes
 	a.RegisterRoute("/flush", http.HandlerFunc(i.FlushHandler), false, "GET", "POST")
 	a.RegisterRoute("/shutdown", http.HandlerFunc(i.ShutdownHandler), false, "GET", "POST")
-	a.RegisterRoute("/push", push.Handler(pushConfig.MaxRecvMsgSize, a.sourceIPs, i.Push), true, "POST") // For testing and debugging.
+
+	// The /ingester/push and /push debug routes bypass the distributor and are
+	// therefore gated behind -ingester.enable-debug-push (default false).
+	if enableDebugPush {
+		a.RegisterRoute("/ingester/push", push.Handler(pushConfig.MaxRecvMsgSize, a.sourceIPs, i.Push), true, "POST") // For testing and debugging.
+		a.RegisterRoute("/push", push.Handler(pushConfig.MaxRecvMsgSize, a.sourceIPs, i.Push), true, "POST")          // For testing and debugging.
+	} else {
+		level.Info(a.logger).Log("msg", "ingester HTTP debug push routes disabled; set -ingester.enable-debug-push=true to enable")
+	}
 }
 
 func (a *API) RegisterTenantDeletion(api *purger.TenantDeletionAPI) {
