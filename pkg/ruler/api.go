@@ -551,3 +551,14 @@ func (a *API) DeleteRuleGroup(w http.ResponseWriter, req *http.Request) {
 
 	respondAccepted(w, logger)
 }
+
+// DeleteTenantConfiguration is an administrative endpoint that deletes every
+// rule group of the tenant identified by X-Scope-OrgID. It is registered only
+// when the ruler API is enabled (see api.(*API).RegisterRulerAPI); otherwise
+// an operator-provisioned rule set must not be deletable by a
+// tenant-authenticated POST. This method delegates to the underlying Ruler
+// handler so the implementation and existing tests remain the single source
+// of truth.
+func (a *API) DeleteTenantConfiguration(w http.ResponseWriter, req *http.Request) {
+	a.ruler.DeleteTenantConfiguration(w, req)
+}
