@@ -125,6 +125,14 @@ type Config struct {
 	ZoneAwarenessEnabled bool                   `yaml:"zone_awareness_enabled"`
 	ExcludedZones        flagext.StringSliceCSV `yaml:"excluded_zones"`
 
+	// AllowForgetViaHTTP controls whether the ring status pages accept POST
+	// requests that forget (remove) ring instances. When false (default) the
+	// destructive capability is disabled regardless of what callers can reach
+	// the HTTP listener; GET-based status pages continue to work. Set to true
+	// only in clusters where the admin HTTP surface is network-restricted and
+	// the operator actually relies on the forget button.
+	AllowForgetViaHTTP bool `yaml:"allow_forget_via_http"`
+
 	// Whether the shuffle-sharding subring cache is disabled. This option is set
 	// internally and never exposed to the user.
 	SubringCacheDisabled bool `yaml:"-"`
@@ -143,6 +151,7 @@ func (cfg *Config) RegisterFlagsWithPrefix(prefix string, f *flag.FlagSet) {
 	f.IntVar(&cfg.ReplicationFactor, prefix+"distributor.replication-factor", 3, "The number of ingesters to write to and read from.")
 	f.BoolVar(&cfg.ZoneAwarenessEnabled, prefix+"distributor.zone-awareness-enabled", false, "True to enable the zone-awareness and replicate ingested samples across different availability zones.")
 	f.Var(&cfg.ExcludedZones, prefix+"distributor.excluded-zones", "Comma-separated list of zones to exclude from the ring. Instances in excluded zones will be filtered out from the ring.")
+	f.BoolVar(&cfg.AllowForgetViaHTTP, prefix+"ring.allow-forget-via-http", false, "Allow the ring status pages to remove (forget) instances via POST. Disabled by default; enable only on clusters where the admin HTTP surface is network-restricted.")
 }
 
 type instanceInfo struct {
