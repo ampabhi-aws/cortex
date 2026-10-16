@@ -7,6 +7,7 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 
 	"github.com/go-kit/log"
@@ -650,6 +651,30 @@ receivers:
     max_alerts: 0
 `,
 		},
+		// user3 has notification credentials embedded in its config. The
+		// ListAllConfigs endpoint is a cross-tenant operator view, so these
+		// values must be redacted before being streamed back to the caller.
+		"user3": {
+			AlertmanagerConfig: `
+global:
+  resolve_timeout: 5m
+  smtp_smarthost: smtp.example.com:587
+  smtp_from: alerts@example.com
+  smtp_auth_username: alerts
+  smtp_auth_password: s3cret-smtp-password
+  slack_api_url: https://hooks.slack.com/services/T000/B000/XXXYYYZZZ-top-secret
+route:
+  receiver: slack
+  group_by:
+  - '...'
+  continue: false
+receivers:
+- name: slack
+  slack_configs:
+  - api_url: https://hooks.slack.com/services/T111/B111/receiver-url-should-be-redacted
+    channel: '#alerts'
+`,
+		},
 	}
 
 	storage := objstore.NewInMemBucket()
@@ -677,7 +702,7 @@ receivers:
 
 	err = am.loadAndSyncConfigs(context.Background(), reasonPeriodic)
 	require.NoError(t, err)
-	require.Len(t, am.alertmanagers, 2)
+	require.Len(t, am.alertmanagers, 3)
 
 	router := mux.NewRouter()
 	router.Path("/multitenant_alertmanager/configs").Methods(http.MethodGet).HandlerFunc(am.ListAllConfigs)
@@ -690,9 +715,26 @@ receivers:
 	require.Equal(t, "application/yaml", resp.Header.Get("Content-Type"))
 	body, err := io.ReadAll(resp.Body)
 	require.NoError(t, err)
-	old, err := yaml.Marshal(testCases)
-	require.NoError(t, err)
-	require.YAMLEq(t, string(old), string(body))
+
+	// The response is a concatenation of yaml.v2 single-key maps (one per
+	// tenant), which together form a single YAML document whose top-level
+	// keys are tenant IDs. Decode it back and verify each tenant's config.
+	gotAll := map[string]*UserConfig{}
+	require.NoError(t, yaml.Unmarshal(body, &gotAll))
+	require.Len(t, gotAll, len(testCases))
+	for u, want := range testCases {
+		got, ok := gotAll[u]
+		require.True(t, ok, "missing user %q in response", u)
+		wantRedacted, err := redactAlertmanagerConfig(want.AlertmanagerConfig)
+		require.NoError(t, err)
+		require.YAMLEq(t, wantRedacted, got.AlertmanagerConfig, "user %q", u)
+	}
+
+	// Belt-and-braces: no cleartext secret from user3 should appear in the
+	// streamed response.
+	for _, needle := range []string{"s3cret-smtp-password", "XXXYYYZZZ-top-secret", "receiver-url-should-be-redacted"} {
+		require.False(t, strings.Contains(string(body), needle), "response leaked secret %q", needle)
+	}
 }
 
 func TestValidateAlertmanagerConfig(t *testing.T) {
