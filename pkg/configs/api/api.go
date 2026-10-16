@@ -81,29 +81,63 @@ func (a *API) admin(w http.ResponseWriter, r *http.Request) {
 `)
 }
 
+// Route describes a single HTTP route exposed by the configs API together
+// with the metadata needed by higher layers to apply the correct middleware.
+type Route struct {
+	Name    string
+	Method  string
+	Path    string
+	Handler http.HandlerFunc
+	// Auth indicates whether this route should be wrapped by the Cortex
+	// authentication middleware (which propagates the X-Scope-OrgID header
+	// into the request context). Tenant-facing endpoints set this to true;
+	// administrative/internal endpoints that are consumed by Cortex itself
+	// without a tenant header set this to false.
+	Auth bool
+}
+
+// Routes returns the HTTP routes served by the configs API.
+//
+// The Auth flag reflects whether a route is tenant-scoped (auth=true, so
+// Cortex's AuthMiddleware wraps it and the handler can rely on the tenant ID
+// being present in the request context) or an administrative/internal route
+// consumed by other Cortex components without a tenant header (auth=false,
+// matching the house pattern used by /multitenant_alertmanager/configs and
+// /ruler/rule_groups).
+func (a *API) Routes() []Route {
+	return []Route{
+		{Name: "root", Method: "GET", Path: "/", Handler: a.admin, Auth: false},
+		// Dedicated tenant-facing APIs for updating rules config. These resolve
+		// the tenant from the request and MUST be behind the auth middleware.
+		{Name: "get_rules", Method: "GET", Path: "/api/prom/configs/rules", Handler: a.getConfig, Auth: true},
+		{Name: "set_rules", Method: "POST", Path: "/api/prom/configs/rules", Handler: a.setConfig, Auth: true},
+		{Name: "get_templates", Method: "GET", Path: "/api/prom/configs/templates", Handler: a.getConfig, Auth: true},
+		{Name: "set_templates", Method: "POST", Path: "/api/prom/configs/templates", Handler: a.setConfig, Auth: true},
+		{Name: "get_alertmanager_config", Method: "GET", Path: "/api/prom/configs/alertmanager", Handler: a.getConfig, Auth: true},
+		{Name: "set_alertmanager_config", Method: "POST", Path: "/api/prom/configs/alertmanager", Handler: a.setConfig, Auth: true},
+		{Name: "validate_alertmanager_config", Method: "POST", Path: "/api/prom/configs/alertmanager/validate", Handler: a.validateAlertmanagerConfig, Auth: true},
+		{Name: "deactivate_config", Method: "DELETE", Path: "/api/prom/configs/deactivate", Handler: a.deactivateConfig, Auth: true},
+		{Name: "restore_config", Method: "POST", Path: "/api/prom/configs/restore", Handler: a.restoreConfig, Auth: true},
+		// Internal/administrative APIs returning all tenants' configurations.
+		// Consumed by Cortex's own configs client (pkg/configs/client/client.go)
+		// without a tenant header; the operator is expected to restrict access
+		// at the proxy / network layer, matching the pattern used by
+		// /multitenant_alertmanager/configs and /ruler/rule_groups.
+		{Name: "private_get_rules", Method: "GET", Path: "/private/api/prom/configs/rules", Handler: a.getConfigs, Auth: false},
+		{Name: "private_get_alertmanager_config", Method: "GET", Path: "/private/api/prom/configs/alertmanager", Handler: a.getConfigs, Auth: false},
+	}
+}
+
 // RegisterRoutes registers the configs API HTTP routes with the provided Router.
+//
+// This installs handlers directly on the raw mux router without applying the
+// Cortex authentication middleware. It is kept for internal use (New wires the
+// API's own router with it) and tests. When wiring the configs module into
+// Cortex use the API package's RegisterConfigAPI instead so that tenant-facing
+// routes inherit the auth middleware.
 func (a *API) RegisterRoutes(r *mux.Router) {
-	for _, route := range []struct {
-		name, method, path string
-		handler            http.HandlerFunc
-	}{
-		{"root", "GET", "/", a.admin},
-		// Dedicated APIs for updating rules config. In the future, these *must*
-		// be used.
-		{"get_rules", "GET", "/api/prom/configs/rules", a.getConfig},
-		{"set_rules", "POST", "/api/prom/configs/rules", a.setConfig},
-		{"get_templates", "GET", "/api/prom/configs/templates", a.getConfig},
-		{"set_templates", "POST", "/api/prom/configs/templates", a.setConfig},
-		{"get_alertmanager_config", "GET", "/api/prom/configs/alertmanager", a.getConfig},
-		{"set_alertmanager_config", "POST", "/api/prom/configs/alertmanager", a.setConfig},
-		{"validate_alertmanager_config", "POST", "/api/prom/configs/alertmanager/validate", a.validateAlertmanagerConfig},
-		{"deactivate_config", "DELETE", "/api/prom/configs/deactivate", a.deactivateConfig},
-		{"restore_config", "POST", "/api/prom/configs/restore", a.restoreConfig},
-		// Internal APIs.
-		{"private_get_rules", "GET", "/private/api/prom/configs/rules", a.getConfigs},
-		{"private_get_alertmanager_config", "GET", "/private/api/prom/configs/alertmanager", a.getConfigs},
-	} {
-		r.Handle(route.path, route.handler).Methods(route.method).Name(route.name)
+	for _, route := range a.Routes() {
+		r.Handle(route.Path, route.Handler).Methods(route.Method).Name(route.Name)
 	}
 }
 

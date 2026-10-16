@@ -18,6 +18,7 @@ import (
 	"github.com/cortexproject/cortex/pkg/alertmanager"
 	"github.com/cortexproject/cortex/pkg/alertmanager/alertmanagerpb"
 	"github.com/cortexproject/cortex/pkg/compactor"
+	configAPI "github.com/cortexproject/cortex/pkg/configs/api"
 	"github.com/cortexproject/cortex/pkg/cortexpb"
 	"github.com/cortexproject/cortex/pkg/distributor"
 	"github.com/cortexproject/cortex/pkg/distributor/distributorpb"
@@ -278,6 +279,20 @@ func (a *API) RegisterIngester(i Ingester, pushConfig distributor.Config) {
 func (a *API) RegisterTenantDeletion(api *purger.TenantDeletionAPI) {
 	a.RegisterRoute("/purger/delete_tenant", http.HandlerFunc(api.DeleteTenant), true, "POST")
 	a.RegisterRoute("/purger/delete_tenant_status", http.HandlerFunc(api.DeleteTenantStatus), true, "GET")
+}
+
+// RegisterConfigAPI registers the legacy configs service HTTP routes through
+// the Cortex API so that tenant-facing routes inherit the authentication
+// middleware. Administrative/internal routes (e.g. /private/api/prom/configs/*)
+// are registered without the tenant-auth middleware, matching the house
+// pattern used by /multitenant_alertmanager/configs and /ruler/rule_groups,
+// and are expected to be restricted by the operator at the proxy / network
+// layer. The configs module itself is deprecated and must be explicitly
+// targeted.
+func (a *API) RegisterConfigAPI(c *configAPI.API) {
+	for _, route := range c.Routes() {
+		a.RegisterRoute(route.Path, route.Handler, route.Auth, route.Method)
+	}
 }
 
 // RegisterRuler registers routes associated with the Ruler service.
