@@ -18,7 +18,7 @@ func TestRateLimitedNotifier(t *testing.T) {
 
 	// Initial limits.
 	limiter := &limiter{limit: 5, burst: 5}
-	rateLimitedNotifier := newRateLimitedNotifier(mock, limiter, 10*time.Second, counter)
+	rateLimitedNotifier := newRateLimitedNotifier(mock, limiter, 10*time.Second, counter, nil)
 
 	runNotifications(t, rateLimitedNotifier, counter, 10, 5, 5, 5)
 

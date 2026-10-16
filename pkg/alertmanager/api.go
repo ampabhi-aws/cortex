@@ -35,6 +35,8 @@ const (
 	errConfigurationTooBig   = "Alertmanager configuration is too big, limit: %d bytes"
 	errTooManyTemplates      = "too many templates in the configuration: %d (limit: %d)"
 	errTemplateTooBig        = "template %s is too big: %d bytes (limit: %d bytes)"
+	errTooManyReceivers      = "too many receivers in the configuration: %d (limit: %d)"
+	errTooManyIntegrations   = "too many receiver integration instances in the configuration: %d (limit: %d)"
 
 	fetchConcurrency = 16
 )
@@ -190,6 +192,19 @@ func validateUserConfig(logger log.Logger, cfg alertspb.AlertConfigDesc, limits 
 		return err
 	}
 
+	// Cap the number of receivers and the total number of receiver integration instances a tenant
+	// can declare. Each integration instance gets wired through the per-tenant notification
+	// rate-limited pipeline, so without a cap a tenant could grow the notification fan-out
+	// (and the amount of shared process/socket/CPU work) without bound.
+	if l := limits.AlertmanagerMaxReceivers(user); l > 0 && len(amCfg.Receivers) > l {
+		return fmt.Errorf(errTooManyReceivers, len(amCfg.Receivers), l)
+	}
+	if l := limits.AlertmanagerMaxReceiverIntegrations(user); l > 0 {
+		if total := countReceiverIntegrations(amCfg.Receivers); total > l {
+			return fmt.Errorf(errTooManyIntegrations, total, l)
+		}
+	}
+
 	// Validate templates referenced in the alertmanager config.
 	for _, name := range amCfg.Templates {
 		if err := validateTemplateFilename(name); err != nil {
@@ -302,6 +317,29 @@ func (am *MultitenantAlertmanager) ListAllConfigs(w http.ResponseWriter, r *http
 	}
 	close(iter)
 	<-done
+}
+
+// countReceiverIntegrations returns the total number of receiver integration instances
+// (sum of webhook_configs, email_configs, pagerduty_configs, opsgenie_configs,
+// wechat_configs, slack_configs, victorops_configs, pushover_configs and sns_configs
+// across every receiver) declared in the given config.
+func countReceiverIntegrations(receivers []*config.Receiver) int {
+	total := 0
+	for _, rcv := range receivers {
+		if rcv == nil {
+			continue
+		}
+		total += len(rcv.WebhookConfigs)
+		total += len(rcv.EmailConfigs)
+		total += len(rcv.PagerdutyConfigs)
+		total += len(rcv.OpsGenieConfigs)
+		total += len(rcv.WechatConfigs)
+		total += len(rcv.SlackConfigs)
+		total += len(rcv.VictorOpsConfigs)
+		total += len(rcv.PushoverConfigs)
+		total += len(rcv.SNSConfigs)
+	}
+	return total
 }
 
 // validateAlertmanagerConfig recursively scans the input config looking for data types for which

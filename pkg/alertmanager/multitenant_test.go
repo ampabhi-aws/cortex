@@ -2109,6 +2109,8 @@ type mockAlertManagerLimits struct {
 	maxDispatcherAggregationGroups int
 	maxAlertsCount                 int
 	maxAlertsSizeBytes             int
+	maxReceivers                   int
+	maxReceiverIntegrations        int
 }
 
 func (m *mockAlertManagerLimits) AlertmanagerMaxConfigSize(tenant string) int {
@@ -2149,4 +2151,12 @@ func (m *mockAlertManagerLimits) AlertmanagerMaxAlertsCount(_ string) int {
 
 func (m *mockAlertManagerLimits) AlertmanagerMaxAlertsSizeBytes(_ string) int {
 	return m.maxAlertsSizeBytes
+}
+
+func (m *mockAlertManagerLimits) AlertmanagerMaxReceivers(_ string) int {
+	return m.maxReceivers
+}
+
+func (m *mockAlertManagerLimits) AlertmanagerMaxReceiverIntegrations(_ string) int {
+	return m.maxReceiverIntegrations
 }
