@@ -447,14 +447,19 @@ func (a *API) CreateRuleGroup(w http.ResponseWriter, req *http.Request) {
 		return
 	}
 
-	payload, err := io.ReadAll(req.Body)
+	payload, err := io.ReadAll(maxBytesReader(w, req, a.ruler.limits.RulerMaxRuleGroupSize(userID)))
 	if err != nil {
+		if isMaxBytesExceeded(err) {
+			level.Warn(logger).Log("msg", "rule group payload too large", "user", userID, "err", err.Error())
+			http.Error(w, err.Error(), http.StatusRequestEntityTooLarge)
+			return
+		}
 		level.Error(logger).Log("msg", "unable to read rule group payload", "err", err.Error())
 		http.Error(w, err.Error(), http.StatusBadRequest)
 		return
 	}
 
-	level.Debug(logger).Log("msg", "attempting to unmarshal rulegroup", "userID", userID, "group", string(payload))
+	level.Debug(logger).Log("msg", "attempting to unmarshal rulegroup", "userID", userID, "payload_bytes", len(payload))
 
 	rg := rulefmt.RuleGroup{}
 	err = yaml.Unmarshal(payload, &rg)
@@ -550,4 +555,29 @@ func (a *API) DeleteRuleGroup(w http.ResponseWriter, req *http.Request) {
 	}
 
 	respondAccepted(w, logger)
+}
+
+// maxBytesReader returns a reader for req.Body that enforces the per-tenant
+// max rule group payload size. A limit of 0 means unlimited.
+func maxBytesReader(w http.ResponseWriter, req *http.Request, limit int) io.Reader {
+	if limit <= 0 {
+		return req.Body
+	}
+	// Add one byte to the limit so http.MaxBytesReader triggers an error
+	// when the payload is strictly larger than the configured limit.
+	req.Body = http.MaxBytesReader(w, req.Body, int64(limit))
+	return req.Body
+}
+
+// isMaxBytesExceeded reports whether err was produced by http.MaxBytesReader
+// as a result of the request body exceeding the configured limit.
+func isMaxBytesExceeded(err error) bool {
+	if err == nil {
+		return false
+	}
+	// net/http's MaxBytesReader returns an error whose message is
+	// "http: request body too large". Match on that to avoid depending on
+	// the unexported *http.MaxBytesError type (not available in older Go
+	// versions).
+	return strings.Contains(err.Error(), "request body too large")
 }
