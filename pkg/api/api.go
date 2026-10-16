@@ -338,7 +338,10 @@ func (a *API) RegisterStoreGateway(s *storegateway.StoreGateway) {
 	storegatewaypb.RegisterStoreGatewayServer(a.server.GRPC, s)
 
 	a.indexPage.AddLink(SectionAdminEndpoints, "/store-gateway/ring", "Store Gateway Ring")
-	a.RegisterRoute("/store-gateway/ring", http.HandlerFunc(s.RingHandler), false, "GET", "POST")
+	// Only register GET: the ring page is a status view and must not accept
+	// unauthenticated POST (which `Ring.ServeHTTP` interprets as a `forget`
+	// mutation that evicts store-gateway instances from the shared ring).
+	a.RegisterRoute("/store-gateway/ring", http.HandlerFunc(s.RingHandler), false, "GET")
 }
 
 // RegisterCompactor registers the ring UI page associated with the compactor.

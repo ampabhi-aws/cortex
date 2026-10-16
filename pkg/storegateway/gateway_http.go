@@ -37,6 +37,16 @@ func writeMessage(w http.ResponseWriter, message string) {
 }
 
 func (c *StoreGateway) RingHandler(w http.ResponseWriter, req *http.Request) {
+	// The ring page is a read-only status view. Reject any non-GET method so
+	// that unauthenticated callers cannot invoke the ring's POST `forget`
+	// mutation (which would evict store-gateway instances from the shared
+	// ring KV store and break blocks-storage queries for every tenant).
+	if req.Method != http.MethodGet && req.Method != http.MethodHead {
+		w.Header().Set("Allow", "GET, HEAD")
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
 	if !c.gatewayCfg.ShardingEnabled {
 		writeMessage(w, "Store gateway has no ring because sharding is disabled.")
 		return
