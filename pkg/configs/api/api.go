@@ -64,8 +64,35 @@ func New(database db.DB, cfg Config) *API {
 	}
 	r := mux.NewRouter()
 	a.RegisterRoutes(r)
+	a.RegisterAdminRoutes(r)
 	a.Handler = r
 	return a
+}
+
+// AdminRoute describes an administrative route served by the configs API.
+// These routes expose cross-tenant data (every tenant's configuration) and
+// MUST be registered behind operator-level authentication when attached to a
+// shared/public HTTP listener. Use RegisterAdminRoutes only on a trusted
+// router (for example, the test harness router); when attaching to Cortex's
+// shared HTTP server, callers should iterate AdminRoutes() and register each
+// entry via api.RegisterRoute with auth=true, or expose them on a separate,
+// network-restricted listener.
+type AdminRoute struct {
+	Name    string
+	Method  string
+	Path    string
+	Handler http.HandlerFunc
+}
+
+// AdminRoutes returns the set of cross-tenant administrative routes. The
+// handlers returned here walk every tenant's configuration (including raw
+// Alertmanager YAML, which may contain receiver secrets); access to these
+// routes MUST be restricted to operators.
+func (a *API) AdminRoutes() []AdminRoute {
+	return []AdminRoute{
+		{"private_get_rules", "GET", "/private/api/prom/configs/rules", a.getConfigs},
+		{"private_get_alertmanager_config", "GET", "/private/api/prom/configs/alertmanager", a.getConfigs},
+	}
 }
 
 func (a *API) admin(w http.ResponseWriter, r *http.Request) {
@@ -81,7 +108,9 @@ func (a *API) admin(w http.ResponseWriter, r *http.Request) {
 `)
 }
 
-// RegisterRoutes registers the configs API HTTP routes with the provided Router.
+// RegisterRoutes registers the per-tenant configs API HTTP routes with the
+// provided Router. Cross-tenant administrative routes are intentionally not
+// registered here; see RegisterAdminRoutes / AdminRoutes.
 func (a *API) RegisterRoutes(r *mux.Router) {
 	for _, route := range []struct {
 		name, method, path string
@@ -99,11 +128,20 @@ func (a *API) RegisterRoutes(r *mux.Router) {
 		{"validate_alertmanager_config", "POST", "/api/prom/configs/alertmanager/validate", a.validateAlertmanagerConfig},
 		{"deactivate_config", "DELETE", "/api/prom/configs/deactivate", a.deactivateConfig},
 		{"restore_config", "POST", "/api/prom/configs/restore", a.restoreConfig},
-		// Internal APIs.
-		{"private_get_rules", "GET", "/private/api/prom/configs/rules", a.getConfigs},
-		{"private_get_alertmanager_config", "GET", "/private/api/prom/configs/alertmanager", a.getConfigs},
 	} {
 		r.Handle(route.path, route.handler).Methods(route.method).Name(route.name)
+	}
+}
+
+// RegisterAdminRoutes registers the cross-tenant administrative routes on the
+// provided Router WITHOUT any authentication wrapper. This is intended for
+// trusted routers (test harness, dedicated admin listener). When attaching to
+// a shared/public HTTP server, callers MUST route each AdminRoutes() entry
+// through operator-authenticating middleware (e.g. api.RegisterRoute with
+// auth=true) instead of calling this method directly.
+func (a *API) RegisterAdminRoutes(r *mux.Router) {
+	for _, route := range a.AdminRoutes() {
+		r.Handle(route.Path, route.Handler).Methods(route.Method).Name(route.Name)
 	}
 }
 
