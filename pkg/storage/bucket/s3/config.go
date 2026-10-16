@@ -62,7 +62,7 @@ type Config struct {
 	Region           string         `yaml:"region"`
 	BucketName       string         `yaml:"bucket_name"`
 	SecretAccessKey  flagext.Secret `yaml:"secret_access_key"`
-	AccessKeyID      string         `yaml:"access_key_id"`
+	AccessKeyID      flagext.Secret `yaml:"access_key_id"`
 	Insecure         bool           `yaml:"insecure"`
 	SignatureVersion string         `yaml:"signature_version"`
 	BucketLookupType string         `yaml:"bucket_lookup_type"`
@@ -78,7 +78,7 @@ func (cfg *Config) RegisterFlags(f *flag.FlagSet) {
 
 // RegisterFlagsWithPrefix registers the flags for s3 storage with the provided prefix
 func (cfg *Config) RegisterFlagsWithPrefix(prefix string, f *flag.FlagSet) {
-	f.StringVar(&cfg.AccessKeyID, prefix+"s3.access-key-id", "", "S3 access key ID")
+	f.Var(&cfg.AccessKeyID, prefix+"s3.access-key-id", "S3 access key ID")
 	f.Var(&cfg.SecretAccessKey, prefix+"s3.secret-access-key", "S3 secret access key")
 	f.StringVar(&cfg.BucketName, prefix+"s3.bucket-name", "", "S3 bucket name")
 	f.StringVar(&cfg.Region, prefix+"s3.region", "", "S3 region. If unset, the client will issue a S3 GetBucketLocation API call to autodetect it.")

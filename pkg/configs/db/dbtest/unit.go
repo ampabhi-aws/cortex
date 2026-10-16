@@ -10,13 +10,14 @@ import (
 	"github.com/weaveworks/common/logging"
 
 	"github.com/cortexproject/cortex/pkg/configs/db"
+	"github.com/cortexproject/cortex/pkg/util/flagext"
 )
 
 // Setup sets up stuff for testing, creating a new database
 func Setup(t *testing.T) db.DB {
 	require.NoError(t, logging.Setup("debug"))
 	database, err := db.New(db.Config{
-		URI: "memory://",
+		URI: flagext.MaskedURLString{Value: "memory://"},
 	})
 	require.NoError(t, err)
 	return database

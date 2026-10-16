@@ -14,6 +14,7 @@ import (
 	"github.com/stretchr/testify/require"
 
 	"github.com/cortexproject/cortex/pkg/util"
+	"github.com/cortexproject/cortex/pkg/util/flagext"
 )
 
 func TestBuildNotifierConfig(t *testing.T) {
@@ -31,7 +32,7 @@ func TestBuildNotifierConfig(t *testing.T) {
 		{
 			name: "with a single URL and no service discovery",
 			cfg: &Config{
-				AlertmanagerURL: "http://alertmanager.default.svc.cluster.local/alertmanager",
+				AlertmanagerURL: flagext.MaskedURLStringList{Value: "http://alertmanager.default.svc.cluster.local/alertmanager"},
 			},
 			ncfg: &config.Config{
 				AlertingConfig: config.AlertingConfig{
@@ -55,7 +56,7 @@ func TestBuildNotifierConfig(t *testing.T) {
 		{
 			name: "with a single URL and service discovery",
 			cfg: &Config{
-				AlertmanagerURL:             "http://_http._tcp.alertmanager.default.svc.cluster.local/alertmanager",
+				AlertmanagerURL:             flagext.MaskedURLStringList{Value: "http://_http._tcp.alertmanager.default.svc.cluster.local/alertmanager"},
 				AlertmanagerDiscovery:       true,
 				AlertmanagerRefreshInterval: time.Duration(60),
 			},
@@ -82,7 +83,7 @@ func TestBuildNotifierConfig(t *testing.T) {
 		{
 			name: "with service discovery and an invalid URL",
 			cfg: &Config{
-				AlertmanagerURL:       "http://_http.default.svc.cluster.local/alertmanager",
+				AlertmanagerURL:       flagext.MaskedURLStringList{Value: "http://_http.default.svc.cluster.local/alertmanager"},
 				AlertmanagerDiscovery: true,
 			},
 			err: fmt.Errorf("when alertmanager-discovery is on, host name must be of the form _portname._tcp.service.fqdn (is \"alertmanager.default.svc.cluster.local\")"),
@@ -90,7 +91,7 @@ func TestBuildNotifierConfig(t *testing.T) {
 		{
 			name: "with multiple URLs and no service discovery",
 			cfg: &Config{
-				AlertmanagerURL: "http://alertmanager-0.default.svc.cluster.local/alertmanager,http://alertmanager-1.default.svc.cluster.local/alertmanager",
+				AlertmanagerURL: flagext.MaskedURLStringList{Value: "http://alertmanager-0.default.svc.cluster.local/alertmanager,http://alertmanager-1.default.svc.cluster.local/alertmanager"},
 			},
 			ncfg: &config.Config{
 				AlertingConfig: config.AlertingConfig{
@@ -124,7 +125,7 @@ func TestBuildNotifierConfig(t *testing.T) {
 		{
 			name: "with multiple URLs and service discovery",
 			cfg: &Config{
-				AlertmanagerURL:             "http://_http._tcp.alertmanager-0.default.svc.cluster.local/alertmanager,http://_http._tcp.alertmanager-1.default.svc.cluster.local/alertmanager",
+				AlertmanagerURL:             flagext.MaskedURLStringList{Value: "http://_http._tcp.alertmanager-0.default.svc.cluster.local/alertmanager,http://_http._tcp.alertmanager-1.default.svc.cluster.local/alertmanager"},
 				AlertmanagerDiscovery:       true,
 				AlertmanagerRefreshInterval: time.Duration(60),
 			},
@@ -164,7 +165,7 @@ func TestBuildNotifierConfig(t *testing.T) {
 		{
 			name: "with Basic Authentication URL",
 			cfg: &Config{
-				AlertmanagerURL: "http://marco:hunter2@alertmanager-0.default.svc.cluster.local/alertmanager",
+				AlertmanagerURL: flagext.MaskedURLStringList{Value: "http://marco:hunter2@alertmanager-0.default.svc.cluster.local/alertmanager"},
 			},
 			ncfg: &config.Config{
 				AlertingConfig: config.AlertingConfig{
@@ -191,11 +192,11 @@ func TestBuildNotifierConfig(t *testing.T) {
 		{
 			name: "with Basic Authentication URL and Explicit",
 			cfg: &Config{
-				AlertmanagerURL: "http://marco:hunter2@alertmanager-0.default.svc.cluster.local/alertmanager",
+				AlertmanagerURL: flagext.MaskedURLStringList{Value: "http://marco:hunter2@alertmanager-0.default.svc.cluster.local/alertmanager"},
 				Notifier: NotifierConfig{
 					BasicAuth: util.BasicAuth{
 						Username: "jacob",
-						Password: "test",
+						Password: flagext.Secret{Value: "test"},
 					},
 				},
 			},
@@ -224,7 +225,7 @@ func TestBuildNotifierConfig(t *testing.T) {
 		{
 			name: "with external labels",
 			cfg: &Config{
-				AlertmanagerURL: "http://alertmanager.default.svc.cluster.local/alertmanager",
+				AlertmanagerURL: flagext.MaskedURLStringList{Value: "http://alertmanager.default.svc.cluster.local/alertmanager"},
 				ExternalLabels: []labels.Label{
 					{Name: "region", Value: "us-east-1"},
 				},
