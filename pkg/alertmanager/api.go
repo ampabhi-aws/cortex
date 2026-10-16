@@ -8,6 +8,7 @@ import (
 	"os"
 	"path/filepath"
 	"reflect"
+	"regexp"
 
 	"github.com/go-kit/log"
 	"github.com/go-kit/log/level"
@@ -286,7 +287,7 @@ func (am *MultitenantAlertmanager) ListAllConfigs(w http.ResponseWriter, r *http
 		data := map[string]*UserConfig{
 			userID: {
 				TemplateFiles:      alertspb.ParseTemplates(cfg),
-				AlertmanagerConfig: cfg.RawConfig,
+				AlertmanagerConfig: redactAlertmanagerConfig(cfg.RawConfig),
 			},
 		}
 
@@ -448,4 +449,50 @@ func validateVictorOpsConfig(cfg config.VictorOpsConfig) error {
 		return errVictorOpsAPIKeyFileNotAllowed
 	}
 	return nil
+}
+
+// redactedPlaceholder is substituted for secret values streamed by the admin
+// cross-tenant list endpoint. The real secret is retained in storage; this
+// only redacts the response body.
+const redactedPlaceholder = "<redacted>"
+
+// redactSecretKeyLineRE matches a YAML scalar line whose key is one of the
+// well-known Alertmanager/Prometheus notification-secret fields. It captures
+// the leading indent + key + colon + whitespace, so the value can be replaced
+// without disturbing surrounding structure. YAML block scalars (|, >) are
+// handled by rewriting the marker line to a plain quoted scalar.
+var redactSecretKeyLineRE = regexp.MustCompile(`(?m)^(\s*(?:-\s+)?(?:` +
+	`api_url|api_key|api_url_file|api_key_file|` +
+	`slack_api_url|slack_api_url_file|` +
+	`smtp_auth_password|smtp_auth_password_file|smtp_auth_secret|` +
+	`service_key|routing_key|` +
+	`auth_token|auth_password|auth_secret|` +
+	`bearer_token|bearer_token_file|` +
+	`password|password_file|` +
+	`client_secret|client_secret_file|` +
+	`credentials|credentials_file` +
+	`)\s*:\s*)(\S.*)$`)
+
+// redactAlertmanagerConfig returns the Alertmanager raw YAML config with
+// known secret-bearing fields replaced by a redacted placeholder. The result
+// is informational and must not be fed back into the Alertmanager as a
+// configuration source.
+func redactAlertmanagerConfig(raw string) string {
+	if raw == "" {
+		return raw
+	}
+	return redactSecretKeyLineRE.ReplaceAllStringFunc(raw, func(line string) string {
+		m := redactSecretKeyLineRE.FindStringSubmatch(line)
+		if len(m) < 3 {
+			return line
+		}
+		value := m[2]
+		// Block scalar indicator (|, |-, >, >- etc.): redact to a quoted
+		// scalar so the following indented block (not matched by this regex)
+		// no longer applies to the key.
+		if len(value) > 0 && (value[0] == '|' || value[0] == '>') {
+			return m[1] + "\"" + redactedPlaceholder + "\""
+		}
+		return m[1] + redactedPlaceholder
+	})
 }

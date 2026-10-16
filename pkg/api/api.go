@@ -180,14 +180,23 @@ func (a *API) RegisterRoutesWithPrefix(prefix string, handler http.Handler, auth
 
 // RegisterAlertmanager registers endpoints associated with the alertmanager. It will only
 // serve endpoints using the legacy http-prefix if it is not run as a single binary.
-func (a *API) RegisterAlertmanager(am *alertmanager.MultitenantAlertmanager, target, apiEnabled bool) {
+//
+// The multitenantAdminAPIEnabled argument explicitly opts in to the cross-tenant
+// administrative dump endpoints (currently /multitenant_alertmanager/configs).
+// These endpoints iterate over every tenant's configuration and must therefore
+// never be exposed to tenant-facing listeners; they are registered only when
+// the operator has opted in.
+func (a *API) RegisterAlertmanager(am *alertmanager.MultitenantAlertmanager, target, apiEnabled, multitenantAdminAPIEnabled bool) {
 	alertmanagerpb.RegisterAlertmanagerServer(a.server.GRPC, am)
 
 	a.indexPage.AddLink(SectionAdminEndpoints, "/multitenant_alertmanager/status", "Alertmanager Status")
 	a.indexPage.AddLink(SectionAdminEndpoints, "/multitenant_alertmanager/ring", "Alertmanager Ring Status")
 	// Ensure this route is registered before the prefixed AM route
 	a.RegisterRoute("/multitenant_alertmanager/status", am.GetStatusHandler(), false, "GET")
-	a.RegisterRoute("/multitenant_alertmanager/configs", http.HandlerFunc(am.ListAllConfigs), false, "GET")
+	if multitenantAdminAPIEnabled {
+		a.indexPage.AddLink(SectionAdminEndpoints, "/multitenant_alertmanager/configs", "List All Alertmanager Configurations (admin, cross-tenant)")
+		a.RegisterRoute("/multitenant_alertmanager/configs", http.HandlerFunc(am.ListAllConfigs), false, "GET")
+	}
 	a.RegisterRoute("/multitenant_alertmanager/ring", http.HandlerFunc(am.RingHandler), false, "GET", "POST")
 	a.RegisterRoute("/multitenant_alertmanager/delete_tenant_config", http.HandlerFunc(am.DeleteUserConfig), true, "POST")
 
@@ -281,7 +290,12 @@ func (a *API) RegisterTenantDeletion(api *purger.TenantDeletionAPI) {
 }
 
 // RegisterRuler registers routes associated with the Ruler service.
-func (a *API) RegisterRuler(r *ruler.Ruler) {
+//
+// The multitenantAdminAPIEnabled argument explicitly opts in to the cross-tenant
+// administrative dump endpoint /ruler/rule_groups, which iterates over every
+// tenant's rule groups. It must never be exposed to tenant-facing listeners,
+// so it is registered only when the operator has opted in.
+func (a *API) RegisterRuler(r *ruler.Ruler, multitenantAdminAPIEnabled bool) {
 	a.indexPage.AddLink(SectionAdminEndpoints, "/ruler/ring", "Ruler Ring Status")
 	a.RegisterRoute("/ruler/ring", r, false, "GET", "POST")
 
@@ -291,8 +305,11 @@ func (a *API) RegisterRuler(r *ruler.Ruler) {
 	// Legacy Ring Route
 	a.RegisterRoute("/ruler_ring", r, false, "GET", "POST")
 
-	// List all user rule groups
-	a.RegisterRoute("/ruler/rule_groups", http.HandlerFunc(r.ListAllRules), false, "GET")
+	if multitenantAdminAPIEnabled {
+		// List all user rule groups (cross-tenant admin endpoint; opt-in only).
+		a.indexPage.AddLink(SectionAdminEndpoints, "/ruler/rule_groups", "List All Rule Groups (admin, cross-tenant)")
+		a.RegisterRoute("/ruler/rule_groups", http.HandlerFunc(r.ListAllRules), false, "GET")
+	}
 
 	ruler.RegisterRulerServer(a.server.GRPC, r)
 }

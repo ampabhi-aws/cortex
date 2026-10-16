@@ -574,7 +574,7 @@ func (t *Cortex) initRuler() (serv services.Service, err error) {
 	}
 
 	// Expose HTTP/GRPC endpoints for the Ruler service
-	t.API.RegisterRuler(t.Ruler)
+	t.API.RegisterRuler(t.Ruler, t.Cfg.Ruler.EnableMultitenantAdminAPI)
 
 	// If the API is enabled, register the Ruler API
 	if t.Cfg.Ruler.EnableAPI {
@@ -612,7 +612,7 @@ func (t *Cortex) initAlertManager() (serv services.Service, err error) {
 		return
 	}
 
-	t.API.RegisterAlertmanager(t.Alertmanager, t.Cfg.isModuleEnabled(AlertManager), t.Cfg.Alertmanager.EnableAPI)
+	t.API.RegisterAlertmanager(t.Alertmanager, t.Cfg.isModuleEnabled(AlertManager), t.Cfg.Alertmanager.EnableAPI, t.Cfg.Alertmanager.EnableMultitenantAdminAPI)
 	return t.Alertmanager, nil
 }
 
