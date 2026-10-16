@@ -306,8 +306,20 @@ func (u *userTSDB) casState(from, to tsdbState) bool {
 	return true
 }
 
+// maxHeadCompactionRanges caps the number of block-range iterations a single
+// compactHead invocation may perform. It is a defence-in-depth guard: in
+// combination with timestamp validation in Ingester.Push, a legitimate head
+// should never span more than a handful of ranges, so this bound only trips if
+// a stale/far-future sample made it into the head. 1000 iterations of the
+// default 2h block range covers ~83 days of head data, which is well beyond
+// any sane working set.
+const maxHeadCompactionRanges = 1000
+
 // compactHead compacts the Head block at specified block durations avoiding a single huge block.
-func (u *userTSDB) compactHead(blockDuration int64) error {
+// It bounds the number of block-range iterations and aborts if the supplied context is cancelled,
+// to protect against an unbounded loop when the head contains a sample with an attacker-controlled
+// far-future timestamp (CWE-835).
+func (u *userTSDB) compactHead(ctx context.Context, blockDuration int64) error {
 	if !u.casState(active, forceCompacting) {
 		return errors.New("TSDB head cannot be compacted because it is not in active state (possibly being closed or blocks shipping in progress)")
 	}
@@ -323,7 +335,23 @@ func (u *userTSDB) compactHead(blockDuration int64) error {
 
 	minTime, maxTime := h.MinTime(), h.MaxTime()
 
+	iterations := 0
 	for (minTime/blockDuration)*blockDuration != (maxTime/blockDuration)*blockDuration {
+		// Honor context cancellation / deadlines so a wedged compaction cannot block the
+		// per-ingester compaction loop forever.
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+
+		// Bound the number of iterations. Each CompactHead call does real disk work
+		// (block reload, memory truncation, WAL truncation) and advances the head's
+		// min time by exactly one blockDuration, so a head whose max time is far in
+		// the future would otherwise drive this loop for an unbounded time.
+		if iterations >= maxHeadCompactionRanges {
+			return errors.Errorf("TSDB head compaction aborted after %d block-range iterations: head spans an abnormally large time window (minTime=%d maxTime=%d blockDuration=%d); check for samples with far-future or far-past timestamps", iterations, minTime, maxTime, blockDuration)
+		}
+		iterations++
+
 		// Data in Head spans across multiple block ranges, so we break it into blocks here.
 		// Block max time is exclusive, so we do a -1 here.
 		blockMaxTime := ((minTime/blockDuration)+1)*blockDuration - 1
@@ -945,6 +973,7 @@ func (i *Ingester) Push(ctx context.Context, req *cortexpb.WriteRequest) (*corte
 		startAppend               = time.Now()
 		sampleOutOfBoundsCount    = 0
 		sampleOutOfOrderCount     = 0
+		sampleTooFarInFutureCount = 0
 		newValueForTimestampCount = 0
 		perUserSeriesLimitCount   = 0
 		perMetricSeriesLimitCount = 0
@@ -955,6 +984,21 @@ func (i *Ingester) Push(ctx context.Context, req *cortexpb.WriteRequest) (*corte
 			}
 		}
 	)
+
+	// Re-validate sample timestamps on the ingester itself, so that the direct
+	// /ingester/push path cannot bypass the distributor's creation_grace_period
+	// check and place a far-future sample in the TSDB head (which would drive
+	// userTSDB.compactHead into an effectively unbounded loop). A zero/negative
+	// grace period disables the upper-bound check (matches historical behavior
+	// when i.limits is nil, e.g. in some tests).
+	var maxAllowedTimestampMs int64
+	checkSampleTimestamp := false
+	if i.limits != nil {
+		if grace := i.limits.CreationGracePeriod(userID); grace > 0 {
+			maxAllowedTimestampMs = startAppend.UnixNano()/int64(time.Millisecond) + grace.Milliseconds()
+			checkSampleTimestamp = true
+		}
+	}
 
 	// Walk the samples, appending them to the users database
 	app := db.Appender(ctx).(extendedAppender)
@@ -970,6 +1014,22 @@ func (i *Ingester) Push(ctx context.Context, req *cortexpb.WriteRequest) (*corte
 
 		for _, s := range ts.Samples {
 			var err error
+
+			// Reject samples whose timestamp is further in the future than the
+			// per-tenant creation grace period. Without this, a far-future
+			// timestamp would be accepted by the TSDB head (which only enforces
+			// a lower bound) and would make userTSDB.compactHead walk every
+			// block range between the head's min and max times.
+			if checkSampleTimestamp && s.TimestampMs > maxAllowedTimestampMs {
+				failedSamplesCount++
+				sampleTooFarInFutureCount++
+				sampleTS := s.TimestampMs
+				sampleLabels := ts.Labels
+				updateFirstPartial(func() error {
+					return wrappedTSDBIngestErr(errors.Errorf("sample timestamp too new: %d exceeds max accepted timestamp %d", sampleTS, maxAllowedTimestampMs), model.Time(sampleTS), sampleLabels)
+				})
+				continue
+			}
 
 			// If the cached reference exists, we try to use it.
 			if ref != 0 {
@@ -1100,6 +1160,9 @@ func (i *Ingester) Push(ctx context.Context, req *cortexpb.WriteRequest) (*corte
 	}
 	if sampleOutOfOrderCount > 0 {
 		validation.DiscardedSamples.WithLabelValues(sampleOutOfOrder, userID).Add(float64(sampleOutOfOrderCount))
+	}
+	if sampleTooFarInFutureCount > 0 {
+		validation.DiscardedSamples.WithLabelValues(sampleTimestampTooNew, userID).Add(float64(sampleTooFarInFutureCount))
 	}
 	if newValueForTimestampCount > 0 {
 		validation.DiscardedSamples.WithLabelValues(newValueForTimestamp, userID).Add(float64(newValueForTimestampCount))
@@ -2229,12 +2292,12 @@ func (i *Ingester) compactBlocks(ctx context.Context, force bool, allowed *util.
 		switch {
 		case force:
 			reason = "forced"
-			err = userDB.compactHead(i.cfg.BlocksStorageConfig.TSDB.BlockRanges[0].Milliseconds())
+			err = userDB.compactHead(ctx, i.cfg.BlocksStorageConfig.TSDB.BlockRanges[0].Milliseconds())
 
 		case i.TSDBState.compactionIdleTimeout > 0 && userDB.isIdle(time.Now(), i.TSDBState.compactionIdleTimeout):
 			reason = "idle"
 			level.Info(logutil.WithContext(ctx, i.logger)).Log("msg", "TSDB is idle, forcing compaction", "user", userID)
-			err = userDB.compactHead(i.cfg.BlocksStorageConfig.TSDB.BlockRanges[0].Milliseconds())
+			err = userDB.compactHead(ctx, i.cfg.BlocksStorageConfig.TSDB.BlockRanges[0].Milliseconds())
 
 		default:
 			reason = "regular"
