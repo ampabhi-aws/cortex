@@ -50,6 +50,16 @@ type TCPTransportConfig struct {
 	// Timeout for writing packet data. Zero = no timeout.
 	PacketWriteTimeout time.Duration `yaml:"packet_write_timeout"`
 
+	// Timeout for reading inbound packet data. Zero = no timeout.
+	PacketReadTimeout time.Duration `yaml:"packet_read_timeout"`
+
+	// Maximum size, in bytes, of an inbound packet. Packets larger than this
+	// are rejected rather than buffered. Zero = no limit (not recommended).
+	MaxPacketSize int `yaml:"max_packet_size"`
+
+	// Maximum number of inbound TCP connections handled concurrently. Zero = no limit.
+	MaxConcurrentConnections int `yaml:"max_concurrent_connections"`
+
 	// Transport logs lot of messages at debug level, so it deserves an extra flag for turning it on
 	TransportDebug bool `yaml:"-"`
 
@@ -72,6 +82,9 @@ func (cfg *TCPTransportConfig) RegisterFlagsWithPrefix(f *flag.FlagSet, prefix s
 	f.IntVar(&cfg.BindPort, prefix+"memberlist.bind-port", 7946, "Port to listen on for gossip messages.")
 	f.DurationVar(&cfg.PacketDialTimeout, prefix+"memberlist.packet-dial-timeout", 5*time.Second, "Timeout used when connecting to other nodes to send packet.")
 	f.DurationVar(&cfg.PacketWriteTimeout, prefix+"memberlist.packet-write-timeout", 5*time.Second, "Timeout for writing 'packet' data.")
+	f.DurationVar(&cfg.PacketReadTimeout, prefix+"memberlist.packet-read-timeout", 10*time.Second, "Timeout for reading inbound 'packet' data from a peer. Zero disables the timeout (not recommended).")
+	f.IntVar(&cfg.MaxPacketSize, prefix+"memberlist.max-packet-size", 10*1024*1024, "Maximum size, in bytes, of a single inbound memberlist 'packet'. Larger packets are rejected. Must be >= UDPBufferSize used by memberlist. Zero disables the limit (not recommended).")
+	f.IntVar(&cfg.MaxConcurrentConnections, prefix+"memberlist.max-concurrent-connections", 1000, "Maximum number of inbound TCP connections handled concurrently by the memberlist transport. Additional connections wait for a slot. Zero disables the limit (not recommended).")
 	f.BoolVar(&cfg.TransportDebug, prefix+"memberlist.transport-debug", false, "Log debug transport messages. Note: global log.level must be at debug level as well.")
 
 	f.BoolVar(&cfg.TLSEnabled, prefix+"memberlist.tls-enabled", false, "Enable TLS on the memberlist transport layer.")
@@ -91,6 +104,9 @@ type TCPTransport struct {
 	tlsConfig    *tls.Config
 
 	shutdown atomic.Int32
+
+	// connLimit, when non-nil, bounds the number of inbound connections handled concurrently.
+	connLimit chan struct{}
 
 	advertiseMu   sync.RWMutex
 	advertiseAddr string
@@ -123,6 +139,10 @@ func NewTCPTransport(config TCPTransportConfig, logger log.Logger) (*TCPTranspor
 		logger:   log.With(logger, "component", "memberlist TCPTransport"),
 		packetCh: make(chan *memberlist.Packet),
 		connCh:   make(chan net.Conn),
+	}
+
+	if config.MaxConcurrentConnections > 0 {
+		t.connLimit = make(chan struct{}, config.MaxConcurrentConnections)
 	}
 
 	var err error
@@ -222,7 +242,25 @@ func (t *TCPTransport) tcpListen(tcpLn net.Listener) {
 		// No error, reset loop delay
 		loopDelay = 0
 
-		go t.handleConnection(conn)
+		// Cap concurrently handled inbound connections to bound goroutine/FD
+		// usage against slow-loris style peers that accept-but-idle.
+		if t.connLimit != nil {
+			select {
+			case t.connLimit <- struct{}{}:
+			default:
+				t.unknownConnections.Inc()
+				level.Warn(t.logger).Log("msg", "too many concurrent inbound connections, dropping", "remote", conn.RemoteAddr(), "limit", cap(t.connLimit))
+				_ = conn.Close()
+				continue
+			}
+		}
+
+		go func(c net.Conn) {
+			if t.connLimit != nil {
+				defer func() { <-t.connLimit }()
+			}
+			t.handleConnection(c)
+		}(conn)
 	}
 }
 
@@ -245,6 +283,16 @@ func (t *TCPTransport) handleConnection(conn net.Conn) {
 		}
 	}()
 
+	// Bound the time an unauthenticated peer can keep this goroutine/FD alive
+	// before producing bytes. For the stream path, the deadline is cleared below
+	// so memberlist's own protocol handling is not disrupted.
+	if t.cfg.PacketReadTimeout > 0 {
+		if err := conn.SetReadDeadline(time.Now().Add(t.cfg.PacketReadTimeout)); err != nil {
+			level.Warn(t.logger).Log("msg", "failed to set read deadline on inbound connection", "err", err, "remote", conn.RemoteAddr())
+			return
+		}
+	}
+
 	// let's read first byte, and determine what to do about this connection
 	msgType := []byte{0}
 	_, err := io.ReadFull(conn, msgType)
@@ -255,6 +303,15 @@ func (t *TCPTransport) handleConnection(conn net.Conn) {
 
 	if messageType(msgType[0]) == stream {
 		t.incomingStreams.Inc()
+
+		// Clear the read deadline before handing the connection to memberlist,
+		// which manages its own timeouts for streams.
+		if t.cfg.PacketReadTimeout > 0 {
+			if err := conn.SetReadDeadline(time.Time{}); err != nil {
+				level.Warn(t.logger).Log("msg", "failed to clear read deadline on stream connection", "err", err, "remote", conn.RemoteAddr())
+				return
+			}
+		}
 
 		// hand over this connection to memberlist
 		closeConn = false
@@ -280,11 +337,23 @@ func (t *TCPTransport) handleConnection(conn net.Conn) {
 			return
 		}
 
-		// read the rest to buffer -- this is the "packet" itself
-		buf, err := io.ReadAll(conn)
+		// read the rest to buffer -- this is the "packet" itself.
+		// Cap the amount of memory a single peer can force us to buffer: wrap
+		// the connection in an io.LimitReader with maxPacketSize+1 bytes so we
+		// can detect oversize packets, and reject anything larger.
+		var packetReader io.Reader = conn
+		if t.cfg.MaxPacketSize > 0 {
+			packetReader = io.LimitReader(conn, int64(t.cfg.MaxPacketSize)+1)
+		}
+		buf, err := io.ReadAll(packetReader)
 		if err != nil {
 			t.receivedPacketsErrors.Inc()
 			level.Warn(t.logger).Log("msg", "error while reading packet data", "err", err, "remote", conn.RemoteAddr())
+			return
+		}
+		if t.cfg.MaxPacketSize > 0 && len(buf) > t.cfg.MaxPacketSize {
+			t.receivedPacketsErrors.Inc()
+			level.Warn(t.logger).Log("msg", "inbound packet exceeds max packet size, rejecting", "max", t.cfg.MaxPacketSize, "remote", conn.RemoteAddr())
 			return
 		}
 
