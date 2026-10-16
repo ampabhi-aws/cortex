@@ -1024,6 +1024,16 @@ func (am *MultitenantAlertmanager) serveRequest(w http.ResponseWriter, req *http
 	}
 
 	if am.fallbackConfig != "" {
+		// When sharding is enabled, only serve the fallback locally for tenants this
+		// instance actually owns. Otherwise a request routed here by the load balancer
+		// (for a path the Distributor does not forward) would unconditionally overwrite
+		// the tenant's stored configuration with an empty one.
+		if am.cfg.ShardingEnabled && !am.isUserOwned(userID) {
+			level.Debug(am.logger).Log("msg", "the Alertmanager is not owned by this instance", "user", userID)
+			http.Error(w, "the Alertmanager is not configured", http.StatusNotFound)
+			return
+		}
+
 		userAM, err = am.alertmanagerFromFallbackConfig(userID)
 		if err != nil {
 			level.Error(am.logger).Log("msg", "unable to initialize the Alertmanager with a fallback configuration", "user", userID, "err", err)
@@ -1040,9 +1050,25 @@ func (am *MultitenantAlertmanager) serveRequest(w http.ResponseWriter, req *http
 }
 
 func (am *MultitenantAlertmanager) alertmanagerFromFallbackConfig(userID string) (*Alertmanager, error) {
+	// Confirm the tenant has no stored configuration before uploading an empty one.
+	// Without this check, serving a request for a tenant whose configuration this
+	// instance has not loaded (e.g. sharding ownership change, or a transient load
+	// failure) would overwrite the tenant's real configuration in object storage.
+	ctx := context.Background()
+	_, err := am.store.GetAlertConfig(ctx, userID)
+	switch {
+	case err == nil:
+		return nil, fmt.Errorf("tenant %s already has an Alertmanager configuration; refusing to overwrite with fallback", userID)
+	case errors.Is(err, alertspb.ErrNotFound):
+		// Expected case: no stored configuration, proceed to upload an empty one so
+		// that the Alertmanager is not de-activated in the next poll.
+	default:
+		return nil, errors.Wrapf(err, "failed to check existing Alertmanager configuration for user %s", userID)
+	}
+
 	// Upload an empty config so that the Alertmanager is no de-activated in the next poll
 	cfgDesc := alertspb.ToProto("", nil, userID)
-	err := am.store.SetAlertConfig(context.Background(), cfgDesc)
+	err = am.store.SetAlertConfig(ctx, cfgDesc)
 	if err != nil {
 		return nil, err
 	}
