@@ -6,6 +6,7 @@ import (
 	"io"
 	"net/http"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/go-kit/log"
@@ -37,6 +38,16 @@ var (
 
 // Scheduler is responsible for queueing and dispatching queries to Queriers.
 type Scheduler struct {
+	// nextStreamID is a monotonic counter used to generate per-stream
+	// identifiers for FrontendLoop streams. It is used to key
+	// pendingRequests so that a CANCEL received on one stream cannot
+	// cancel requests enqueued on a different stream, even if two streams
+	// declare the same FrontendAddress on INIT (the FrontendLoop channel
+	// is auth-exempt and the frontend address is self-asserted).
+	// Must be kept as the first field for 64-bit alignment on 32-bit
+	// platforms (see sync/atomic bug notes).
+	nextStreamID uint64
+
 	services.Service
 
 	cfg Config
@@ -65,9 +76,13 @@ type Scheduler struct {
 	queueDuration            prometheus.Histogram
 }
 
+// requestKey identifies a queued request. streamID binds the request to
+// the specific FrontendLoop stream that enqueued it so cancellations and
+// pending-request lookups cannot be redirected across streams by a peer
+// that merely re-asserts another frontend's address at INIT.
 type requestKey struct {
-	frontendAddr string
-	queryID      uint64
+	streamID uint64
+	queryID  uint64
 }
 
 type connectedFrontend struct {
@@ -147,10 +162,14 @@ type Limits interface {
 
 type schedulerRequest struct {
 	frontendAddress string
-	userID          string
-	queryID         uint64
-	request         *httpgrpc.HTTPRequest
-	statsEnabled    bool
+	// streamID binds this request to the FrontendLoop stream that enqueued
+	// it; it is only used internally for pendingRequests lookup and never
+	// sent on the wire or compared across streams.
+	streamID     uint64
+	userID       string
+	queryID      uint64
+	request      *httpgrpc.HTTPRequest
+	statsEnabled bool
 
 	enqueueTime time.Time
 
@@ -164,7 +183,7 @@ type schedulerRequest struct {
 
 // FrontendLoop handles connection from frontend.
 func (s *Scheduler) FrontendLoop(frontend schedulerpb.SchedulerForFrontend_FrontendLoopServer) error {
-	frontendAddress, frontendCtx, err := s.frontendConnected(frontend)
+	frontendAddress, streamID, frontendCtx, err := s.frontendConnected(frontend)
 	if err != nil {
 		return err
 	}
@@ -197,7 +216,7 @@ func (s *Scheduler) FrontendLoop(frontend schedulerpb.SchedulerForFrontend_Front
 
 		switch msg.GetType() {
 		case schedulerpb.ENQUEUE:
-			err = s.enqueueRequest(frontendCtx, frontendAddress, msg)
+			err = s.enqueueRequest(frontendCtx, frontendAddress, streamID, msg)
 			switch {
 			case err == nil:
 				resp = &schedulerpb.SchedulerToFrontend{Status: schedulerpb.OK}
@@ -208,7 +227,13 @@ func (s *Scheduler) FrontendLoop(frontend schedulerpb.SchedulerForFrontend_Front
 			}
 
 		case schedulerpb.CANCEL:
-			s.cancelRequestAndRemoveFromPending(frontendAddress, msg.QueryID)
+			// Only cancel requests that were enqueued on *this* stream. The
+			// frontend-scheduler protocol has every frontend worker send its
+			// CANCEL on the same stream it used for ENQUEUE, so this does not
+			// change legitimate behaviour, but it prevents a peer that opens a
+			// new stream and re-asserts another frontend's address from
+			// cancelling that frontend's in-flight queries.
+			s.cancelRequestAndRemoveFromPending(streamID, msg.QueryID)
 			resp = &schedulerpb.SchedulerToFrontend{Status: schedulerpb.OK}
 
 		default:
@@ -227,14 +252,21 @@ func (s *Scheduler) FrontendLoop(frontend schedulerpb.SchedulerForFrontend_Front
 	return frontend.Send(&schedulerpb.SchedulerToFrontend{Status: schedulerpb.SHUTTING_DOWN})
 }
 
-func (s *Scheduler) frontendConnected(frontend schedulerpb.SchedulerForFrontend_FrontendLoopServer) (string, context.Context, error) {
+func (s *Scheduler) frontendConnected(frontend schedulerpb.SchedulerForFrontend_FrontendLoopServer) (string, uint64, context.Context, error) {
 	msg, err := frontend.Recv()
 	if err != nil {
-		return "", nil, err
+		return "", 0, nil, err
 	}
 	if msg.Type != schedulerpb.INIT || msg.FrontendAddress == "" {
-		return "", nil, errors.New("no frontend address")
+		return "", 0, nil, errors.New("no frontend address")
 	}
+
+	// Allocate a stream-scoped identifier. This is used to key the
+	// pendingRequests map so that cancellations and lookups are bound to
+	// the specific FrontendLoop stream rather than to the self-asserted
+	// FrontendAddress string. The FrontendLoop method is in the gRPC
+	// auth-exemption list, so FrontendAddress is not authenticated.
+	streamID := atomic.AddUint64(&s.nextStreamID, 1)
 
 	s.connectedFrontendsMu.Lock()
 	defer s.connectedFrontendsMu.Unlock()
@@ -249,7 +281,7 @@ func (s *Scheduler) frontendConnected(frontend schedulerpb.SchedulerForFrontend_
 	}
 
 	cf.connections++
-	return msg.FrontendAddress, cf.ctx, nil
+	return msg.FrontendAddress, streamID, cf.ctx, nil
 }
 
 func (s *Scheduler) frontendDisconnected(frontendAddress string) {
@@ -264,7 +296,7 @@ func (s *Scheduler) frontendDisconnected(frontendAddress string) {
 	}
 }
 
-func (s *Scheduler) enqueueRequest(frontendContext context.Context, frontendAddr string, msg *schedulerpb.FrontendToScheduler) error {
+func (s *Scheduler) enqueueRequest(frontendContext context.Context, frontendAddr string, streamID uint64, msg *schedulerpb.FrontendToScheduler) error {
 	// Create new context for this request, to support cancellation.
 	ctx, cancel := context.WithCancel(frontendContext)
 	shouldCancel := true
@@ -286,6 +318,7 @@ func (s *Scheduler) enqueueRequest(frontendContext context.Context, frontendAddr
 
 	req := &schedulerRequest{
 		frontendAddress: frontendAddr,
+		streamID:        streamID,
 		userID:          msg.UserID,
 		queryID:         msg.QueryID,
 		request:         msg.HttpRequest,
@@ -312,16 +345,16 @@ func (s *Scheduler) enqueueRequest(frontendContext context.Context, frontendAddr
 
 		s.pendingRequestsMu.Lock()
 		defer s.pendingRequestsMu.Unlock()
-		s.pendingRequests[requestKey{frontendAddr: frontendAddr, queryID: msg.QueryID}] = req
+		s.pendingRequests[requestKey{streamID: streamID, queryID: msg.QueryID}] = req
 	})
 }
 
 // This method doesn't do removal from the queue.
-func (s *Scheduler) cancelRequestAndRemoveFromPending(frontendAddr string, queryID uint64) {
+func (s *Scheduler) cancelRequestAndRemoveFromPending(streamID uint64, queryID uint64) {
 	s.pendingRequestsMu.Lock()
 	defer s.pendingRequestsMu.Unlock()
 
-	key := requestKey{frontendAddr: frontendAddr, queryID: queryID}
+	key := requestKey{streamID: streamID, queryID: queryID}
 	req := s.pendingRequests[key]
 	if req != nil {
 		req.ctxCancel()
@@ -378,7 +411,7 @@ func (s *Scheduler) QuerierLoop(querier schedulerpb.SchedulerForQuerier_QuerierL
 
 		if r.ctx.Err() != nil {
 			// Remove from pending requests.
-			s.cancelRequestAndRemoveFromPending(r.frontendAddress, r.queryID)
+			s.cancelRequestAndRemoveFromPending(r.streamID, r.queryID)
 
 			lastUserIndex = lastUserIndex.ReuseLastUser()
 			continue
@@ -401,7 +434,7 @@ func (s *Scheduler) NotifyQuerierShutdown(_ context.Context, req *schedulerpb.No
 
 func (s *Scheduler) forwardRequestToQuerier(querier schedulerpb.SchedulerForQuerier_QuerierLoopServer, req *schedulerRequest) error {
 	// Make sure to cancel request at the end to cleanup resources.
-	defer s.cancelRequestAndRemoveFromPending(req.frontendAddress, req.queryID)
+	defer s.cancelRequestAndRemoveFromPending(req.streamID, req.queryID)
 
 	// Handle the stream sending & receiving on a goroutine so we can
 	// monitoring the contexts in a select and cancel things appropriately.
