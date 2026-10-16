@@ -288,7 +288,25 @@ var (
 	ErrNoRuleGroups = errors.New("no rule groups found")
 	// ErrBadRuleGroup is returned when the provided rule group can not be unmarshalled
 	ErrBadRuleGroup = errors.New("unable to decoded rule group")
+	// ErrInvalidNamespace is returned when the namespace path variable is not safe to use as a filesystem component.
+	ErrInvalidNamespace = errors.New("invalid namespace")
+	// ErrInvalidGroupName is returned when the group name path variable is not safe to use as a filesystem component.
+	ErrInvalidGroupName = errors.New("invalid group name")
 )
+
+// isSafePathComponent rejects values that could be used to escape a per-tenant
+// directory when the backend uses the value as a filesystem path component.
+// It rejects path separators (`/`, `\`), the current/parent directory
+// shortcuts (`.`, `..`), and empty strings.
+func isSafePathComponent(s string) bool {
+	if s == "" || s == "." || s == ".." {
+		return false
+	}
+	if strings.ContainsAny(s, "/\\") {
+		return false
+	}
+	return true
+}
 
 func marshalAndSend(output interface{}, w http.ResponseWriter, logger log.Logger) {
 	d, err := yaml.Marshal(&output)
@@ -336,6 +354,10 @@ func parseNamespace(params map[string]string) (string, error) {
 		return "", err
 	}
 
+	if !isSafePathComponent(namespace) {
+		return "", ErrInvalidNamespace
+	}
+
 	return namespace, nil
 }
 
@@ -350,6 +372,10 @@ func parseGroupName(params map[string]string) (string, error) {
 	groupName, err := url.PathUnescape(groupName)
 	if err != nil {
 		return "", err
+	}
+
+	if !isSafePathComponent(groupName) {
+		return "", ErrInvalidGroupName
 	}
 
 	return groupName, nil
@@ -395,7 +421,8 @@ func (a *API) ListRules(w http.ResponseWriter, req *http.Request) {
 	level.Debug(logger).Log("msg", "retrieving rule groups with namespace", "userID", userID, "namespace", namespace)
 	rgs, err := a.store.ListRuleGroupsForUserAndNamespace(req.Context(), userID, namespace)
 	if err != nil {
-		http.Error(w, err.Error(), http.StatusBadRequest)
+		level.Error(logger).Log("msg", "unable to list rule groups", "err", err.Error(), "user", userID)
+		http.Error(w, "unable to list rule groups", http.StatusBadRequest)
 		return
 	}
 
