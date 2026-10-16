@@ -686,6 +686,8 @@ GET /multitenant_alertmanager/configs
 
 List all Alertmanager configurations. This endpoint is not part of alertmanager-API and is always available regardless of whether alertmanager-API is enabled or not. It should not be exposed to end users. This endpoint returns a YAML dictionary with all the Alertmanager configurations and `200` status code on success.
 
+_Requires [authentication](#authentication)._ The response contains every tenant's raw Alertmanager configuration (which may embed notification secrets); operators must restrict access to this route in their authenticating proxy / path allowlist.
+
 ### Alertmanager ring status
 
 ```
