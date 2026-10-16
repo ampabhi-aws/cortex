@@ -328,17 +328,12 @@ func (am *Alertmanager) ApplyConfig(userID string, conf *config.Config, rawCfg s
 
 	am.api.Update(conf, func(_ model.LabelSet) {})
 
-	// Ensure inhibitor is set before being called
-	if am.inhibitor != nil {
-		am.inhibitor.Stop()
-	}
-
-	// Ensure dispatcher is set before being called
-	if am.dispatcher != nil {
-		am.dispatcher.Stop()
-	}
-
-	am.inhibitor = inhibit.NewInhibitor(am.alerts, conf.InhibitRules, am.marker, log.With(am.logger, "component", "inhibitor"))
+	// Build the new inhibitor, integrations map, pipeline and dispatcher BEFORE
+	// stopping the existing ones. This way, if any construction step fails
+	// (e.g. buildIntegrationsMap because of a bad receiver http_config), the
+	// previously running pipeline keeps serving notifications and the caller
+	// gets the error back so it can mark the reload as unsuccessful.
+	newInhibitor := inhibit.NewInhibitor(am.alerts, conf.InhibitRules, am.marker, log.With(am.logger, "component", "inhibitor"))
 
 	waitFunc := clusterWait(am.state.Position, am.cfg.PeerTimeout)
 
@@ -365,7 +360,7 @@ func (am *Alertmanager) ApplyConfig(userID string, conf *config.Config, rawCfg s
 		return notifier
 	})
 	if err != nil {
-		return nil
+		return err
 	}
 
 	muteTimes := make(map[string][]timeinterval.TimeInterval, len(conf.MuteTimeIntervals))
@@ -376,14 +371,13 @@ func (am *Alertmanager) ApplyConfig(userID string, conf *config.Config, rawCfg s
 	pipeline := am.pipelineBuilder.New(
 		integrationsMap,
 		waitFunc,
-		am.inhibitor,
+		newInhibitor,
 		silence.NewSilencer(am.silences, am.marker, am.logger),
 		muteTimes,
 		am.nflog,
 		am.state,
 	)
-	am.lastPipeline = pipeline
-	am.dispatcher = dispatch.NewDispatcher(
+	newDispatcher := dispatch.NewDispatcher(
 		am.alerts,
 		dispatch.NewRoute(conf.Route, nil),
 		pipeline,
@@ -393,6 +387,19 @@ func (am *Alertmanager) ApplyConfig(userID string, conf *config.Config, rawCfg s
 		log.With(am.logger, "component", "dispatcher"),
 		am.dispatcherMetrics,
 	)
+
+	// All construction succeeded. Now stop the previous inhibitor/dispatcher
+	// and swap in the new ones.
+	if am.inhibitor != nil {
+		am.inhibitor.Stop()
+	}
+	if am.dispatcher != nil {
+		am.dispatcher.Stop()
+	}
+
+	am.inhibitor = newInhibitor
+	am.lastPipeline = pipeline
+	am.dispatcher = newDispatcher
 
 	go am.dispatcher.Run()
 	go am.inhibitor.Run()
