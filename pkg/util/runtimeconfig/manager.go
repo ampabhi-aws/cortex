@@ -31,12 +31,21 @@ type Config struct {
 	// non-empty value
 	LoadPath string `yaml:"file"`
 	Loader   Loader `yaml:"-"`
+	// ExposeTenantOverrides, when true, allows the per-tenant overrides
+	// section of the runtime configuration to be returned by the
+	// /runtime_config HTTP endpoint. It defaults to false so the
+	// cross-tenant metadata (tenant IDs, per-tenant limits, S3 SSE/KMS key
+	// identifiers, Alertmanager egress-firewall posture, etc.) is not
+	// disclosed by an unauthenticated or unauthorised caller unless the
+	// operator explicitly opts in.
+	ExposeTenantOverrides bool `yaml:"expose_tenant_overrides"`
 }
 
 // RegisterFlags registers flags.
 func (mc *Config) RegisterFlags(f *flag.FlagSet) {
 	f.StringVar(&mc.LoadPath, "runtime-config.file", "", "File with the configuration that can be updated in runtime.")
 	f.DurationVar(&mc.ReloadPeriod, "runtime-config.reload-period", 10*time.Second, "How often to check runtime config file.")
+	f.BoolVar(&mc.ExposeTenantOverrides, "runtime-config.expose-tenant-overrides", false, "When enabled, the /runtime_config HTTP endpoint includes the per-tenant `overrides` section (tenant IDs, limits, S3 SSE/KMS key IDs, Alertmanager egress-firewall posture) in its response. Disabled by default to avoid cross-tenant metadata disclosure to callers of this unauthenticated admin endpoint; enable only when access to the endpoint is restricted at the reverse proxy / gateway.")
 }
 
 // Manager periodically reloads the configuration from a file, and keeps this
@@ -207,4 +216,11 @@ func (om *Manager) GetConfig() interface{} {
 	defer om.configMtx.RUnlock()
 
 	return om.config
+}
+
+// ExposeTenantOverrides reports whether the manager has been configured to
+// allow the per-tenant overrides section to be returned by the
+// /runtime_config HTTP handler.
+func (om *Manager) ExposeTenantOverrides() bool {
+	return om.cfg.ExposeTenantOverrides
 }

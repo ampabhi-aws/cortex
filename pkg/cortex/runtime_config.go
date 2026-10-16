@@ -119,11 +119,28 @@ func ingesterInstanceLimits(manager *runtimeconfig.Manager) func() *ingester.Ins
 }
 
 func runtimeConfigHandler(runtimeCfgManager *runtimeconfig.Manager, defaultLimits validation.Limits) http.HandlerFunc {
+	exposeTenantOverrides := false
+	if runtimeCfgManager != nil {
+		exposeTenantOverrides = runtimeCfgManager.ExposeTenantOverrides()
+	}
 	return func(w http.ResponseWriter, r *http.Request) {
 		cfg, ok := runtimeCfgManager.GetConfig().(*runtimeConfigValues)
 		if !ok || cfg == nil {
 			util.WriteTextResponse(w, "runtime config file doesn't exist")
 			return
+		}
+
+		// To avoid disclosing cross-tenant metadata (tenant IDs, per-tenant
+		// limits, S3 SSE/KMS key identifiers, Alertmanager egress-firewall
+		// posture, ...) to callers of this unauthenticated admin endpoint,
+		// the per-tenant `overrides` section is stripped from the response
+		// unless the operator has explicitly opted in via
+		// -runtime-config.expose-tenant-overrides. See CWE-497.
+		filteredCfg := cfg
+		if !exposeTenantOverrides {
+			cfgCopy := *cfg
+			cfgCopy.TenantLimits = nil
+			filteredCfg = &cfgCopy
 		}
 
 		var output interface{}
@@ -132,14 +149,16 @@ func runtimeConfigHandler(runtimeCfgManager *runtimeconfig.Manager, defaultLimit
 			// Default runtime config is just empty struct, but to make diff work,
 			// we set defaultLimits for every tenant that exists in runtime config.
 			defaultCfg := runtimeConfigValues{}
-			defaultCfg.TenantLimits = map[string]*validation.Limits{}
-			for k, v := range cfg.TenantLimits {
-				if v != nil {
-					defaultCfg.TenantLimits[k] = &defaultLimits
+			if exposeTenantOverrides {
+				defaultCfg.TenantLimits = map[string]*validation.Limits{}
+				for k, v := range cfg.TenantLimits {
+					if v != nil {
+						defaultCfg.TenantLimits[k] = &defaultLimits
+					}
 				}
 			}
 
-			cfgYaml, err := util.YAMLMarshalUnmarshal(cfg)
+			cfgYaml, err := util.YAMLMarshalUnmarshal(filteredCfg)
 			if err != nil {
 				http.Error(w, err.Error(), http.StatusInternalServerError)
 				return
@@ -158,7 +177,7 @@ func runtimeConfigHandler(runtimeCfgManager *runtimeconfig.Manager, defaultLimit
 			}
 
 		default:
-			output = cfg
+			output = filteredCfg
 		}
 		util.WriteYAMLResponse(w, output)
 	}
