@@ -39,6 +39,22 @@ you won't see any data. As of now, you can't see series from other tenants.
 
 For more information regarding the tenant ID limits, refer to: [Tenant ID limitations](./limitations.md#tenant-id-naming)
 
+### Alertmanager inter-replica gRPC
+
+The Alertmanager gRPC methods `UpdateState`, `ReadState` and `HandleRequest`
+exist only for communication between Alertmanager replicas in the same
+Cortex cluster. They do **not** take their tenant identity from the
+caller-supplied `X-Scope-OrgID`/`x-scope-orgid` alone - the server also
+requires that the gRPC peer address matches an instance currently
+registered in the Alertmanager ring for the user's shard, and that any
+replicated `clusterpb.Part` key belongs to the authenticated tenant.
+
+Operators must still ensure the Cortex gRPC port (default `9095`) is
+**never** exposed to tenant-reachable networks and should additionally
+enable gRPC mTLS peer authentication via `-server.grpc-tls-client-auth`
+and `-server.grpc-tls-ca-path` with a CA bundle scoped to Alertmanager
+replicas.
+
 ### Cortex-Tenant
 
 One way to add `X-Scope-OrgID` to Prometheus requests is to use a [cortex-tenant](https://github.com/blind-oracle/cortex-tenant)
