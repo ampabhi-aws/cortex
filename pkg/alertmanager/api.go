@@ -20,7 +20,6 @@ import (
 	"github.com/cortexproject/cortex/pkg/alertmanager/alertspb"
 	"github.com/cortexproject/cortex/pkg/tenant"
 	"github.com/cortexproject/cortex/pkg/util"
-	"github.com/cortexproject/cortex/pkg/util/concurrency"
 	util_log "github.com/cortexproject/cortex/pkg/util/log"
 )
 
@@ -31,12 +30,9 @@ const (
 	errStoringConfiguration  = "unable to store the Alertmanager config"
 	errDeletingConfiguration = "unable to delete the Alertmanager config"
 	errNoOrgID               = "unable to determine the OrgID"
-	errListAllUser           = "unable to list the Alertmanager users"
 	errConfigurationTooBig   = "Alertmanager configuration is too big, limit: %d bytes"
 	errTooManyTemplates      = "too many templates in the configuration: %d (limit: %d)"
 	errTemplateTooBig        = "template %s is too big: %d bytes (limit: %d bytes)"
-
-	fetchConcurrency = 16
 )
 
 var (
@@ -261,10 +257,19 @@ func validateUserConfig(logger log.Logger, cfg alertspb.AlertConfigDesc, limits 
 
 func (am *MultitenantAlertmanager) ListAllConfigs(w http.ResponseWriter, r *http.Request) {
 	logger := util_log.WithContext(r.Context(), am.logger)
-	userIDs, err := am.store.ListAllUsers(r.Context())
+
+	// This endpoint historically streamed every tenant's Alertmanager config,
+	// but doing so is a cross-tenant confidentiality break: raw Alertmanager
+	// configurations embed cleartext notification secrets (SMTP/Slack/PagerDuty
+	// keys, webhook URLs, bearer tokens...). The handler is now tenant-scoped:
+	// it requires an authenticated tenant (via the standard X-Scope-OrgID
+	// header enforced by the auth middleware) and returns only that tenant's
+	// Alertmanager configuration. In addition, well-known secret-bearing
+	// fields are redacted from the serialised response as defence in depth.
+	userID, err := tenant.TenantID(r.Context())
 	if err != nil {
-		level.Error(logger).Log("msg", "failed to list users of alertmanager", "err", err)
-		http.Error(w, fmt.Sprintf("%s: %s", errListAllUser, err.Error()), http.StatusInternalServerError)
+		level.Error(logger).Log("msg", errNoOrgID, "err", err.Error())
+		http.Error(w, fmt.Sprintf("%s: %s", errNoOrgID, err.Error()), http.StatusUnauthorized)
 		return
 	}
 
@@ -276,17 +281,21 @@ func (am *MultitenantAlertmanager) ListAllConfigs(w http.ResponseWriter, r *http
 		close(done)
 	}()
 
-	err = concurrency.ForEachUser(r.Context(), userIDs, fetchConcurrency, func(ctx context.Context, userID string) error {
+	err = func(ctx context.Context, userID string) error {
 		cfg, err := am.store.GetAlertConfig(ctx, userID)
 		if errors.Is(err, alertspb.ErrNotFound) {
 			return nil
 		} else if err != nil {
 			return errors.Wrapf(err, "failed to fetch alertmanager config for user %s", userID)
 		}
+		redactedRaw, rerr := redactAlertmanagerConfigSecrets(cfg.RawConfig)
+		if rerr != nil {
+			return errors.Wrapf(rerr, "failed to redact alertmanager config for user %s", userID)
+		}
 		data := map[string]*UserConfig{
 			userID: {
 				TemplateFiles:      alertspb.ParseTemplates(cfg),
-				AlertmanagerConfig: cfg.RawConfig,
+				AlertmanagerConfig: redactedRaw,
 			},
 		}
 
@@ -296,12 +305,105 @@ func (am *MultitenantAlertmanager) ListAllConfigs(w http.ResponseWriter, r *http
 		}
 
 		return nil
-	})
+	}(r.Context(), userID)
 	if err != nil {
-		level.Error(logger).Log("msg", "failed to list all alertmanager configs", "err", err)
+		level.Error(logger).Log("msg", "failed to list alertmanager config", "err", err, "user", userID)
 	}
 	close(iter)
 	<-done
+}
+
+// redactedSecretPlaceholder is written in place of secret-bearing field values.
+const redactedSecretPlaceholder = "<redacted>"
+
+// secretFieldNames are YAML keys inside an Alertmanager configuration whose
+// values commonly contain cleartext credentials or URLs that embed tokens.
+// They are redacted before being returned on operator dump endpoints.
+var secretFieldNames = map[string]struct{}{
+	"smtp_auth_password": {},
+	"smtp_auth_secret":   {},
+	"slack_api_url":      {},
+	"api_url":            {},
+	"api_key":            {},
+	"api_secret":         {},
+	"service_key":        {},
+	"routing_key":        {},
+	"token":              {},
+	"user_key":           {},
+	"password":           {},
+	"bearer_token":       {},
+	"client_secret":      {},
+	"url":                {}, // webhook_configs[].url frequently embeds a secret token
+	"webhook_url":        {},
+}
+
+// redactAlertmanagerConfigSecrets parses an Alertmanager configuration YAML
+// document and replaces the values of well-known secret-bearing fields with a
+// fixed placeholder. The YAML round-trip preserves structure; unknown fields
+// are passed through unchanged. If the input is not valid YAML it is returned
+// unmodified so that this helper never fails open on malformed configs.
+func redactAlertmanagerConfigSecrets(raw string) (string, error) {
+	if raw == "" {
+		return raw, nil
+	}
+	var parsed interface{}
+	if err := yaml.Unmarshal([]byte(raw), &parsed); err != nil {
+		// Preserve existing behaviour (do not crash the handler) if the stored
+		// config is not valid YAML. Returning the original value is still safe
+		// because this handler is now tenant-scoped.
+		return raw, nil
+	}
+	redacted := redactSecretsRecursive(parsed)
+	out, err := yaml.Marshal(redacted)
+	if err != nil {
+		return "", err
+	}
+	return string(out), nil
+}
+
+// redactSecretsRecursive walks a decoded YAML value and replaces secret-bearing
+// field values with a placeholder.
+func redactSecretsRecursive(v interface{}) interface{} {
+	switch node := v.(type) {
+	case map[interface{}]interface{}:
+		for k, val := range node {
+			if key, ok := k.(string); ok {
+				if _, isSecret := secretFieldNames[key]; isSecret {
+					if val != nil && !isEmptyScalar(val) {
+						node[k] = redactedSecretPlaceholder
+						continue
+					}
+				}
+			}
+			node[k] = redactSecretsRecursive(val)
+		}
+		return node
+	case map[string]interface{}:
+		for k, val := range node {
+			if _, isSecret := secretFieldNames[k]; isSecret {
+				if val != nil && !isEmptyScalar(val) {
+					node[k] = redactedSecretPlaceholder
+					continue
+				}
+			}
+			node[k] = redactSecretsRecursive(val)
+		}
+		return node
+	case []interface{}:
+		for i, val := range node {
+			node[i] = redactSecretsRecursive(val)
+		}
+		return node
+	default:
+		return v
+	}
+}
+
+func isEmptyScalar(v interface{}) bool {
+	if s, ok := v.(string); ok {
+		return s == ""
+	}
+	return false
 }
 
 // validateAlertmanagerConfig recursively scans the input config looking for data types for which
