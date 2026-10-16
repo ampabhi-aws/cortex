@@ -5,6 +5,7 @@ import (
 	"html/template"
 	"net/http"
 	"path"
+	"strings"
 	"sync"
 
 	"github.com/go-kit/log"
@@ -147,8 +148,91 @@ func DefaultConfigHandler(actualCfg interface{}, defaultCfg interface{}) http.Ha
 			output = actualCfg
 		}
 
-		util.WriteYAMLResponse(w, output)
+		// Fail-closed redaction: any field whose yaml key contains
+		// password/secret/token/credential is replaced with "********". Typed
+		// redaction via flagext.Secret stays in place; this is defense in depth
+		// for config fields that are plain strings today (e.g. values that
+		// pre-date the Secret type).
+		redacted, err := redactSensitiveConfig(output)
+		if err != nil {
+			http.Error(w, err.Error(), http.StatusInternalServerError)
+			return
+		}
+
+		util.WriteYAMLResponse(w, redacted)
 	}
+}
+
+// sensitiveConfigKeySubstrings is the list of lower-cased substrings that mark
+// a YAML key as sensitive for the purpose of /config output redaction.
+var sensitiveConfigKeySubstrings = []string{"password", "secret", "token", "credential"}
+
+// redactSensitiveConfig walks the config structure after YAML round-tripping
+// and replaces values keyed by anything matching sensitiveConfigKeySubstrings
+// with the string "********". It is a defence-in-depth filter: typed
+// redaction (flagext.Secret.MarshalYAML) still applies for every field that
+// uses the Secret type. Empty values are preserved to keep the output useful
+// for operators diffing against defaults.
+func redactSensitiveConfig(in interface{}) (interface{}, error) {
+	obj, err := util.YAMLMarshalUnmarshal(in)
+	if err != nil {
+		return nil, err
+	}
+	return redactConfigMap(obj), nil
+}
+
+func redactConfigMap(m map[interface{}]interface{}) map[interface{}]interface{} {
+	for k, v := range m {
+		if isSensitiveConfigKey(k) {
+			if !isEmptyValue(v) {
+				m[k] = "********"
+			}
+			continue
+		}
+		m[k] = redactConfigValue(v)
+	}
+	return m
+}
+
+func redactConfigValue(v interface{}) interface{} {
+	switch val := v.(type) {
+	case map[interface{}]interface{}:
+		return redactConfigMap(val)
+	case []interface{}:
+		for i, item := range val {
+			val[i] = redactConfigValue(item)
+		}
+		return val
+	}
+	return v
+}
+
+func isSensitiveConfigKey(k interface{}) bool {
+	ks, ok := k.(string)
+	if !ok {
+		return false
+	}
+	ks = strings.ToLower(ks)
+	for _, needle := range sensitiveConfigKeySubstrings {
+		if strings.Contains(ks, needle) {
+			return true
+		}
+	}
+	return false
+}
+
+func isEmptyValue(v interface{}) bool {
+	switch val := v.(type) {
+	case nil:
+		return true
+	case string:
+		return val == ""
+	case map[interface{}]interface{}:
+		return len(val) == 0
+	case []interface{}:
+		return len(val) == 0
+	}
+	return false
 }
 
 // NewQuerierHandler returns a HTTP handler that can be used by the querier service to
