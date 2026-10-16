@@ -49,8 +49,16 @@ type DB interface {
 	GetConfig(ctx context.Context, userID string) (userconfig.View, error)
 	SetConfig(ctx context.Context, userID string, cfg userconfig.Config) error
 
-	GetAllConfigs(ctx context.Context) (map[string]userconfig.View, error)
-	GetConfigs(ctx context.Context, since userconfig.ID) (map[string]userconfig.View, error)
+	// GetAllConfigs returns the latest configurations.
+	// If userID is non-empty the result is restricted to that tenant so the
+	// DB layer cannot return cross-tenant rows by default; an empty userID
+	// is reserved for operator tooling that has already enforced its own
+	// access control.
+	GetAllConfigs(ctx context.Context, userID string) (map[string]userconfig.View, error)
+	// GetConfigs returns configurations updated since `since`.
+	// If userID is non-empty the result is restricted to that tenant; see
+	// GetAllConfigs for the semantics of an empty userID.
+	GetConfigs(ctx context.Context, since userconfig.ID, userID string) (map[string]userconfig.View, error)
 
 	DeactivateConfig(ctx context.Context, userID string) error
 	RestoreConfig(ctx context.Context, userID string) error

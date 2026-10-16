@@ -42,18 +42,33 @@ func (d *DB) SetConfig(ctx context.Context, userID string, cfg userconfig.Config
 	return nil
 }
 
-// GetAllConfigs gets all of the userconfig.
-func (d *DB) GetAllConfigs(ctx context.Context) (map[string]userconfig.View, error) {
-	return d.cfgs, nil
+// GetAllConfigs gets all of the userconfig. If userID is non-empty the
+// result is restricted to that tenant so the DB layer cannot return
+// cross-tenant rows by default.
+func (d *DB) GetAllConfigs(ctx context.Context, userID string) (map[string]userconfig.View, error) {
+	if userID == "" {
+		return d.cfgs, nil
+	}
+	cfgs := map[string]userconfig.View{}
+	if c, ok := d.cfgs[userID]; ok {
+		cfgs[userID] = c
+	}
+	return cfgs, nil
 }
 
-// GetConfigs gets all of the configs that have changed recently.
-func (d *DB) GetConfigs(ctx context.Context, since userconfig.ID) (map[string]userconfig.View, error) {
+// GetConfigs gets all of the configs that have changed recently. If userID is
+// non-empty the result is restricted to that tenant so the DB layer cannot
+// return cross-tenant rows by default.
+func (d *DB) GetConfigs(ctx context.Context, since userconfig.ID, userID string) (map[string]userconfig.View, error) {
 	cfgs := map[string]userconfig.View{}
 	for user, c := range d.cfgs {
-		if c.ID > since {
-			cfgs[user] = c
+		if c.ID <= since {
+			continue
 		}
+		if userID != "" && user != userID {
+			continue
+		}
+		cfgs[user] = c
 	}
 	return cfgs, nil
 }

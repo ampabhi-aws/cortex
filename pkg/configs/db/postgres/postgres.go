@@ -179,17 +179,28 @@ func (d DB) SetConfig(ctx context.Context, userID string, cfg userconfig.Config)
 	return err
 }
 
-// GetAllConfigs gets all of the userconfig.
-func (d DB) GetAllConfigs(ctx context.Context) (map[string]userconfig.View, error) {
+// GetAllConfigs gets all of the userconfig. If userID is non-empty the
+// result is restricted to that tenant so the DB layer cannot return
+// cross-tenant rows by default.
+func (d DB) GetAllConfigs(ctx context.Context, userID string) (map[string]userconfig.View, error) {
+	if userID != "" {
+		return d.findConfigs(squirrel.And{allConfigs, squirrel.Eq{"owner_id": userID}})
+	}
 	return d.findConfigs(allConfigs)
 }
 
-// GetConfigs gets all of the configs that have changed recently.
-func (d DB) GetConfigs(ctx context.Context, since userconfig.ID) (map[string]userconfig.View, error) {
-	return d.findConfigs(squirrel.And{
+// GetConfigs gets all of the configs that have changed recently. If userID is
+// non-empty the result is restricted to that tenant so the DB layer cannot
+// return cross-tenant rows by default.
+func (d DB) GetConfigs(ctx context.Context, since userconfig.ID, userID string) (map[string]userconfig.View, error) {
+	filter := squirrel.And{
 		allConfigs,
 		squirrel.Gt{"id": since},
-	})
+	}
+	if userID != "" {
+		filter = append(filter, squirrel.Eq{"owner_id": userID})
+	}
+	return d.findConfigs(filter)
 }
 
 // GetRulesConfig gets the latest alertmanager config for a user.
