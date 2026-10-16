@@ -38,6 +38,12 @@ type Distributor struct {
 	alertmanagerRing        ring.ReadRing
 	alertmanagerClientsPool ClientsPool
 
+	// selfAddr, when set, is the ring address of the local alertmanager
+	// instance. It is attached as the gRPC peer address on outgoing
+	// HandleRequest calls so the receiving replica's inter-replica
+	// authorization check can verify the caller is a ring member.
+	selfAddr string
+
 	logger log.Logger
 }
 
@@ -57,6 +63,13 @@ func NewDistributor(cfg ClientConfig, maxRecvMsgSize int64, alertmanagersRing *r
 
 	d.Service = services.NewBasicService(nil, d.running, nil)
 	return d, nil
+}
+
+// SetSelfAddress records the local alertmanager ring address so the
+// Distributor can authenticate itself to peer replicas on gRPC HandleRequest
+// calls. Must be set before serving traffic when sharding is enabled.
+func (d *Distributor) SetSelfAddress(addr string) {
+	d.selfAddr = addr
 }
 
 func (d *Distributor) running(ctx context.Context) error {
@@ -314,7 +327,7 @@ func (d *Distributor) doRequest(ctx context.Context, am ring.InstanceDesc, req *
 		return nil, errors.Wrapf(err, "failed to get alertmanager client from pool (alertmanager address: %s)", am.Addr)
 	}
 
-	return amClient.HandleRequest(ctx, req)
+	return amClient.HandleRequest(withOutgoingReplicaPeer(ctx, d.selfAddr), req)
 }
 
 func shardByUser(userID string) uint32 {

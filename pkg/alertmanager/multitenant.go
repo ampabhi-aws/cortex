@@ -4,6 +4,7 @@ import (
 	"context"
 	"flag"
 	"fmt"
+	"net"
 	"net/http"
 	"net/url"
 	"os"
@@ -25,6 +26,9 @@ import (
 	"github.com/weaveworks/common/httpgrpc/server"
 	"github.com/weaveworks/common/user"
 	"golang.org/x/time/rate"
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/peer"
+	"google.golang.org/grpc/status"
 
 	"github.com/cortexproject/cortex/pkg/alertmanager/alertmanagerpb"
 	"github.com/cortexproject/cortex/pkg/alertmanager/alertspb"
@@ -59,6 +63,17 @@ var (
 	errInvalidExternalURL                  = errors.New("the configured external URL is invalid: should not end with /")
 	errShardingUnsupportedStorage          = errors.New("the configured alertmanager storage backend is not supported when sharding is enabled")
 	errZoneAwarenessEnabledWithoutZoneInfo = errors.New("the configured alertmanager has zone awareness enabled but zone is not set")
+
+	// Replication authorization errors. The replication-only gRPC methods
+	// (UpdateState, ReadState, HandleRequest) are peer-to-peer APIs and must
+	// only be invoked by other alertmanager replicas in the ring. The gRPC
+	// listener must never be exposed to tenant-reachable networks; operators
+	// should additionally enable server.grpc-tls-client-auth with a CA bundle
+	// scoped to alertmanager replicas.
+	errReplicationShardingDisabled   = status.Error(codes.FailedPrecondition, "alertmanager sharding is disabled; inter-replica replication APIs are not available")
+	errReplicationNoPeerInContext    = status.Error(codes.PermissionDenied, "missing peer address on gRPC context for inter-replica replication call")
+	errReplicationUnauthorizedCaller = status.Error(codes.PermissionDenied, "caller is not a registered alertmanager replica for the requested tenant")
+	errReplicationPartKeyMismatch    = status.Error(codes.InvalidArgument, "replication Part key does not belong to the authenticated tenant")
 )
 
 // MultitenantAlertmanagerConfig is the configuration for a multitenant Alertmanager.
@@ -471,6 +486,14 @@ func (am *MultitenantAlertmanager) starting(ctx context.Context) (err error) {
 			return err
 		}
 		level.Info(am.logger).Log("msg", "alertmanager is JOINING in the ring")
+
+		// Record this instance's ring address so the Distributor can
+		// authenticate itself as a legitimate replica when forwarding
+		// tenant HTTP requests to the owning alertmanager via gRPC
+		// HandleRequest.
+		if am.distributor != nil {
+			am.distributor.SetSelfAddress(am.ringLifecycler.GetInstanceAddr())
+		}
 	}
 
 	// At this point, if sharding is enabled, the instance is registered with some tokens
@@ -1004,8 +1027,128 @@ func (am *MultitenantAlertmanager) ServeHTTP(w http.ResponseWriter, req *http.Re
 
 // HandleRequest implements gRPC Alertmanager service, which receives request from AlertManager-Distributor.
 func (am *MultitenantAlertmanager) HandleRequest(ctx context.Context, in *httpgrpc.HTTPRequest) (*httpgrpc.HTTPResponse, error) {
+	userID, err := tenant.TenantID(ctx)
+	if err != nil {
+		return nil, err
+	}
+	if err := am.authorizeInterReplicaCall(ctx, userID); err != nil {
+		return nil, err
+	}
 	return am.grpcServer.Handle(ctx, in)
 }
+
+// authorizeInterReplicaCall authorises callers of the gRPC methods that exist
+// solely for alertmanager replica-to-replica traffic (UpdateState, ReadState,
+// HandleRequest). These are peer-only APIs: the caller-supplied x-scope-orgid
+// metadata is not sufficient to identify a legitimate replica. We additionally
+// require that:
+//   1. Alertmanager sharding is enabled - otherwise there are no replicas and
+//      these methods have no legitimate caller.
+//   2. The gRPC peer address is set on the context (i.e. the call actually
+//      arrived over the gRPC transport).
+//   3. The peer's host matches the host portion of an instance currently
+//      registered in the alertmanager ring for shardByUser(userID), and is
+//      not this instance itself. This is the same ring data used by
+//      ReplicateStateForUser/ReadFullStateForUser when selecting replicas.
+//
+// This does not replace transport-level peer authentication: operators should
+// still configure gRPC mTLS (-server.grpc-tls-client-auth / -ca-path) and keep
+// the gRPC port off tenant-reachable networks. It does, however, make the
+// handlers refuse requests from any source that is not a current ring member
+// for the targeted tenant, which closes the cross-tenant read/write that was
+// previously possible by only setting x-scope-orgid.
+func (am *MultitenantAlertmanager) authorizeInterReplicaCall(ctx context.Context, userID string) error {
+	if !am.cfg.ShardingEnabled || am.ring == nil || am.ringLifecycler == nil {
+		return errReplicationShardingDisabled
+	}
+
+	p, ok := peer.FromContext(ctx)
+	if !ok || p == nil || p.Addr == nil {
+		return errReplicationNoPeerInContext
+	}
+	peerHost := hostOnly(p.Addr.String())
+	if peerHost == "" {
+		return errReplicationNoPeerInContext
+	}
+
+	set, err := am.ring.Get(shardByUser(userID), RingOp, nil, nil, nil)
+	if err != nil {
+		return status.Error(codes.Internal, fmt.Sprintf("failed to read alertmanager ring: %v", err))
+	}
+
+	selfHost := hostOnly(am.ringLifecycler.GetInstanceAddr())
+	for _, inst := range set.Instances {
+		instHost := hostOnly(inst.Addr)
+		if instHost == "" || instHost == selfHost {
+			// Replication arrives from other replicas; never trust our own
+			// listening address even if a loopback source happens to match.
+			continue
+		}
+		if instHost == peerHost {
+			return nil
+		}
+	}
+	return errReplicationUnauthorizedCaller
+}
+
+// hostOnly returns the host (without port) of a host:port address. If no port
+// is present, the input is returned unchanged.
+func hostOnly(addr string) string {
+	if addr == "" {
+		return ""
+	}
+	if host, _, err := net.SplitHostPort(addr); err == nil {
+		return host
+	}
+	return addr
+}
+
+// partKeyBelongsToTenant verifies that an alertmanager cluster Part key - of
+// the form "sil:<userID>" or "nfl:<userID>" (see pkg/alertmanager/alertmanager.go:206,222) -
+// is scoped to the authenticated tenant. This prevents a caller authorised
+// for tenant A (via ring membership) from merging state into tenant B.
+func partKeyBelongsToTenant(key, userID string) bool {
+	if userID == "" {
+		return false
+	}
+	for _, prefix := range []string{"sil:", "nfl:"} {
+		if strings.HasPrefix(key, prefix) && strings.TrimPrefix(key, prefix) == userID {
+			return true
+		}
+	}
+	return false
+}
+
+// withOutgoingReplicaPeer annotates an outgoing inter-replica call context
+// with this instance's ring address as a gRPC peer value. In production this
+// is a no-op: the receiving gRPC server replaces the peer context with the
+// real TCP peer (see http2_server.go). In in-process tests that bypass the
+// gRPC transport (passthroughAlertmanagerClient), the context is passed
+// directly to the server, so this allows the server-side ring-membership
+// authorization check to behave the same way as it does in production.
+func withOutgoingReplicaPeer(ctx context.Context, selfAddr string) context.Context {
+	if selfAddr == "" {
+		return ctx
+	}
+	host := hostOnly(selfAddr)
+	if host == "" {
+		return ctx
+	}
+	ip := net.ParseIP(host)
+	if ip == nil {
+		// Non-IP (hostname) ring address - best effort only.
+		return peer.NewContext(ctx, &peer.Peer{Addr: &namedAddr{host: host}})
+	}
+	return peer.NewContext(ctx, &peer.Peer{Addr: &net.TCPAddr{IP: ip, Port: 0}})
+}
+
+// namedAddr is a minimal net.Addr implementation returning a bare host string
+// so hostOnly() can recover it on the server side. Used only when the ring
+// address is not an IP literal.
+type namedAddr struct{ host string }
+
+func (n *namedAddr) Network() string { return "tcp" }
+func (n *namedAddr) String() string  { return n.host }
 
 // serveRequest serves the Alertmanager's web UI and API.
 func (am *MultitenantAlertmanager) serveRequest(w http.ResponseWriter, req *http.Request) {
@@ -1073,7 +1216,7 @@ func (am *MultitenantAlertmanager) ReplicateStateForUser(ctx context.Context, us
 			return err
 		}
 
-		resp, err := c.UpdateState(user.InjectOrgID(ctx, userID), part)
+		resp, err := c.UpdateState(withOutgoingReplicaPeer(user.InjectOrgID(ctx, userID), selfAddress), part)
 		if err != nil {
 			return err
 		}
@@ -1120,7 +1263,7 @@ func (am *MultitenantAlertmanager) ReadFullStateForUser(ctx context.Context, use
 			return nil
 		}
 
-		resp, err := c.ReadState(user.InjectOrgID(ctx, userID), &alertmanagerpb.ReadStateRequest{})
+		resp, err := c.ReadState(withOutgoingReplicaPeer(user.InjectOrgID(ctx, userID), am.ringLifecycler.GetInstanceAddr()), &alertmanagerpb.ReadStateRequest{})
 		if err != nil {
 			level.Error(am.logger).Log("msg", "rpc reading state from replica failed", "addr", addr, "user", userID, "err", err)
 			return nil
@@ -1157,6 +1300,14 @@ func (am *MultitenantAlertmanager) UpdateState(ctx context.Context, part *cluste
 	userID, err := tenant.TenantID(ctx)
 	if err != nil {
 		return nil, err
+	}
+
+	if err := am.authorizeInterReplicaCall(ctx, userID); err != nil {
+		return nil, err
+	}
+
+	if part == nil || !partKeyBelongsToTenant(part.Key, userID) {
+		return nil, errReplicationPartKeyMismatch
 	}
 
 	am.alertmanagersMtx.Lock()
@@ -1262,6 +1413,10 @@ func (am *MultitenantAlertmanager) getPerUserDirectories() map[string]string {
 func (am *MultitenantAlertmanager) ReadState(ctx context.Context, req *alertmanagerpb.ReadStateRequest) (*alertmanagerpb.ReadStateResponse, error) {
 	userID, err := tenant.TenantID(ctx)
 	if err != nil {
+		return nil, err
+	}
+
+	if err := am.authorizeInterReplicaCall(ctx, userID); err != nil {
 		return nil, err
 	}
 
