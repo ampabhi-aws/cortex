@@ -111,6 +111,13 @@ type Config struct {
 
 	IgnoreSeriesLimitForMetricNames string `yaml:"ignore_series_limit_for_metric_names"`
 
+	// EnableDebugPush, when true, registers the /ingester/push (and legacy /push)
+	// HTTP routes that bypass the distributor's per-tenant validation and rate
+	// limiting. It is intended for testing and debugging only and defaults to
+	// false so that tenant-reachable listeners do not expose the raw ingester
+	// write path.
+	EnableDebugPush bool `yaml:"enable_debug_push"`
+
 	// For testing, you can override the address and ID of this ingester.
 	ingesterClientFactory func(addr string, cfg client.Config) (client.HealthAndIngesterClient, error)
 }
@@ -132,6 +139,7 @@ func (cfg *Config) RegisterFlags(f *flag.FlagSet) {
 	f.Int64Var(&cfg.DefaultLimits.MaxInflightPushRequests, "ingester.instance-limits.max-inflight-push-requests", 0, "Max inflight push requests that this ingester can handle (across all tenants). Additional requests will be rejected. 0 = unlimited.")
 
 	f.StringVar(&cfg.IgnoreSeriesLimitForMetricNames, "ingester.ignore-series-limit-for-metric-names", "", "Comma-separated list of metric names, for which -ingester.max-series-per-metric and -ingester.max-global-series-per-metric limits will be ignored. Does not affect max-series-per-user or max-global-series-per-metric limits.")
+	f.BoolVar(&cfg.EnableDebugPush, "ingester.enable-debug-push", false, "When true, exposes the /ingester/push (and legacy /push) HTTP debug routes that call Ingester.Push directly. These routes bypass the distributor's per-tenant validation and rate limiting and should only be enabled on a listener restricted to administrators. Defaults to false.")
 }
 
 func (cfg *Config) getIgnoreSeriesLimitForMetricNamesMap() map[string]struct{} {
