@@ -24,6 +24,12 @@ const (
 	defaultSettleReadTimeout = 15 * time.Second
 	defaultStoreReadTimeout  = 15 * time.Second
 
+	// msgChannelBufferSize is the capacity of the per-tenant broadcast
+	// channel. A non-zero buffer plus a non-blocking send in broadcast()
+	// ensures a slow replica can never hold the Alertmanager silence/nflog
+	// mutex while waiting for state.running to consume a message.
+	msgChannelBufferSize = 200
+
 	// Initial sync outcome label values.
 	syncFromReplica  = "from-replica"
 	syncFromStorage  = "from-storage"
@@ -53,6 +59,7 @@ type state struct {
 	partialStateMergesFailed *prometheus.CounterVec
 	stateReplicationTotal    *prometheus.CounterVec
 	stateReplicationFailed   *prometheus.CounterVec
+	stateReplicationDropped  *prometheus.CounterVec
 	fetchReplicaStateTotal   prometheus.Counter
 	fetchReplicaStateFailed  prometheus.Counter
 	initialSyncTotal         prometheus.Counter
@@ -72,7 +79,7 @@ func newReplicatedStates(userID string, rf int, re Replicator, st alertstore.Ale
 		replicator:        re,
 		store:             st,
 		states:            make(map[string]cluster.State, 2), // we use two, one for the notifications and one for silences.
-		msgc:              make(chan *clusterpb.Part),
+		msgc:              make(chan *clusterpb.Part, msgChannelBufferSize),
 		reg:               r,
 		settleReadTimeout: defaultSettleReadTimeout,
 		storeReadTimeout:  defaultStoreReadTimeout,
@@ -91,6 +98,10 @@ func newReplicatedStates(userID string, rf int, re Replicator, st alertstore.Ale
 		stateReplicationFailed: promauto.With(r).NewCounterVec(prometheus.CounterOpts{
 			Name: "alertmanager_state_replication_failed_total",
 			Help: "Number of times we have failed to replicate a state to other alertmanagers.",
+		}, []string{"key"}),
+		stateReplicationDropped: promauto.With(r).NewCounterVec(prometheus.CounterOpts{
+			Name: "alertmanager_state_replication_dropped_total",
+			Help: "Number of times we have dropped a state broadcast because the replication channel was full.",
 		}, []string{"key"}),
 		fetchReplicaStateTotal: promauto.With(r).NewCounter(prometheus.CounterOpts{
 			Name: "alertmanager_state_fetch_replica_state_total",
@@ -135,6 +146,7 @@ func (s *state) AddState(key string, cs cluster.State, _ prometheus.Registerer) 
 	s.partialStateMergesFailed.WithLabelValues(key)
 	s.stateReplicationTotal.WithLabelValues(key)
 	s.stateReplicationFailed.WithLabelValues(key)
+	s.stateReplicationDropped.WithLabelValues(key)
 
 	return &stateChannel{
 		s:   s,
@@ -298,8 +310,19 @@ func (s *state) running(ctx context.Context) error {
 
 func (s *state) broadcast(key string, b []byte) {
 	// We should ignore the Merges into the initial state during settling.
-	if s.Ready() {
-		s.msgc <- &clusterpb.Part{Key: key, Data: b}
+	if !s.Ready() {
+		return
+	}
+	// Non-blocking send: the caller may be holding the tenant's silence or
+	// notification-log mutex (via the vendored Alertmanager), so we must not
+	// block waiting for state.running to drain msgc. If the channel is full
+	// (because peer replication is slow or stalled), drop the broadcast and
+	// count it instead of holding the mutex.
+	select {
+	case s.msgc <- &clusterpb.Part{Key: key, Data: b}:
+	default:
+		s.stateReplicationDropped.WithLabelValues(key).Inc()
+		level.Warn(s.logger).Log("msg", "dropped state broadcast because replication channel is full", "user", s.userID, "key", key)
 	}
 }
 
