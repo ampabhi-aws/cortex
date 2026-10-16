@@ -234,6 +234,9 @@ func (c *haTracker) loop(ctx context.Context) error {
 			delete(c.elected, key)
 			c.electedReplicaChanges.DeleteLabelValues(user, cluster)
 			c.electedReplicaTimestamp.DeleteLabelValues(user, cluster)
+			// Also delete the per-cluster KV CAS calls counter so that long-lived tenants don't
+			// accumulate permanent children in this metric vector after a cluster is removed.
+			c.kvCASCalls.DeleteLabelValues(user, cluster)
 
 			userClusters := c.clusters[user]
 			if userClusters != nil {
@@ -378,7 +381,6 @@ func (c *haTracker) checkReplica(ctx context.Context, userID, cluster, replica s
 
 	c.electedLock.RLock()
 	entry, ok := c.elected[key]
-	clusters := len(c.clusters[userID])
 	c.electedLock.RUnlock()
 
 	if ok && now.Sub(timestamp.Time(entry.ReceivedAt)) < c.cfg.UpdateTimeout+c.updateTimeoutJitter {
@@ -388,16 +390,47 @@ func (c *haTracker) checkReplica(ctx context.Context, userID, cluster, replica s
 		return nil
 	}
 
+	// Reserve a cluster slot (if this is a cluster we don't know about yet) under the write lock,
+	// so that the MaxHAClusters check is authoritative against concurrent/bursty requests rather than
+	// relying on the asynchronous KV watch callback to populate c.clusters.
+	reserved := false
 	if !ok {
-		// If we don't know about this cluster yet and we have reached the limit for number of clusters, we error out now.
-		if limit := c.limits.MaxHAClusters(userID); limit > 0 && clusters+1 > limit {
-			return tooManyClustersError{limit: limit}
+		c.electedLock.Lock()
+		userClusters := c.clusters[userID]
+		_, alreadyTracked := userClusters[cluster]
+		if !alreadyTracked {
+			if limit := c.limits.MaxHAClusters(userID); limit > 0 && len(userClusters)+1 > limit {
+				c.electedLock.Unlock()
+				return tooManyClustersError{limit: limit}
+			}
+			if userClusters == nil {
+				userClusters = map[string]struct{}{}
+				c.clusters[userID] = userClusters
+			}
+			userClusters[cluster] = struct{}{}
+			reserved = true
 		}
+		c.electedLock.Unlock()
 	}
 
 	err := c.checkKVStore(ctx, key, replica, now)
 	c.kvCASCalls.WithLabelValues(userID, cluster).Inc()
 	if err != nil {
+		// If we reserved a cluster slot but the CAS failed (and no watch callback has yet persisted
+		// this cluster via the normal path), release the reservation so a legitimate retry or a
+		// different cluster can take the slot.
+		if reserved {
+			c.electedLock.Lock()
+			if _, exists := c.elected[key]; !exists {
+				if userClusters := c.clusters[userID]; userClusters != nil {
+					delete(userClusters, cluster)
+					if len(userClusters) == 0 {
+						delete(c.clusters, userID)
+					}
+				}
+			}
+			c.electedLock.Unlock()
+		}
 		// The callback within checkKVStore will return a replicasNotMatchError if the sample is being deduped,
 		// otherwise there may have been an actual error CAS'ing that we should log.
 		if !errors.Is(err, replicasNotMatchError{}) {
