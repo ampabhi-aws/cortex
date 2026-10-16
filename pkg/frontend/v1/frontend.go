@@ -31,13 +31,17 @@ var (
 
 // Config for a Frontend.
 type Config struct {
-	MaxOutstandingPerTenant int           `yaml:"max_outstanding_per_tenant"`
-	QuerierForgetDelay      time.Duration `yaml:"querier_forget_delay"`
+	MaxOutstandingPerTenant      int           `yaml:"max_outstanding_per_tenant"`
+	MaxQueueTenants              int           `yaml:"max_queue_tenants"`
+	MaxOutstandingBytesPerTenant int           `yaml:"max_outstanding_bytes_per_tenant"`
+	QuerierForgetDelay           time.Duration `yaml:"querier_forget_delay"`
 }
 
 // RegisterFlags adds the flags required to config this to the given FlagSet.
 func (cfg *Config) RegisterFlags(f *flag.FlagSet) {
 	f.IntVar(&cfg.MaxOutstandingPerTenant, "querier.max-outstanding-requests-per-tenant", 100, "Maximum number of outstanding requests per tenant per frontend; requests beyond this error with HTTP 429.")
+	f.IntVar(&cfg.MaxQueueTenants, "querier.max-queue-tenants", 0, "Maximum number of distinct tenants that may concurrently hold a request queue on this query-frontend. 0 disables the cap. Caps the frontend's tenant set so that an untrusted peer cannot inflate it via arbitrary X-Scope-OrgID values.")
+	f.IntVar(&cfg.MaxOutstandingBytesPerTenant, "querier.max-outstanding-bytes-per-tenant", 0, "Maximum total bytes of request payload a single tenant may have concurrently queued on this query-frontend. 0 disables the byte accounting. Enforced in addition to -querier.max-outstanding-requests-per-tenant.")
 	f.DurationVar(&cfg.QuerierForgetDelay, "query-frontend.querier-forget-delay", 0, "If a querier disconnects without sending notification about graceful shutdown, the query-frontend will keep the querier in the tenant's shard until the forget delay has passed. This feature is useful to reduce the blast radius when shuffle-sharding is enabled.")
 }
 
@@ -79,6 +83,21 @@ type request struct {
 	response chan *httpgrpc.HTTPResponse
 }
 
+// Context lets the queue drop this request at enqueue time if its originating caller has
+// already cancelled, so an attacker-sized payload cannot pin a per-tenant channel slot.
+func (r *request) Context() context.Context {
+	return r.originalCtx
+}
+
+// Size reports the serialised size of the carried HTTP request. The queue uses it to enforce
+// an optional per-tenant queued-bytes budget.
+func (r *request) Size() int {
+	if r == nil || r.request == nil {
+		return 0
+	}
+	return r.request.Size()
+}
+
 // New creates a new frontend. Frontend implements service, and must be started and stopped.
 func New(cfg Config, limits Limits, log log.Logger, registerer prometheus.Registerer) (*Frontend, error) {
 	f := &Frontend{
@@ -100,7 +119,7 @@ func New(cfg Config, limits Limits, log log.Logger, registerer prometheus.Regist
 		}),
 	}
 
-	f.requestQueue = queue.NewRequestQueue(cfg.MaxOutstandingPerTenant, cfg.QuerierForgetDelay, f.queueLength, f.discardedRequests)
+	f.requestQueue = queue.NewRequestQueueWithLimits(cfg.MaxOutstandingPerTenant, cfg.MaxQueueTenants, cfg.MaxOutstandingBytesPerTenant, cfg.QuerierForgetDelay, f.queueLength, f.discardedRequests)
 	f.activeUsers = util.NewActiveUsersCleanupWithDefaultValues(f.cleanupInactiveUserMetrics)
 
 	var err error
@@ -332,7 +351,7 @@ func (f *Frontend) queueRequest(ctx context.Context, req *request) error {
 	f.activeUsers.UpdateUserTimestamp(joinedTenantID, now)
 
 	err = f.requestQueue.EnqueueRequest(joinedTenantID, req, maxQueriers, nil)
-	if err == queue.ErrTooManyRequests {
+	if err == queue.ErrTooManyRequests || err == queue.ErrTooManyTenants {
 		return errTooManyRequest
 	}
 	return err

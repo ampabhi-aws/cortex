@@ -81,12 +81,16 @@ type connectedFrontend struct {
 
 type Config struct {
 	MaxOutstandingPerTenant int               `yaml:"max_outstanding_requests_per_tenant"`
+	MaxQueueTenants         int               `yaml:"max_queue_tenants"`
+	MaxOutstandingBytesPerTenant int          `yaml:"max_outstanding_bytes_per_tenant"`
 	QuerierForgetDelay      time.Duration     `yaml:"querier_forget_delay"`
 	GRPCClientConfig        grpcclient.Config `yaml:"grpc_client_config" doc:"description=This configures the gRPC client used to report errors back to the query-frontend."`
 }
 
 func (cfg *Config) RegisterFlags(f *flag.FlagSet) {
 	f.IntVar(&cfg.MaxOutstandingPerTenant, "query-scheduler.max-outstanding-requests-per-tenant", 100, "Maximum number of outstanding requests per tenant per query-scheduler. In-flight requests above this limit will fail with HTTP response status code 429.")
+	f.IntVar(&cfg.MaxQueueTenants, "query-scheduler.max-queue-tenants", 0, "Maximum number of distinct tenants that may concurrently hold a request queue on this query-scheduler. 0 disables the cap. When reached, further requests presenting a new tenant ID are rejected with 429 so that an untrusted peer cannot inflate the scheduler's tenant set.")
+	f.IntVar(&cfg.MaxOutstandingBytesPerTenant, "query-scheduler.max-outstanding-bytes-per-tenant", 0, "Maximum total bytes of request payload a single tenant may have concurrently queued on this query-scheduler. 0 disables the byte accounting. Enforced in addition to -query-scheduler.max-outstanding-requests-per-tenant.")
 	f.DurationVar(&cfg.QuerierForgetDelay, "query-scheduler.querier-forget-delay", 0, "If a querier disconnects without sending notification about graceful shutdown, the query-scheduler will keep the querier in the tenant's shard until the forget delay has passed. This feature is useful to reduce the blast radius when shuffle-sharding is enabled.")
 	cfg.GRPCClientConfig.RegisterFlagsWithPrefix("query-scheduler.grpc-client-config", f)
 }
@@ -111,7 +115,7 @@ func NewScheduler(cfg Config, limits Limits, log log.Logger, registerer promethe
 		Name: "cortex_query_scheduler_discarded_requests_total",
 		Help: "Total number of query requests discarded.",
 	}, []string{"user"})
-	s.requestQueue = queue.NewRequestQueue(cfg.MaxOutstandingPerTenant, cfg.QuerierForgetDelay, s.queueLength, s.discardedRequests)
+	s.requestQueue = queue.NewRequestQueueWithLimits(cfg.MaxOutstandingPerTenant, cfg.MaxQueueTenants, cfg.MaxOutstandingBytesPerTenant, cfg.QuerierForgetDelay, s.queueLength, s.discardedRequests)
 
 	s.queueDuration = promauto.With(registerer).NewHistogram(prometheus.HistogramOpts{
 		Name:    "cortex_query_scheduler_queue_duration_seconds",
@@ -162,6 +166,23 @@ type schedulerRequest struct {
 	parentSpanContext opentracing.SpanContext
 }
 
+// Context lets the queue drop this request at enqueue time if it has already been cancelled,
+// so an attacker-sized payload cannot pin a per-tenant channel slot until a dequeue would
+// discard it.
+func (r *schedulerRequest) Context() context.Context {
+	return r.ctx
+}
+
+// Size reports the serialised size of the carried HTTP request. The queue uses it to enforce
+// an optional per-tenant queued-bytes budget in addition to the per-tenant outstanding
+// request-count cap.
+func (r *schedulerRequest) Size() int {
+	if r == nil || r.request == nil {
+		return 0
+	}
+	return r.request.Size()
+}
+
 // FrontendLoop handles connection from frontend.
 func (s *Scheduler) FrontendLoop(frontend schedulerpb.SchedulerForFrontend_FrontendLoopServer) error {
 	frontendAddress, frontendCtx, err := s.frontendConnected(frontend)
@@ -201,7 +222,7 @@ func (s *Scheduler) FrontendLoop(frontend schedulerpb.SchedulerForFrontend_Front
 			switch {
 			case err == nil:
 				resp = &schedulerpb.SchedulerToFrontend{Status: schedulerpb.OK}
-			case err == queue.ErrTooManyRequests:
+			case err == queue.ErrTooManyRequests, err == queue.ErrTooManyTenants:
 				resp = &schedulerpb.SchedulerToFrontend{Status: schedulerpb.TOO_MANY_REQUESTS_PER_TENANT}
 			default:
 				resp = &schedulerpb.SchedulerToFrontend{Status: schedulerpb.ERROR, Error: err.Error()}
