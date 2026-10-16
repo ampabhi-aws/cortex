@@ -81,12 +81,24 @@ func (a *API) admin(w http.ResponseWriter, r *http.Request) {
 `)
 }
 
-// RegisterRoutes registers the configs API HTTP routes with the provided Router.
-func (a *API) RegisterRoutes(r *mux.Router) {
-	for _, route := range []struct {
-		name, method, path string
-		handler            http.HandlerFunc
-	}{
+// maxConfigRequestBodyBytes bounds the size of request bodies accepted by the
+// configs endpoints that parse user-supplied YAML/JSON. This mirrors the
+// defensive body limits used elsewhere in Cortex and protects callers
+// (including the /alertmanager/validate handler) from unbounded memory use.
+const maxConfigRequestBodyBytes = 5 * 1024 * 1024 // 5 MiB
+
+type configRoute struct {
+	name, method, path string
+	handler            http.HandlerFunc
+}
+
+// tenantFacingRoutes are the configs endpoints that resolve a tenant from the
+// request context. They must be registered behind the Cortex HTTP auth
+// middleware so auth-disabled deployments pin the tenant to "fake" exactly
+// like every other endpoint, and so multi-tenant deployments cannot read or
+// overwrite other tenants' data via a client-chosen X-Scope-OrgID header.
+func (a *API) tenantFacingRoutes() []configRoute {
+	return []configRoute{
 		{"root", "GET", "/", a.admin},
 		// Dedicated APIs for updating rules config. In the future, these *must*
 		// be used.
@@ -99,17 +111,60 @@ func (a *API) RegisterRoutes(r *mux.Router) {
 		{"validate_alertmanager_config", "POST", "/api/prom/configs/alertmanager/validate", a.validateAlertmanagerConfig},
 		{"deactivate_config", "DELETE", "/api/prom/configs/deactivate", a.deactivateConfig},
 		{"restore_config", "POST", "/api/prom/configs/restore", a.restoreConfig},
-		// Internal APIs.
+	}
+}
+
+// privateRoutes are the all-tenant propagation endpoints. They dump every
+// tenant's configuration and must NOT be exposed on the tenant-facing
+// listener.
+func (a *API) privateRoutes() []configRoute {
+	return []configRoute{
 		{"private_get_rules", "GET", "/private/api/prom/configs/rules", a.getConfigs},
 		{"private_get_alertmanager_config", "GET", "/private/api/prom/configs/alertmanager", a.getConfigs},
-	} {
+	}
+}
+
+// RegisterRoutes registers the configs API HTTP routes with the provided
+// mux.Router. It is retained for in-process callers (including this package's
+// own test harness) that drive the handler directly. Production deployments
+// should register the tenant-facing routes through pkg/api so that the
+// configured HTTPAuthMiddleware is applied; see RegisterTenantRoutes.
+func (a *API) RegisterRoutes(r *mux.Router) {
+	for _, route := range a.tenantFacingRoutes() {
 		r.Handle(route.path, route.handler).Methods(route.method).Name(route.name)
+	}
+	for _, route := range a.privateRoutes() {
+		r.Handle(route.path, route.handler).Methods(route.method).Name(route.name)
+	}
+}
+
+// RouteRegisterer is the subset of pkg/api.API required to register the
+// tenant-facing configs routes with the Cortex HTTP auth middleware applied.
+// It is declared here to avoid an import cycle with pkg/api.
+type RouteRegisterer interface {
+	RegisterRoute(path string, handler http.Handler, auth bool, method string, methods ...string)
+}
+
+// RegisterTenantRoutes registers the tenant-facing configs endpoints through
+// pkg/api so that the configured HTTPAuthMiddleware wraps each handler. The
+// handlers derive the tenant ID from the request context (populated by the
+// middleware) rather than from the raw X-Scope-OrgID header, matching every
+// other Cortex endpoint. The /private/... propagation endpoints are
+// intentionally omitted: they return every tenant's configuration and must
+// not be served on the tenant-facing listener. The informational "/" admin
+// page is also skipped because pkg/api already serves the index page there.
+func (a *API) RegisterTenantRoutes(r RouteRegisterer) {
+	for _, route := range a.tenantFacingRoutes() {
+		if route.path == "/" {
+			continue
+		}
+		r.RegisterRoute(route.path, route.handler, true, route.method)
 	}
 }
 
 // getConfig returns the request configuration.
 func (a *API) getConfig(w http.ResponseWriter, r *http.Request) {
-	userID, _, err := tenant.ExtractTenantIDFromHTTPRequest(r)
+	userID, err := tenant.TenantID(r.Context())
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusUnauthorized)
 		return
@@ -147,12 +202,16 @@ func (a *API) getConfig(w http.ResponseWriter, r *http.Request) {
 }
 
 func (a *API) setConfig(w http.ResponseWriter, r *http.Request) {
-	userID, _, err := tenant.ExtractTenantIDFromHTTPRequest(r)
+	userID, err := tenant.TenantID(r.Context())
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusUnauthorized)
 		return
 	}
 	logger := util_log.WithContext(r.Context(), util_log.Logger)
+
+	// Bound the request body: the handler parses attacker-controlled YAML/JSON
+	// into an Alertmanager/Prometheus configuration tree.
+	r.Body = http.MaxBytesReader(w, r.Body, maxConfigRequestBodyBytes)
 
 	var cfg userconfig.Config
 	switch parseConfigFormat(r.Header.Get("Content-Type"), FormatJSON) {
@@ -203,10 +262,23 @@ func (a *API) setConfig(w http.ResponseWriter, r *http.Request) {
 
 func (a *API) validateAlertmanagerConfig(w http.ResponseWriter, r *http.Request) {
 	logger := util_log.WithContext(r.Context(), util_log.Logger)
+
+	// Require an authenticated tenant context (populated by the HTTP auth
+	// middleware) before doing any work: the handler parses attacker-controlled
+	// YAML and must not be reachable unauthenticated.
+	if _, err := tenant.TenantID(r.Context()); err != nil {
+		http.Error(w, err.Error(), http.StatusUnauthorized)
+		return
+	}
+
+	// Bound the request body before io.ReadAll so a large payload cannot
+	// exhaust memory.
+	r.Body = http.MaxBytesReader(w, r.Body, maxConfigRequestBodyBytes)
+
 	cfg, err := io.ReadAll(r.Body)
 	if err != nil {
 		level.Error(logger).Log("msg", "error reading request body", "err", err)
-		http.Error(w, err.Error(), http.StatusInternalServerError)
+		http.Error(w, err.Error(), http.StatusBadRequest)
 		return
 	}
 
@@ -297,7 +369,7 @@ func (a *API) getConfigs(w http.ResponseWriter, r *http.Request) {
 }
 
 func (a *API) deactivateConfig(w http.ResponseWriter, r *http.Request) {
-	userID, _, err := tenant.ExtractTenantIDFromHTTPRequest(r)
+	userID, err := tenant.TenantID(r.Context())
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusUnauthorized)
 		return
@@ -319,7 +391,7 @@ func (a *API) deactivateConfig(w http.ResponseWriter, r *http.Request) {
 }
 
 func (a *API) restoreConfig(w http.ResponseWriter, r *http.Request) {
-	userID, _, err := tenant.ExtractTenantIDFromHTTPRequest(r)
+	userID, err := tenant.TenantID(r.Context())
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusUnauthorized)
 		return

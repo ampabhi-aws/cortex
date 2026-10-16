@@ -591,7 +591,11 @@ func (t *Cortex) initConfig() (serv services.Service, err error) {
 	}
 
 	t.ConfigAPI = configAPI.New(t.ConfigDB, t.Cfg.Configs.API)
-	t.ConfigAPI.RegisterRoutes(t.Server.HTTP)
+	// Register the tenant-facing configs endpoints through pkg/api so that the
+	// configured HTTPAuthMiddleware wraps each handler, matching every other
+	// Cortex route. The /private/... all-tenant propagation endpoints are
+	// intentionally not exposed on the public listener.
+	t.ConfigAPI.RegisterTenantRoutes(t.API)
 	return services.NewIdleService(nil, func(_ error) error {
 		t.ConfigDB.Close()
 		return nil
