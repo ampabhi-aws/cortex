@@ -3182,7 +3182,7 @@ func Test_Ingester_AllUserStats(t *testing.T) {
 	}
 
 	// Get label names
-	res, err := i.AllUserStats(context.Background(), &client.UserStatsRequest{})
+	res, err := i.AllUserStats(user.InjectOrgID(context.Background(), client.AllUserStatsOperatorTenantID), &client.UserStatsRequest{})
 	require.NoError(t, err)
 
 	expect := []*client.UserIDStatsResponse{

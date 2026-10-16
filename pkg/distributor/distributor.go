@@ -1206,7 +1206,12 @@ func (d *Distributor) AllUserStats(ctx context.Context) ([]UserIDStats, error) {
 	perUserTotals := make(map[string]UserStats)
 
 	req := &ingester_client.UserStatsRequest{}
-	ctx = user.InjectOrgID(ctx, "1") // fake: ingester insists on having an org ID
+	// AllUserStats is restricted to the reserved operator principal: the
+	// ingester's RPC rejects any other X-Scope-OrgID so that an arbitrary
+	// tenant cannot enumerate every live tenant together with its series
+	// count and ingestion rate. See
+	// pkg/ingester/client/custom.go:AllUserStatsOperatorTenantID.
+	ctx = user.InjectOrgID(ctx, ingester_client.AllUserStatsOperatorTenantID)
 	// Not using d.ForReplicationSet(), so we can fail after first error.
 	replicationSet, err := d.ingestersRing.GetAllHealthy(ring.Read)
 	if err != nil {

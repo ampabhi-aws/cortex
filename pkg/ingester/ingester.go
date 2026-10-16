@@ -1557,9 +1557,27 @@ func (i *Ingester) UserStats(ctx context.Context, req *client.UserStatsRequest) 
 }
 
 // AllUserStats returns ingestion statistics for all users known to this ingester.
-func (i *Ingester) AllUserStats(_ context.Context, _ *client.UserStatsRequest) (*client.UsersStatsResponse, error) {
+//
+// This RPC exposes the identity, series count and ingestion rates of every
+// tenant whose TSDB is open on the instance, so it must not be callable by
+// arbitrary tenant principals. The caller is required to present the reserved
+// operator principal (client.AllUserStatsOperatorTenantID); any other
+// X-Scope-OrgID is rejected with PermissionDenied. The distributor's
+// AllUserStats fan-out injects this reserved principal before calling the
+// ingester, and the HTTP route that re-publishes the aggregated view is a
+// documented operator endpoint that must be protected by the external auth
+// layer per docs/guides/authentication-and-authorisation.md.
+func (i *Ingester) AllUserStats(ctx context.Context, _ *client.UserStatsRequest) (*client.UsersStatsResponse, error) {
 	if err := i.checkRunning(); err != nil {
 		return nil, err
+	}
+
+	userID, err := tenant.TenantID(ctx)
+	if err != nil {
+		return nil, err
+	}
+	if userID != client.AllUserStatsOperatorTenantID {
+		return nil, status.Error(codes.PermissionDenied, "AllUserStats is restricted to the operator principal")
 	}
 
 	i.stoppedMtx.RLock()
