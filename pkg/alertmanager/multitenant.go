@@ -821,6 +821,18 @@ func (am *MultitenantAlertmanager) setConfig(cfg alertspb.AlertConfigDesc) error
 		}
 	}
 
+	// Validate template filenames before we touch the on-disk layout. This mirrors the
+	// validation performed by the SetUserConfig HTTP handler (see validateUserConfig) so
+	// that configs reaching the apply path through alternative writers (e.g. the legacy
+	// configs service POST /api/prom/configs/alertmanager) cannot escape the per-tenant
+	// directory or bypass the Cortex *_file restrictions enforced below.
+	for _, tmpl := range cfg.Templates {
+		if err := validateTemplateFilename(tmpl.Filename); err != nil {
+			level.Error(am.logger).Log("msg", "invalid Alertmanager configuration: rejected template filename", "user", cfg.User, "template", tmpl.Filename, "err", err)
+			return fmt.Errorf("invalid Cortex configuration for %v: %v", cfg.User, err)
+		}
+	}
+
 	for _, tmpl := range cfg.Templates {
 		templateFilePath, err := safeTemplateFilepath(userTemplateDir, tmpl.Filename)
 		if err != nil {
@@ -871,6 +883,20 @@ func (am *MultitenantAlertmanager) setConfig(cfg alertspb.AlertConfigDesc) error
 			// they submit a broken one, the Manager will keep running the last known
 			// working configuration.
 			return fmt.Errorf("invalid Cortex configuration for %v: %v", cfg.User, err)
+		}
+	}
+
+	// Re-run the Cortex-specific validation here (not only in the SetUserConfig HTTP
+	// handler) so that every config reaching the apply path is checked, regardless of
+	// which writer put it in the alert store. This closes a gap where a tenant can push
+	// a config through an alternative writer (e.g. the legacy configs service
+	// POST /api/prom/configs/alertmanager) that bypasses the *_file deny list
+	// (password_file, bearer_token_file, credentials_file, TLS *_file, slack api_url_file,
+	// victorops api_key_file, ...). See CVE-2021-31232.
+	if userAmConfig != nil {
+		if validationErr := validateAlertmanagerConfig(userAmConfig); validationErr != nil {
+			level.Error(am.logger).Log("msg", "invalid Alertmanager configuration rejected at apply time", "user", cfg.User, "err", validationErr)
+			return fmt.Errorf("invalid Cortex configuration for %v: %v", cfg.User, validationErr)
 		}
 	}
 
