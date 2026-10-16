@@ -863,12 +863,23 @@ func (r *Ruler) DeleteTenantConfiguration(w http.ResponseWriter, req *http.Reque
 func (r *Ruler) ListAllRules(w http.ResponseWriter, req *http.Request) {
 	logger := util_log.WithContext(req.Context(), r.logger)
 
-	userIDs, err := r.store.ListAllUsers(req.Context())
+	// Resolve the tenant from the request context (populated by the auth
+	// middleware from the X-Scope-OrgID header). Without a tenant we must
+	// not expose rule groups: previously this handler iterated every tenant
+	// returned by store.ListAllUsers and streamed each tenant's complete
+	// rule groups (PromQL expressions, labels and annotations), which
+	// disclosed cross-tenant data to any caller that could reach the
+	// endpoint. Scope the response to the caller's tenant.
+	userID, err := tenant.TenantID(req.Context())
 	if err != nil {
-		level.Error(logger).Log("msg", errListAllUser, "err", err)
-		http.Error(w, fmt.Sprintf("%s: %s", errListAllUser, err.Error()), http.StatusInternalServerError)
+		// Mirror DeleteTenantConfiguration: when the auth middleware is in
+		// place this is unreachable, but if the route is reached without a
+		// tenant respond with Unauthorized rather than leaking data.
+		http.Error(w, err.Error(), http.StatusUnauthorized)
 		return
 	}
+
+	userIDs := []string{userID}
 
 	done := make(chan struct{})
 	iter := make(chan interface{})

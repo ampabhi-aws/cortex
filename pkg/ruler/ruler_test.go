@@ -1108,7 +1108,10 @@ func TestRuler_ListAllRules(t *testing.T) {
 	router := mux.NewRouter()
 	router.Path("/ruler/rule_groups").Methods(http.MethodGet).HandlerFunc(r.ListAllRules)
 
-	req := requestFor(t, http.MethodGet, "https://localhost:8080/ruler/rule_groups", nil, "")
+	// The handler now scopes its response to the tenant resolved from the
+	// request context, so make the request as "user1" and assert we only
+	// see that tenant's rule groups.
+	req := requestFor(t, http.MethodGet, "https://localhost:8080/ruler/rule_groups", nil, "user1")
 	w := httptest.NewRecorder()
 	router.ServeHTTP(w, req)
 
@@ -1120,9 +1123,7 @@ func TestRuler_ListAllRules(t *testing.T) {
 	require.Equal(t, "application/yaml", resp.Header.Get("Content-Type"))
 
 	gs := make(map[string]map[string][]rulefmt.RuleGroup) // user:namespace:[]rulefmt.RuleGroup
-	for userID := range mockRules {
-		gs[userID] = mockRules[userID].Formatted()
-	}
+	gs["user1"] = mockRules["user1"].Formatted()
 
 	// check for unnecessary fields
 	unnecessaryFields := []string{"kind", "style", "tag", "value", "anchor", "alias", "content", "headcomment", "linecomment", "footcomment", "line", "column"}
@@ -1133,6 +1134,16 @@ func TestRuler_ListAllRules(t *testing.T) {
 	expectedResponse, err := yaml.Marshal(gs)
 	require.NoError(t, err)
 	require.YAMLEq(t, string(expectedResponse), string(body))
+
+	// Other tenants' rule groups must not appear in the response.
+	require.NotContains(t, string(body), "user2")
+
+	// Without a tenant in the context the handler must refuse to serve
+	// rule groups.
+	unauthReq := httptest.NewRequest(http.MethodGet, "https://localhost:8080/ruler/rule_groups", nil)
+	unauthW := httptest.NewRecorder()
+	router.ServeHTTP(unauthW, unauthReq)
+	require.Equal(t, http.StatusUnauthorized, unauthW.Result().StatusCode)
 }
 
 type senderFunc func(alerts ...*notifier.Alert)
