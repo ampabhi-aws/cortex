@@ -280,11 +280,24 @@ func (t *TCPTransport) handleConnection(conn net.Conn) {
 			return
 		}
 
-		// read the rest to buffer -- this is the "packet" itself
-		buf, err := io.ReadAll(conn)
+		// read the rest to buffer -- this is the "packet" itself.
+		//
+		// We cap the packet body at maxUDPPacketSize bytes so a malicious or
+		// buggy peer cannot push an arbitrarily large payload that would then
+		// be handed to the delegate (NotifyMsg/MergeRemoteState). The limit
+		// is identical to the memberlist UDPBufferSize configured for the
+		// cluster; a slightly larger allowance covers the trailing md5 digest
+		// and any small framing overhead.
+		buf, err := io.ReadAll(io.LimitReader(conn, int64(maxUDPPacketSize)+int64(md5.Size)+1))
 		if err != nil {
 			t.receivedPacketsErrors.Inc()
 			level.Warn(t.logger).Log("msg", "error while reading packet data", "err", err, "remote", conn.RemoteAddr())
+			return
+		}
+
+		if len(buf) > maxUDPPacketSize+md5.Size {
+			t.receivedPacketsErrors.Inc()
+			level.Warn(t.logger).Log("msg", "received packet exceeds maximum accepted size, dropping", "size", len(buf), "limit", maxUDPPacketSize, "remote", conn.RemoteAddr())
 			return
 		}
 

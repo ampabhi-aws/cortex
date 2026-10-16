@@ -28,6 +28,28 @@ import (
 const (
 	maxCasRetries              = 10          // max retries in CAS operation
 	noChangeDetectedRetrySleep = time.Second // how long to sleep after no change was detected in CAS
+
+	// maxUDPPacketSize is the per-packet budget memberlist uses to pack broadcasts
+	// (also set as mlCfg.UDPBufferSize below). Items in the TransmitLimitedQueue
+	// larger than this budget are never selected by GetBroadcasts and would be
+	// retained for the lifetime of the process; we therefore refuse to enqueue
+	// them. See hashicorp/memberlist state.go/net.go and queue.go.
+	maxUDPPacketSize = 10 * 1024 * 1024
+
+	// maxBroadcastMessageSize is the largest marshalled KV pair we are willing
+	// to put on the broadcast queue. We subtract a small headroom for the
+	// compound packet overhead memberlist applies when packing broadcasts
+	// (compoundHeaderOverhead + compoundOverhead = 4 bytes in the vendored
+	// memberlist). Oversized items are dropped and counted in
+	// numberOfBroadcastMessagesDropped, matching that metric's help text.
+	maxBroadcastMessageSize = maxUDPPacketSize - 4
+
+	// maxAcceptedKVPairSize bounds the size of an individual KV pair accepted
+	// from gossip (NotifyMsg or MergeRemoteState). An attacker-controlled peer
+	// could otherwise push arbitrarily large values that we would then try to
+	// re-broadcast. The cap matches the broadcast cap so values we accept are
+	// always possible to retransmit.
+	maxAcceptedKVPairSize = maxBroadcastMessageSize
 )
 
 // Client implements kv.Client interface, by using memberlist.KV
@@ -400,7 +422,7 @@ func (m *KV) buildMemberlistConfig() (*memberlist.Config, error) {
 
 	// Memberlist uses UDPBufferSize to figure out how many messages it can put into single "packet".
 	// As we don't use UDP for sending packets, we can use higher value here.
-	mlCfg.UDPBufferSize = 10 * 1024 * 1024
+	mlCfg.UDPBufferSize = maxUDPPacketSize
 
 	// For our use cases, we don't need a very fast detection of dead nodes. Since we use a TCP transport
 	// and we open a new TCP connection for each packet, we prefer to reduce the probe frequency and increase
@@ -938,6 +960,17 @@ func (m *KV) broadcastNewValue(key string, change Mergeable, version uint, codec
 		return
 	}
 
+	// The hashicorp/memberlist TransmitLimitedQueue can only select items that
+	// fit the per-packet budget (UDPBufferSize minus overhead). An item larger
+	// than that budget would never be transmitted, never reach the retransmit
+	// limit, and never call Finished(), permanently retaining memory. Drop
+	// oversized messages here instead, as the drop metric help text advertises.
+	if len(pairData) > maxBroadcastMessageSize {
+		level.Error(m.logger).Log("msg", "broadcast message too big, dropping", "key", key, "version", version, "size", len(pairData), "limit", maxBroadcastMessageSize)
+		m.numberOfBroadcastMessagesDropped.Inc()
+		return
+	}
+
 	m.addSentMessage(message{
 		Time:    time.Now(),
 		Size:    len(pairData),
@@ -1013,6 +1046,17 @@ func (m *KV) NotifyMsg(msg []byte) {
 
 func (m *KV) queueBroadcast(key string, content []string, version uint, message []byte) {
 	l := len(message)
+
+	// Defense-in-depth: broadcastNewValue is the only in-tree caller and it
+	// already drops oversized payloads, but refuse here too so any future caller
+	// cannot wedge the TransmitLimitedQueue with an item larger than the
+	// per-packet budget (which would never be selected by GetBroadcasts and
+	// would therefore never be released).
+	if l > maxBroadcastMessageSize {
+		level.Error(m.logger).Log("msg", "broadcast message too big, dropping", "key", key, "version", version, "size", l, "limit", maxBroadcastMessageSize)
+		m.numberOfBroadcastMessagesDropped.Inc()
+		return
+	}
 
 	b := ringBroadcast{
 		key:     key,
@@ -1140,6 +1184,17 @@ func (m *KV) MergeRemoteState(data []byte, join bool) {
 		if len(data) < int(kvPairLength) {
 			err = fmt.Errorf("not enough data left for next KV Pair, expected %d, remaining %d bytes", kvPairLength, len(data))
 			break
+		}
+
+		// Bound per-KV-pair size accepted from remote peers. Without this an
+		// attacker could push a value large enough that re-broadcasting the
+		// merged change would be refused by broadcastNewValue while still
+		// forcing us to decode and merge an unbounded payload per pair. Skip
+		// oversized pairs and continue parsing the next one.
+		if kvPairLength > maxAcceptedKVPairSize {
+			level.Warn(m.logger).Log("msg", "received KV pair exceeds maximum accepted size, skipping", "size", kvPairLength, "limit", maxAcceptedKVPairSize)
+			data = data[kvPairLength:]
+			continue
 		}
 
 		kvPair.Reset()
