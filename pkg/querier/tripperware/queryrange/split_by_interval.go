@@ -2,6 +2,7 @@ package queryrange
 
 import (
 	"context"
+	"math"
 	"net/http"
 	"time"
 
@@ -11,6 +12,23 @@ import (
 	"github.com/weaveworks/common/httpgrpc"
 
 	"github.com/cortexproject/cortex/pkg/querier/tripperware"
+)
+
+// maxSplitByIntervalSubRequests is a safety upper bound on the number of
+// sub-requests produced by splitQuery for a single incoming query_range
+// request. Even with the smallest supported split interval of 1 minute, a
+// legitimate query that spans more than ~190 years cannot exceed this bound,
+// so hitting it indicates either a tenant-crafted step value that causes the
+// loop to wrap around int64 (CWE-190) or an otherwise pathological input.
+// Reaching this cap aborts the split with HTTP 400 instead of letting the
+// query-frontend allocate an unbounded slice of sub-requests and OOM the
+// shared process.
+const maxSplitByIntervalSubRequests = 100000
+
+var errTooManyQuerySplits = httpgrpc.Errorf(
+	http.StatusBadRequest,
+	"the query would be split into more than %d sub-requests. Please reduce the time range, increase the step, or increase -querier.split-queries-by-interval.",
+	maxSplitByIntervalSubRequests,
 )
 
 type IntervalFn func(r tripperware.Request) time.Duration
@@ -81,13 +99,36 @@ func splitQuery(r tripperware.Request, interval time.Duration) ([]tripperware.Re
 		return nil, err
 	}
 	var reqs []tripperware.Request
-	for start := r.GetStart(); start < r.GetEnd(); start = nextIntervalBoundary(start, r.GetStep(), interval) + r.GetStep() {
-		end := nextIntervalBoundary(start, r.GetStep(), interval)
-		if end+r.GetStep() >= r.GetEnd() {
+	step := r.GetStep()
+	for start := r.GetStart(); start < r.GetEnd(); {
+		end := nextIntervalBoundary(start, step, interval)
+		if end+step >= r.GetEnd() || end+step < end {
 			end = r.GetEnd()
 		}
 
 		reqs = append(reqs, r.WithQuery(query).WithStartEnd(start, end))
+
+		// Bound the number of produced sub-requests so a single request cannot
+		// drive unbounded allocation in the shared query-frontend.
+		if len(reqs) > maxSplitByIntervalSubRequests {
+			return nil, errTooManyQuerySplits
+		}
+
+		// Advance to the next sub-request start with an overflow-safe check.
+		// For a tenant-controlled step close to math.MaxInt64, computing
+		// `nextIntervalBoundary(start, step, interval) + step` would wrap int64
+		// (CWE-190) and the loop would walk the whole int64 range in small
+		// decrements instead of terminating. If adding `step` would overflow
+		// or fail to advance `start` strictly forward, we're done.
+		boundary := nextIntervalBoundary(start, step, interval)
+		if step > 0 && boundary > math.MaxInt64-step {
+			break
+		}
+		next := boundary + step
+		if next <= start {
+			break
+		}
+		start = next
 	}
 	return reqs, nil
 }
