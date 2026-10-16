@@ -3,6 +3,7 @@ package configdb
 import (
 	"context"
 	"errors"
+	"sync"
 
 	"github.com/cortexproject/cortex/pkg/alertmanager/alertspb"
 	"github.com/cortexproject/cortex/pkg/configs/client"
@@ -21,6 +22,15 @@ var (
 // Store is a concrete implementation of RuleStore that sources rules from the config service
 type Store struct {
 	configClient client.Client
+
+	// mtx guards since and alertConfigs. It must be held for the whole
+	// reloadConfigs body (GetAlerts + cache mutation + since update) so that
+	// concurrent callers (the periodic poll goroutine and HTTP handler
+	// goroutines, including the 16-way fan-out in ListAllConfigs) do not
+	// race on the shared map or cursor. Public methods must never range over
+	// or index alertConfigs without the lock; they get a snapshot copy from
+	// reloadConfigs instead.
+	mtx          sync.Mutex
 	since        userconfig.ID
 	alertConfigs map[string]alertspb.AlertConfigDesc
 }
@@ -113,7 +123,14 @@ func (c *Store) DeleteFullState(ctx context.Context, user string) error {
 	return errState
 }
 
+// reloadConfigs fetches configs newer than the cached cursor, applies them
+// to the shared cache under the store mutex, and returns a shallow copy of
+// the cache. The returned map is owned by the caller, so callers may safely
+// range over or index it without holding the lock.
 func (c *Store) reloadConfigs(ctx context.Context) (map[string]alertspb.AlertConfigDesc, error) {
+	c.mtx.Lock()
+	defer c.mtx.Unlock()
+
 	configs, err := c.configClient.GetAlerts(ctx, c.since)
 	if err != nil {
 		return nil, err
@@ -142,5 +159,11 @@ func (c *Store) reloadConfigs(ctx context.Context) (map[string]alertspb.AlertCon
 
 	c.since = configs.GetLatestConfigID()
 
-	return c.alertConfigs, nil
+	// Return a copy so callers can read the result without holding the lock.
+	snapshot := make(map[string]alertspb.AlertConfigDesc, len(c.alertConfigs))
+	for user, cfg := range c.alertConfigs {
+		snapshot[user] = cfg
+	}
+
+	return snapshot, nil
 }
