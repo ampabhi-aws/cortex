@@ -209,6 +209,18 @@ type Limits interface {
 	// AlertmanagerMaxTemplateSize returns max size of individual template. 0 = no limit.
 	AlertmanagerMaxTemplateSize(tenant string) int
 
+	// AlertmanagerMaxTemplateExpansionSize returns the maximum size, in bytes, of a single
+	// rendered Alertmanager notification template expansion. 0 = no limit. When exceeded,
+	// the render is aborted so a tenant-authored template cannot produce unbounded output
+	// in the shared multitenant process.
+	AlertmanagerMaxTemplateExpansionSize(tenant string) int
+
+	// AlertmanagerMaxTemplateNestingDepth returns the maximum allowed nesting depth of
+	// range/with/template actions in tenant-authored Alertmanager templates (both template
+	// files and inline notifier template strings), rejected at config validation time.
+	// 0 = no limit.
+	AlertmanagerMaxTemplateNestingDepth(tenant string) int
+
 	// AlertmanagerMaxDispatcherAggregationGroups returns maximum number of aggregation groups in Alertmanager's dispatcher that a tenant can have.
 	// Each aggregation group consumes single goroutine. 0 = unlimited.
 	AlertmanagerMaxDispatcherAggregationGroups(t string) int

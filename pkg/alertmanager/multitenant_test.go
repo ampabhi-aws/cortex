@@ -2106,6 +2106,8 @@ type mockAlertManagerLimits struct {
 	maxConfigSize                  int
 	maxTemplatesCount              int
 	maxSizeOfTemplate              int
+	maxTemplateExpansionSize       int
+	maxTemplateNestingDepth        int
 	maxDispatcherAggregationGroups int
 	maxAlertsCount                 int
 	maxAlertsSizeBytes             int
@@ -2121,6 +2123,14 @@ func (m *mockAlertManagerLimits) AlertmanagerMaxTemplatesCount(tenant string) in
 
 func (m *mockAlertManagerLimits) AlertmanagerMaxTemplateSize(tenant string) int {
 	return m.maxSizeOfTemplate
+}
+
+func (m *mockAlertManagerLimits) AlertmanagerMaxTemplateExpansionSize(tenant string) int {
+	return m.maxTemplateExpansionSize
+}
+
+func (m *mockAlertManagerLimits) AlertmanagerMaxTemplateNestingDepth(tenant string) int {
+	return m.maxTemplateNestingDepth
 }
 
 func (m *mockAlertManagerLimits) AlertmanagerReceiversBlockCIDRNetworks(user string) []flagext.CIDR {

@@ -15,6 +15,7 @@ package template
 
 import (
 	"bytes"
+	"errors"
 	tmplhtml "html/template"
 	"io/ioutil"
 	"net/url"
@@ -32,12 +33,50 @@ import (
 	"github.com/prometheus/alertmanager/types"
 )
 
+// ErrTemplateOutputTooLarge is returned by ExecuteTextString and
+// ExecuteHTMLString when a template render exceeds the configured
+// MaxOutputBytes cap. This is used by the multitenant Alertmanager
+// to bound the cost of rendering tenant-controlled notification
+// templates (CWE-400): without an output cap, a tiny config with
+// nested {{ range .Alerts }} blocks over M alerts can produce
+// O(M^N) bytes and starve the shared process.
+var ErrTemplateOutputTooLarge = errors.New("template output exceeded maximum allowed size")
+
+// limitedWriter is a bytes.Buffer that stops accepting writes after a
+// fixed number of bytes and returns ErrTemplateOutputTooLarge. We rely
+// on text/template aborting Execute on writer errors.
+type limitedWriter struct {
+	buf bytes.Buffer
+	max int
+}
+
+func (w *limitedWriter) Write(p []byte) (int, error) {
+	if w.max > 0 && w.buf.Len()+len(p) > w.max {
+		// Still accept the portion that fits so partial content is captured
+		// for logging, then signal the error so Execute aborts.
+		remaining := w.max - w.buf.Len()
+		if remaining > 0 {
+			w.buf.Write(p[:remaining])
+		}
+		return 0, ErrTemplateOutputTooLarge
+	}
+	return w.buf.Write(p)
+}
+
 // Template bundles a text and a html template instance.
 type Template struct {
 	text *tmpltext.Template
 	html *tmplhtml.Template
 
 	ExternalURL *url.URL
+
+	// MaxOutputBytes bounds the number of bytes produced by a single
+	// ExecuteTextString / ExecuteHTMLString invocation. 0 means no
+	// limit (preserves historical behaviour for callers that do not
+	// set it). The multitenant Alertmanager sets this to a per-tenant
+	// limit so that one tenant's expensive template cannot exhaust the
+	// heap of the shared process.
+	MaxOutputBytes int
 }
 
 // FromGlobs calls ParseGlob on all path globs provided and returns the
@@ -92,6 +131,11 @@ func FromGlobs(paths ...string) (*Template, error) {
 }
 
 // ExecuteTextString needs a meaningful doc comment (TODO(fabxc)).
+//
+// When Template.MaxOutputBytes is > 0, rendering is aborted and
+// ErrTemplateOutputTooLarge is returned if the output would exceed the
+// configured size. This bounds the cost of rendering untrusted
+// (tenant-controlled) templates.
 func (t *Template) ExecuteTextString(text string, data interface{}) (string, error) {
 	if text == "" {
 		return "", nil
@@ -104,12 +148,21 @@ func (t *Template) ExecuteTextString(text string, data interface{}) (string, err
 	if err != nil {
 		return "", err
 	}
+	if t.MaxOutputBytes > 0 {
+		w := &limitedWriter{max: t.MaxOutputBytes}
+		err = tmpl.Execute(w, data)
+		return w.buf.String(), err
+	}
 	var buf bytes.Buffer
 	err = tmpl.Execute(&buf, data)
 	return buf.String(), err
 }
 
 // ExecuteHTMLString needs a meaningful doc comment (TODO(fabxc)).
+//
+// When Template.MaxOutputBytes is > 0, rendering is aborted and
+// ErrTemplateOutputTooLarge is returned if the output would exceed the
+// configured size.
 func (t *Template) ExecuteHTMLString(html string, data interface{}) (string, error) {
 	if html == "" {
 		return "", nil
@@ -121,6 +174,11 @@ func (t *Template) ExecuteHTMLString(html string, data interface{}) (string, err
 	tmpl, err = tmpl.New("").Option("missingkey=zero").Parse(html)
 	if err != nil {
 		return "", err
+	}
+	if t.MaxOutputBytes > 0 {
+		w := &limitedWriter{max: t.MaxOutputBytes}
+		err = tmpl.Execute(w, data)
+		return w.buf.String(), err
 	}
 	var buf bytes.Buffer
 	err = tmpl.Execute(&buf, data)

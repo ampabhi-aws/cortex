@@ -326,6 +326,15 @@ func (am *Alertmanager) ApplyConfig(userID string, conf *config.Config, rawCfg s
 	}
 	tmpl.ExternalURL = am.cfg.ExternalURL
 
+	// Bound the output size of a single template render. This prevents a
+	// tenant-authored template (either a template file or an inline
+	// notifier field such as slack_configs[].text) from producing
+	// unbounded output and starving the shared multitenant Alertmanager
+	// process. Zero means no limit; validation-time limits still apply.
+	if am.cfg.Limits != nil {
+		tmpl.MaxOutputBytes = am.cfg.Limits.AlertmanagerMaxTemplateExpansionSize(userID)
+	}
+
 	am.api.Update(conf, func(_ model.LabelSet) {})
 
 	// Ensure inhibitor is set before being called
