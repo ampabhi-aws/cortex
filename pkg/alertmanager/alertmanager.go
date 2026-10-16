@@ -492,10 +492,23 @@ func buildReceiverIntegrations(nc *config.Receiver, tmpl *template.Template, fir
 		commoncfg.WithDialContextFunc(firewallDialer.DialContext),
 	}
 
+	// The email integration dials its tenant-chosen smarthost directly (bare net.Dialer in the
+	// vendored notifier), so the per-tenant receivers firewall does not cover SMTP. If the
+	// firewall is enabled for this tenant we must fail closed rather than silently open an
+	// unrestricted SSRF primitive from the Alertmanager pod. See CWE-918.
+	emailBlockedByFirewall := firewallDialer.Enabled()
+
 	for i, c := range nc.WebhookConfigs {
 		add("webhook", i, c, func(l log.Logger) (notify.Notifier, error) { return webhook.New(c, tmpl, l, httpOps...) })
 	}
 	for i, c := range nc.EmailConfigs {
+		c := c
+		if emailBlockedByFirewall {
+			add("email", i, c, func(l log.Logger) (notify.Notifier, error) {
+				return nil, errors.New("email_configs and global.smtp_smarthost are not allowed when the receivers firewall is enabled (alertmanager.receivers-firewall-block-private-addresses / block-cidr-networks): the firewall does not cover SMTP")
+			})
+			continue
+		}
 		add("email", i, c, func(l log.Logger) (notify.Notifier, error) { return email.New(c, tmpl, l), nil })
 	}
 	for i, c := range nc.PagerdutyConfigs {

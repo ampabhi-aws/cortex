@@ -109,3 +109,5 @@ Despite hardening the system is out of the scope of Cortex, Cortex provides a ba
 - `-alertmanager.receivers-firewall-block-private-addresses`
 
 _These settings can also be overridden on a per-tenant basis via overrides specified in the [runtime config](../configuration/arguments.md#runtime-configuration-file)._
+
+> **Note:** The receivers firewall only covers the HTTP-based receiver integrations (`webhook`, `pagerduty`, `opsgenie`, `wechat`, `slack`, `victorops`, `pushover` and `sns`). The vendored upstream `email` notifier dials the tenant-chosen `smarthost` directly, so SMTP destinations are not routed through the firewall. For this reason, when the firewall is enabled for a tenant, Cortex **fails closed** and rejects Alertmanager configurations that reference `email_configs` or set `global.smtp_smarthost`.
