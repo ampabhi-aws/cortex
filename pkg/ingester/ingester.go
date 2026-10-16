@@ -127,7 +127,7 @@ func (cfg *Config) RegisterFlags(f *flag.FlagSet) {
 	f.DurationVar(&cfg.ActiveSeriesMetricsIdleTimeout, "ingester.active-series-metrics-idle-timeout", 10*time.Minute, "After what time a series is considered to be inactive.")
 
 	f.Float64Var(&cfg.DefaultLimits.MaxIngestionRate, "ingester.instance-limits.max-ingestion-rate", 0, "Max ingestion rate (samples/sec) that ingester will accept. This limit is per-ingester, not per-tenant. Additional push requests will be rejected. Current ingestion rate is computed as exponentially weighted moving average, updated every second. This limit only works when using blocks engine. 0 = unlimited.")
-	f.Int64Var(&cfg.DefaultLimits.MaxInMemoryTenants, "ingester.instance-limits.max-tenants", 0, "Max users that this ingester can hold. Requests from additional users will be rejected. This limit only works when using blocks engine. 0 = unlimited.")
+	f.Int64Var(&cfg.DefaultLimits.MaxInMemoryTenants, "ingester.instance-limits.max-tenants", 10000, "Max users that this ingester can hold. Requests from additional users will be rejected. This limit only works when using blocks engine. 0 = unlimited.")
 	f.Int64Var(&cfg.DefaultLimits.MaxInMemorySeries, "ingester.instance-limits.max-series", 0, "Max series that this ingester can hold (across all tenants). Requests to create additional series will be rejected. This limit only works when using blocks engine. 0 = unlimited.")
 	f.Int64Var(&cfg.DefaultLimits.MaxInflightPushRequests, "ingester.instance-limits.max-inflight-push-requests", 0, "Max inflight push requests that this ingester can handle (across all tenants). Additional requests will be rejected. 0 = unlimited.")
 
@@ -770,10 +770,6 @@ func (i *Ingester) stopping(_ error) error {
 }
 
 func (i *Ingester) updateLoop(ctx context.Context) error {
-	if limits := i.getInstanceLimits(); limits != nil && *limits != (InstanceLimits{}) {
-		// This check will not cover enabling instance limits in runtime, but it will do for now.
-		logutil.WarnExperimentalUse("ingester instance limits")
-	}
 
 	rateUpdateTicker := time.NewTicker(i.cfg.RateUpdatePeriod)
 	defer rateUpdateTicker.Stop()
@@ -2268,8 +2264,14 @@ func (i *Ingester) closeAndDeleteIdleUserTSDBs(ctx context.Context) error {
 
 func (i *Ingester) closeAndDeleteUserTSDBIfIdle(userID string) tsdbCloseCheckResult {
 	userDB := i.getTSDB(userID)
-	if userDB == nil || userDB.shipper == nil {
-		// We will not delete local data when not using shipping to storage.
+	if userDB == nil {
+		return tsdbShippingDisabled
+	}
+	// When shipping is enabled we require blocks to have been uploaded before
+	// closing. When shipping is disabled we still allow reclamation of idle
+	// TSDBs so that abandoned tenants cannot pin ingester memory and file
+	// descriptors indefinitely.
+	if userDB.shipper == nil && i.cfg.BlocksStorageConfig.TSDB.IsBlocksShippingEnabled() {
 		return tsdbShippingDisabled
 	}
 
