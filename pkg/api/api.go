@@ -257,21 +257,34 @@ type Ingester interface {
 	FlushHandler(http.ResponseWriter, *http.Request)
 	ShutdownHandler(http.ResponseWriter, *http.Request)
 	Push(context.Context, *cortexpb.WriteRequest) (*cortexpb.WriteResponse, error)
+	// AdminEndpointsEnabled reports whether the destructive admin HTTP
+	// endpoints (/ingester/flush, /ingester/shutdown and their legacy
+	// aliases) should be exposed. When false the routes are not registered
+	// at all, so no network caller can reach them.
+	AdminEndpointsEnabled() bool
 }
 
 // RegisterIngester registers the ingesters HTTP and GRPC service
 func (a *API) RegisterIngester(i Ingester, pushConfig distributor.Config) {
 	client.RegisterIngesterServer(a.server.GRPC, i)
 
-	a.indexPage.AddLink(SectionDangerous, "/ingester/flush", "Trigger a Flush of data from Ingester to storage")
-	a.indexPage.AddLink(SectionDangerous, "/ingester/shutdown", "Trigger Ingester Shutdown (Dangerous)")
-	a.RegisterRoute("/ingester/flush", http.HandlerFunc(i.FlushHandler), false, "GET", "POST")
-	a.RegisterRoute("/ingester/shutdown", http.HandlerFunc(i.ShutdownHandler), false, "GET", "POST")
+	if i.AdminEndpointsEnabled() {
+		a.indexPage.AddLink(SectionDangerous, "/ingester/flush", "Trigger a Flush of data from Ingester to storage")
+		a.indexPage.AddLink(SectionDangerous, "/ingester/shutdown", "Trigger Ingester Shutdown (Dangerous)")
+		// Admin endpoints are POST-only (so they cannot be triggered by a GET
+		// navigation or an <img> tag) and require an authenticated tenant
+		// context. Operators are expected to additionally restrict access to
+		// these paths at the reverse proxy / auth gateway.
+		a.RegisterRoute("/ingester/flush", http.HandlerFunc(i.FlushHandler), true, "POST")
+		a.RegisterRoute("/ingester/shutdown", http.HandlerFunc(i.ShutdownHandler), true, "POST")
+	}
 	a.RegisterRoute("/ingester/push", push.Handler(pushConfig.MaxRecvMsgSize, a.sourceIPs, i.Push), true, "POST") // For testing and debugging.
 
 	// Legacy Routes
-	a.RegisterRoute("/flush", http.HandlerFunc(i.FlushHandler), false, "GET", "POST")
-	a.RegisterRoute("/shutdown", http.HandlerFunc(i.ShutdownHandler), false, "GET", "POST")
+	if i.AdminEndpointsEnabled() {
+		a.RegisterRoute("/flush", http.HandlerFunc(i.FlushHandler), true, "POST")
+		a.RegisterRoute("/shutdown", http.HandlerFunc(i.ShutdownHandler), true, "POST")
+	}
 	a.RegisterRoute("/push", push.Handler(pushConfig.MaxRecvMsgSize, a.sourceIPs, i.Push), true, "POST") // For testing and debugging.
 }
 

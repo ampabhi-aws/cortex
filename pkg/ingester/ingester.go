@@ -111,6 +111,15 @@ type Config struct {
 
 	IgnoreSeriesLimitForMetricNames string `yaml:"ignore_series_limit_for_metric_names"`
 
+	// EnableAdminEndpoints controls whether the destructive admin HTTP endpoints
+	// (/ingester/flush, /ingester/shutdown and their legacy /flush, /shutdown
+	// aliases) are exposed over HTTP. These endpoints can force head compaction
+	// for arbitrary tenants and terminate the ingester, so they are disabled by
+	// default and must be explicitly enabled by operators. When enabled, the
+	// routes are registered as POST-only and require an authenticated tenant
+	// (via the X-Scope-OrgID header).
+	EnableAdminEndpoints bool `yaml:"enable_admin_endpoints"`
+
 	// For testing, you can override the address and ID of this ingester.
 	ingesterClientFactory func(addr string, cfg client.Config) (client.HealthAndIngesterClient, error)
 }
@@ -132,6 +141,7 @@ func (cfg *Config) RegisterFlags(f *flag.FlagSet) {
 	f.Int64Var(&cfg.DefaultLimits.MaxInflightPushRequests, "ingester.instance-limits.max-inflight-push-requests", 0, "Max inflight push requests that this ingester can handle (across all tenants). Additional requests will be rejected. 0 = unlimited.")
 
 	f.StringVar(&cfg.IgnoreSeriesLimitForMetricNames, "ingester.ignore-series-limit-for-metric-names", "", "Comma-separated list of metric names, for which -ingester.max-series-per-metric and -ingester.max-global-series-per-metric limits will be ignored. Does not affect max-series-per-user or max-global-series-per-metric limits.")
+	f.BoolVar(&cfg.EnableAdminEndpoints, "ingester.enable-admin-endpoints", false, "Expose the destructive admin HTTP endpoints (/ingester/flush, /ingester/shutdown and their legacy /flush, /shutdown aliases). When enabled, these routes are registered as POST-only and require an authenticated tenant (X-Scope-OrgID header); the operator is expected to additionally restrict access to them in the reverse proxy / auth gateway.")
 }
 
 func (cfg *Config) getIgnoreSeriesLimitForMetricNamesMap() map[string]struct{} {
@@ -183,6 +193,18 @@ type Ingester struct {
 	// Rate of pushed samples. Only used by V2-ingester to limit global samples push rate.
 	ingestionRate        *util_math.EwmaRate
 	inflightPushRequests atomic.Int64
+
+	// Guards against repeated unauthenticated amplification of /ingester/flush
+	// when the request is run asynchronously (wait != true). Set to 1 while a
+	// forced flush/compaction is pending so additional async requests are
+	// rejected rather than queued as new goroutines.
+	forceFlushInProgress atomic.Bool
+}
+
+// AdminEndpointsEnabled reports whether the ingester admin HTTP endpoints
+// (flush, shutdown) have been explicitly enabled by the operator.
+func (i *Ingester) AdminEndpointsEnabled() bool {
+	return i.cfg.EnableAdminEndpoints
 }
 
 // Shipper interface is used to have an easy way to mock it in tests.
@@ -2489,7 +2511,42 @@ func (i *Ingester) flushHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	tenants := r.Form[tenantParam]
+	// Require an authenticated tenant identity on the request. Without this
+	// check an unauthenticated caller could force-compact arbitrary tenants
+	// (or every tenant on the instance, when the `tenant` form value is
+	// omitted and util.NewAllowedTenants(nil, nil) allows everything).
+	authTenants, err := tenant.TenantIDs(r.Context())
+	if err != nil || len(authTenants) == 0 {
+		level.Warn(logutil.WithContext(r.Context(), i.logger)).Log("msg", "flush handler rejected unauthenticated request", "err", err)
+		http.Error(w, "authentication required", http.StatusUnauthorized)
+		return
+	}
+
+	// Intersect the requested `tenant` form values with the authenticated
+	// identity so callers can only flush tenants they are authorized for.
+	// If no `tenant` form value is supplied, default to the authenticated
+	// tenants rather than "every tenant on the instance".
+	authSet := make(map[string]struct{}, len(authTenants))
+	for _, t := range authTenants {
+		authSet[t] = struct{}{}
+	}
+
+	requested := r.Form[tenantParam]
+	var tenants []string
+	if len(requested) == 0 {
+		tenants = append(tenants, authTenants...)
+	} else {
+		for _, t := range requested {
+			if _, ok := authSet[t]; ok {
+				tenants = append(tenants, t)
+			}
+		}
+		if len(tenants) == 0 {
+			level.Warn(logutil.WithContext(r.Context(), i.logger)).Log("msg", "flush handler rejected request: no requested tenant is authorized")
+			http.Error(w, "no authorized tenant requested", http.StatusForbidden)
+			return
+		}
+	}
 
 	allowedUsers := util.NewAllowedTenants(tenants, nil)
 	run := func() {
@@ -2549,7 +2606,19 @@ func (i *Ingester) flushHandler(w http.ResponseWriter, r *http.Request) {
 		// Run synchronously. This simplifies and speeds up tests.
 		run()
 	} else {
-		go run()
+		// Reject (rather than queue) a request while another forced flush is
+		// already pending, so repeated calls cannot amplify into an unbounded
+		// number of goroutines each re-triggering a full compaction + shipper
+		// sync.
+		if !i.forceFlushInProgress.CompareAndSwap(false, true) {
+			level.Warn(logutil.WithContext(r.Context(), i.logger)).Log("msg", "flush handler rejected: another forced flush is already in progress")
+			http.Error(w, "another forced flush is already in progress", http.StatusTooManyRequests)
+			return
+		}
+		go func() {
+			defer i.forceFlushInProgress.Store(false)
+			run()
+		}()
 	}
 
 	w.WriteHeader(http.StatusNoContent)

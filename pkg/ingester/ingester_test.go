@@ -2894,7 +2894,7 @@ func TestIngester_flushing(t *testing.T) {
 				`), "cortex_ingester_shipper_uploads_total"))
 
 				// Using wait=true makes this a synchronous call.
-				i.FlushHandler(httptest.NewRecorder(), httptest.NewRequest("POST", "/flush?wait=true", nil))
+				i.FlushHandler(httptest.NewRecorder(), httptest.NewRequest("POST", "/flush?wait=true", nil).WithContext(user.InjectOrgID(context.Background(), userID)))
 
 				verifyCompactedHead(t, i, true)
 				require.NoError(t, testutil.GatherAndCompare(reg, bytes.NewBufferString(`
@@ -2925,7 +2925,7 @@ func TestIngester_flushing(t *testing.T) {
 				users.Add(tenantParam, "another-unknown-user")
 
 				// Using wait=true makes this a synchronous call.
-				i.FlushHandler(httptest.NewRecorder(), httptest.NewRequest("POST", "/flush?wait=true&"+users.Encode(), nil))
+				i.FlushHandler(httptest.NewRecorder(), httptest.NewRequest("POST", "/flush?wait=true&"+users.Encode(), nil).WithContext(user.InjectOrgID(context.Background(), userID)))
 
 				// Still nothing shipped or compacted.
 				require.NoError(t, testutil.GatherAndCompare(reg, bytes.NewBufferString(`
@@ -2940,7 +2940,7 @@ func TestIngester_flushing(t *testing.T) {
 				users.Add(tenantParam, userID) // Our user
 				users.Add(tenantParam, "yet-another-user")
 
-				i.FlushHandler(httptest.NewRecorder(), httptest.NewRequest("POST", "/flush?wait=true&"+users.Encode(), nil))
+				i.FlushHandler(httptest.NewRecorder(), httptest.NewRequest("POST", "/flush?wait=true&"+users.Encode(), nil).WithContext(user.InjectOrgID(context.Background(), userID)))
 
 				verifyCompactedHead(t, i, true)
 				require.NoError(t, testutil.GatherAndCompare(reg, bytes.NewBufferString(`
@@ -2976,7 +2976,7 @@ func TestIngester_flushing(t *testing.T) {
 					cortex_ingester_shipper_uploads_total 0
 				`), "cortex_ingester_shipper_uploads_total"))
 
-				i.FlushHandler(httptest.NewRecorder(), httptest.NewRequest("POST", "/flush?wait=true", nil))
+				i.FlushHandler(httptest.NewRecorder(), httptest.NewRequest("POST", "/flush?wait=true", nil).WithContext(user.InjectOrgID(context.Background(), userID)))
 
 				verifyCompactedHead(t, i, true)
 
@@ -3704,7 +3704,7 @@ func TestIngesterNoFlushWithInFlightRequest(t *testing.T) {
 
 	// Flush handler only triggers compactions, but doesn't wait for them to finish. We cannot use ?wait=true here,
 	// because it would deadlock -- flush will wait for appendLock to be released.
-	i.FlushHandler(httptest.NewRecorder(), httptest.NewRequest("POST", "/flush", nil))
+	i.FlushHandler(httptest.NewRecorder(), httptest.NewRequest("POST", "/flush", nil).WithContext(user.InjectOrgID(context.Background(), userID)))
 
 	// Flushing should not have succeeded even after 5 seconds.
 	time.Sleep(5 * time.Second)
