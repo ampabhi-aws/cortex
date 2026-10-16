@@ -265,13 +265,19 @@ func (a *API) RegisterIngester(i Ingester, pushConfig distributor.Config) {
 
 	a.indexPage.AddLink(SectionDangerous, "/ingester/flush", "Trigger a Flush of data from Ingester to storage")
 	a.indexPage.AddLink(SectionDangerous, "/ingester/shutdown", "Trigger Ingester Shutdown (Dangerous)")
-	a.RegisterRoute("/ingester/flush", http.HandlerFunc(i.FlushHandler), false, "GET", "POST")
-	a.RegisterRoute("/ingester/shutdown", http.HandlerFunc(i.ShutdownHandler), false, "GET", "POST")
+	// /ingester/flush and /ingester/shutdown are destructive operator endpoints.
+	// They are registered with auth=true so that the configured HTTP auth
+	// middleware runs, and restricted to POST so they cannot be triggered by a
+	// stray GET navigation (e.g. a browser preview, link-prefetcher, or SSRF
+	// GET).  Deployments are still expected to gate these endpoints at an
+	// authenticating reverse proxy as described in docs/architecture.md.
+	a.RegisterRoute("/ingester/flush", http.HandlerFunc(i.FlushHandler), true, "POST")
+	a.RegisterRoute("/ingester/shutdown", http.HandlerFunc(i.ShutdownHandler), true, "POST")
 	a.RegisterRoute("/ingester/push", push.Handler(pushConfig.MaxRecvMsgSize, a.sourceIPs, i.Push), true, "POST") // For testing and debugging.
 
 	// Legacy Routes
-	a.RegisterRoute("/flush", http.HandlerFunc(i.FlushHandler), false, "GET", "POST")
-	a.RegisterRoute("/shutdown", http.HandlerFunc(i.ShutdownHandler), false, "GET", "POST")
+	a.RegisterRoute("/flush", http.HandlerFunc(i.FlushHandler), true, "POST")
+	a.RegisterRoute("/shutdown", http.HandlerFunc(i.ShutdownHandler), true, "POST")
 	a.RegisterRoute("/push", push.Handler(pushConfig.MaxRecvMsgSize, a.sourceIPs, i.Push), true, "POST") // For testing and debugging.
 }
 
