@@ -961,7 +961,7 @@ func (m *errDistributor) MetricsForLabelMatchersStream(ctx context.Context, from
 	return nil, errDistributorError
 }
 
-func (m *errDistributor) MetricsMetadata(ctx context.Context) ([]scrape.MetricMetadata, error) {
+func (m *errDistributor) MetricsMetadata(ctx context.Context, req *MetricsMetadataRequest) ([]scrape.MetricMetadata, error) {
 	return nil, errDistributorError
 }
 
@@ -1021,7 +1021,7 @@ func (d *emptyDistributor) MetricsForLabelMatchersStream(ctx context.Context, fr
 	return nil, nil
 }
 
-func (d *emptyDistributor) MetricsMetadata(ctx context.Context) ([]scrape.MetricMetadata, error) {
+func (d *emptyDistributor) MetricsMetadata(ctx context.Context, req *MetricsMetadataRequest) ([]scrape.MetricMetadata, error) {
 	return nil, nil
 }
 
