@@ -19,8 +19,24 @@ const (
 
 var (
 	ErrTooManyRequests = errors.New("too many outstanding requests")
+	ErrTooManyTenants  = errors.New("too many tenants with outstanding requests")
 	ErrStopped         = errors.New("queue is stopped")
 )
+
+// sizedRequest is an optional interface implemented by Request types. When implemented, the
+// RequestQueue counts queued bytes per tenant and refuses enqueues that would exceed the
+// configured per-tenant queued-bytes budget (in addition to the per-tenant outstanding-request
+// cap). Returning a non-positive value causes byte accounting for that request to be skipped.
+type sizedRequest interface {
+	Size() int
+}
+
+// cancellableRequest is an optional interface implemented by Request types. When implemented,
+// EnqueueRequest will drop a request whose context is already cancelled rather than keeping
+// its payload in the per-tenant channel until a dequeue would discard it.
+type cancellableRequest interface {
+	Context() context.Context
+}
 
 // UserIndex is opaque type that allows to resume iteration over users between successive calls
 // of RequestQueue.GetNextRequestForQuerier method.
@@ -61,9 +77,22 @@ type RequestQueue struct {
 	discardedRequests *prometheus.CounterVec // Per user.
 }
 
+// NewRequestQueue builds a RequestQueue with the per-tenant outstanding-request cap and
+// forget-delay. maxUsers and maxUserQueuedBytes default to 0 (disabled); use
+// NewRequestQueueWithLimits to configure the global tenant cap and per-tenant queued-bytes
+// budget that bound queue state against untrusted/attacker-controlled tenant IDs.
 func NewRequestQueue(maxOutstandingPerTenant int, forgetDelay time.Duration, queueLength *prometheus.GaugeVec, discardedRequests *prometheus.CounterVec) *RequestQueue {
+	return NewRequestQueueWithLimits(maxOutstandingPerTenant, 0, 0, forgetDelay, queueLength, discardedRequests)
+}
+
+// NewRequestQueueWithLimits builds a RequestQueue with explicit bounds on the number of
+// concurrently queued tenants (maxUsers; 0 disables) and on the total bytes buffered per
+// tenant (maxUserQueuedBytes; 0 disables). These are the volumetric guards that prevent an
+// untrusted peer from inflating per-tenant queue state via distinct caller-supplied tenant
+// IDs or over-sized request bodies.
+func NewRequestQueueWithLimits(maxOutstandingPerTenant, maxUsers, maxUserQueuedBytes int, forgetDelay time.Duration, queueLength *prometheus.GaugeVec, discardedRequests *prometheus.CounterVec) *RequestQueue {
 	q := &RequestQueue{
-		queues:                  newUserQueues(maxOutstandingPerTenant, forgetDelay),
+		queues:                  newUserQueuesWithLimits(maxOutstandingPerTenant, maxUsers, maxUserQueuedBytes, forgetDelay),
 		connectedQuerierWorkers: atomic.NewInt32(0),
 		queueLength:             queueLength,
 		discardedRequests:       discardedRequests,
@@ -75,12 +104,45 @@ func NewRequestQueue(maxOutstandingPerTenant int, forgetDelay time.Duration, que
 	return q
 }
 
+// requestSize returns the Size() of req when it implements sizedRequest, otherwise 0. A
+// non-positive size is also normalised to 0 so byte accounting is a no-op for that request.
+func requestSize(req Request) int {
+	if sr, ok := req.(sizedRequest); ok {
+		n := sr.Size()
+		if n > 0 {
+			return n
+		}
+	}
+	return 0
+}
+
+// requestCancelled reports whether req carries a context (via the cancellableRequest optional
+// interface) that has already been cancelled.
+func requestCancelled(req Request) bool {
+	cr, ok := req.(cancellableRequest)
+	if !ok {
+		return false
+	}
+	ctx := cr.Context()
+	if ctx == nil {
+		return false
+	}
+	return ctx.Err() != nil
+}
+
 // EnqueueRequest puts the request into the queue. MaxQueries is user-specific value that specifies how many queriers can
 // this user use (zero or negative = all queriers). It is passed to each EnqueueRequest, because it can change
 // between calls.
 //
 // If request is successfully enqueued, successFn is called with the lock held, before any querier can receive the request.
 func (q *RequestQueue) EnqueueRequest(userID string, req Request, maxQueriers int, successFn func()) error {
+	// Fast-path: if the request's context is already cancelled, drop it before taking the
+	// global mutex so that a cancelled request never pins a channel slot or request payload.
+	if requestCancelled(req) {
+		q.discardedRequests.WithLabelValues(userID).Inc()
+		return context.Canceled
+	}
+
 	q.mtx.Lock()
 	defer q.mtx.Unlock()
 
@@ -90,12 +152,32 @@ func (q *RequestQueue) EnqueueRequest(userID string, req Request, maxQueriers in
 
 	queue := q.queues.getOrAddQueue(userID, maxQueriers)
 	if queue == nil {
-		// This can only happen if userID is "".
-		return errors.New("no queue found")
+		if userID == "" {
+			// This can only happen if userID is "".
+			return errors.New("no queue found")
+		}
+		// Global tenant cap reached: refuse to allocate a new per-tenant queue so that an
+		// untrusted peer cannot inflate the scheduler's tenant set.
+		q.discardedRequests.WithLabelValues(userID).Inc()
+		return ErrTooManyTenants
+	}
+
+	// Enforce the per-tenant queued-bytes budget, when configured and the request reports its
+	// size, in addition to the per-tenant channel capacity.
+	size := requestSize(req)
+	if q.queues.maxUserQueuedBytes > 0 && size > 0 {
+		uq := q.queues.userQueues[userID]
+		if uq.queuedBytes+int64(size) > int64(q.queues.maxUserQueuedBytes) {
+			q.discardedRequests.WithLabelValues(userID).Inc()
+			return ErrTooManyRequests
+		}
 	}
 
 	select {
 	case queue <- req:
+		if size > 0 {
+			q.queues.userQueues[userID].queuedBytes += int64(size)
+		}
 		q.queueLength.WithLabelValues(userID).Inc()
 		q.cond.Broadcast()
 		// Call this function while holding a lock. This guarantees that no querier can fetch the request before function returns.
@@ -143,6 +225,15 @@ FindQueue:
 		// Pick next request from the queue.
 		for {
 			request := <-queue
+			uq := q.queues.userQueues[userID]
+			if uq != nil {
+				if size := requestSize(request); size > 0 {
+					uq.queuedBytes -= int64(size)
+					if uq.queuedBytes < 0 {
+						uq.queuedBytes = 0
+					}
+				}
+			}
 			if len(queue) == 0 {
 				q.queues.deleteQueue(userID)
 			}

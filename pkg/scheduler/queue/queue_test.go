@@ -55,6 +55,7 @@ func BenchmarkGetNextRequest(b *testing.B) {
 		b:
 			// Find querier with at least one request to avoid blocking in getNextRequestForQuerier.
 			for _, q := range queues[i].queues.userQueues {
+				queues[i].queues.refreshUserQueriersLocked(q)
 				for qid := range q.queriers {
 					querier = qid
 					break b

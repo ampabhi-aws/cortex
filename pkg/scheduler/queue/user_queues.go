@@ -32,6 +32,16 @@ type queues struct {
 
 	maxUserQueueSize int
 
+	// Maximum number of concurrently queued tenants. 0 disables the cap. When reached,
+	// getOrAddQueue refuses to allocate a new per-tenant queue so that an attacker-controlled
+	// tenant ID cannot inflate the scheduler's tenant set without bound.
+	maxUsers int
+
+	// Maximum number of bytes that can be concurrently queued per-tenant across the per-tenant
+	// channel. 0 disables the byte accounting. When set, EnqueueRequest also refuses enqueues
+	// whose Size() would cause the per-tenant queued-bytes total to exceed this budget.
+	maxUserQueuedBytes int
+
 	// How long to wait before removing a querier which has got disconnected
 	// but hasn't notified about a graceful shutdown.
 	forgetDelay time.Duration
@@ -41,15 +51,31 @@ type queues struct {
 
 	// Sorted list of querier names, used when creating per-user shard.
 	sortedQueriers []string
+
+	// Monotonic version bumped every time the set of sortedQueriers changes. Per-tenant shard
+	// assignments are recomputed lazily when a tenant is next touched and its stored version
+	// does not match this one. This replaces the previous O(tenants) pass that was done under
+	// the global queue mutex on every querier connect/disconnect.
+	queriersVersion int64
 }
 
 type userQueue struct {
 	ch chan Request
 
+	// Running total of the Size() of requests currently buffered in ch, when the Request type
+	// implements sizedRequest. Used to enforce a per-tenant queued-bytes budget in addition to
+	// the per-tenant outstanding-request count.
+	queuedBytes int64
+
 	// If not nil, only these queriers can handle user requests. If nil, all queriers can.
 	// We set this to nil if number of available queriers <= maxQueriers.
 	queriers    map[string]struct{}
 	maxQueriers int
+
+	// Value of queues.queriersVersion at the time queriers was last recomputed. If it does not
+	// match the parent queues' queriersVersion, queriers is stale and must be refreshed before
+	// use.
+	queriersVersion int64
 
 	// Seed for shuffle sharding of queriers. This seed is based on userID only and is therefore consistent
 	// between different frontends.
@@ -60,13 +86,19 @@ type userQueue struct {
 }
 
 func newUserQueues(maxUserQueueSize int, forgetDelay time.Duration) *queues {
+	return newUserQueuesWithLimits(maxUserQueueSize, 0, 0, forgetDelay)
+}
+
+func newUserQueuesWithLimits(maxUserQueueSize, maxUsers, maxUserQueuedBytes int, forgetDelay time.Duration) *queues {
 	return &queues{
-		userQueues:       map[string]*userQueue{},
-		users:            nil,
-		maxUserQueueSize: maxUserQueueSize,
-		forgetDelay:      forgetDelay,
-		queriers:         map[string]*querier{},
-		sortedQueriers:   nil,
+		userQueues:         map[string]*userQueue{},
+		users:              nil,
+		maxUserQueueSize:   maxUserQueueSize,
+		maxUsers:           maxUsers,
+		maxUserQueuedBytes: maxUserQueuedBytes,
+		forgetDelay:        forgetDelay,
+		queriers:           map[string]*querier{},
+		sortedQueriers:     nil,
 	}
 }
 
@@ -93,6 +125,7 @@ func (q *queues) deleteQueue(userID string) {
 // MaxQueriers is used to compute which queriers should handle requests for this user.
 // If maxQueriers is <= 0, all queriers can handle this user's requests.
 // If maxQueriers has changed since the last call, queriers for this are recomputed.
+// Returns nil if userID is empty or if a new queue would exceed the configured maxUsers cap.
 func (q *queues) getOrAddQueue(userID string, maxQueriers int) chan Request {
 	// Empty user is not allowed, as that would break our users list ("" is used for free spot).
 	if userID == "" {
@@ -106,6 +139,14 @@ func (q *queues) getOrAddQueue(userID string, maxQueriers int) chan Request {
 	uq := q.userQueues[userID]
 
 	if uq == nil {
+		// Enforce the global tenant cap: refuse to allocate state for yet another tenant ID when
+		// the configured maximum has been reached. Combined with the per-tenant outstanding
+		// limits this bounds the scheduler's queue state against an attacker who presents
+		// an unbounded number of distinct tenant IDs.
+		if q.maxUsers > 0 && len(q.userQueues) >= q.maxUsers {
+			return nil
+		}
+
 		uq = &userQueue{
 			ch:    make(chan Request, q.maxUserQueueSize),
 			seed:  util.ShuffleShardSeed(userID, ""),
@@ -132,9 +173,25 @@ func (q *queues) getOrAddQueue(userID string, maxQueriers int) chan Request {
 	if uq.maxQueriers != maxQueriers {
 		uq.maxQueriers = maxQueriers
 		uq.queriers = shuffleQueriersForUser(uq.seed, maxQueriers, q.sortedQueriers, nil)
+		uq.queriersVersion = q.queriersVersion
+	} else {
+		// Refresh lazily if the global queriers set has changed since we last computed this
+		// tenant's assignment.
+		q.refreshUserQueriersLocked(uq)
 	}
 
 	return uq.ch
+}
+
+// refreshUserQueriersLocked recomputes a single tenant's querier assignment if the global
+// queriers set has changed since it was last computed. It must be called with the parent
+// RequestQueue mutex held.
+func (q *queues) refreshUserQueriersLocked(uq *userQueue) {
+	if uq.queriersVersion == q.queriersVersion {
+		return
+	}
+	uq.queriers = shuffleQueriersForUser(uq.seed, uq.maxQueriers, q.sortedQueriers, nil)
+	uq.queriersVersion = q.queriersVersion
 }
 
 // Finds next queue for the querier. To support fair scheduling between users, client is expected
@@ -157,16 +214,18 @@ func (q *queues) getNextQueueForQuerier(lastUserIndex int, querierID string) (ch
 			continue
 		}
 
-		q := q.userQueues[u]
+		uq := q.userQueues[u]
+		// Lazily materialise this tenant's querier assignment before using it.
+		q.refreshUserQueriersLocked(uq)
 
-		if q.queriers != nil {
-			if _, ok := q.queriers[querierID]; !ok {
+		if uq.queriers != nil {
+			if _, ok := uq.queriers[querierID]; !ok {
 				// This querier is not handling the user.
 				continue
 			}
 		}
 
-		return q.ch, u, uid
+		return uq.ch, u, uid
 	}
 	return nil, "", uid
 }
@@ -188,7 +247,10 @@ func (q *queues) addQuerierConnection(querierID string) {
 	q.sortedQueriers = append(q.sortedQueriers, querierID)
 	sort.Strings(q.sortedQueriers)
 
-	q.recomputeUserQueriers()
+	// Invalidate per-tenant querier assignments. They are refreshed lazily per-tenant when the
+	// tenant is next touched, so this is O(1) rather than O(tenants) while holding the global
+	// RequestQueue mutex.
+	q.queriersVersion++
 }
 
 func (q *queues) removeQuerierConnection(querierID string, now time.Time) {
@@ -226,7 +288,8 @@ func (q *queues) removeQuerier(querierID string) {
 
 	q.sortedQueriers = append(q.sortedQueriers[:ix], q.sortedQueriers[ix+1:]...)
 
-	q.recomputeUserQueriers()
+	// Invalidate per-tenant querier assignments; they are refreshed lazily.
+	q.queriersVersion++
 }
 
 // notifyQuerierShutdown records that a querier has sent notification about a graceful shutdown.
@@ -268,14 +331,6 @@ func (q *queues) forgetDisconnectedQueriers(now time.Time) int {
 	}
 
 	return forgotten
-}
-
-func (q *queues) recomputeUserQueriers() {
-	scratchpad := make([]string, 0, len(q.sortedQueriers))
-
-	for _, uq := range q.userQueues {
-		uq.queriers = shuffleQueriersForUser(uq.seed, uq.maxQueriers, q.sortedQueriers, scratchpad)
-	}
 }
 
 // shuffleQueriersForUser returns nil if queriersToSelect is 0 or there are not enough queriers to select from.

@@ -401,6 +401,9 @@ func isConsistent(uq *queues) error {
 			return fmt.Errorf("invalid user's index, expected=%d, got=%d", ix, q.index)
 		}
 
+		// Querier assignments are now computed lazily per-tenant; materialise before inspecting.
+		uq.refreshUserQueriersLocked(q)
+
 		if q.maxQueriers == 0 && q.queriers != nil {
 			return fmt.Errorf("user %s has queriers, but maxQueriers=0", u)
 		}
@@ -425,6 +428,8 @@ func isConsistent(uq *queues) error {
 func getUsersByQuerier(queues *queues, querierID string) []string {
 	var userIDs []string
 	for userID, q := range queues.userQueues {
+		// Querier assignments are now computed lazily per-tenant; materialise before inspecting.
+		queues.refreshUserQueriersLocked(q)
 		if q.queriers == nil {
 			// If it's nil then all queriers can handle this user.
 			userIDs = append(userIDs, userID)
