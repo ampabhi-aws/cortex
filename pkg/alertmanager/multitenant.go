@@ -80,6 +80,14 @@ type MultitenantAlertmanagerConfig struct {
 
 	EnableAPI bool `yaml:"enable_api"`
 
+	// AdminTenants is an optional allowlist of tenant IDs (X-Scope-OrgID values)
+	// permitted to call cross-tenant administrative endpoints such as
+	// /multitenant_alertmanager/configs. When empty, those endpoints still
+	// require an authenticated tenant (an X-Scope-OrgID header), matching
+	// Cortex's documented operator-endpoint posture; secrets are redacted from
+	// the response regardless.
+	AdminTenants flagext.StringSliceCSV `yaml:"admin_tenants"`
+
 	// For distributor.
 	AlertmanagerClient ClientConfig `yaml:"alertmanager_client"`
 
@@ -114,6 +122,7 @@ func (cfg *MultitenantAlertmanagerConfig) RegisterFlags(f *flag.FlagSet) {
 	f.DurationVar(&cfg.PollInterval, "alertmanager.configs.poll-interval", 15*time.Second, "How frequently to poll Cortex configs")
 
 	f.BoolVar(&cfg.EnableAPI, "experimental.alertmanager.enable-api", false, "Enable the experimental alertmanager config api.")
+	f.Var(&cfg.AdminTenants, "alertmanager.admin-tenants", "Comma-separated list of tenant IDs (X-Scope-OrgID values) permitted to call cross-tenant administrative endpoints such as /multitenant_alertmanager/configs. If empty, those endpoints are available to any authenticated caller, matching Cortex's documented operator-endpoint model.")
 
 	f.BoolVar(&cfg.ShardingEnabled, "alertmanager.sharding-enabled", false, "Shard tenants across multiple alertmanager instances.")
 
