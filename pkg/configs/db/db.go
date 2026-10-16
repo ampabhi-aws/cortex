@@ -10,13 +10,14 @@ import (
 	"github.com/cortexproject/cortex/pkg/configs/db/memory"
 	"github.com/cortexproject/cortex/pkg/configs/db/postgres"
 	"github.com/cortexproject/cortex/pkg/configs/userconfig"
+	"github.com/cortexproject/cortex/pkg/util/flagext"
 )
 
 // Config configures the database.
 type Config struct {
-	URI           string `yaml:"uri"`
-	MigrationsDir string `yaml:"migrations_dir"`
-	PasswordFile  string `yaml:"password_file"`
+	URI           flagext.Secret `yaml:"uri"`
+	MigrationsDir string         `yaml:"migrations_dir"`
+	PasswordFile  flagext.Secret `yaml:"password_file"`
 
 	// Allow injection of mock DBs for unit testing.
 	Mock DB `yaml:"-"`
@@ -24,9 +25,11 @@ type Config struct {
 
 // RegisterFlags adds the flags required to configure this to the given FlagSet.
 func (cfg *Config) RegisterFlags(f *flag.FlagSet) {
-	f.StringVar(&cfg.URI, "configs.database.uri", "postgres://postgres@configs-db.weave.local/configs?sslmode=disable", "URI where the database can be found (for dev you can use memory://)")
+	// Preserve the historical default value by seeding it before registering.
+	cfg.URI.Value = "postgres://postgres@configs-db.weave.local/configs?sslmode=disable"
+	f.Var(&cfg.URI, "configs.database.uri", "URI where the database can be found (for dev you can use memory://)")
 	f.StringVar(&cfg.MigrationsDir, "configs.database.migrations-dir", "", "Path where the database migration files can be found")
-	f.StringVar(&cfg.PasswordFile, "configs.database.password-file", "", "File containing password (username goes in URI)")
+	f.Var(&cfg.PasswordFile, "configs.database.password-file", "File containing password (username goes in URI)")
 }
 
 // DB is the interface for the database.
@@ -64,16 +67,16 @@ func New(cfg Config) (DB, error) {
 		return cfg.Mock, nil
 	}
 
-	u, err := url.Parse(cfg.URI)
+	u, err := url.Parse(cfg.URI.Value)
 	if err != nil {
 		return nil, err
 	}
 
-	if len(cfg.PasswordFile) != 0 {
+	if len(cfg.PasswordFile.Value) != 0 {
 		if u.User == nil {
 			return nil, fmt.Errorf("--database.password-file requires username in --database.uri")
 		}
-		passwordBytes, err := os.ReadFile(cfg.PasswordFile)
+		passwordBytes, err := os.ReadFile(cfg.PasswordFile.Value)
 		if err != nil {
 			return nil, fmt.Errorf("Could not read database password file: %v", err)
 		}
