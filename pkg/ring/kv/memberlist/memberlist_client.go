@@ -1197,6 +1197,17 @@ func (m *KV) mergeBytesValueForKey(key string, incomingData []byte, codec codec.
 		return nil, 0, fmt.Errorf("expected Mergeable, got: %T", decodedValue)
 	}
 
+	// If the Mergeable implementation exposes a cheap pre-merge
+	// validation/normalisation hook, run it here, *before* taking the
+	// process-wide storeMu. This ensures that attacker-controlled gossip
+	// input cannot stall ring reads, heartbeats and CAS operations by
+	// forcing pathological work inside the lock.
+	if n, ok := incomingValue.(interface{ NormalizeIncoming() error }); ok {
+		if err := n.NormalizeIncoming(); err != nil {
+			return nil, 0, fmt.Errorf("failed to normalize incoming value: %v", err)
+		}
+	}
+
 	return m.mergeValueForKey(key, incomingValue, 0, codec)
 }
 

@@ -201,6 +201,13 @@ func (d *Desc) mergeWithTime(mergeable memberlist.Mergeable, localCAS bool, now 
 		return nil, nil
 	}
 
+	// Enforce bounds on untrusted input before any further processing. These bounds
+	// are far above any legitimate ring size and exist to prevent a malicious or
+	// malformed gossip message from pinning CPU inside the KV store lock.
+	if err := validateIncomingDesc(other); err != nil {
+		return nil, err
+	}
+
 	normalizeIngestersMap(other)
 
 	thisIngesterMap := d.Ingesters
@@ -281,6 +288,54 @@ func (d *Desc) MergeContent() []string {
 	return result
 }
 
+// Upper bounds on the size of an incoming (untrusted) ring Desc. These are
+// deliberately generous (orders of magnitude above any realistic Cortex
+// deployment) and exist only to prevent a malicious or malformed gossip
+// message from forcing pathological work inside the global KV store lock.
+//
+// Legitimate Cortex rings use at most a few hundred tokens per instance
+// (configurable, typically 128 or 512) and a few thousand instances
+// cluster-wide; the limits below leave more than a 100x margin.
+const (
+	maxTokensPerInstanceInMessage = 1 << 20 // 1,048,576
+	maxInstancesPerMessage        = 1 << 16 // 65,536
+)
+
+// validateIncomingDesc enforces size bounds on a Desc that has been received
+// from an untrusted source (a gossip peer). It is intentionally cheap: it only
+// looks at map/slice lengths and does not allocate.
+func validateIncomingDesc(other *Desc) error {
+	if other == nil {
+		return nil
+	}
+	if n := len(other.Ingesters); n > maxInstancesPerMessage {
+		return fmt.Errorf("ring message rejected: too many instances (%d > %d)", n, maxInstancesPerMessage)
+	}
+	for name, ing := range other.Ingesters {
+		if n := len(ing.Tokens); n > maxTokensPerInstanceInMessage {
+			return fmt.Errorf("ring message rejected: instance %q has too many tokens (%d > %d)", name, n, maxTokensPerInstanceInMessage)
+		}
+	}
+	return nil
+}
+
+// NormalizeIncoming validates and normalises a Desc that has been received
+// from an untrusted peer. It is safe (and intended) to call this outside of
+// the memberlist KV store lock so that attacker-controlled input cannot stall
+// ring reads, heartbeats and CAS operations while being processed. The
+// subsequent Merge call will run its own validation/normalisation, but after
+// this method both are O(n) and effectively no-ops.
+func (d *Desc) NormalizeIncoming() error {
+	if d == nil {
+		return nil
+	}
+	if err := validateIncomingDesc(d); err != nil {
+		return err
+	}
+	normalizeIngestersMap(d)
+	return nil
+}
+
 // normalizeIngestersMap will do the following:
 // - sorts tokens and removes duplicates (only within single ingester)
 // - modifies the input ring
@@ -301,16 +356,19 @@ func normalizeIngestersMap(inputRing *Desc) {
 			sort.Sort(Tokens(ing.Tokens))
 		}
 
-		// tokens are sorted now, we can easily remove duplicates.
-		prev := ing.Tokens[0]
-		for ix := 1; ix < len(ing.Tokens); {
-			if ing.Tokens[ix] == prev {
-				ing.Tokens = append(ing.Tokens[:ix], ing.Tokens[ix+1:]...)
-			} else {
-				prev = ing.Tokens[ix]
-				ix++
+		// tokens are sorted now, we can easily remove duplicates with a single
+		// linear compaction pass. The previous implementation shifted the tail
+		// of the slice for every duplicate, which is O(n^2) in the number of
+		// duplicate tokens and can be exploited by a malicious gossip peer to
+		// pin CPU inside the KV store lock. The write-pointer loop below runs
+		// in O(n) and performs at most n-1 comparisons and n assignments.
+		out := ing.Tokens[:1]
+		for _, t := range ing.Tokens[1:] {
+			if t != out[len(out)-1] {
+				out = append(out, t)
 			}
 		}
+		ing.Tokens = out
 
 		// write updated value back to map
 		inputRing.Ingesters[n] = ing
