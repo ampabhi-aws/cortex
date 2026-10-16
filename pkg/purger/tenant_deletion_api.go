@@ -2,6 +2,7 @@ package purger
 
 import (
 	"context"
+	"flag"
 	"net/http"
 	"strings"
 	"time"
@@ -18,6 +19,29 @@ import (
 	"github.com/cortexproject/cortex/pkg/tenant"
 	"github.com/cortexproject/cortex/pkg/util"
 )
+
+// Config holds configuration for the Purger service, in particular the
+// administrative tenant-deletion endpoint. The tenant-deletion endpoint is
+// strictly an administrative operation: it writes a marker that the compactor
+// subsequently uses to hard-delete every block of a tenant from object storage,
+// and causes ingesters to drop the tenant's TSDB. There is no in-process
+// authorization check beyond the tenant-ID resolution performed by
+// middleware.AuthenticateUser (which only copies the X-Scope-OrgID header into
+// the request context). Operators must explicitly opt-in to registering the
+// endpoint, and authenticating gateways must block it for tenant traffic.
+// See docs/proposals/tenant-deletion.md.
+type Config struct {
+	// EnableAPI gates registration of the /purger/delete_tenant* endpoints.
+	// It is OFF by default, mirroring the opt-in pattern used by the
+	// experimental ruler and alertmanager APIs
+	// (-experimental.ruler.enable-api, -experimental.alertmanager.enable-api).
+	EnableAPI bool `yaml:"enable_api"`
+}
+
+// RegisterFlags registers flags for the Purger configuration.
+func (cfg *Config) RegisterFlags(f *flag.FlagSet) {
+	f.BoolVar(&cfg.EnableAPI, "experimental.purger.enable-api", false, "Enable the experimental, administrative tenant-deletion API (POST and DELETE /purger/delete_tenant, GET /purger/delete_tenant_status). This endpoint writes a marker that causes the compactor to permanently delete all of the tenant's blocks and ingesters to drop the tenant's local TSDB; it must not be exposed to tenants. Operators must additionally block /purger/* at the authenticating gateway.")
+}
 
 type TenantDeletionAPI struct {
 	bucketClient objstore.Bucket
@@ -42,6 +66,10 @@ func newTenantDeletionAPI(bkt objstore.Bucket, cfgProvider bucket.TenantConfigPr
 	}
 }
 
+// DeleteTenant writes the tenant-deletion marker. It is an administrative
+// operation: callers must repeat the tenant id in the confirm_tenant query
+// parameter so that a stray or forged POST cannot trigger the destructive
+// cleanup, and the caller is audit-logged.
 func (api *TenantDeletionAPI) DeleteTenant(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
 	userID, err := tenant.TenantID(ctx)
@@ -49,6 +77,22 @@ func (api *TenantDeletionAPI) DeleteTenant(w http.ResponseWriter, r *http.Reques
 		// When Cortex is running, it uses Auth Middleware for checking X-Scope-OrgID and injecting tenant into context.
 		// Auth Middleware sends http.StatusUnauthorized if X-Scope-OrgID is missing, so we do too here, for consistency.
 		http.Error(w, err.Error(), http.StatusUnauthorized)
+		return
+	}
+
+	// Require an explicit confirmation parameter that matches the resolved
+	// tenant id. This prevents a stray or forged POST (e.g. via CSRF/SSRF
+	// through a gateway) from triggering an irreversible delete just by
+	// reaching the URL with the correct X-Scope-OrgID header.
+	confirm := r.URL.Query().Get("confirm_tenant")
+	if confirm == "" {
+		http.Error(w, "missing required query parameter: confirm_tenant must repeat the tenant id", http.StatusBadRequest)
+		return
+	}
+	if confirm != userID {
+		level.Warn(api.logger).Log("msg", "tenant deletion rejected: confirm_tenant does not match tenant id",
+			"user", userID, "remote_addr", r.RemoteAddr, "user_agent", r.UserAgent())
+		http.Error(w, "confirm_tenant does not match the tenant id in X-Scope-OrgID", http.StatusBadRequest)
 		return
 	}
 
@@ -60,7 +104,35 @@ func (api *TenantDeletionAPI) DeleteTenant(w http.ResponseWriter, r *http.Reques
 		return
 	}
 
-	level.Info(api.logger).Log("msg", "tenant deletion mark in blocks storage created", "user", userID)
+	// Audit-log the destructive operation. Reverse proxies in front of Cortex
+	// should also log and authenticate the caller; this provides a server-side
+	// record even when the proxy log is unavailable.
+	level.Info(api.logger).Log("msg", "tenant deletion mark in blocks storage created",
+		"user", userID, "remote_addr", r.RemoteAddr, "user_agent", r.UserAgent())
+
+	w.WriteHeader(http.StatusOK)
+}
+
+// DeleteTenantDeletionMark removes a previously-written tenant-deletion marker,
+// allowing an operator to cancel the destructive cleanup before the compactor
+// has finished deleting the tenant's blocks. The call is idempotent: it
+// succeeds even if no marker is present.
+func (api *TenantDeletionAPI) DeleteTenantDeletionMark(w http.ResponseWriter, r *http.Request) {
+	ctx := r.Context()
+	userID, err := tenant.TenantID(ctx)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusUnauthorized)
+		return
+	}
+
+	if err := cortex_tsdb.DeleteTenantDeletionMark(ctx, api.bucketClient, userID, api.cfgProvider); err != nil {
+		level.Error(api.logger).Log("msg", "failed to delete tenant deletion mark", "user", userID, "err", err)
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+
+	level.Info(api.logger).Log("msg", "tenant deletion mark in blocks storage removed",
+		"user", userID, "remote_addr", r.RemoteAddr, "user_agent", r.UserAgent())
 
 	w.WriteHeader(http.StatusOK)
 }

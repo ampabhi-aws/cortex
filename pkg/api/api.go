@@ -275,8 +275,29 @@ func (a *API) RegisterIngester(i Ingester, pushConfig distributor.Config) {
 	a.RegisterRoute("/push", push.Handler(pushConfig.MaxRecvMsgSize, a.sourceIPs, i.Push), true, "POST") // For testing and debugging.
 }
 
-func (a *API) RegisterTenantDeletion(api *purger.TenantDeletionAPI) {
+// RegisterTenantDeletion registers the administrative tenant-deletion
+// endpoints. These endpoints are destructive: writing the tenant-deletion
+// marker causes the compactor to permanently remove every block of the
+// tenant from object storage and causes ingesters to drop the tenant's
+// in-memory TSDB. They are therefore gated behind an explicit opt-in flag
+// (-experimental.purger.enable-api) and should be blocked for tenant
+// traffic by the authenticating gateway in front of Cortex. See
+// docs/proposals/tenant-deletion.md.
+func (a *API) RegisterTenantDeletion(api *purger.TenantDeletionAPI, apiEnabled bool) {
+	if !apiEnabled {
+		return
+	}
+
+	// Advertise the endpoints under "Admin Endpoints" rather than exposing
+	// them as general tenant data-plane paths.
+	a.indexPage.AddLink(SectionAdminEndpoints, "/purger/delete_tenant", "Tenant Deletion (Administrative)")
+	a.indexPage.AddLink(SectionAdminEndpoints, "/purger/delete_tenant_status", "Tenant Deletion Status (Administrative)")
+
 	a.RegisterRoute("/purger/delete_tenant", http.HandlerFunc(api.DeleteTenant), true, "POST")
+	// Counterpart endpoint to remove a previously-written deletion marker
+	// before the compactor has finished cleanup, so the operation is
+	// recoverable without manual bucket surgery.
+	a.RegisterRoute("/purger/delete_tenant", http.HandlerFunc(api.DeleteTenantDeletionMark), true, "DELETE")
 	a.RegisterRoute("/purger/delete_tenant_status", http.HandlerFunc(api.DeleteTenantStatus), true, "GET")
 }
 
