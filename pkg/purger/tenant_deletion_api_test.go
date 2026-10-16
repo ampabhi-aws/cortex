@@ -18,7 +18,7 @@ import (
 
 func TestDeleteTenant(t *testing.T) {
 	bkt := objstore.NewInMemBucket()
-	api := newTenantDeletionAPI(bkt, nil, log.NewNopLogger())
+	api := newTenantDeletionAPI(Config{AllowDeleteTenant: true}, bkt, nil, log.NewNopLogger())
 
 	{
 		resp := httptest.NewRecorder()
@@ -38,6 +38,24 @@ func TestDeleteTenant(t *testing.T) {
 		objs := bkt.Objects()
 		require.NotNil(t, objs[path.Join("fake", tsdb.TenantDeletionMarkPath)])
 	}
+}
+
+func TestDeleteTenantDisabledByDefault(t *testing.T) {
+	bkt := objstore.NewInMemBucket()
+	// Default config: AllowDeleteTenant is false; the endpoint must reject the
+	// request even though the tenant is authenticated, because the design
+	// treats /purger/delete_tenant as an operator-only admin endpoint.
+	api := newTenantDeletionAPI(Config{}, bkt, nil, log.NewNopLogger())
+
+	ctx := context.Background()
+	ctx = user.InjectOrgID(ctx, "fake")
+
+	req := &http.Request{}
+	resp := httptest.NewRecorder()
+	api.DeleteTenant(resp, req.WithContext(ctx))
+
+	require.Equal(t, http.StatusForbidden, resp.Code)
+	require.Empty(t, bkt.Objects(), "deletion mark must not be written when the endpoint is disabled")
 }
 
 func TestDeleteTenantStatus(t *testing.T) {
@@ -80,7 +98,7 @@ func TestDeleteTenantStatus(t *testing.T) {
 				require.NoError(t, bkt.Upload(context.Background(), objName, bytes.NewReader(data)))
 			}
 
-			api := newTenantDeletionAPI(bkt, nil, log.NewNopLogger())
+			api := newTenantDeletionAPI(Config{}, bkt, nil, log.NewNopLogger())
 
 			res, err := api.isBlocksForUserDeleted(context.Background(), username)
 			require.NoError(t, err)

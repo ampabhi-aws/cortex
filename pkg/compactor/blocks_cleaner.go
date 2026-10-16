@@ -3,6 +3,7 @@ package compactor
 import (
 	"context"
 	"fmt"
+	"strings"
 	"time"
 
 	"github.com/go-kit/log"
@@ -283,14 +284,48 @@ func (c *BlocksCleaner) deleteUserMarkedForDeletion(ctx context.Context, userID 
 		level.Info(userLogger).Log("msg", "deleted files under "+block.DebugMetas+" for tenant marked for deletion", "count", deleted)
 	}
 
-	// Tenant deletion mark file is inside Markers as well.
-	if deleted, err := bucket.DeletePrefix(ctx, userBucket, bucketindex.MarkersPathname, userLogger); err != nil {
+	// Clean up block-level marker files but intentionally preserve the
+	// tenant-deletion marker itself. The marker (with `finished_time` set) is
+	// kept as a persistent tombstone so that:
+	//   * peer components (ingesters, compactor, queriers) continue to see the
+	//     tenant as deleted and keep refusing to ship / accept its data, and
+	//   * re-activation of a deleted tenant is an explicit operator action
+	//     (removing the marker) instead of an implicit side-effect of the
+	//     cleaner finishing.
+	// See docs/proposals/tenant-deletion.md for the design rationale.
+	if deleted, err := deleteMarkersExceptTenantDeletionMark(ctx, userBucket, userLogger); err != nil {
 		return errors.Wrap(err, "failed to delete marker files")
 	} else if deleted > 0 {
-		level.Info(userLogger).Log("msg", "deleted marker files for tenant marked for deletion", "count", deleted)
+		level.Info(userLogger).Log("msg", "deleted marker files for tenant marked for deletion (tenant deletion mark preserved as tombstone)", "count", deleted)
 	}
 
 	return nil
+}
+
+// deleteMarkersExceptTenantDeletionMark deletes every object under the
+// per-tenant `markers/` prefix except for the tenant-deletion marker itself,
+// which must be preserved as a tombstone after final cleanup. Returns the
+// number of deleted objects.
+func deleteMarkersExceptTenantDeletionMark(ctx context.Context, userBucket objstore.Bucket, logger log.Logger) (int, error) {
+	result := 0
+	err := userBucket.Iter(ctx, bucketindex.MarkersPathname, func(name string) error {
+		if name == cortex_tsdb.TenantDeletionMarkPath {
+			// Preserve the tenant deletion mark as a persistent tombstone.
+			return nil
+		}
+		if strings.HasSuffix(name, objstore.DirDelim) {
+			deleted, err := bucket.DeletePrefix(ctx, userBucket, name, logger)
+			result += deleted
+			return err
+		}
+		if err := userBucket.Delete(ctx, name); err != nil {
+			return err
+		}
+		result++
+		level.Debug(logger).Log("msg", "deleted file", "file", name)
+		return nil
+	})
+	return result, err
 }
 
 func (c *BlocksCleaner) cleanUser(ctx context.Context, userID string, firstRun bool) (returnErr error) {
