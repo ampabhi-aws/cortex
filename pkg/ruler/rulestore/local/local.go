@@ -5,6 +5,7 @@ import (
 	"flag"
 	"os"
 	"path/filepath"
+	"strings"
 
 	"github.com/pkg/errors"
 	promRules "github.com/prometheus/prometheus/rules"
@@ -168,7 +169,10 @@ func (l *Client) loadAllRulesGroupsForUser(ctx context.Context, userID string) (
 }
 
 func (l *Client) loadAllRulesGroupsForUserAndNamespace(_ context.Context, userID string, namespace string) (rulespb.RuleGroupList, error) {
-	filename := filepath.Join(l.cfg.Directory, userID, namespace)
+	filename, err := safeJoin(l.cfg.Directory, userID, namespace)
+	if err != nil {
+		return nil, err
+	}
 
 	rulegroups, allErrors := l.loader.Load(filename)
 	if len(allErrors) > 0 {
@@ -183,4 +187,31 @@ func (l *Client) loadAllRulesGroupsForUserAndNamespace(_ context.Context, userID
 	}
 
 	return list, nil
+}
+
+// safeJoin builds <dir>/<userID>/<namespace> and verifies that the resolved
+// absolute path is strictly contained within <dir>/<userID>. This defends the
+// local rule store against traversal via a tenant-controlled namespace
+// segment, mirroring pkg/alertmanager/multitenant.go:safeTemplateFilepath.
+func safeJoin(dir, userID, namespace string) (string, error) {
+	userDir, err := filepath.Abs(filepath.Join(dir, userID))
+	if err != nil {
+		return "", err
+	}
+
+	fullPath, err := filepath.Abs(filepath.Join(userDir, namespace))
+	if err != nil {
+		return "", err
+	}
+
+	// Require the resolved path to be strictly under userDir. Equality with
+	// userDir itself is not allowed because the caller expects a rule file,
+	// not the user directory. Appending the OS separator prevents matching a
+	// sibling directory whose name shares a prefix with userDir.
+	prefix := userDir + string(filepath.Separator)
+	if !strings.HasPrefix(fullPath, prefix) {
+		return "", errors.Errorf("invalid namespace %q: the resolved path is escaping the per-tenant directory", namespace)
+	}
+
+	return fullPath, nil
 }

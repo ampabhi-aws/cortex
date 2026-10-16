@@ -288,7 +288,23 @@ var (
 	ErrNoRuleGroups = errors.New("no rule groups found")
 	// ErrBadRuleGroup is returned when the provided rule group can not be unmarshalled
 	ErrBadRuleGroup = errors.New("unable to decoded rule group")
+	// ErrInvalidNamespace signals that the namespace path segment is not safe to use as a filename
+	ErrInvalidNamespace = errors.New("invalid namespace")
+	// ErrInvalidGroupName signals that the group name path segment is not safe to use as a filename
+	ErrInvalidGroupName = errors.New("invalid group name")
 )
+
+// containsUnsafePathSegments returns true if the string is a directory
+// reference like `.` or `..`, or if it contains any path separator character
+// (`/` or `\`). This mirrors pkg/tenant/resolver.go:containsUnsafePathSegments
+// and is used to reject tenant-controlled URL segments (namespace, group name)
+// before they can reach any filesystem-backed rule store.
+func containsUnsafePathSegments(id string) bool {
+	if id == "." || id == ".." {
+		return true
+	}
+	return strings.ContainsAny(id, "\\/")
+}
 
 func marshalAndSend(output interface{}, w http.ResponseWriter, logger log.Logger) {
 	d, err := yaml.Marshal(&output)
@@ -336,6 +352,13 @@ func parseNamespace(params map[string]string) (string, error) {
 		return "", err
 	}
 
+	// Reject empty or directory-escaping namespaces. The namespace is used as a
+	// filename segment by the local rule store (and as a key in other stores),
+	// so '.', '..', and path separators must not be accepted.
+	if namespace == "" || containsUnsafePathSegments(namespace) {
+		return "", ErrInvalidNamespace
+	}
+
 	return namespace, nil
 }
 
@@ -350,6 +373,12 @@ func parseGroupName(params map[string]string) (string, error) {
 	groupName, err := url.PathUnescape(groupName)
 	if err != nil {
 		return "", err
+	}
+
+	// Reject empty or directory-escaping group names for the same reasons as
+	// namespaces: these segments can reach filesystem-backed stores.
+	if groupName == "" || containsUnsafePathSegments(groupName) {
+		return "", ErrInvalidGroupName
 	}
 
 	return groupName, nil
