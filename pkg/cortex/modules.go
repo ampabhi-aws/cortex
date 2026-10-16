@@ -592,6 +592,15 @@ func (t *Cortex) initConfig() (serv services.Service, err error) {
 
 	t.ConfigAPI = configAPI.New(t.ConfigDB, t.Cfg.Configs.API)
 	t.ConfigAPI.RegisterRoutes(t.Server.HTTP)
+	// The cross-tenant /private/api/prom/configs/* endpoints are registered
+	// through the API's RegisterRoute helper so the configured authentication
+	// middleware is applied. These endpoints return every tenant's
+	// configuration (including raw Alertmanager YAML with receiver secrets)
+	// and must be reachable only by operator-level callers; the deployment
+	// gateway should additionally restrict the /private/ path prefix.
+	for _, route := range t.ConfigAPI.AdminRoutes() {
+		t.API.RegisterRoute(route.Path, route.Handler, true, route.Method)
+	}
 	return services.NewIdleService(nil, func(_ error) error {
 		t.ConfigDB.Close()
 		return nil

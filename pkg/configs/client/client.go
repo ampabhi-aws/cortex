@@ -142,6 +142,14 @@ func doRequest(endpoint string, timeout time.Duration, tlsConfig *tls.Config, si
 	}
 
 	req.Header.Set("User-Agent", fmt.Sprintf("Cortex/%s", version.Version))
+	// The /private/api/prom/configs/* endpoints are cross-tenant admin
+	// endpoints and are now registered behind the HTTP auth middleware, which
+	// requires an X-Scope-OrgID header. The handler itself ignores the
+	// supplied tenant and returns every tenant's configuration (by design,
+	// so the ruler/alertmanager can poll all tenants), but the middleware
+	// still demands a non-empty value. Advertise this request as an internal
+	// operator-level client via a dedicated admin tenant ID.
+	req.Header.Set("X-Scope-OrgID", "__system__")
 
 	resp, err := client.Do(req)
 	if err != nil {
