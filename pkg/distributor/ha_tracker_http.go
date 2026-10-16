@@ -4,11 +4,13 @@ import (
 	"html/template"
 	"net/http"
 	"sort"
+	"strconv"
 	"strings"
 	"time"
 
 	"github.com/prometheus/prometheus/model/timestamp"
 
+	"github.com/cortexproject/cortex/pkg/tenant"
 	"github.com/cortexproject/cortex/pkg/util"
 )
 
@@ -49,6 +51,11 @@ const trackerTpl = `
 	</body>
 </html>`
 
+// haTrackerPageDefaultLimit bounds how many elected entries ServeHTTP returns
+// per request so a single caller cannot force an unbounded scan of the elected
+// map while holding the read lock that checkReplica needs on the push path.
+const haTrackerPageDefaultLimit = 1000
+
 var trackerTmpl *template.Template
 
 func init() {
@@ -56,7 +63,26 @@ func init() {
 }
 
 func (h *haTracker) ServeHTTP(w http.ResponseWriter, req *http.Request) {
-	h.electedLock.RLock()
+	// Require a tenant from the request context. The HA tracker keys are
+	// cluster-wide (one entry per (tenant, cluster) pair), so without a
+	// tenant scope the handler would disclose every tenant's HA cluster
+	// and replica names to the caller.
+	userID, err := tenant.TenantID(req.Context())
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusUnauthorized)
+		return
+	}
+
+	// Bound the amount of work performed per request so a caller cannot
+	// force an O(n log n) scan over the whole elected map while holding
+	// electedLock.
+	limit := haTrackerPageDefaultLimit
+	if raw := req.URL.Query().Get("limit"); raw != "" {
+		if parsed, perr := strconv.Atoi(raw); perr == nil && parsed > 0 && parsed <= haTrackerPageDefaultLimit {
+			limit = parsed
+		}
+	}
+
 	type replica struct {
 		UserID       string        `json:"userID"`
 		Cluster      string        `json:"cluster"`
@@ -66,9 +92,21 @@ func (h *haTracker) ServeHTTP(w http.ResponseWriter, req *http.Request) {
 		FailoverTime time.Duration `json:"failoverDuration"`
 	}
 
+	// The elected map is keyed by "<userID>/<cluster>". Only emit entries
+	// whose key prefix matches the caller's tenant so the handler cannot
+	// be used to enumerate other tenants' HA cluster/replica metadata.
+	userPrefix := userID + "/"
+
 	electedReplicas := []replica{}
+	h.electedLock.RLock()
 	for key, desc := range h.elected {
+		if !strings.HasPrefix(key, userPrefix) {
+			continue
+		}
 		chunks := strings.SplitN(key, "/", 2)
+		if len(chunks) != 2 || chunks[0] != userID {
+			continue
+		}
 
 		electedReplicas = append(electedReplicas, replica{
 			UserID:       chunks[0],
@@ -90,6 +128,10 @@ func (h *haTracker) ServeHTTP(w http.ResponseWriter, req *http.Request) {
 		}
 		return first.Cluster < second.Cluster
 	})
+
+	if len(electedReplicas) > limit {
+		electedReplicas = electedReplicas[:limit]
+	}
 
 	util.RenderHTTPResponse(w, struct {
 		Elected []replica `json:"elected"`
