@@ -5,8 +5,15 @@ import (
 	"sort"
 	"time"
 
+	"github.com/pkg/errors"
+
 	"github.com/cortexproject/cortex/pkg/util"
 )
+
+// ErrTooManyTenants is returned by getOrAddQueue when the per-scheduler cap on
+// the number of concurrently tracked tenant queues has been reached. It is
+// mapped to ErrTooManyRequests by RequestQueue so that frontends receive a 429.
+var ErrTooManyTenants = errors.New("too many tenants with outstanding requests")
 
 // querier holds information about a querier registered in the queue.
 type querier struct {
@@ -31,6 +38,11 @@ type queues struct {
 	users []string
 
 	maxUserQueueSize int
+
+	// Upper bound on the number of concurrently tracked tenant queues. Once reached,
+	// getOrAddQueue returns ErrTooManyTenants for previously unseen tenants.
+	// Zero or negative means unlimited (preserves historical behaviour for tests).
+	maxUsers int
 
 	// How long to wait before removing a querier which has got disconnected
 	// but hasn't notified about a graceful shutdown.
@@ -60,10 +72,17 @@ type userQueue struct {
 }
 
 func newUserQueues(maxUserQueueSize int, forgetDelay time.Duration) *queues {
+	return newUserQueuesWithMax(maxUserQueueSize, 0, forgetDelay)
+}
+
+// newUserQueuesWithMax is like newUserQueues but also enforces a cap on the
+// total number of concurrently tracked tenant queues (0 = unlimited).
+func newUserQueuesWithMax(maxUserQueueSize, maxUsers int, forgetDelay time.Duration) *queues {
 	return &queues{
 		userQueues:       map[string]*userQueue{},
 		users:            nil,
 		maxUserQueueSize: maxUserQueueSize,
+		maxUsers:         maxUsers,
 		forgetDelay:      forgetDelay,
 		queriers:         map[string]*querier{},
 		sortedQueriers:   nil,
@@ -93,10 +112,15 @@ func (q *queues) deleteQueue(userID string) {
 // MaxQueriers is used to compute which queriers should handle requests for this user.
 // If maxQueriers is <= 0, all queriers can handle this user's requests.
 // If maxQueriers has changed since the last call, queriers for this are recomputed.
-func (q *queues) getOrAddQueue(userID string, maxQueriers int) chan Request {
+//
+// Returns (nil, nil) for an empty userID (callers already reject this upstream).
+// Returns (nil, ErrTooManyTenants) when creating a new queue would exceed the
+// configured per-scheduler cap on concurrently tracked tenants; existing
+// tenants' queues are always returned so in-flight requests continue to drain.
+func (q *queues) getOrAddQueue(userID string, maxQueriers int) (chan Request, error) {
 	// Empty user is not allowed, as that would break our users list ("" is used for free spot).
 	if userID == "" {
-		return nil
+		return nil, nil
 	}
 
 	if maxQueriers < 0 {
@@ -106,6 +130,13 @@ func (q *queues) getOrAddQueue(userID string, maxQueriers int) chan Request {
 	uq := q.userQueues[userID]
 
 	if uq == nil {
+		// Enforce the global cap on concurrently tracked tenants before allocating
+		// a new per-tenant channel. This protects the scheduler from unbounded
+		// memory and metric-cardinality growth driven by attacker-chosen keys.
+		if q.maxUsers > 0 && len(q.userQueues) >= q.maxUsers {
+			return nil, ErrTooManyTenants
+		}
+
 		uq = &userQueue{
 			ch:    make(chan Request, q.maxUserQueueSize),
 			seed:  util.ShuffleShardSeed(userID, ""),
@@ -134,7 +165,7 @@ func (q *queues) getOrAddQueue(userID string, maxQueriers int) chan Request {
 		uq.queriers = shuffleQueriersForUser(uq.seed, maxQueriers, q.sortedQueriers, nil)
 	}
 
-	return uq.ch
+	return uq.ch, nil
 }
 
 // Finds next queue for the querier. To support fair scheduling between users, client is expected

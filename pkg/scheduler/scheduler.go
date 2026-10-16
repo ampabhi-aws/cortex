@@ -286,7 +286,7 @@ func (s *Scheduler) enqueueRequest(frontendContext context.Context, frontendAddr
 
 	req := &schedulerRequest{
 		frontendAddress: frontendAddr,
-		userID:          msg.UserID,
+		userID:          userID,
 		queryID:         msg.QueryID,
 		request:         msg.HttpRequest,
 		statsEnabled:    msg.StatsEnabled,
@@ -303,6 +303,18 @@ func (s *Scheduler) enqueueRequest(frontendContext context.Context, frontendAddr
 	tenantIDs, err := tenant.TenantIDsFromOrgID(userID)
 	if err != nil {
 		return err
+	}
+	// Also apply the strict charset/length rules on every component tenant ID
+	// before the userID is used as a per-tenant queue key, activeUsers key and
+	// Prometheus metric label value. The default SingleResolver used above only
+	// rejects a handful of unsafe path segments (., .., /, \\) and imposes no
+	// length limit, so without this check a trusted gRPC peer could otherwise
+	// mint arbitrarily many/long distinct keys and inflate per-tenant queue
+	// channels and metric label cardinality.
+	for _, id := range tenantIDs {
+		if err := tenant.ValidTenantID(id); err != nil {
+			return err
+		}
 	}
 	maxQueriers := validation.SmallestPositiveNonZeroIntPerTenant(tenantIDs, s.limits.MaxQueriersPerUser)
 

@@ -158,7 +158,9 @@ func TestQueuesConsistency(t *testing.T) {
 			for i := 0; i < 10000; i++ {
 				switch r.Int() % 6 {
 				case 0:
-					assert.NotNil(t, uq.getOrAddQueue(generateTenant(r), 3))
+					q, err := uq.getOrAddQueue(generateTenant(r), 3)
+					assert.NoError(t, err)
+					assert.NotNil(t, q)
 				case 1:
 					qid := generateQuerier(r)
 					_, _, luid := uq.getNextQueueForQuerier(lastUserIndexes[qid], qid)
@@ -360,10 +362,13 @@ func generateQuerier(r *rand.Rand) string {
 }
 
 func getOrAdd(t *testing.T, uq *queues, tenant string, maxQueriers int) chan Request {
-	q := uq.getOrAddQueue(tenant, maxQueriers)
+	q, err := uq.getOrAddQueue(tenant, maxQueriers)
+	assert.NoError(t, err)
 	assert.NotNil(t, q)
 	assert.NoError(t, isConsistent(uq))
-	assert.Equal(t, q, uq.getOrAddQueue(tenant, maxQueriers))
+	q2, err := uq.getOrAddQueue(tenant, maxQueriers)
+	assert.NoError(t, err)
+	assert.Equal(t, q, q2)
 	return q
 }
 
@@ -483,4 +488,37 @@ func TestShuffleQueriersCorrectness(t *testing.T) {
 			require.True(t, ix < len(allSortedQueriers) && allSortedQueriers[ix] == q, "selected querier is not between all queriers")
 		}
 	}
+}
+
+// TestQueues_MaxUsers verifies that the per-scheduler cap on concurrently
+// tracked tenant queues rejects previously-unseen tenants with ErrTooManyTenants
+// once the cap is reached, while existing tenants' queues keep working.
+func TestQueues_MaxUsers(t *testing.T) {
+	uq := newUserQueuesWithMax(0, 2, 0)
+	assert.NotNil(t, uq)
+	assert.NoError(t, isConsistent(uq))
+
+	// First two distinct tenants fit under the cap.
+	q1, err := uq.getOrAddQueue("tenant-1", 0)
+	require.NoError(t, err)
+	require.NotNil(t, q1)
+	q2, err := uq.getOrAddQueue("tenant-2", 0)
+	require.NoError(t, err)
+	require.NotNil(t, q2)
+
+	// Third new tenant is rejected.
+	q3, err := uq.getOrAddQueue("tenant-3", 0)
+	require.Equal(t, ErrTooManyTenants, err)
+	require.Nil(t, q3)
+
+	// Existing tenants still get their queue back.
+	q1again, err := uq.getOrAddQueue("tenant-1", 0)
+	require.NoError(t, err)
+	require.Equal(t, q1, q1again)
+
+	// After an existing tenant drains and is deleted, a new one can take its slot.
+	uq.deleteQueue("tenant-1")
+	q4, err := uq.getOrAddQueue("tenant-4", 0)
+	require.NoError(t, err)
+	require.NotNil(t, q4)
 }
