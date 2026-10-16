@@ -578,7 +578,7 @@ func (t *Cortex) initRuler() (serv services.Service, err error) {
 
 	// If the API is enabled, register the Ruler API
 	if t.Cfg.Ruler.EnableAPI {
-		t.API.RegisterRulerAPI(ruler.NewAPI(t.Ruler, t.RulerStorage, util_log.Logger))
+		t.API.RegisterRulerAPI(ruler.NewAPI(t.Ruler, t.RulerStorage, util_log.Logger), t.Ruler)
 	}
 
 	return t.Ruler, nil
