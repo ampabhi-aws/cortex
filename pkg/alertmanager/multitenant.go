@@ -1023,6 +1023,19 @@ func (am *MultitenantAlertmanager) serveRequest(w http.ResponseWriter, req *http
 		return
 	}
 
+	// Refuse to serve or instantiate a tenant Alertmanager on an instance that
+	// does not own the tenant. Without this check, a non-owning replica that
+	// received the request (because the Distributor did not recognise the
+	// path, or because sharding is disabled) would fall through to the
+	// fallback-config path below and could destructively overwrite the
+	// tenant's stored configuration. Returning 404 lets the caller retry
+	// against an owning replica.
+	if !am.isUserOwned(userID) {
+		level.Debug(am.logger).Log("msg", "not serving Alertmanager request on non-owning replica", "user", userID)
+		http.Error(w, "the Alertmanager is not configured", http.StatusNotFound)
+		return
+	}
+
 	if am.fallbackConfig != "" {
 		userAM, err = am.alertmanagerFromFallbackConfig(userID)
 		if err != nil {
@@ -1040,16 +1053,34 @@ func (am *MultitenantAlertmanager) serveRequest(w http.ResponseWriter, req *http
 }
 
 func (am *MultitenantAlertmanager) alertmanagerFromFallbackConfig(userID string) (*Alertmanager, error) {
-	// Upload an empty config so that the Alertmanager is no de-activated in the next poll
-	cfgDesc := alertspb.ToProto("", nil, userID)
-	err := am.store.SetAlertConfig(context.Background(), cfgDesc)
-	if err != nil {
+	// Check whether the tenant already has a stored Alertmanager config. We
+	// must not overwrite an existing stored configuration from the request
+	// path: an instance that received a request before the first poll has
+	// loaded the tenant (or that received a request for a tenant it does not
+	// own) would otherwise upload an empty AlertConfigDesc and permanently
+	// destroy the tenant's receivers, routes and template files.
+	cfgDesc, err := am.store.GetAlertConfig(context.Background(), userID)
+	switch {
+	case err == nil:
+		// A real configuration already exists in the store. Use it to
+		// instantiate the tenant Alertmanager instead of overwriting the
+		// stored object with an empty placeholder. The periodic poll will
+		// converge the other replicas on this same configuration.
+	case errors.Is(err, alertspb.ErrNotFound):
+		// The tenant has no stored configuration. Upload an empty
+		// placeholder so the tenant Alertmanager is not de-activated on the
+		// next poll - this is the intended "start with fallback" behaviour.
+		cfgDesc = alertspb.ToProto("", nil, userID)
+		if err := am.store.SetAlertConfig(context.Background(), cfgDesc); err != nil {
+			return nil, err
+		}
+	default:
 		return nil, err
 	}
 
-	// Calling setConfig with an empty configuration will use the fallback config.
-	err = am.setConfig(cfgDesc)
-	if err != nil {
+	// Calling setConfig with the (possibly empty) configuration will either
+	// apply the tenant's real config or fall through to the fallback config.
+	if err := am.setConfig(cfgDesc); err != nil {
 		return nil, err
 	}
 

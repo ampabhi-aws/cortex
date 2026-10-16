@@ -300,34 +300,41 @@ func TestDistributor_DistributeRequest(t *testing.T) {
 }
 
 func TestDistributor_IsPathSupported(t *testing.T) {
-	supported := map[string]bool{
-		"/alertmanager/api/v1/alerts":           true,
-		"/alertmanager/api/v1/alerts/groups":    false,
-		"/alertmanager/api/v1/silences":         true,
-		"/alertmanager/api/v1/silence/id":       true,
-		"/alertmanager/api/v1/silence/anything": true,
-		"/alertmanager/api/v1/silence/really":   true,
-		"/alertmanager/api/v1/status":           true,
-		"/alertmanager/api/v1/receivers":        true,
-		"/alertmanager/api/v1/other":            false,
-		"/alertmanager/api/v2/alerts":           true,
-		"/alertmanager/api/v2/alerts/groups":    true,
-		"/alertmanager/api/v2/silences":         true,
-		"/alertmanager/api/v2/silence/id":       true,
-		"/alertmanager/api/v2/silence/anything": true,
-		"/alertmanager/api/v2/silence/really":   true,
-		"/alertmanager/api/v2/status":           true,
-		"/alertmanager/api/v2/receivers":        true,
-		"/alertmanager/api/v2/other":            false,
-		"/alertmanager/other":                   false,
-		"/other":                                false,
+	// IsPathSupported now returns true for every path. The Alertmanager HTTP
+	// router only hands the Distributor paths under the Alertmanager prefix,
+	// and routing those paths through the Distributor (rather than serving
+	// them locally on a potentially non-owning replica) is required to
+	// prevent the fallback-config path from destructively overwriting a
+	// tenant's stored configuration.
+	paths := []string{
+		"/alertmanager/api/v1/alerts",
+		"/alertmanager/api/v1/alerts/groups",
+		"/alertmanager/api/v1/silences",
+		"/alertmanager/api/v1/silence/id",
+		"/alertmanager/api/v1/silence/anything",
+		"/alertmanager/api/v1/silence/really",
+		"/alertmanager/api/v1/status",
+		"/alertmanager/api/v1/receivers",
+		"/alertmanager/api/v1/other",
+		"/alertmanager/api/v2/alerts",
+		"/alertmanager/api/v2/alerts/groups",
+		"/alertmanager/api/v2/silences",
+		"/alertmanager/api/v2/silence/id",
+		"/alertmanager/api/v2/silence/anything",
+		"/alertmanager/api/v2/silence/really",
+		"/alertmanager/api/v2/status",
+		"/alertmanager/api/v2/receivers",
+		"/alertmanager/api/v2/other",
+		"/alertmanager/other",
+		"/alertmanager/",
+		"/other",
 	}
 
-	for path, isSupported := range supported {
+	for _, path := range paths {
 		t.Run(path, func(t *testing.T) {
 			d, _, cleanup := prepare(t, 1, 1, 1, []byte{})
 			t.Cleanup(cleanup)
-			require.Equal(t, isSupported, d.IsPathSupported(path))
+			require.True(t, d.IsPathSupported(path))
 		})
 	}
 }
