@@ -47,6 +47,16 @@ func (l *RateLimiter) AllowN(now time.Time, tenantID string, n int) bool {
 	return l.getTenantLimiter(now, tenantID).AllowN(now, n)
 }
 
+// RemoveTenant removes the per-tenant rate limiter entry for the given
+// tenantID, if present. This is used to release memory held for tenants
+// that have become inactive. If no entry exists for the tenant, the call
+// is a no-op.
+func (l *RateLimiter) RemoveTenant(tenantID string) {
+	l.tenantsLock.Lock()
+	delete(l.tenants, tenantID)
+	l.tenantsLock.Unlock()
+}
+
 // Limit returns the currently configured maximum overall tokens rate.
 func (l *RateLimiter) Limit(now time.Time, tenantID string) float64 {
 	return float64(l.getTenantLimiter(now, tenantID).Limit())
