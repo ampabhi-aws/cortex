@@ -5,12 +5,35 @@ import (
 	"flag"
 	"os"
 	"path/filepath"
+	"strings"
 
 	"github.com/pkg/errors"
 	promRules "github.com/prometheus/prometheus/rules"
 
 	"github.com/cortexproject/cortex/pkg/ruler/rulespb"
 )
+
+// ErrInvalidRuleNamespace is returned when the namespace passed to the local
+// rule store is not a single, local path element and therefore cannot safely
+// be joined into a filesystem path.
+var ErrInvalidRuleNamespace = errors.New("invalid rule namespace")
+
+// validateNamespace rejects any namespace value that cannot be treated as a
+// single, local filesystem path element. This prevents a tenant-controlled
+// namespace from being used to traverse outside the per-tenant rules
+// directory via `..`, path separators or absolute paths.
+func validateNamespace(namespace string) error {
+	if namespace == "" || namespace == "." || namespace == ".." {
+		return ErrInvalidRuleNamespace
+	}
+	if strings.ContainsAny(namespace, `/\`) {
+		return ErrInvalidRuleNamespace
+	}
+	if filepath.IsAbs(namespace) {
+		return ErrInvalidRuleNamespace
+	}
+	return nil
+}
 
 const (
 	Name = "local"
@@ -168,7 +191,20 @@ func (l *Client) loadAllRulesGroupsForUser(ctx context.Context, userID string) (
 }
 
 func (l *Client) loadAllRulesGroupsForUserAndNamespace(_ context.Context, userID string, namespace string) (rulespb.RuleGroupList, error) {
-	filename := filepath.Join(l.cfg.Directory, userID, namespace)
+	if err := validateNamespace(namespace); err != nil {
+		return nil, err
+	}
+
+	userDir := filepath.Join(l.cfg.Directory, userID)
+	filename := filepath.Join(userDir, namespace)
+
+	// Defense-in-depth: ensure the resolved filename stays inside the
+	// per-tenant directory. validateNamespace should already guarantee
+	// this, but double-check in case of unexpected inputs on any platform.
+	cleanedUserDir := filepath.Clean(userDir) + string(os.PathSeparator)
+	if !strings.HasPrefix(filepath.Clean(filename), cleanedUserDir) {
+		return nil, ErrInvalidRuleNamespace
+	}
 
 	rulegroups, allErrors := l.loader.Load(filename)
 	if len(allErrors) > 0 {

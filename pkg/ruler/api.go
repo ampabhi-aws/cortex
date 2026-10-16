@@ -395,7 +395,8 @@ func (a *API) ListRules(w http.ResponseWriter, req *http.Request) {
 	level.Debug(logger).Log("msg", "retrieving rule groups with namespace", "userID", userID, "namespace", namespace)
 	rgs, err := a.store.ListRuleGroupsForUserAndNamespace(req.Context(), userID, namespace)
 	if err != nil {
-		http.Error(w, err.Error(), http.StatusBadRequest)
+		level.Error(logger).Log("msg", "unable to list rule groups", "userID", userID, "err", err)
+		http.Error(w, "unable to list rule groups", http.StatusBadRequest)
 		return
 	}
 
