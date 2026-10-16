@@ -3,6 +3,7 @@ package configdb
 import (
 	"context"
 	"errors"
+	"sync"
 
 	"github.com/cortexproject/cortex/pkg/configs/client"
 	"github.com/cortexproject/cortex/pkg/configs/userconfig"
@@ -15,7 +16,15 @@ const (
 
 // ConfigRuleStore is a concrete implementation of RuleStore that sources rules from the config service
 type ConfigRuleStore struct {
-	configClient  client.Client
+	configClient client.Client
+
+	// mtx guards concurrent access to the cached rule groups and the
+	// `since` cursor. ListAllRuleGroups is called concurrently from the
+	// ruler's /ruler/rule_groups fan-out (fetchRulesConcurrency=16) and
+	// from the background syncRules goroutine, so the cache mutations and
+	// the cursor update must be serialized to avoid Go's unrecoverable
+	// `concurrent map writes` runtime abort.
+	mtx           sync.Mutex
 	since         userconfig.ID
 	ruleGroupList map[string]rulespb.RuleGroupList
 }
@@ -47,6 +56,9 @@ func (c *ConfigRuleStore) ListAllUsers(ctx context.Context) ([]string, error) {
 
 // ListAllRuleGroups implements RuleStore
 func (c *ConfigRuleStore) ListAllRuleGroups(ctx context.Context) (map[string]rulespb.RuleGroupList, error) {
+	c.mtx.Lock()
+	defer c.mtx.Unlock()
+
 	configs, err := c.configClient.GetRules(ctx, c.since)
 
 	if err != nil {
@@ -73,7 +85,17 @@ func (c *ConfigRuleStore) ListAllRuleGroups(ctx context.Context) (map[string]rul
 
 	c.since = getLatestConfigID(configs, c.since)
 
-	return c.ruleGroupList, nil
+	// Return a defensive copy of the cached map so callers cannot mutate
+	// (or race with mutations of) the shared cache. The per-user slices
+	// are copied too, since callers filter them in place.
+	out := make(map[string]rulespb.RuleGroupList, len(c.ruleGroupList))
+	for user, list := range c.ruleGroupList {
+		copied := make(rulespb.RuleGroupList, len(list))
+		copy(copied, list)
+		out[user] = copied
+	}
+
+	return out, nil
 }
 
 // getLatestConfigID gets the latest configs ID.
@@ -94,20 +116,21 @@ func (c *ConfigRuleStore) ListRuleGroupsForUserAndNamespace(ctx context.Context,
 		return nil, err
 	}
 
+	list := r[userID]
 	if namespace == "" {
-		return r[userID], nil
+		return list, nil
 	}
 
-	list := r[userID]
-	for ix := 0; ix < len(list); {
-		if list[ix].GetNamespace() != namespace {
-			list = append(list[:ix], list[ix+1:]...)
-		} else {
-			ix++
+	// Build a fresh slice for the namespace filter instead of filtering
+	// the (possibly cache-aliased) slice in place.
+	out := make(rulespb.RuleGroupList, 0, len(list))
+	for _, g := range list {
+		if g.GetNamespace() == namespace {
+			out = append(out, g)
 		}
 	}
 
-	return list, nil
+	return out, nil
 }
 
 func (c *ConfigRuleStore) LoadRuleGroups(ctx context.Context, groupsToLoad map[string]rulespb.RuleGroupList) error {
