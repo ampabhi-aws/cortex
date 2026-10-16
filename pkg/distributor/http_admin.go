@@ -9,6 +9,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/cortexproject/cortex/pkg/tenant"
 	"github.com/cortexproject/cortex/pkg/util"
 )
 
@@ -68,12 +69,31 @@ func (s userStatsByTimeseries) Less(i, j int) bool {
 }
 
 // AllUserStatsHandler shows stats for all users.
+//
+// The route is wired with auth=true: the handler scopes the returned stats to
+// the tenant resolved from the request context so a caller cannot enumerate
+// other tenants' IDs or ingest metadata.
 func (d *Distributor) AllUserStatsHandler(w http.ResponseWriter, r *http.Request) {
+	userID, err := tenant.TenantID(r.Context())
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusUnauthorized)
+		return
+	}
+
 	stats, err := d.AllUserStats(r.Context())
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
 	}
+
+	// Filter to only the caller's tenant.
+	filtered := stats[:0]
+	for _, s := range stats {
+		if s.UserID == userID {
+			filtered = append(filtered, s)
+		}
+	}
+	stats = filtered
 
 	sort.Sort(userStatsByTimeseries(stats))
 

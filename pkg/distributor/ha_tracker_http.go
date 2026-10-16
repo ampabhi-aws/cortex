@@ -9,6 +9,7 @@ import (
 
 	"github.com/prometheus/prometheus/model/timestamp"
 
+	"github.com/cortexproject/cortex/pkg/tenant"
 	"github.com/cortexproject/cortex/pkg/util"
 )
 
@@ -56,7 +57,16 @@ func init() {
 }
 
 func (h *haTracker) ServeHTTP(w http.ResponseWriter, req *http.Request) {
-	h.electedLock.RLock()
+	// Scope the rendered rows to the caller's tenant. The route is wired with
+	// auth=true so the AuthenticateUser middleware has already placed the
+	// X-Scope-OrgID into the request context; without a tenant we must not
+	// disclose any other tenant's cluster/replica label values.
+	userID, err := tenant.TenantID(req.Context())
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusUnauthorized)
+		return
+	}
+
 	type replica struct {
 		UserID       string        `json:"userID"`
 		Cluster      string        `json:"cluster"`
@@ -67,8 +77,12 @@ func (h *haTracker) ServeHTTP(w http.ResponseWriter, req *http.Request) {
 	}
 
 	electedReplicas := []replica{}
+	h.electedLock.RLock()
 	for key, desc := range h.elected {
 		chunks := strings.SplitN(key, "/", 2)
+		if len(chunks) != 2 || chunks[0] != userID {
+			continue
+		}
 
 		electedReplicas = append(electedReplicas, replica{
 			UserID:       chunks[0],
