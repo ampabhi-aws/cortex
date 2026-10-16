@@ -3,6 +3,7 @@ package tenantfederation
 import (
 	"context"
 	"fmt"
+	"net/http"
 	"sort"
 	"strings"
 
@@ -11,6 +12,7 @@ import (
 	"github.com/prometheus/prometheus/storage"
 	"github.com/prometheus/prometheus/tsdb/chunkenc"
 	tsdb_errors "github.com/prometheus/prometheus/tsdb/errors"
+	"github.com/weaveworks/common/httpgrpc"
 	"github.com/weaveworks/common/user"
 
 	"github.com/cortexproject/cortex/pkg/tenant"
@@ -36,15 +38,25 @@ const (
 // If the label "__tenant_id__" is already existing, its value is overwritten
 // by the tenant ID and the previous value is exposed through a new label
 // prefixed with "original_". This behaviour is not implemented recursively.
-func NewQueryable(upstream storage.Queryable, byPassWithSingleQuerier bool) storage.Queryable {
-	return NewMergeQueryable(defaultTenantLabel, tenantQuerierCallback(upstream), byPassWithSingleQuerier)
+// If maxTenants is > 0, requests with more than maxTenants tenant IDs in the
+// X-Scope-OrgID header are rejected with HTTP 400 before any per-tenant
+// querier is constructed.
+func NewQueryable(upstream storage.Queryable, byPassWithSingleQuerier bool, maxTenants int) storage.Queryable {
+	return NewMergeQueryable(defaultTenantLabel, tenantQuerierCallback(upstream, maxTenants), byPassWithSingleQuerier)
 }
 
-func tenantQuerierCallback(queryable storage.Queryable) MergeQuerierCallback {
+func tenantQuerierCallback(queryable storage.Queryable, maxTenants int) MergeQuerierCallback {
 	return func(ctx context.Context, mint int64, maxt int64) ([]string, []storage.Querier, error) {
 		tenantIDs, err := tenant.TenantIDs(ctx)
 		if err != nil {
 			return nil, nil, err
+		}
+
+		// Enforce the per-request tenant count limit before constructing any
+		// queriers, so an attacker-controlled X-Scope-OrgID header cannot turn
+		// one HTTP request into an unbounded fan-out across tenants.
+		if maxTenants > 0 && len(tenantIDs) > maxTenants {
+			return nil, nil, httpgrpc.Errorf(http.StatusBadRequest, "too many tenant IDs supplied in the request (requested: %d, limit: %d). Reduce the number of tenant IDs in the X-Scope-OrgID header or increase -tenant-federation.max-tenants.", len(tenantIDs), maxTenants)
 		}
 
 		var queriers = make([]storage.Querier, len(tenantIDs))
