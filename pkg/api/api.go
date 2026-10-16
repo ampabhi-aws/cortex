@@ -18,6 +18,7 @@ import (
 	"github.com/cortexproject/cortex/pkg/alertmanager"
 	"github.com/cortexproject/cortex/pkg/alertmanager/alertmanagerpb"
 	"github.com/cortexproject/cortex/pkg/compactor"
+	configAPI "github.com/cortexproject/cortex/pkg/configs/api"
 	"github.com/cortexproject/cortex/pkg/cortexpb"
 	"github.com/cortexproject/cortex/pkg/distributor"
 	"github.com/cortexproject/cortex/pkg/distributor/distributorpb"
@@ -322,6 +323,26 @@ func (a *API) RegisterRulerAPI(r *ruler.API) {
 	a.RegisterRoute(path.Join(a.cfg.LegacyHTTPPrefix, "/rules/{namespace}"), http.HandlerFunc(r.CreateRuleGroup), true, "POST")
 	a.RegisterRoute(path.Join(a.cfg.LegacyHTTPPrefix, "/rules/{namespace}/{groupName}"), http.HandlerFunc(r.DeleteRuleGroup), true, "DELETE")
 	a.RegisterRoute(path.Join(a.cfg.LegacyHTTPPrefix, "/rules/{namespace}"), http.HandlerFunc(r.DeleteNamespace), true, "DELETE")
+}
+
+// RegisterConfigAPI registers the legacy configs API routes with the shared
+// HTTP router, applying the configured HTTP auth middleware per route. Tenant
+// scoped routes are registered with auth=true so that the auth middleware (or
+// its fake-auth counterpart under -auth.enabled=false) is the only source of
+// the tenant ID; internal/private cross-tenant routes keep their current
+// behaviour but should be exposed only on a restricted listener in production.
+//
+// The configs module's own trivial admin index page (GET /) is intentionally
+// not registered here because the shared HTTP router already serves its own
+// index on that path (see RegisterAPI).
+func (a *API) RegisterConfigAPI(c *configAPI.API) {
+	for _, route := range c.Routes() {
+		if route.Path == "/" {
+			continue
+		}
+		handler := http.Handler(route.Handler)
+		a.RegisterRoute(route.Path, handler, route.Auth, route.Method)
+	}
 }
 
 // RegisterRing registers the ring UI page associated with the distributor for writes.
