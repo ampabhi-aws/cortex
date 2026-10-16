@@ -82,13 +82,14 @@ func (cfg *TCPTransportConfig) RegisterFlagsWithPrefix(f *flag.FlagSet, prefix s
 // operations ("packet" and "stream" are terms used by memberlist).
 // It uses a new TCP connections for each operation. There is no connection reuse.
 type TCPTransport struct {
-	cfg          TCPTransportConfig
-	logger       log.Logger
-	packetCh     chan *memberlist.Packet
-	connCh       chan net.Conn
-	wg           sync.WaitGroup
-	tcpListeners []net.Listener
-	tlsConfig    *tls.Config
+	cfg             TCPTransportConfig
+	logger          log.Logger
+	packetCh        chan *memberlist.Packet
+	connCh          chan net.Conn
+	wg              sync.WaitGroup
+	tcpListeners    []net.Listener
+	tlsConfig       *tls.Config // client-side config used for outbound dials
+	tlsServerConfig *tls.Config // server-side config used for the gossip listener
 
 	shutdown atomic.Int32
 
@@ -127,9 +128,24 @@ func NewTCPTransport(config TCPTransportConfig, logger log.Logger) (*TCPTranspor
 
 	var err error
 	if config.TLSEnabled {
+		// Outbound dials (tls.DialWithDialer in getConnection) continue to
+		// use the client-side configuration derived from the inline
+		// cortextls.ClientConfig (RootCAs, Certificates, ServerName, ...).
 		t.tlsConfig, err = config.TLS.GetTLSConfig()
 		if err != nil {
 			return nil, errors.Wrap(err, "unable to create TLS config")
+		}
+
+		// The gossip listener MUST NOT reuse the client config: that would
+		// leave ClientAuth at Go's zero value (tls.NoClientCert) and the
+		// listener would complete handshakes with any anonymous client,
+		// giving no peer authentication at all. Build a dedicated
+		// server-side config that requires and verifies client certs
+		// against the same CA bundle, and that cannot be silently relaxed
+		// by tls_insecure_skip_verify.
+		t.tlsServerConfig, err = config.TLS.GetServerTLSConfig()
+		if err != nil {
+			return nil, errors.Wrap(err, "unable to create server TLS config")
 		}
 	}
 
@@ -151,7 +167,7 @@ func NewTCPTransport(config TCPTransportConfig, logger log.Logger) (*TCPTranspor
 
 		var tcpLn net.Listener
 		if config.TLSEnabled {
-			tcpLn, err = tls.Listen("tcp", tcpAddr.String(), t.tlsConfig)
+			tcpLn, err = tls.Listen("tcp", tcpAddr.String(), t.tlsServerConfig)
 			if err != nil {
 				return nil, errors.Wrapf(err, "failed to start TLS TCP listener on %q port %d", addr, port)
 			}
