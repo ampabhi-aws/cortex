@@ -36,6 +36,20 @@ func (m *KV) createAndRegisterMetrics() {
 		Help:      "Number of received broadcast user messages that were invalid. Hopefully 0.",
 	})
 
+	m.numberOfDroppedUnknownKeys = promauto.With(m.registerer).NewCounter(prometheus.CounterOpts{
+		Namespace: m.cfg.MetricsNamespace,
+		Subsystem: subsystem,
+		Name:      "received_broadcasts_dropped_unknown_keys_total",
+		Help:      "Number of received KV pairs dropped because the key was not in the local allowlist or the KV store size limit was reached.",
+	})
+
+	m.numberOfDroppedOversizedMessages = promauto.With(m.registerer).NewCounter(prometheus.CounterOpts{
+		Namespace: m.cfg.MetricsNamespace,
+		Subsystem: subsystem,
+		Name:      "received_broadcasts_dropped_oversized_total",
+		Help:      "Number of received KV pairs dropped because the key length or encoded value size exceeded the configured limits.",
+	})
+
 	m.numberOfPushes = promauto.With(m.registerer).NewCounter(prometheus.CounterOpts{
 		Namespace: m.cfg.MetricsNamespace,
 		Subsystem: subsystem,
