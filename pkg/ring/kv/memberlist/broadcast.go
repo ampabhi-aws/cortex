@@ -27,16 +27,22 @@ func (r ringBroadcast) Invalidates(old memberlist.Broadcast) bool {
 		// if 'content' (result of Mergeable.MergeContent) of this broadcast is a superset of content of old value,
 		// and this broadcast has resulted in a newer ring update, we can invalidate the old value
 
-		for _, oldName := range oldb.content {
-			found := false
-			for _, newName := range r.content {
-				if oldName == newName {
-					found = true
-					break
-				}
-			}
+		// Short-circuit: a strictly smaller new content cannot be a superset.
+		if len(r.content) < len(oldb.content) {
+			return false
+		}
 
-			if !found {
+		// Build a set from r.content once, then check containment in O(len(oldb.content)).
+		// This replaces a nested linear scan that was O(len(oldb.content) * len(r.content))
+		// and could be abused by a gossip peer injecting a large ring.Desc to stall the
+		// broadcast queue (CWE-407).
+		newSet := make(map[string]struct{}, len(r.content))
+		for _, newName := range r.content {
+			newSet[newName] = struct{}{}
+		}
+
+		for _, oldName := range oldb.content {
+			if _, found := newSet[oldName]; !found {
 				return false
 			}
 		}
