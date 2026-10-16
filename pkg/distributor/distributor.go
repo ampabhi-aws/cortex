@@ -489,6 +489,18 @@ func (d *Distributor) checkSample(ctx context.Context, userID, cluster, replica 
 		return false, nil
 	}
 
+	// Apply the same guard to the cluster label value. Both `cluster` and `replica` are taken straight
+	// from the push body before validateSeries/ValidateLabels has run, and `cluster` is used downstream
+	// as a KV-store key and as a Prometheus metric label value (unbounded-cardinality CounterVec child)
+	// in haTracker.checkReplica. Without this guard, an attacker able to push to a tenant with
+	// accept_ha_samples=true can inject arbitrarily long or non-UTF8 label values that are retained
+	// forever in the distributor's metrics registry and in the shared Consul/etcd KV store. We accept
+	// the sample here (so the normal validation path can produce the standard 400 response) but skip
+	// HA handling for it.
+	if len(cluster) > d.limits.MaxLabelValueLength(userID) || !model.LabelValue(cluster).IsValid() {
+		return false, nil
+	}
+
 	// At this point we know we have both HA labels, we should lookup
 	// the cluster/instance here to see if we want to accept this sample.
 	err := d.HATracker.checkReplica(ctx, userID, cluster, replica, time.Now())
