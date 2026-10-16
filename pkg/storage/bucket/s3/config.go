@@ -41,6 +41,10 @@ var (
 	errUnsupportedSSEType          = errors.New("unsupported S3 SSE type")
 	errInvalidSSEContext           = errors.New("invalid S3 SSE encryption context")
 	errInvalidBucketLookupType     = errors.New("invalid bucket lookup type")
+	// ErrMissingSSEKMSKeyID is returned when the SSE type is SSE-KMS but no KMS
+	// key ID has been configured. Without a key ID the upload would silently
+	// fall back to the bucket/account default KMS key.
+	ErrMissingSSEKMSKeyID = errors.New("KMS key ID is required when S3 SSE type is SSE-KMS")
 )
 
 // HTTPConfig stores the http.Transport configuration for the s3 minio client.
@@ -143,6 +147,10 @@ func (cfg *SSEConfig) Validate() error {
 		return errUnsupportedSSEType
 	}
 
+	if cfg.Type == SSEKMS && cfg.KMSKeyID == "" {
+		return ErrMissingSSEKMSKeyID
+	}
+
 	if _, err := parseKMSEncryptionContext(cfg.KMSEncryptionContext); err != nil {
 		return errInvalidSSEContext
 	}
@@ -181,6 +189,9 @@ func (cfg *SSEConfig) BuildMinioConfig() (encrypt.ServerSide, error) {
 	case "":
 		return nil, nil
 	case SSEKMS:
+		if cfg.KMSKeyID == "" {
+			return nil, ErrMissingSSEKMSKeyID
+		}
 		encryptionCtx, err := parseKMSEncryptionContext(cfg.KMSEncryptionContext)
 		if err != nil {
 			return nil, err
