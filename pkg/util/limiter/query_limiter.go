@@ -54,6 +54,15 @@ func AddQueryLimiterToContext(ctx context.Context, limiter *QueryLimiter) contex
 	return context.WithValue(ctx, ctxKey, limiter)
 }
 
+// HasQueryLimiter reports whether a QueryLimiter has been attached to the
+// context. Callers that want to install a shared, request-scoped limiter
+// above layers that would otherwise install a per-tenant limiter can use
+// this to avoid overwriting the shared one.
+func HasQueryLimiter(ctx context.Context) bool {
+	_, ok := ctx.Value(ctxKey).(*QueryLimiter)
+	return ok
+}
+
 // QueryLimiterFromContextWithFallback returns a QueryLimiter from the current context.
 // If there is not a QueryLimiter on the context it will return a new no-op limiter.
 func QueryLimiterFromContextWithFallback(ctx context.Context) *QueryLimiter {

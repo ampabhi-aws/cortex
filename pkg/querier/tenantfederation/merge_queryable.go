@@ -13,9 +13,12 @@ import (
 	tsdb_errors "github.com/prometheus/prometheus/tsdb/errors"
 	"github.com/weaveworks/common/user"
 
+	"github.com/cortexproject/cortex/pkg/querier/lazyquery"
 	"github.com/cortexproject/cortex/pkg/tenant"
 	"github.com/cortexproject/cortex/pkg/util/concurrency"
+	"github.com/cortexproject/cortex/pkg/util/limiter"
 	"github.com/cortexproject/cortex/pkg/util/spanlogger"
+	"github.com/cortexproject/cortex/pkg/util/validation"
 )
 
 const (
@@ -23,6 +26,16 @@ const (
 	retainExistingPrefix = "original_"
 	maxConcurrency       = 16
 )
+
+// QueryLimits is the minimal set of per-tenant limits that the tenant
+// federation layer needs to build a single per-request QueryLimiter that is
+// shared across all tenants in the federated query.
+type QueryLimits interface {
+	MaxFetchedSeriesPerQuery(userID string) int
+	MaxFetchedChunkBytesPerQuery(userID string) int
+	MaxChunksPerQuery(userID string) int
+	MaxFetchedDataBytesPerQuery(userID string) int
+}
 
 // NewQueryable returns a queryable that iterates through all the tenant IDs
 // that are part of the request and aggregates the results from each tenant's
@@ -36,15 +49,58 @@ const (
 // If the label "__tenant_id__" is already existing, its value is overwritten
 // by the tenant ID and the previous value is exposed through a new label
 // prefixed with "original_". This behaviour is not implemented recursively.
+//
+// It applies no cap on the number of federated tenants and does not inject a
+// shared QueryLimiter. Use NewQueryableWithOptions in production to enable
+// those protections.
 func NewQueryable(upstream storage.Queryable, byPassWithSingleQuerier bool) storage.Queryable {
-	return NewMergeQueryable(defaultTenantLabel, tenantQuerierCallback(upstream), byPassWithSingleQuerier)
+	return NewQueryableWithOptions(upstream, byPassWithSingleQuerier, 0, nil)
 }
 
-func tenantQuerierCallback(queryable storage.Queryable) MergeQuerierCallback {
+// NewQueryableWithOptions is like NewQueryable but additionally enforces a
+// cap on the number of tenants that may appear in a single federated query
+// and, if a non-nil QueryLimits is provided, creates a single QueryLimiter
+// per incoming request so that max_fetched_series_per_query,
+// max_fetched_chunks_per_query, max_fetched_chunk_bytes_per_query and
+// max_fetched_data_bytes_per_query are enforced for the whole federated
+// query instead of once per tenant.
+//
+// maxTenants <= 0 means no limit on the number of federated tenants.
+func NewQueryableWithOptions(upstream storage.Queryable, byPassWithSingleQuerier bool, maxTenants int, limits QueryLimits) storage.Queryable {
+	return NewMergeQueryable(defaultTenantLabel, tenantQuerierCallbackWithOptions(upstream, maxTenants, limits), byPassWithSingleQuerier)
+}
+
+func tenantQuerierCallbackWithOptions(queryable storage.Queryable, maxTenants int, limits QueryLimits) MergeQuerierCallback {
 	return func(ctx context.Context, mint int64, maxt int64) ([]string, []storage.Querier, error) {
 		tenantIDs, err := tenant.TenantIDs(ctx)
 		if err != nil {
 			return nil, nil, err
+		}
+
+		// Enforce an explicit cap on the number of federated tenants before
+		// any per-tenant querier is created. This prevents a single request
+		// from fanning out one full querier (and one full per-query resource
+		// budget) per '|'-separated tenant ID in X-Scope-OrgID.
+		if maxTenants > 0 && len(tenantIDs) > maxTenants {
+			return nil, nil, fmt.Errorf("too many tenants in federated query: got %d, max is %d", len(tenantIDs), maxTenants)
+		}
+
+		// Install a single QueryLimiter for the whole federated request
+		// (if we were given a limits provider and one is not already set),
+		// so that per-query resource budgets are enforced for the whole
+		// query instead of once per tenant. The merged limiter uses the
+		// smallest positive non-zero per-tenant limit across the involved
+		// tenants, which matches the semantics applied elsewhere.
+		if limits != nil {
+			if !limiter.HasQueryLimiter(ctx) {
+				mergedLimiter := limiter.NewQueryLimiter(
+					validation.SmallestPositiveNonZeroIntPerTenant(tenantIDs, limits.MaxFetchedSeriesPerQuery),
+					validation.SmallestPositiveNonZeroIntPerTenant(tenantIDs, limits.MaxFetchedChunkBytesPerQuery),
+					validation.SmallestPositiveNonZeroIntPerTenant(tenantIDs, limits.MaxChunksPerQuery),
+					validation.SmallestPositiveNonZeroIntPerTenant(tenantIDs, limits.MaxFetchedDataBytesPerQuery),
+				)
+				ctx = limiter.AddQueryLimiterToContext(ctx, mergedLimiter)
+			}
 		}
 
 		var queriers = make([]storage.Querier, len(tenantIDs))
@@ -56,6 +112,16 @@ func tenantQuerierCallback(queryable storage.Queryable) MergeQuerierCallback {
 			)
 			if err != nil {
 				return nil, nil, err
+			}
+			// Unwrap lazyquery.LazyQuerier so that mergeQuerier.Select's
+			// maxConcurrency bound is effective: a LazyQuerier.Select would
+			// spawn its own goroutine and return immediately, letting all N
+			// per-tenant backends run concurrently regardless of the worker
+			// pool size. By using the inner synchronous querier here, the
+			// bounded worker pool in mergeQuerier.Select actually caps the
+			// number of in-flight per-tenant fan-outs.
+			if lq, ok := q.(lazyquery.LazyQuerier); ok {
+				q = lq.Inner()
 			}
 			queriers[pos] = q
 		}

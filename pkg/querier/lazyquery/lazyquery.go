@@ -16,6 +16,13 @@ func NewLazyQuerier(next storage.Querier) storage.Querier {
 	return LazyQuerier{next}
 }
 
+// Inner returns the wrapped storage.Querier. Callers that need the
+// synchronous (non-lazy) querier can use this to bypass the lazy Select
+// adapter when they already provide their own concurrency control.
+func (l LazyQuerier) Inner() storage.Querier {
+	return l.next
+}
+
 // Select implements Storage.Querier
 func (l LazyQuerier) Select(selectSorted bool, params *storage.SelectHints, matchers ...*labels.Matcher) storage.SeriesSet {
 	// make sure there is space in the buffer, to unblock the goroutine and let it die even if nobody is
