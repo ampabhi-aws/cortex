@@ -496,7 +496,24 @@ func buildReceiverIntegrations(nc *config.Receiver, tmpl *template.Template, fir
 		add("webhook", i, c, func(l log.Logger) (notify.Notifier, error) { return webhook.New(c, tmpl, l, httpOps...) })
 	}
 	for i, c := range nc.EmailConfigs {
-		add("email", i, c, func(l log.Logger) (notify.Notifier, error) { return email.New(c, tmpl, l), nil })
+		add("email", i, c, func(l log.Logger) (notify.Notifier, error) {
+			// The vendored Alertmanager email notifier dials the SMTP smarthost directly with
+			// a bare net.Dialer{} / tls.Dial, so the per-tenant FirewallDialer injected via
+			// commoncfg.WithDialContextFunc into every other integration cannot filter it.
+			// Wrap the notifier so that each Notify() call re-resolves and re-checks the
+			// smarthost against the tenant's firewall rules (BlockPrivateAddresses /
+			// BlockCIDRNetworks) before the vendor code opens the TCP connection.
+			// Re-checking per-call also prevents a DNS rebinding bypass between apply-time
+			// and notification-time.
+			if err := validateEmailSmarthost(c.Smarthost, firewallDialer); err != nil {
+				return nil, errors.Wrap(err, "email smarthost rejected by receiver firewall")
+			}
+			return &firewallEmailNotifier{
+				Notifier:  email.New(c, tmpl, l),
+				smarthost: c.Smarthost,
+				dialer:    firewallDialer,
+			}, nil
+		})
 	}
 	for i, c := range nc.PagerdutyConfigs {
 		add("pagerduty", i, c, func(l log.Logger) (notify.Notifier, error) { return pagerduty.New(c, tmpl, l, httpOps...) })
@@ -570,6 +587,45 @@ func (p firewallDialerConfigProvider) BlockCIDRNetworks() []flagext.CIDR {
 
 func (p firewallDialerConfigProvider) BlockPrivateAddresses() bool {
 	return p.limits.AlertmanagerReceiversBlockPrivateAddresses(p.userID)
+}
+
+// validateEmailSmarthost rejects an Alertmanager email_configs smarthost whose
+// host resolves to an address blocked by the per-tenant receiver firewall.
+//
+// This is a pre-check only: because the vendored Alertmanager email notifier
+// dials the smarthost with a bare net.Dialer{} and cannot take an injected
+// dialer, the enforced check at Notify time is performed by
+// firewallEmailNotifier.Notify.
+func validateEmailSmarthost(smarthost config.HostPort, dialer *util_net.FirewallDialer) error {
+	if dialer == nil || smarthost.Host == "" {
+		return nil
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	return dialer.ValidateAddress(ctx, smarthost.String())
+}
+
+// firewallEmailNotifier wraps the vendored email.Email notifier with a
+// per-call check of the smarthost against the per-tenant receiver firewall.
+// The vendored email notifier does not accept a custom dialer, so without this
+// wrapper a tenant-controlled smarthost can bypass BlockPrivateAddresses /
+// BlockCIDRNetworks entirely. Re-validating per Notify call also mitigates DNS
+// rebinding between apply-time and the actual TCP dial inside the vendor code.
+type firewallEmailNotifier struct {
+	notify.Notifier
+	smarthost config.HostPort
+	dialer    *util_net.FirewallDialer
+}
+
+func (n *firewallEmailNotifier) Notify(ctx context.Context, alerts ...*types.Alert) (bool, error) {
+	if n.dialer != nil && n.smarthost.Host != "" {
+		if err := n.dialer.ValidateAddress(ctx, n.smarthost.String()); err != nil {
+			// Returning a non-retryable error here prevents the notification pipeline
+			// from retrying against the same blocked endpoint on every tick.
+			return false, errors.Wrap(err, "email smarthost rejected by receiver firewall")
+		}
+	}
+	return n.Notifier.Notify(ctx, alerts...)
 }
 
 type tenantRateLimits struct {
