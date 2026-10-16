@@ -73,6 +73,51 @@ func (cfg *ClientConfig) GetTLSConfig() (*tls.Config, error) {
 	return config, nil
 }
 
+// GetServerTLSConfig initialises a server-side tls.Config from the same
+// certificate material used by ClientConfig. The returned config is intended
+// for use with tls.Listen (or any other listener-side use): it loads the
+// server leaf certificate from CertPath/KeyPath and, when CAPath is set,
+// enables mutual TLS by requiring and verifying client certificates against
+// that CA bundle (ClientAuth=RequireAndVerifyClientCert, ClientCAs=<bundle>).
+//
+// Unlike GetTLSConfig, this method deliberately ignores
+// ClientConfig.InsecureSkipVerify and ClientConfig.ServerName -- those fields
+// only make sense for the outbound/client direction and must not silently
+// disable peer verification on a listener.
+func (cfg *ClientConfig) GetServerTLSConfig() (*tls.Config, error) {
+	config := &tls.Config{}
+
+	// A server listener needs its own leaf certificate.
+	if cfg.CertPath == "" {
+		return nil, errCertMissing
+	}
+	if cfg.KeyPath == "" {
+		return nil, errKeyMissing
+	}
+	serverCert, err := tls.LoadX509KeyPair(cfg.CertPath, cfg.KeyPath)
+	if err != nil {
+		return nil, errors.Wrapf(err, "failed to load TLS certificate %s,%s", cfg.CertPath, cfg.KeyPath)
+	}
+	config.Certificates = []tls.Certificate{serverCert}
+
+	// If a CA bundle is configured, require and verify client certificates
+	// against it (mutual TLS). Without this, Go defaults to
+	// tls.NoClientCert and anonymous clients can complete the handshake.
+	if cfg.CAPath != "" {
+		caCert, err := os.ReadFile(cfg.CAPath)
+		if err != nil {
+			return nil, errors.Wrapf(err, "error loading ca cert: %s", cfg.CAPath)
+		}
+		caCertPool := x509.NewCertPool()
+		caCertPool.AppendCertsFromPEM(caCert)
+
+		config.ClientCAs = caCertPool
+		config.ClientAuth = tls.RequireAndVerifyClientCert
+	}
+
+	return config, nil
+}
+
 // GetGRPCDialOptions creates GRPC DialOptions for TLS
 func (cfg *ClientConfig) GetGRPCDialOptions(enabled bool) ([]grpc.DialOption, error) {
 	if !enabled {
