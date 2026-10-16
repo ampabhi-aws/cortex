@@ -50,6 +50,15 @@ type TCPTransportConfig struct {
 	// Timeout for writing packet data. Zero = no timeout.
 	PacketWriteTimeout time.Duration `yaml:"packet_write_timeout"`
 
+	// Timeout for reading an inbound packet (header + body) from a peer. Zero = no timeout.
+	// Prevents stalled peers from pinning goroutines and file descriptors indefinitely.
+	PacketReadTimeout time.Duration `yaml:"packet_read_timeout"`
+
+	// Maximum size (in bytes) of an inbound "packet" body (including trailing md5 digest)
+	// that will be accepted. Prevents a peer from exhausting memory by streaming unbounded
+	// data into io.ReadAll. Zero = default (10 MiB, matching mlCfg.UDPBufferSize).
+	MaxPacketSize int `yaml:"max_packet_size"`
+
 	// Transport logs lot of messages at debug level, so it deserves an extra flag for turning it on
 	TransportDebug bool `yaml:"-"`
 
@@ -72,6 +81,8 @@ func (cfg *TCPTransportConfig) RegisterFlagsWithPrefix(f *flag.FlagSet, prefix s
 	f.IntVar(&cfg.BindPort, prefix+"memberlist.bind-port", 7946, "Port to listen on for gossip messages.")
 	f.DurationVar(&cfg.PacketDialTimeout, prefix+"memberlist.packet-dial-timeout", 5*time.Second, "Timeout used when connecting to other nodes to send packet.")
 	f.DurationVar(&cfg.PacketWriteTimeout, prefix+"memberlist.packet-write-timeout", 5*time.Second, "Timeout for writing 'packet' data.")
+	f.DurationVar(&cfg.PacketReadTimeout, prefix+"memberlist.packet-read-timeout", 10*time.Second, "Timeout for reading an inbound 'packet' from a peer. Prevents stalled peers from holding goroutines and file descriptors indefinitely. Zero = no timeout.")
+	f.IntVar(&cfg.MaxPacketSize, prefix+"memberlist.max-packet-size", 10*1024*1024, "Maximum size (in bytes) of an inbound 'packet' body accepted from a peer. Prevents a peer from exhausting memory by streaming unbounded data. Must be > 0.")
 	f.BoolVar(&cfg.TransportDebug, prefix+"memberlist.transport-debug", false, "Log debug transport messages. Note: global log.level must be at debug level as well.")
 
 	f.BoolVar(&cfg.TLSEnabled, prefix+"memberlist.tls-enabled", false, "Enable TLS on the memberlist transport layer.")
@@ -245,6 +256,16 @@ func (t *TCPTransport) handleConnection(conn net.Conn) {
 		}
 	}()
 
+	// Set a read deadline on the accepted connection before the first read so that
+	// a peer that opens a connection and then stalls cannot pin a goroutine and
+	// file descriptor forever.
+	if t.cfg.PacketReadTimeout > 0 {
+		if err := conn.SetReadDeadline(time.Now().Add(t.cfg.PacketReadTimeout)); err != nil {
+			level.Warn(t.logger).Log("msg", "failed to set read deadline on inbound connection", "err", err, "remote", conn.RemoteAddr())
+			return
+		}
+	}
+
 	// let's read first byte, and determine what to do about this connection
 	msgType := []byte{0}
 	_, err := io.ReadFull(conn, msgType)
@@ -255,6 +276,15 @@ func (t *TCPTransport) handleConnection(conn net.Conn) {
 
 	if messageType(msgType[0]) == stream {
 		t.incomingStreams.Inc()
+
+		// Clear the read deadline before handing the connection to memberlist:
+		// stream connections are long-lived and memberlist manages its own timeouts.
+		if t.cfg.PacketReadTimeout > 0 {
+			if err := conn.SetReadDeadline(time.Time{}); err != nil {
+				level.Warn(t.logger).Log("msg", "failed to clear read deadline on stream connection", "err", err, "remote", conn.RemoteAddr())
+				return
+			}
+		}
 
 		// hand over this connection to memberlist
 		closeConn = false
@@ -280,11 +310,25 @@ func (t *TCPTransport) handleConnection(conn net.Conn) {
 			return
 		}
 
-		// read the rest to buffer -- this is the "packet" itself
-		buf, err := io.ReadAll(conn)
+		// read the rest to buffer -- this is the "packet" itself.
+		// Bound the read with io.LimitReader so a peer cannot force unbounded allocation
+		// via io.ReadAll. We allow one extra byte beyond the configured maximum so we can
+		// detect oversized packets and reject them rather than silently truncating.
+		maxPacketSize := t.cfg.MaxPacketSize
+		if maxPacketSize <= 0 {
+			maxPacketSize = 10 * 1024 * 1024
+		}
+		maxBodySize := int64(maxPacketSize) + int64(md5.Size)
+		buf, err := io.ReadAll(io.LimitReader(conn, maxBodySize+1))
 		if err != nil {
 			t.receivedPacketsErrors.Inc()
 			level.Warn(t.logger).Log("msg", "error while reading packet data", "err", err, "remote", conn.RemoteAddr())
+			return
+		}
+
+		if int64(len(buf)) > maxBodySize {
+			t.receivedPacketsErrors.Inc()
+			level.Warn(t.logger).Log("msg", "received packet exceeds max allowed size", "max", maxBodySize, "remote", conn.RemoteAddr())
 			return
 		}
 
