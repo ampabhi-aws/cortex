@@ -2,6 +2,7 @@ package v1
 
 import (
 	"context"
+	"crypto/tls"
 	"flag"
 	"fmt"
 	"net/http"
@@ -14,6 +15,8 @@ import (
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/promauto"
 	"github.com/weaveworks/common/httpgrpc"
+	"google.golang.org/grpc/credentials"
+	"google.golang.org/grpc/peer"
 
 	"github.com/cortexproject/cortex/pkg/frontend/v1/frontendv1pb"
 	"github.com/cortexproject/cortex/pkg/querier/stats"
@@ -195,6 +198,23 @@ func (f *Frontend) Process(server frontendv1pb.Frontend_ProcessServer) error {
 		return err
 	}
 
+	// If the gRPC transport authenticated the peer with a client certificate (mTLS),
+	// prefer the certificate-bound identity over the self-asserted GET_ID value. This
+	// prevents a peer that can reach the frontend's gRPC port from impersonating an
+	// arbitrary querier ID. The GET_ID exchange is still performed above for backwards
+	// compatibility with the wire protocol, but its value is only trusted when there
+	// is no stronger transport identity available.
+	if authID, ok := authenticatedClientID(server.Context()); ok {
+		if querierID != "" && querierID != authID {
+			level.Warn(f.log).Log(
+				"msg", "querier self-asserted ClientID does not match authenticated peer; using authenticated identity",
+				"asserted", querierID,
+				"authenticated", authID,
+			)
+		}
+		querierID = authID
+	}
+
 	f.requestQueue.RegisterQuerierConnection(querierID)
 	defer f.requestQueue.UnregisterQuerierConnection(querierID)
 
@@ -257,6 +277,17 @@ func (f *Frontend) Process(server frontendv1pb.Frontend_ProcessServer) error {
 				return
 			}
 
+			// Correlate the response with the dispatched request: if the client
+			// echoed back a ClientID (older queriers may leave it empty), it must
+			// match the authenticated/registered querier identity for this stream.
+			// A mismatch means a confused or hostile peer is attempting to answer
+			// on behalf of a different querier and must not be delivered to the
+			// tenant's in-flight HTTP request.
+			if rid := resp.GetClientID(); rid != "" && rid != querierID {
+				errs <- fmt.Errorf("querier response ClientID %q does not match stream querier %q", rid, querierID)
+				return
+			}
+
 			resps <- resp
 		}()
 
@@ -285,11 +316,58 @@ func (f *Frontend) Process(server frontendv1pb.Frontend_ProcessServer) error {
 	}
 }
 
-func (f *Frontend) NotifyClientShutdown(_ context.Context, req *frontendv1pb.NotifyClientShutdownRequest) (*frontendv1pb.NotifyClientShutdownResponse, error) {
-	level.Info(f.log).Log("msg", "received shutdown notification from querier", "querier", req.GetClientID())
-	f.requestQueue.NotifyQuerierShutdown(req.GetClientID())
+func (f *Frontend) NotifyClientShutdown(ctx context.Context, req *frontendv1pb.NotifyClientShutdownRequest) (*frontendv1pb.NotifyClientShutdownResponse, error) {
+	// Prefer the transport-authenticated identity (mTLS peer certificate) when
+	// available: this message is otherwise unauthenticated and takes an
+	// attacker-controlled ClientID off the wire, letting any peer that can reach
+	// the frontend's gRPC port evict an arbitrary real querier from the
+	// dispatcher pool.
+	clientID := req.GetClientID()
+	if authID, ok := authenticatedClientID(ctx); ok {
+		if clientID != "" && clientID != authID {
+			level.Warn(f.log).Log(
+				"msg", "NotifyClientShutdown ClientID does not match authenticated peer; using authenticated identity",
+				"asserted", clientID,
+				"authenticated", authID,
+			)
+		}
+		clientID = authID
+	}
+	level.Info(f.log).Log("msg", "received shutdown notification from querier", "querier", clientID)
+	f.requestQueue.NotifyQuerierShutdown(clientID)
 
 	return &frontendv1pb.NotifyClientShutdownResponse{}, nil
+}
+
+// authenticatedClientID returns the Common Name of the peer's verified client
+// certificate, when the gRPC transport performed mTLS. The second return value
+// is false if there is no transport-level peer identity (e.g. plaintext gRPC
+// or server-only TLS) in which case callers must fall back to the previous
+// self-asserted identity flow.
+func authenticatedClientID(ctx context.Context) (string, bool) {
+	p, ok := peer.FromContext(ctx)
+	if !ok || p == nil || p.AuthInfo == nil {
+		return "", false
+	}
+	tlsInfo, ok := p.AuthInfo.(credentials.TLSInfo)
+	if !ok {
+		return "", false
+	}
+	return commonNameFromTLSState(tlsInfo.State)
+}
+
+func commonNameFromTLSState(state tls.ConnectionState) (string, bool) {
+	if len(state.VerifiedChains) > 0 && len(state.VerifiedChains[0]) > 0 {
+		if cn := state.VerifiedChains[0][0].Subject.CommonName; cn != "" {
+			return cn, true
+		}
+	}
+	if len(state.PeerCertificates) > 0 {
+		if cn := state.PeerCertificates[0].Subject.CommonName; cn != "" {
+			return cn, true
+		}
+	}
+	return "", false
 }
 
 func getQuerierID(server frontendv1pb.Frontend_ProcessServer) (string, error) {
