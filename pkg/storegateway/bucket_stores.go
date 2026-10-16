@@ -33,6 +33,7 @@ import (
 
 	"github.com/cortexproject/cortex/pkg/storage/bucket"
 	"github.com/cortexproject/cortex/pkg/storage/tsdb"
+	"github.com/cortexproject/cortex/pkg/tenant"
 	"github.com/cortexproject/cortex/pkg/util/backoff"
 	util_log "github.com/cortexproject/cortex/pkg/util/log"
 	"github.com/cortexproject/cortex/pkg/util/spanlogger"
@@ -276,9 +277,9 @@ func (u *BucketStores) Series(req *storepb.SeriesRequest, srv storepb.Store_Seri
 	spanLog, spanCtx := spanlogger.New(srv.Context(), "BucketStores.Series")
 	defer spanLog.Span.Finish()
 
-	userID := getUserIDFromGRPCContext(spanCtx)
-	if userID == "" {
-		return fmt.Errorf("no userID")
+	userID, err := getUserIDFromGRPCContext(spanCtx)
+	if err != nil {
+		return err
 	}
 
 	store := u.getStore(userID)
@@ -297,9 +298,9 @@ func (u *BucketStores) LabelNames(ctx context.Context, req *storepb.LabelNamesRe
 	spanLog, spanCtx := spanlogger.New(ctx, "BucketStores.LabelNames")
 	defer spanLog.Span.Finish()
 
-	userID := getUserIDFromGRPCContext(spanCtx)
-	if userID == "" {
-		return nil, fmt.Errorf("no userID")
+	userID, err := getUserIDFromGRPCContext(spanCtx)
+	if err != nil {
+		return nil, err
 	}
 
 	store := u.getStore(userID)
@@ -315,9 +316,9 @@ func (u *BucketStores) LabelValues(ctx context.Context, req *storepb.LabelValues
 	spanLog, spanCtx := spanlogger.New(ctx, "BucketStores.LabelValues")
 	defer spanLog.Span.Finish()
 
-	userID := getUserIDFromGRPCContext(spanCtx)
-	if userID == "" {
-		return nil, fmt.Errorf("no userID")
+	userID, err := getUserIDFromGRPCContext(spanCtx)
+	if err != nil {
+		return nil, err
 	}
 
 	store := u.getStore(userID)
@@ -548,18 +549,48 @@ func (u *BucketStores) deleteLocalFilesForExcludedTenants(includeUserIDs map[str
 	}
 }
 
-func getUserIDFromGRPCContext(ctx context.Context) string {
-	meta, ok := metadata.FromIncomingContext(ctx)
-	if !ok {
-		return ""
+// getUserIDFromGRPCContext resolves the tenant ID from the authenticated
+// request context (populated by the gRPC auth interceptor from the
+// x-scope-orgid metadata) and uses it as the sole tenant selector when
+// serving store-gateway RPCs. For backwards compatibility with existing
+// callers (e.g. the querier) that also set the legacy __org_id__ gRPC
+// metadata entry, this function additionally rejects any request whose
+// __org_id__ metadata, if present, disagrees with the authenticated tenant.
+// The resolved tenant ID is validated with tenant.ValidTenantID before being
+// returned, so it is safe to use as a per-tenant store-map key / object
+// storage prefix.
+func getUserIDFromGRPCContext(ctx context.Context) (string, error) {
+	userID, err := tenant.TenantID(ctx)
+	if err != nil {
+		return "", fmt.Errorf("no userID: %w", err)
+	}
+	if userID == "" {
+		return "", fmt.Errorf("no userID")
 	}
 
-	values := meta.Get(tsdb.TenantIDExternalLabel)
-	if len(values) != 1 {
-		return ""
+	// If the caller also supplied the legacy __org_id__ metadata entry
+	// (set by the querier for backwards compatibility), require it to
+	// match the authenticated tenant. This prevents a caller from
+	// smuggling a different tenant identity through a secondary metadata
+	// key that used to be the only tenant selector on this code path.
+	if meta, ok := metadata.FromIncomingContext(ctx); ok {
+		if values := meta.Get(tsdb.TenantIDExternalLabel); len(values) > 0 {
+			if len(values) != 1 || values[0] != userID {
+				return "", fmt.Errorf("%s gRPC metadata does not match authenticated tenant", tsdb.TenantIDExternalLabel)
+			}
+		}
 	}
 
-	return values[0]
+	// Validate the resolved tenant ID before using it as a store-map key
+	// / object-storage prefix. tenant.TenantID already rejects unsafe
+	// path segments, but ValidTenantID enforces the documented naming
+	// rules (character set and length) which the store map and bucket
+	// prefix implicitly rely on.
+	if err := tenant.ValidTenantID(userID); err != nil {
+		return "", fmt.Errorf("invalid tenant ID: %w", err)
+	}
+
+	return userID, nil
 }
 
 // ReplicaLabelRemover is a BaseFetcher modifier modifies external labels of existing blocks, it removes given replica labels from the metadata of blocks that have it.
