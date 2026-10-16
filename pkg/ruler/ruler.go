@@ -63,9 +63,6 @@ const (
 	// Limit errors
 	errMaxRuleGroupsPerUserLimitExceeded        = "per-user rule groups limit (limit: %d actual: %d) exceeded"
 	errMaxRulesPerRuleGroupPerUserLimitExceeded = "per-user rules per rule group limit (limit: %d actual: %d) exceeded"
-
-	// errors
-	errListAllUser = "unable to list the ruler users"
 )
 
 // Config is the configuration for the recording rules server.
@@ -863,10 +860,17 @@ func (r *Ruler) DeleteTenantConfiguration(w http.ResponseWriter, req *http.Reque
 func (r *Ruler) ListAllRules(w http.ResponseWriter, req *http.Request) {
 	logger := util_log.WithContext(req.Context(), r.logger)
 
-	userIDs, err := r.store.ListAllUsers(req.Context())
+	// The endpoint must be tenant-scoped: resolve the caller tenant and only
+	// serve that tenant's rule groups. Returning every tenant's rule groups
+	// here leaks cross-tenant configuration (recording/alerting rules,
+	// PromQL expressions, labels and annotations) to any caller that can
+	// reach this HTTP route (CWE-306).
+	userID, err := tenant.TenantID(req.Context())
 	if err != nil {
-		level.Error(logger).Log("msg", errListAllUser, "err", err)
-		http.Error(w, fmt.Sprintf("%s: %s", errListAllUser, err.Error()), http.StatusInternalServerError)
+		// When Cortex is running, the Auth middleware extracts X-Scope-OrgID
+		// and injects it into the context; it responds 401 when the header
+		// is missing, so we do the same here for direct callers / tests.
+		http.Error(w, err.Error(), http.StatusUnauthorized)
 		return
 	}
 
@@ -878,7 +882,7 @@ func (r *Ruler) ListAllRules(w http.ResponseWriter, req *http.Request) {
 		close(done)
 	}()
 
-	err = concurrency.ForEachUser(req.Context(), userIDs, fetchRulesConcurrency, func(ctx context.Context, userID string) error {
+	err = concurrency.ForEachUser(req.Context(), []string{userID}, fetchRulesConcurrency, func(ctx context.Context, userID string) error {
 		rg, err := r.store.ListRuleGroupsForUserAndNamespace(ctx, userID, "")
 		if err != nil {
 			return errors.Wrapf(err, "failed to fetch ruler config for user %s", userID)
@@ -897,7 +901,7 @@ func (r *Ruler) ListAllRules(w http.ResponseWriter, req *http.Request) {
 		return nil
 	})
 	if err != nil {
-		level.Error(logger).Log("msg", "failed to list all ruler configs", "err", err)
+		level.Error(logger).Log("msg", "failed to list ruler configs", "err", err, "user", userID)
 	}
 	close(iter)
 	<-done
