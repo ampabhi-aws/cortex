@@ -74,6 +74,17 @@ func containsUnsafePathSegments(id string) bool {
 	return strings.ContainsAny(id, "\\/")
 }
 
+// containsReservedTenantIDDelimiters reports whether the tenant ID contains
+// characters that Cortex uses as delimiters when embedding the tenant ID in
+// composite namespace identifiers (e.g. query-results cache keys built with
+// ':' and multi-tenant lists joined with '|'). Allowing these characters in a
+// single tenant ID would make the resulting delimiter-joined strings
+// ambiguous and would let a tenant craft an ID whose composite key collides
+// with another tenant's.
+func containsReservedTenantIDDelimiters(id string) bool {
+	return strings.ContainsAny(id, ":"+tenantIDsLabelSeparator)
+}
+
 var errInvalidTenantID = errors.New("invalid tenant ID")
 
 func (t *SingleResolver) TenantID(ctx context.Context) (string, error) {
@@ -83,7 +94,7 @@ func (t *SingleResolver) TenantID(ctx context.Context) (string, error) {
 		return "", err
 	}
 
-	if containsUnsafePathSegments(id) {
+	if containsUnsafePathSegments(id) || containsReservedTenantIDDelimiters(id) {
 		return "", errInvalidTenantID
 	}
 
