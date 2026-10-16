@@ -18,6 +18,7 @@ import (
 	"github.com/cortexproject/cortex/pkg/alertmanager"
 	"github.com/cortexproject/cortex/pkg/alertmanager/alertmanagerpb"
 	"github.com/cortexproject/cortex/pkg/compactor"
+	configAPI "github.com/cortexproject/cortex/pkg/configs/api"
 	"github.com/cortexproject/cortex/pkg/cortexpb"
 	"github.com/cortexproject/cortex/pkg/distributor"
 	"github.com/cortexproject/cortex/pkg/distributor/distributorpb"
@@ -322,6 +323,25 @@ func (a *API) RegisterRulerAPI(r *ruler.API) {
 	a.RegisterRoute(path.Join(a.cfg.LegacyHTTPPrefix, "/rules/{namespace}"), http.HandlerFunc(r.CreateRuleGroup), true, "POST")
 	a.RegisterRoute(path.Join(a.cfg.LegacyHTTPPrefix, "/rules/{namespace}/{groupName}"), http.HandlerFunc(r.DeleteRuleGroup), true, "DELETE")
 	a.RegisterRoute(path.Join(a.cfg.LegacyHTTPPrefix, "/rules/{namespace}"), http.HandlerFunc(r.DeleteNamespace), true, "DELETE")
+}
+
+// RegisterConfigAPI registers the routes exposed by the legacy configs service
+// through the top-level API wrapper so that the configured HTTPAuthMiddleware
+// is applied to every tenant-scoped route. Previously the configs router was
+// attached directly to the shared HTTP mux via RegisterRoutes, which bypassed
+// the server's authentication middleware entirely and let any caller that
+// could reach the port read, overwrite or disable any tenant's configuration
+// by naming that tenant in an X-Scope-OrgID header.
+func (a *API) RegisterConfigAPI(c *configAPI.API) {
+	for _, route := range c.Routes() {
+		// Route metadata declares whether the route must be authenticated.
+		// All tenant-scoped routes (and the internal /private/... all-tenant
+		// routes) are flagged true so the configured HTTPAuthMiddleware --
+		// which in -auth.enabled=false mode is fakeHTTPAuthMiddleware --
+		// controls the tenant identity instead of trusting an unverified
+		// client-supplied header.
+		a.RegisterRoute(route.Path, route.Handler, route.Auth, route.Method)
+	}
 }
 
 // RegisterRing registers the ring UI page associated with the distributor for writes.
