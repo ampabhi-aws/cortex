@@ -288,10 +288,17 @@ func (w *frontendSchedulerWorker) schedulerLoop(loop schedulerpb.SchedulerForFro
 
 			case schedulerpb.ERROR:
 				req.enqueue <- enqueueResult{status: waitForResponse}
+				// The scheduler carries the error text in resp.Error; the local
+				// err is nil here (already checked above after loop.Recv). Guard
+				// against an empty message so callers always get a usable body.
+				body := resp.Error
+				if body == "" {
+					body = "unknown error"
+				}
 				req.response <- &frontendv2pb.QueryResultRequest{
 					HttpResponse: &httpgrpc.HTTPResponse{
 						Code: http.StatusInternalServerError,
-						Body: []byte(err.Error()),
+						Body: []byte(body),
 					},
 				}
 

@@ -1,6 +1,8 @@
 package httpgrpcutil
 
 import (
+	"strings"
+
 	"github.com/opentracing/opentracing-go"
 	"github.com/weaveworks/common/httpgrpc"
 )
@@ -9,6 +11,17 @@ import (
 type HttpgrpcHeadersCarrier httpgrpc.HTTPRequest
 
 func (c *HttpgrpcHeadersCarrier) Set(key, val string) {
+	// Replace any existing values for this key (case-insensitive match on the
+	// HTTP header name) rather than appending. This prevents a client-supplied
+	// value (e.g. a malformed uber-trace-id) from being carried alongside the
+	// value we inject here when the carrier is used to propagate trace context.
+	for _, h := range c.Headers {
+		if strings.EqualFold(h.Key, key) {
+			h.Key = key
+			h.Values = []string{val}
+			return
+		}
+	}
 	c.Headers = append(c.Headers, &httpgrpc.Header{
 		Key:    key,
 		Values: []string{val},
