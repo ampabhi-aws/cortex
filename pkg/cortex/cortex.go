@@ -111,6 +111,7 @@ type Config struct {
 	Compactor        compactor.Config                `yaml:"compactor"`
 	StoreGateway     storegateway.Config             `yaml:"store_gateway"`
 	TenantFederation tenantfederation.Config         `yaml:"tenant_federation"`
+	Purger           purger.Config                   `yaml:"purger"`
 
 	Ruler               ruler.Config                               `yaml:"ruler"`
 	RulerStorage        rulestore.Config                           `yaml:"ruler_storage"`
@@ -157,6 +158,7 @@ func (c *Config) RegisterFlags(f *flag.FlagSet) {
 	c.Compactor.RegisterFlags(f)
 	c.StoreGateway.RegisterFlags(f)
 	c.TenantFederation.RegisterFlags(f)
+	c.Purger.RegisterFlags(f)
 
 	c.Ruler.RegisterFlags(f)
 	c.RulerStorage.RegisterFlags(f)
