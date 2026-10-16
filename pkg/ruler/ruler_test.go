@@ -1101,6 +1101,7 @@ type ruleGroupKey struct {
 func TestRuler_ListAllRules(t *testing.T) {
 	store := newMockRuleStore(mockRules)
 	cfg := defaultRulerConfig(t)
+	cfg.APIAdminTenants = []string{"admin"}
 
 	r := newTestRuler(t, cfg, store, nil)
 	defer services.StopAndAwaitTerminated(context.Background(), r) //nolint:errcheck
@@ -1108,7 +1109,20 @@ func TestRuler_ListAllRules(t *testing.T) {
 	router := mux.NewRouter()
 	router.Path("/ruler/rule_groups").Methods(http.MethodGet).HandlerFunc(r.ListAllRules)
 
-	req := requestFor(t, http.MethodGet, "https://localhost:8080/ruler/rule_groups", nil, "")
+	// Unauthenticated requests must be rejected: the endpoint exposes every
+	// tenant's rule configuration.
+	unauthReq := requestFor(t, http.MethodGet, "https://localhost:8080/ruler/rule_groups", nil, "")
+	unauthW := httptest.NewRecorder()
+	router.ServeHTTP(unauthW, unauthReq)
+	require.Equal(t, http.StatusUnauthorized, unauthW.Result().StatusCode)
+
+	// Authenticated but non-admin tenants must also be rejected.
+	nonAdminReq := requestFor(t, http.MethodGet, "https://localhost:8080/ruler/rule_groups", nil, "user1")
+	nonAdminW := httptest.NewRecorder()
+	router.ServeHTTP(nonAdminW, nonAdminReq)
+	require.Equal(t, http.StatusForbidden, nonAdminW.Result().StatusCode)
+
+	req := requestFor(t, http.MethodGet, "https://localhost:8080/ruler/rule_groups", nil, "admin")
 	w := httptest.NewRecorder()
 	router.ServeHTTP(w, req)
 
