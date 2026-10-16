@@ -15,6 +15,7 @@ import (
 	"github.com/prometheus/alertmanager/config"
 	"github.com/prometheus/alertmanager/template"
 	commoncfg "github.com/prometheus/common/config"
+	"github.com/prometheus/common/sigv4"
 	"gopkg.in/yaml.v2"
 
 	"github.com/cortexproject/cortex/pkg/alertmanager/alertspb"
@@ -45,6 +46,9 @@ var (
 	errTLSFileNotAllowed             = errors.New("setting TLS ca_file, cert_file and key_file is not allowed")
 	errSlackAPIURLFileNotAllowed     = errors.New("setting Slack api_url_file and global slack_api_url_file is not allowed")
 	errVictorOpsAPIKeyFileNotAllowed = errors.New("setting VictorOps api_key_file is not allowed")
+	errSNSSigV4CredentialsRequired   = errors.New("setting SNS sigv4.access_key and sigv4.secret_key is required: tenant SNS receivers may not rely on the Alertmanager process's ambient AWS credentials")
+	errSNSSigV4ProfileNotAllowed     = errors.New("setting SNS sigv4.profile is not allowed: tenant SNS receivers may not reference the Alertmanager process's local AWS config/credentials files")
+	errSNSSigV4RoleARNNotAllowed     = errors.New("setting SNS sigv4.role_arn is not allowed: tenant SNS receivers may not use the Alertmanager process's identity to assume arbitrary roles")
 )
 
 // UserConfig is used to communicate a users alertmanager configs
@@ -350,6 +354,16 @@ func validateAlertmanagerConfig(cfg interface{}) error {
 		if err := validateVictorOpsConfig(v.Interface().(config.VictorOpsConfig)); err != nil {
 			return err
 		}
+
+	case reflect.TypeOf(config.SNSConfig{}):
+		if err := validateSNSConfig(v.Interface().(config.SNSConfig)); err != nil {
+			return err
+		}
+
+	case reflect.TypeOf(sigv4.SigV4Config{}):
+		if err := validateSigV4Config(v.Interface().(sigv4.SigV4Config)); err != nil {
+			return err
+		}
 	}
 
 	// If the input config is a struct, recursively iterate on all fields.
@@ -437,6 +451,29 @@ func validateGlobalConfig(cfg config.GlobalConfig) error {
 func validateSlackConfig(cfg config.SlackConfig) error {
 	if cfg.APIURLFile != "" {
 		return errSlackAPIURLFileNotAllowed
+	}
+	return nil
+}
+
+// validateSNSConfig validates the SNS config and returns an error if it contains settings
+// not allowed by Cortex. SNS receivers may not rely on the Alertmanager process's ambient
+// AWS credentials or on operator-local AWS state, which would otherwise let a tenant act
+// as a confused deputy for the shared process identity.
+func validateSNSConfig(cfg config.SNSConfig) error {
+	return validateSigV4Config(cfg.Sigv4)
+}
+
+// validateSigV4Config enforces that tenant SigV4 settings carry inline credentials and
+// do not reference operator-local AWS profiles or roles.
+func validateSigV4Config(cfg sigv4.SigV4Config) error {
+	if cfg.Profile != "" {
+		return errSNSSigV4ProfileNotAllowed
+	}
+	if cfg.RoleARN != "" {
+		return errSNSSigV4RoleARNNotAllowed
+	}
+	if cfg.AccessKey == "" || cfg.SecretKey == "" {
+		return errSNSSigV4CredentialsRequired
 	}
 	return nil
 }

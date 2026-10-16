@@ -15,6 +15,7 @@ import (
 	"github.com/prometheus/alertmanager/config"
 	"github.com/prometheus/client_golang/prometheus"
 	commoncfg "github.com/prometheus/common/config"
+	"github.com/prometheus/common/sigv4"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	"github.com/thanos-io/objstore"
@@ -784,6 +785,75 @@ func TestValidateAlertmanagerConfig(t *testing.T) {
 				}},
 			},
 			expected: errTLSFileNotAllowed,
+		},
+		"SNSConfig without inline sigv4 credentials": {
+			input: config.SNSConfig{
+				TopicARN: "arn:aws:sns:us-east-1:111122223333:example",
+				Sigv4: sigv4.SigV4Config{
+					Region: "us-east-1",
+				},
+			},
+			expected: errSNSSigV4CredentialsRequired,
+		},
+		"SNSConfig with only sigv4.access_key": {
+			input: config.SNSConfig{
+				TopicARN: "arn:aws:sns:us-east-1:111122223333:example",
+				Sigv4: sigv4.SigV4Config{
+					Region:    "us-east-1",
+					AccessKey: "AKIA...",
+				},
+			},
+			expected: errSNSSigV4CredentialsRequired,
+		},
+		"SNSConfig with sigv4.profile set": {
+			input: config.SNSConfig{
+				TopicARN: "arn:aws:sns:us-east-1:111122223333:example",
+				Sigv4: sigv4.SigV4Config{
+					Region:    "us-east-1",
+					AccessKey: "AKIA...",
+					SecretKey: commoncfg.Secret("secret"),
+					Profile:   "operator",
+				},
+			},
+			expected: errSNSSigV4ProfileNotAllowed,
+		},
+		"SNSConfig with sigv4.role_arn set": {
+			input: config.SNSConfig{
+				TopicARN: "arn:aws:sns:us-east-1:111122223333:example",
+				Sigv4: sigv4.SigV4Config{
+					Region:    "us-east-1",
+					AccessKey: "AKIA...",
+					SecretKey: commoncfg.Secret("secret"),
+					RoleARN:   "arn:aws:iam::111122223333:role/foo",
+				},
+			},
+			expected: errSNSSigV4RoleARNNotAllowed,
+		},
+		"SNSConfig nested inside receivers slice without sigv4 credentials": {
+			input: config.Config{
+				Receivers: []*config.Receiver{{
+					Name: "sns",
+					SNSConfigs: []*config.SNSConfig{{
+						APIUrl:   "http://attacker.example/",
+						TopicARN: "arn:aws:sns:us-east-1:111122223333:example",
+						Sigv4: sigv4.SigV4Config{
+							Region: "us-east-1",
+						},
+					}},
+				}},
+			},
+			expected: errSNSSigV4CredentialsRequired,
+		},
+		"SNSConfig with valid inline sigv4 credentials passes": {
+			input: config.SNSConfig{
+				TopicARN: "arn:aws:sns:us-east-1:111122223333:example",
+				Sigv4: sigv4.SigV4Config{
+					Region:    "us-east-1",
+					AccessKey: "AKIA...",
+					SecretKey: commoncfg.Secret("secret"),
+				},
+			},
+			expected: nil,
 		},
 	}
 
