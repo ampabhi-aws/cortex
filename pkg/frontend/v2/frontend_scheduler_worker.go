@@ -140,6 +140,20 @@ func (f *frontendSchedulerWorkers) connectToScheduler(ctx context.Context, addre
 	return conn, nil
 }
 
+// cancelChBufferPerWorker is the size of the per-schedulerLoop goroutine
+// slack in the cancellation channel. The total channel buffer is this value
+// multiplied by the number of schedulerLoop receivers (worker concurrency),
+// which lets a burst of client disconnects enqueue cancellations without
+// being dropped even when every receiver is currently blocked in a gRPC
+// Send/Recv round trip.
+const cancelChBufferPerWorker = 64
+
+// cancelSendTimeout bounds how long RoundTripGRPC will block trying to
+// deliver a cancellation to a scheduler worker when the buffered channel
+// is full (for example because the workers are shutting down or stuck).
+// It is intentionally short to avoid stalling the HTTP response path.
+const cancelSendTimeout = 100 * time.Millisecond
+
 // Worker managing single gRPC connection to Scheduler. Each worker starts multiple goroutines for forwarding
 // requests and cancellations to scheduler.
 type frontendSchedulerWorker struct {
@@ -171,7 +185,13 @@ func newFrontendSchedulerWorker(conn *grpc.ClientConn, schedulerAddr string, fro
 		schedulerAddr: schedulerAddr,
 		frontendAddr:  frontendAddr,
 		requestCh:     requestCh,
-		cancelCh:      make(chan uint64),
+		// Buffer cancelCh so that cancellation notifications are not dropped
+		// when all `concurrency` schedulerLoop receivers are temporarily busy
+		// doing Send/Recv round trips against the scheduler. The frontend's
+		// RoundTripGRPC falls back to a bounded blocking send with timeout if
+		// this buffer is also full, so cancellations are reliably delivered
+		// in the common case while still bounding caller latency on shutdown.
+		cancelCh: make(chan uint64, cancelChBufferPerWorker*concurrency),
 	}
 	w.ctx, w.cancel = context.WithCancel(context.Background())
 
