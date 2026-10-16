@@ -74,6 +74,18 @@ func containsUnsafePathSegments(id string) bool {
 	return strings.ContainsAny(id, "\\/")
 }
 
+// containsCacheKeySeparator reports whether the tenant ID contains the ':'
+// character, which is used as a field separator in several internal cache
+// keys (notably the query-frontend results cache). Allowing ':' in tenant
+// IDs could let an attacker craft a tenant ID + query combination that
+// collides with another tenant's cache entry, enabling cross-tenant reads
+// and cache poisoning. Rejecting it here matches the documented tenant-ID
+// character set (https://cortexmetrics.io/docs/guides/limitations/#tenant-id-naming)
+// which also excludes ':'.
+func containsCacheKeySeparator(id string) bool {
+	return strings.ContainsRune(id, ':')
+}
+
 var errInvalidTenantID = errors.New("invalid tenant ID")
 
 func (t *SingleResolver) TenantID(ctx context.Context) (string, error) {
@@ -83,7 +95,7 @@ func (t *SingleResolver) TenantID(ctx context.Context) (string, error) {
 		return "", err
 	}
 
-	if containsUnsafePathSegments(id) {
+	if containsUnsafePathSegments(id) || containsCacheKeySeparator(id) {
 		return "", errInvalidTenantID
 	}
 

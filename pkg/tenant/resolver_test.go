@@ -99,6 +99,12 @@ func TestSingleResolver(t *testing.T) {
 			errTenantID:  errInvalidTenantID,
 			errTenantIDs: errInvalidTenantID,
 		},
+		{
+			name:         "containing-colon",
+			headerValue:  strptr("with:colon"),
+			errTenantID:  errInvalidTenantID,
+			errTenantIDs: errInvalidTenantID,
+		},
 	}...) {
 		t.Run(tc.name, tc.test(r))
 	}
