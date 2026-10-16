@@ -32,9 +32,32 @@ var (
 	ErrWebhookNotificationsAreDisabled = errors.New("webhook notifications are disabled")
 )
 
+// Default limits used to bound the size of untrusted request bodies and
+// per-tenant template files handled by the configs API. These mirror the
+// bounds the Alertmanager API enforces (pkg/alertmanager/api.go,
+// pkg/alertmanager/multitenant.go:alertmanager.max-recv-msg-size) and the
+// MaxBytesReader pattern used elsewhere in the tree
+// (pkg/alertmanager/distributor.go, pkg/frontend/transport/handler.go).
+const (
+	defaultMaxConfigSize    = 16 << 20 // 16 MiB
+	defaultMaxTemplateSize  = 1 << 20  // 1 MiB per template file
+	defaultMaxTemplatesCount = 20
+)
+
 // Config configures Configs API
 type Config struct {
 	Notifications NotificationsConfig `yaml:"notifications"`
+
+	// MaxConfigSize is the maximum size (in bytes) of a config request body
+	// accepted by the configs API. Bodies larger than this are rejected with
+	// HTTP 413 before being decoded. A value <= 0 disables the limit.
+	MaxConfigSize int64 `yaml:"max_config_size_bytes"`
+	// MaxTemplateSize is the maximum size (in bytes) of a single template
+	// file stored via the configs API. A value <= 0 disables the limit.
+	MaxTemplateSize int `yaml:"max_template_size_bytes"`
+	// MaxTemplatesCount is the maximum number of template files that may be
+	// stored in a single config. A value <= 0 disables the limit.
+	MaxTemplatesCount int `yaml:"max_templates_count"`
 }
 
 // NotificationsConfig configures Alertmanager notifications method.
@@ -47,6 +70,16 @@ type NotificationsConfig struct {
 func (cfg *Config) RegisterFlags(f *flag.FlagSet) {
 	f.BoolVar(&cfg.Notifications.DisableEmail, "configs.notifications.disable-email", false, "Disable Email notifications for Alertmanager.")
 	f.BoolVar(&cfg.Notifications.DisableWebHook, "configs.notifications.disable-webhook", false, "Disable WebHook notifications for Alertmanager.")
+	f.Int64Var(&cfg.MaxConfigSize, "configs.max-config-size-bytes", defaultMaxConfigSize, "Maximum size (bytes) of a config request body accepted by the configs API. Larger bodies are rejected with HTTP 413. 0 disables the limit.")
+	f.IntVar(&cfg.MaxTemplateSize, "configs.max-template-size-bytes", defaultMaxTemplateSize, "Maximum size (bytes) of a single template file stored via the configs API. 0 disables the limit.")
+	f.IntVar(&cfg.MaxTemplatesCount, "configs.max-templates-count", defaultMaxTemplatesCount, "Maximum number of template files that may be stored in a single config. 0 disables the limit.")
+}
+
+func (cfg *Config) maxConfigSize() int64 {
+	if cfg.MaxConfigSize <= 0 {
+		return 0
+	}
+	return cfg.MaxConfigSize
 }
 
 // API implements the configs api.
@@ -154,10 +187,21 @@ func (a *API) setConfig(w http.ResponseWriter, r *http.Request) {
 	}
 	logger := util_log.WithContext(r.Context(), util_log.Logger)
 
+	// Bound the request body so a malicious or malformed upload cannot force
+	// unbounded allocation during JSON/YAML decoding. Matches the pattern used
+	// in pkg/alertmanager/distributor.go and pkg/frontend/transport/handler.go.
+	if limit := a.cfg.maxConfigSize(); limit > 0 {
+		r.Body = http.MaxBytesReader(w, r.Body, limit)
+	}
+
 	var cfg userconfig.Config
 	switch parseConfigFormat(r.Header.Get("Content-Type"), FormatJSON) {
 	case FormatJSON:
 		if err := json.NewDecoder(r.Body).Decode(&cfg); err != nil {
+			if util.IsRequestBodyTooLarge(err) {
+				http.Error(w, "Request body too large", http.StatusRequestEntityTooLarge)
+				return
+			}
 			// XXX: Untested
 			level.Error(logger).Log("msg", "error decoding json body", "err", err)
 			http.Error(w, err.Error(), http.StatusBadRequest)
@@ -165,6 +209,10 @@ func (a *API) setConfig(w http.ResponseWriter, r *http.Request) {
 		}
 	case FormatYAML:
 		if err := yaml.NewDecoder(r.Body).Decode(&cfg); err != nil {
+			if util.IsRequestBodyTooLarge(err) {
+				http.Error(w, "Request body too large", http.StatusRequestEntityTooLarge)
+				return
+			}
 			// XXX: Untested
 			level.Error(logger).Log("msg", "error decoding yaml body", "err", err)
 			http.Error(w, err.Error(), http.StatusBadRequest)
@@ -192,6 +240,11 @@ func (a *API) setConfig(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, fmt.Sprintf("Invalid templates: %v", err), http.StatusBadRequest)
 		return
 	}
+	if err := validateTemplateLimits(cfg, a.cfg.MaxTemplatesCount, a.cfg.MaxTemplateSize); err != nil {
+		level.Error(logger).Log("msg", "template limits exceeded", "err", err)
+		http.Error(w, fmt.Sprintf("Invalid templates: %v", err), http.StatusBadRequest)
+		return
+	}
 	if err := a.db.SetConfig(r.Context(), userID, cfg); err != nil {
 		// XXX: Untested
 		level.Error(logger).Log("msg", "error storing config", "err", err)
@@ -202,9 +255,26 @@ func (a *API) setConfig(w http.ResponseWriter, r *http.Request) {
 }
 
 func (a *API) validateAlertmanagerConfig(w http.ResponseWriter, r *http.Request) {
+	// Require tenant authentication on the validate endpoint, matching every
+	// other mutating/reading handler in this file. Without this the route is
+	// anonymous and can be invoked by any caller that can reach the HTTP port.
+	if _, _, err := tenant.ExtractTenantIDFromHTTPRequest(r); err != nil {
+		http.Error(w, err.Error(), http.StatusUnauthorized)
+		return
+	}
 	logger := util_log.WithContext(r.Context(), util_log.Logger)
-	cfg, err := io.ReadAll(r.Body)
+	// Bound the request body before io.ReadAll so an attacker cannot force
+	// unbounded allocation. Matches pkg/alertmanager/distributor.go:167.
+	body := r.Body
+	if limit := a.cfg.maxConfigSize(); limit > 0 {
+		body = http.MaxBytesReader(w, r.Body, limit)
+	}
+	cfg, err := io.ReadAll(body)
 	if err != nil {
+		if util.IsRequestBodyTooLarge(err) {
+			http.Error(w, "Request body too large", http.StatusRequestEntityTooLarge)
+			return
+		}
 		level.Error(logger).Log("msg", "error reading request body", "err", err)
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
@@ -254,6 +324,23 @@ func validateTemplateFiles(c userconfig.Config) error {
 		}
 	}
 
+	return nil
+}
+
+// validateTemplateLimits enforces the per-tenant caps on the number and size
+// of template files, mirroring pkg/alertmanager/api.go:200-211. Limits that
+// are <= 0 are treated as disabled.
+func validateTemplateLimits(c userconfig.Config, maxCount, maxSize int) error {
+	if maxCount > 0 && len(c.TemplateFiles) > maxCount {
+		return fmt.Errorf("too many template files: %d (limit: %d)", len(c.TemplateFiles), maxCount)
+	}
+	if maxSize > 0 {
+		for fn, content := range c.TemplateFiles {
+			if len(content) > maxSize {
+				return fmt.Errorf("template file %q too large: %d bytes (limit: %d)", fn, len(content), maxSize)
+			}
+		}
+	}
 	return nil
 }
 
