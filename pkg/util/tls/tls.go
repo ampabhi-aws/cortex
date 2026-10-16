@@ -73,6 +73,50 @@ func (cfg *ClientConfig) GetTLSConfig() (*tls.Config, error) {
 	return config, nil
 }
 
+// GetServerTLSConfig initialises a server-side tls.Config from config options.
+//
+// Unlike GetTLSConfig, which produces a client-side configuration, this method
+// returns a *tls.Config suitable for use with tls.Listen / tls.NewListener. The
+// server certificate is loaded from cfg.CertPath/cfg.KeyPath. When clientCAPath
+// is non-empty, the configured CA bundle is installed as ClientCAs and
+// ClientAuth is set to tls.RequireAndVerifyClientCert so that inbound peers
+// must present a certificate chained to that CA. When clientCAPath is empty,
+// clientAuth controls the ClientAuth policy (default tls.NoClientCert).
+func (cfg *ClientConfig) GetServerTLSConfig(clientCAPath string, clientAuth tls.ClientAuthType) (*tls.Config, error) {
+	if cfg.CertPath == "" || cfg.KeyPath == "" {
+		return nil, errors.New("server certificate and key must both be configured for TLS listener")
+	}
+
+	serverCert, err := tls.LoadX509KeyPair(cfg.CertPath, cfg.KeyPath)
+	if err != nil {
+		return nil, errors.Wrapf(err, "failed to load server TLS certificate %s,%s", cfg.CertPath, cfg.KeyPath)
+	}
+
+	config := &tls.Config{
+		Certificates: []tls.Certificate{serverCert},
+		ClientAuth:   clientAuth,
+		MinVersion:   tls.VersionTLS12,
+	}
+
+	if clientCAPath != "" {
+		caCert, err := os.ReadFile(clientCAPath)
+		if err != nil {
+			return nil, errors.Wrapf(err, "error loading client CA cert: %s", clientCAPath)
+		}
+		clientCAPool := x509.NewCertPool()
+		if !clientCAPool.AppendCertsFromPEM(caCert) {
+			return nil, errors.Errorf("failed to parse any client CA certificates from %s", clientCAPath)
+		}
+		config.ClientCAs = clientCAPool
+		// Enforce mutual TLS when a client CA is supplied.
+		if config.ClientAuth < tls.RequireAndVerifyClientCert {
+			config.ClientAuth = tls.RequireAndVerifyClientCert
+		}
+	}
+
+	return config, nil
+}
+
 // GetGRPCDialOptions creates GRPC DialOptions for TLS
 func (cfg *ClientConfig) GetGRPCDialOptions(enabled bool) ([]grpc.DialOption, error) {
 	if !enabled {

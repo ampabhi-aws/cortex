@@ -5,6 +5,7 @@ import (
 	"context"
 	"crypto/rand"
 	"encoding/binary"
+	"encoding/hex"
 	"errors"
 	"flag"
 	"fmt"
@@ -157,6 +158,18 @@ type KVConfig struct {
 	// How much space to use to keep received and sent messages in memory (for troubleshooting).
 	MessageHistoryBufferBytes int `yaml:"message_history_buffer_bytes"`
 
+	// Shared-secret encryption / cluster-isolation options.
+	//
+	// ClusterSecretKey is a hex-encoded 16, 24 or 32-byte key enabling
+	// memberlist's symmetric-key message encryption (AES-128/192/256). When
+	// set, GossipVerifyIncoming/Outgoing control whether unencrypted frames
+	// are accepted/sent during a rolling rollout. Combined with mutual TLS
+	// on the transport, this authenticates every gossip message and
+	// isolates clusters that share a network segment.
+	ClusterSecretKey     string `yaml:"cluster_secret_key"`
+	GossipVerifyIncoming bool   `yaml:"gossip_verify_incoming"`
+	GossipVerifyOutgoing bool   `yaml:"gossip_verify_outgoing"`
+
 	TCPTransport TCPTransportConfig `yaml:",inline"`
 
 	// Where to put custom metrics. Metrics are not registered, if this is nil.
@@ -190,6 +203,9 @@ func (cfg *KVConfig) RegisterFlagsWithPrefix(f *flag.FlagSet, prefix string) {
 	f.DurationVar(&cfg.GossipToTheDeadTime, prefix+"memberlist.gossip-to-dead-nodes-time", mlDefaults.GossipToTheDeadTime, "How long to keep gossiping to dead nodes, to give them chance to refute their death.")
 	f.DurationVar(&cfg.DeadNodeReclaimTime, prefix+"memberlist.dead-node-reclaim-time", mlDefaults.DeadNodeReclaimTime, "How soon can dead node's name be reclaimed with new address. 0 to disable.")
 	f.IntVar(&cfg.MessageHistoryBufferBytes, prefix+"memberlist.message-history-buffer-bytes", 0, "How much space to use for keeping received and sent messages in memory for troubleshooting (two buffers). 0 to disable.")
+	f.StringVar(&cfg.ClusterSecretKey, prefix+"memberlist.cluster-secret-key", "", "Hex-encoded 16, 24 or 32 byte shared secret used to encrypt and authenticate gossip messages. If empty, gossip messages are not encrypted at the memberlist layer (TLS on the transport can still be used instead).")
+	f.BoolVar(&cfg.GossipVerifyIncoming, prefix+"memberlist.gossip-verify-incoming", true, "If a cluster secret key is configured, require incoming gossip packets to be encrypted. Only disable this temporarily while rotating keys or rolling encryption out on a running cluster.")
+	f.BoolVar(&cfg.GossipVerifyOutgoing, prefix+"memberlist.gossip-verify-outgoing", true, "If a cluster secret key is configured, encrypt outgoing gossip packets. Only disable this temporarily while rotating keys or rolling encryption out on a running cluster.")
 	f.BoolVar(&cfg.EnableCompression, prefix+"memberlist.compression-enabled", mlDefaults.EnableCompression, "Enable message compression. This can be used to reduce bandwidth usage at the cost of slightly more CPU utilization.")
 	f.StringVar(&cfg.AdvertiseAddr, prefix+"memberlist.advertise-addr", mlDefaults.AdvertiseAddr, "Gossip address to advertise to other members in the cluster. Used for NAT traversal.")
 	f.IntVar(&cfg.AdvertisePort, prefix+"memberlist.advertise-port", mlDefaults.AdvertisePort, "Gossip port to advertise to other members in the cluster. Used for NAT traversal.")
@@ -397,6 +413,29 @@ func (m *KV) buildMemberlistConfig() (*memberlist.Config, error) {
 
 	mlCfg.LogOutput = newMemberlistLoggerAdapter(m.logger, false)
 	mlCfg.Transport = tr
+
+	// Enable memberlist's shared-secret encryption / authentication when a
+	// cluster secret key is configured. This provides a second layer of peer
+	// authentication (every gossip packet is authenticated with AES-GCM) and
+	// isolates clusters that share the same network segment.
+	if m.cfg.ClusterSecretKey != "" {
+		key, err := hex.DecodeString(m.cfg.ClusterSecretKey)
+		if err != nil {
+			return nil, fmt.Errorf("invalid memberlist.cluster-secret-key: %v", err)
+		}
+		if l := len(key); l != 16 && l != 24 && l != 32 {
+			return nil, fmt.Errorf("invalid memberlist.cluster-secret-key length %d: must decode to 16, 24 or 32 bytes", l)
+		}
+		mlCfg.SecretKey = key
+		mlCfg.GossipVerifyIncoming = m.cfg.GossipVerifyIncoming
+		mlCfg.GossipVerifyOutgoing = m.cfg.GossipVerifyOutgoing
+	} else {
+		// Without a shared secret there is nothing to verify, so leave the
+		// memberlist defaults in place (verify-on when a key is loaded) and
+		// make sure we don't try to require encryption with no key.
+		mlCfg.GossipVerifyIncoming = false
+		mlCfg.GossipVerifyOutgoing = false
+	}
 
 	// Memberlist uses UDPBufferSize to figure out how many messages it can put into single "packet".
 	// As we don't use UDP for sending packets, we can use higher value here.
