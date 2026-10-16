@@ -191,7 +191,17 @@ func ValidateLabels(cfg LabelValidationConfig, userID string, ls []cortexpb.Labe
 	numLabelNames := len(ls)
 	if numLabelNames > cfg.MaxLabelNamesPerSeries(userID) {
 		DiscardedSamples.WithLabelValues(maxLabelNamesPerSeries, userID).Inc()
-		return newTooManyLabelsError(ls, cfg.MaxLabelNamesPerSeries(userID))
+		// The length of `ls` is bounded only by the push body size (which is
+		// a byte budget, not a label-count budget) so the attacker can make
+		// `ls` tens of millions of entries long. Hand the error constructor
+		// only the smallest prefix needed to communicate that the limit was
+		// exceeded; this keeps the error path's allocations bounded even if
+		// a later renderer were to walk the slice.
+		truncLen := cfg.MaxLabelNamesPerSeries(userID) + 1
+		if truncLen < 0 || truncLen > numLabelNames {
+			truncLen = numLabelNames
+		}
+		return newTooManyLabelsError(ls[:truncLen], cfg.MaxLabelNamesPerSeries(userID))
 	}
 
 	maxLabelNameLength := cfg.MaxLabelNameLength(userID)

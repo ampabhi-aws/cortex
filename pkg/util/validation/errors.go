@@ -128,9 +128,13 @@ func newTooManyLabelsError(series []cortexpb.LabelAdapter, limit int) Validation
 }
 
 func (e *tooManyLabelsError) Error() string {
+	// Do not materialise the full attacker-controlled label slice into a
+	// model.Metric map / sorted []string / joined string: with ~millions of
+	// labels that is multi-GB of allocations. formatLabelSet already caps
+	// both the number of labels and the byte budget it renders.
 	return fmt.Sprintf(
 		"series has too many labels (actual: %d, limit: %d) series: '%s'",
-		len(e.series), e.limit, cortexpb.FromLabelAdaptersToMetric(e.series).String())
+		len(e.series), e.limit, formatLabelSet(e.series))
 }
 
 type noMetricNameError struct{}
@@ -193,7 +197,9 @@ type exemplarValidationError struct {
 }
 
 func (e *exemplarValidationError) Error() string {
-	return fmt.Sprintf(e.message, e.timestamp, cortexpb.FromLabelAdaptersToLabels(e.seriesLabels).String(), cortexpb.FromLabelAdaptersToLabels(e.exemplarLabels).String())
+	// Avoid rendering an unbounded number of attacker-controlled labels: both
+	// the series labels and the exemplar labels are capped by formatLabelSet.
+	return fmt.Sprintf(e.message, e.timestamp, formatLabelSet(e.seriesLabels), formatLabelSet(e.exemplarLabels))
 }
 
 func newExemplarEmtpyLabelsError(seriesLabels []cortexpb.LabelAdapter, exemplarLabels []cortexpb.LabelAdapter, timestamp int64) ValidationError {
@@ -225,28 +231,95 @@ func newExemplarLabelLengthError(seriesLabels []cortexpb.LabelAdapter, exemplarL
 	}
 }
 
+const (
+	// maxLabelsInFormattedError bounds how many labels formatLabelSet will
+	// render from an attacker-controlled series before appending an ellipsis.
+	maxLabelsInFormattedError = 10
+	// maxBytesInFormattedError bounds the total byte size of the formatted
+	// label list portion before an ellipsis is appended. It is intentionally
+	// close to the %.200q precision used by sibling error formats so overall
+	// error strings stay small even if a very large per-label name/value
+	// slips through earlier validation.
+	maxBytesInFormattedError = 1024
+	formattedErrorEllipsis   = " ..."
+)
+
 // formatLabelSet formats label adapters as a metric name with labels, while preserving
 // label order, and keeping duplicates. If there are multiple "__name__" labels, only
 // first one is used as metric name, other ones will be included as regular labels.
+//
+// The attacker can control the length of ls (bounded only by the push body
+// size cap), so the renderer is bounded by BOTH a max number of labels and
+// a max byte budget; anything beyond that is truncated with an ellipsis.
+// This is critical: at the time the "too many labels" error is constructed
+// a single series can hold millions of labels, and the old implementation
+// materialised one allocation per label plus a global join buffer, which
+// alone could consume multiple GB of heap in the distributor.
 func formatLabelSet(ls []cortexpb.LabelAdapter) string {
 	metricName, hasMetricName := "", false
 
-	labelStrings := make([]string, 0, len(ls))
+	budget := maxBytesInFormattedError
+	preAlloc := maxLabelsInFormattedError
+	if len(ls) < preAlloc {
+		preAlloc = len(ls)
+	}
+	labelStrings := make([]string, 0, preAlloc)
+	truncated := false
 	for _, l := range ls {
 		if l.Name == model.MetricNameLabel && !hasMetricName && l.Value != "" {
 			metricName = l.Value
 			hasMetricName = true
-		} else {
-			labelStrings = append(labelStrings, fmt.Sprintf("%s=%q", l.Name, l.Value))
+			continue
+		}
+		if len(labelStrings) >= maxLabelsInFormattedError || budget <= 0 {
+			truncated = true
+			break
+		}
+		s := fmt.Sprintf("%s=%q", l.Name, l.Value)
+		if len(s) > budget {
+			// Keep the prefix so the error is still useful but bounded.
+			if budget > 0 {
+				s = s[:budget]
+			} else {
+				s = ""
+			}
+			truncated = true
+			labelStrings = append(labelStrings, s)
+			budget = 0
+			break
+		}
+		labelStrings = append(labelStrings, s)
+		budget -= len(s)
+	}
+
+	// If we only consumed the metric name slot and never recorded that we hit
+	// the cap, the full label list was rendered. Otherwise more labels remain.
+	if !truncated {
+		remaining := len(ls) - len(labelStrings)
+		if hasMetricName {
+			remaining--
+		}
+		if remaining > 0 {
+			truncated = true
 		}
 	}
 
 	if len(labelStrings) == 0 {
 		if hasMetricName {
+			if truncated {
+				return metricName + "{" + strings.TrimSpace(formattedErrorEllipsis) + "}"
+			}
 			return metricName
+		}
+		if truncated {
+			return "{" + strings.TrimSpace(formattedErrorEllipsis) + "}"
 		}
 		return "{}"
 	}
 
-	return fmt.Sprintf("%s{%s}", metricName, strings.Join(labelStrings, ", "))
+	body := strings.Join(labelStrings, ", ")
+	if truncated {
+		body += "," + formattedErrorEllipsis
+	}
+	return fmt.Sprintf("%s{%s}", metricName, body)
 }
