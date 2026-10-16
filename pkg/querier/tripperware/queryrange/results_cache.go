@@ -601,7 +601,7 @@ func (s resultsCache) filterRecentExtents(req tripperware.Request, maxCacheFresh
 }
 
 func (s resultsCache) get(ctx context.Context, key string) ([]Extent, bool) {
-	found, bufs, _ := s.cache.Fetch(ctx, []string{cache.HashKey(key)})
+	found, bufs, _ := s.cache.Fetch(ctx, []string{cacheHashKey(key)})
 	if len(found) != 1 {
 		return nil, false
 	}
@@ -642,7 +642,46 @@ func (s resultsCache) put(ctx context.Context, key string, extents []Extent) {
 		return
 	}
 
-	s.cache.Store(ctx, []string{cache.HashKey(key)}, [][]byte{buf})
+	s.cache.Store(ctx, []string{cacheHashKey(key)}, [][]byte{buf})
+}
+
+// cacheHashKey builds the final storage key for the shared results cache.
+//
+// The logical key produced by CacheSplitter.GenerateCacheKey has the form
+// "<tenantIDs>:<query>:<step>:<interval>". We namespace the hashed digest by
+// prefixing it with an escaped tenant portion so that even if the digest
+// collides across two distinct logical keys the colliding entries can never
+// land in the same tenant's slot (defense in depth against cross-tenant
+// cache-entry displacement; CWE-328).
+func cacheHashKey(key string) string {
+	tenantPart := key
+	if i := strings.IndexByte(key, ':'); i >= 0 {
+		tenantPart = key[:i]
+	}
+	return escapeCacheKeyTenant(tenantPart) + ":" + cache.HashKey(key)
+}
+
+// escapeCacheKeyTenant percent-escapes any byte in the tenant identifier that
+// is not a safe memcached key byte. Valid Cortex tenant IDs are already
+// restricted to a safe charset, but we defensively escape so that an
+// unexpected character (including the multi-tenant separator '|') cannot be
+// used to make two different tenants share a cache-key prefix.
+func escapeCacheKeyTenant(tenantID string) string {
+	var b strings.Builder
+	b.Grow(len(tenantID))
+	for i := 0; i < len(tenantID); i++ {
+		c := tenantID[i]
+		safe := (c >= 'a' && c <= 'z') ||
+			(c >= 'A' && c <= 'Z') ||
+			(c >= '0' && c <= '9') ||
+			c == '-' || c == '_' || c == '.'
+		if safe {
+			b.WriteByte(c)
+		} else {
+			fmt.Fprintf(&b, "%%%02X", c)
+		}
+	}
+	return b.String()
 }
 
 func jaegerSpanID(ctx context.Context) string {
