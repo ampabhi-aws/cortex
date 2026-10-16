@@ -684,7 +684,7 @@ Displays a web page with the current status of the Alertmanager, including the A
 GET /multitenant_alertmanager/configs
 ```
 
-List all Alertmanager configurations. This endpoint is not part of alertmanager-API and is always available regardless of whether alertmanager-API is enabled or not. It should not be exposed to end users. This endpoint returns a YAML dictionary with all the Alertmanager configurations and `200` status code on success.
+**Removed.** This endpoint previously streamed every tenant's raw Alertmanager configuration (including receiver credentials such as Slack/PagerDuty/OpsGenie tokens, webhook URLs and SMTP passwords) and was registered without authentication, which allowed any caller able to reach the Cortex HTTP listener to read all tenants' alerting secrets. The handler now responds with `410 Gone`. Use the per-tenant [`GET /api/v1/alerts`](#get-alertmanager-configuration) endpoint, which resolves the tenant from the authenticated request context, to retrieve a single tenant's configuration.
 
 ### Alertmanager ring status
 

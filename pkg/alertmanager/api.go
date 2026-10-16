@@ -1,7 +1,6 @@
 package alertmanager
 
 import (
-	"context"
 	"fmt"
 	"io"
 	"net/http"
@@ -19,8 +18,6 @@ import (
 
 	"github.com/cortexproject/cortex/pkg/alertmanager/alertspb"
 	"github.com/cortexproject/cortex/pkg/tenant"
-	"github.com/cortexproject/cortex/pkg/util"
-	"github.com/cortexproject/cortex/pkg/util/concurrency"
 	util_log "github.com/cortexproject/cortex/pkg/util/log"
 )
 
@@ -31,12 +28,9 @@ const (
 	errStoringConfiguration  = "unable to store the Alertmanager config"
 	errDeletingConfiguration = "unable to delete the Alertmanager config"
 	errNoOrgID               = "unable to determine the OrgID"
-	errListAllUser           = "unable to list the Alertmanager users"
 	errConfigurationTooBig   = "Alertmanager configuration is too big, limit: %d bytes"
 	errTooManyTemplates      = "too many templates in the configuration: %d (limit: %d)"
 	errTemplateTooBig        = "template %s is too big: %d bytes (limit: %d bytes)"
-
-	fetchConcurrency = 16
 )
 
 var (
@@ -259,49 +253,17 @@ func validateUserConfig(logger log.Logger, cfg alertspb.AlertConfigDesc, limits 
 	return nil
 }
 
+// ListAllConfigs used to stream every tenant's Alertmanager configuration
+// (including receiver secrets) over an unauthenticated HTTP route, which made
+// one request sufficient to leak cross-tenant data to any caller able to reach
+// the Cortex HTTP listener. The route has been removed and this handler now
+// refuses to serve cross-tenant data; operators should use the tenant-scoped
+// `GET /api/v1/alerts` endpoint, which resolves the tenant from the
+// authenticated request context.
 func (am *MultitenantAlertmanager) ListAllConfigs(w http.ResponseWriter, r *http.Request) {
 	logger := util_log.WithContext(r.Context(), am.logger)
-	userIDs, err := am.store.ListAllUsers(r.Context())
-	if err != nil {
-		level.Error(logger).Log("msg", "failed to list users of alertmanager", "err", err)
-		http.Error(w, fmt.Sprintf("%s: %s", errListAllUser, err.Error()), http.StatusInternalServerError)
-		return
-	}
-
-	done := make(chan struct{})
-	iter := make(chan interface{})
-
-	go func() {
-		util.StreamWriteYAMLResponse(w, iter, logger)
-		close(done)
-	}()
-
-	err = concurrency.ForEachUser(r.Context(), userIDs, fetchConcurrency, func(ctx context.Context, userID string) error {
-		cfg, err := am.store.GetAlertConfig(ctx, userID)
-		if errors.Is(err, alertspb.ErrNotFound) {
-			return nil
-		} else if err != nil {
-			return errors.Wrapf(err, "failed to fetch alertmanager config for user %s", userID)
-		}
-		data := map[string]*UserConfig{
-			userID: {
-				TemplateFiles:      alertspb.ParseTemplates(cfg),
-				AlertmanagerConfig: cfg.RawConfig,
-			},
-		}
-
-		select {
-		case iter <- data:
-		case <-done: // stop early, if sending response has already finished
-		}
-
-		return nil
-	})
-	if err != nil {
-		level.Error(logger).Log("msg", "failed to list all alertmanager configs", "err", err)
-	}
-	close(iter)
-	<-done
+	level.Warn(logger).Log("msg", "rejected request to removed cross-tenant alertmanager configs endpoint")
+	http.Error(w, "the bulk /multitenant_alertmanager/configs endpoint has been removed; use the tenant-scoped GET /api/v1/alerts endpoint instead", http.StatusGone)
 }
 
 // validateAlertmanagerConfig recursively scans the input config looking for data types for which
