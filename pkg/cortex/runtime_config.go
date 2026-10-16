@@ -2,6 +2,7 @@ package cortex
 
 import (
 	"errors"
+	"fmt"
 	"io"
 	"net/http"
 
@@ -126,6 +127,14 @@ func runtimeConfigHandler(runtimeCfgManager *runtimeconfig.Manager, defaultLimit
 			return
 		}
 
+		// Build a copy of the runtime config with tenant IDs stripped from the
+		// overrides map so that an unauthenticated reader cannot enumerate the
+		// set of tenants that have per-tenant limit overrides. The override
+		// values themselves are preserved (anonymized by index) because they
+		// are useful for operator debugging and do not identify individual
+		// tenants on their own.
+		safeCfg := anonymizeTenantLimits(cfg)
+
 		var output interface{}
 		switch r.URL.Query().Get("mode") {
 		case "diff":
@@ -133,13 +142,13 @@ func runtimeConfigHandler(runtimeCfgManager *runtimeconfig.Manager, defaultLimit
 			// we set defaultLimits for every tenant that exists in runtime config.
 			defaultCfg := runtimeConfigValues{}
 			defaultCfg.TenantLimits = map[string]*validation.Limits{}
-			for k, v := range cfg.TenantLimits {
+			for k, v := range safeCfg.TenantLimits {
 				if v != nil {
 					defaultCfg.TenantLimits[k] = &defaultLimits
 				}
 			}
 
-			cfgYaml, err := util.YAMLMarshalUnmarshal(cfg)
+			cfgYaml, err := util.YAMLMarshalUnmarshal(safeCfg)
 			if err != nil {
 				http.Error(w, err.Error(), http.StatusInternalServerError)
 				return
@@ -158,8 +167,30 @@ func runtimeConfigHandler(runtimeCfgManager *runtimeconfig.Manager, defaultLimit
 			}
 
 		default:
-			output = cfg
+			output = safeCfg
 		}
 		util.WriteYAMLResponse(w, output)
 	}
+}
+
+// anonymizeTenantLimits returns a shallow copy of the runtime config whose
+// per-tenant overrides are re-keyed with opaque placeholders instead of the
+// real tenant IDs. The *validation.Limits pointers are preserved. This stops
+// /runtime_config from enumerating the tenant roster to an unauthenticated
+// caller while still exposing enough information to debug overrides.
+func anonymizeTenantLimits(cfg *runtimeConfigValues) *runtimeConfigValues {
+	if cfg == nil {
+		return cfg
+	}
+	if len(cfg.TenantLimits) == 0 {
+		return cfg
+	}
+	anon := *cfg
+	anon.TenantLimits = make(map[string]*validation.Limits, len(cfg.TenantLimits))
+	i := 0
+	for _, v := range cfg.TenantLimits {
+		anon.TenantLimits[fmt.Sprintf("tenant-%d", i)] = v
+		i++
+	}
+	return &anon
 }
