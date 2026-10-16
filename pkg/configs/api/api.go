@@ -82,6 +82,12 @@ func (a *API) admin(w http.ResponseWriter, r *http.Request) {
 }
 
 // RegisterRoutes registers the configs API HTTP routes with the provided Router.
+//
+// Deprecated: prefer registering the configs API via
+// (*api.API).RegisterConfigAPI, which routes handlers through the standard
+// Cortex auth middleware chain. This method is retained for backward
+// compatibility (notably for construction via New) and must not be mounted
+// directly on a server mux that lacks the auth middleware.
 func (a *API) RegisterRoutes(r *mux.Router) {
 	for _, route := range []struct {
 		name, method, path string
@@ -106,6 +112,33 @@ func (a *API) RegisterRoutes(r *mux.Router) {
 		r.Handle(route.path, route.handler).Methods(route.method).Name(route.name)
 	}
 }
+
+// GetConfig is an exported wrapper around getConfig so routers in other
+// packages (e.g. pkg/api) can mount the handler behind their own middleware.
+func (a *API) GetConfig(w http.ResponseWriter, r *http.Request) { a.getConfig(w, r) }
+
+// SetConfig is an exported wrapper around setConfig for the same reason as
+// GetConfig.
+func (a *API) SetConfig(w http.ResponseWriter, r *http.Request) { a.setConfig(w, r) }
+
+// ValidateAlertmanagerConfig is an exported wrapper around
+// validateAlertmanagerConfig.
+func (a *API) ValidateAlertmanagerConfig(w http.ResponseWriter, r *http.Request) {
+	a.validateAlertmanagerConfig(w, r)
+}
+
+// DeactivateConfig is an exported wrapper around deactivateConfig.
+func (a *API) DeactivateConfig(w http.ResponseWriter, r *http.Request) { a.deactivateConfig(w, r) }
+
+// RestoreConfig is an exported wrapper around restoreConfig.
+func (a *API) RestoreConfig(w http.ResponseWriter, r *http.Request) { a.restoreConfig(w, r) }
+
+// GetConfigs is an exported wrapper around getConfigs. It serves the
+// /private/api/prom/configs/* cross-tenant endpoints consumed by
+// pkg/configs/client. These endpoints must be protected by an external
+// authorization layer or served on an internal-only listener; see
+// (*api.API).RegisterConfigAPI for details.
+func (a *API) GetConfigs(w http.ResponseWriter, r *http.Request) { a.getConfigs(w, r) }
 
 // getConfig returns the request configuration.
 func (a *API) getConfig(w http.ResponseWriter, r *http.Request) {

@@ -18,6 +18,7 @@ import (
 	"github.com/cortexproject/cortex/pkg/alertmanager"
 	"github.com/cortexproject/cortex/pkg/alertmanager/alertmanagerpb"
 	"github.com/cortexproject/cortex/pkg/compactor"
+	configAPI "github.com/cortexproject/cortex/pkg/configs/api"
 	"github.com/cortexproject/cortex/pkg/cortexpb"
 	"github.com/cortexproject/cortex/pkg/distributor"
 	"github.com/cortexproject/cortex/pkg/distributor/distributorpb"
@@ -417,4 +418,40 @@ func (a *API) RegisterServiceMapHandler(handler http.Handler) {
 func (a *API) RegisterMemberlistKV(handler http.Handler) {
 	a.indexPage.AddLink(SectionAdminEndpoints, "/memberlist", "Memberlist Status")
 	a.RegisterRoute("/memberlist", handler, false, "GET")
+}
+
+// RegisterConfigAPI registers routes associated with the (deprecated) configs
+// service. Per-tenant routes go through the standard auth middleware chain so
+// the tenant extraction is applied consistently with other Cortex components.
+// The /private/api/prom/configs/* cross-tenant endpoints are internal
+// server-to-server APIs consumed by pkg/configs/client (ruler/alertmanager
+// configdb backends); they are registered with auth=false to match the
+// documented pattern of other admin endpoints (e.g. /multitenant_alertmanager/configs,
+// /ruler/rule_groups) that "should not be exposed to end users" and must be
+// protected by an external authorization layer or served on an internal-only
+// listener.
+func (a *API) RegisterConfigAPI(c *configAPI.API) {
+	// Per-tenant Dedicated APIs. Routed through the auth middleware so the
+	// tenant extraction (X-Scope-OrgID) is enforced consistently with the
+	// rest of Cortex before reaching the handlers.
+	a.RegisterRoute("/api/prom/configs/rules", http.HandlerFunc(c.GetConfig), true, "GET")
+	a.RegisterRoute("/api/prom/configs/rules", http.HandlerFunc(c.SetConfig), true, "POST")
+	a.RegisterRoute("/api/prom/configs/templates", http.HandlerFunc(c.GetConfig), true, "GET")
+	a.RegisterRoute("/api/prom/configs/templates", http.HandlerFunc(c.SetConfig), true, "POST")
+	a.RegisterRoute("/api/prom/configs/alertmanager", http.HandlerFunc(c.GetConfig), true, "GET")
+	a.RegisterRoute("/api/prom/configs/alertmanager", http.HandlerFunc(c.SetConfig), true, "POST")
+	// Validation endpoint does not use tenancy; leave unauthenticated to
+	// preserve existing behaviour.
+	a.RegisterRoute("/api/prom/configs/alertmanager/validate", http.HandlerFunc(c.ValidateAlertmanagerConfig), false, "POST")
+	a.RegisterRoute("/api/prom/configs/deactivate", http.HandlerFunc(c.DeactivateConfig), true, "DELETE")
+	a.RegisterRoute("/api/prom/configs/restore", http.HandlerFunc(c.RestoreConfig), true, "POST")
+
+	// Internal cross-tenant endpoints. These are server-to-server APIs used
+	// by the configdb-backed ruler/alertmanager clients, which do not send
+	// X-Scope-OrgID; auth=false matches that contract and the pattern used
+	// by other admin-only endpoints. Operators MUST NOT expose these paths
+	// to end users (filter at the ingress / reverse proxy, or run the
+	// configs module on an internal-only listener).
+	a.RegisterRoute("/private/api/prom/configs/rules", http.HandlerFunc(c.GetConfigs), false, "GET")
+	a.RegisterRoute("/private/api/prom/configs/alertmanager", http.HandlerFunc(c.GetConfigs), false, "GET")
 }

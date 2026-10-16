@@ -591,7 +591,11 @@ func (t *Cortex) initConfig() (serv services.Service, err error) {
 	}
 
 	t.ConfigAPI = configAPI.New(t.ConfigDB, t.Cfg.Configs.API)
-	t.ConfigAPI.RegisterRoutes(t.Server.HTTP)
+	// Register configs-service routes through API.RegisterRoute so the
+	// standard Cortex auth middleware chain wraps the per-tenant handlers;
+	// previously these routes were mounted directly on the server mux and
+	// bypassed every middleware.
+	t.API.RegisterConfigAPI(t.ConfigAPI)
 	return services.NewIdleService(nil, func(_ error) error {
 		t.ConfigDB.Close()
 		return nil
