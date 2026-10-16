@@ -267,9 +267,17 @@ func (a *API) getConfigs(w http.ResponseWriter, r *http.Request) {
 	var cfgs map[string]userconfig.View
 	var cfgErr error
 	logger := util_log.WithContext(r.Context(), util_log.Logger)
+	// Resolve the caller's tenant and scope the result to it so this
+	// internal propagation endpoint cannot be used to read other tenants'
+	// rules or Alertmanager configurations.
+	userID, _, err := tenant.ExtractTenantIDFromHTTPRequest(r)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusUnauthorized)
+		return
+	}
 	rawSince := r.FormValue("since")
 	if rawSince == "" {
-		cfgs, cfgErr = a.db.GetAllConfigs(r.Context())
+		cfgs, cfgErr = a.db.GetAllConfigs(r.Context(), userID)
 	} else {
 		since, err := strconv.ParseUint(rawSince, 10, 0)
 		if err != nil {
@@ -277,7 +285,7 @@ func (a *API) getConfigs(w http.ResponseWriter, r *http.Request) {
 			http.Error(w, err.Error(), http.StatusBadRequest)
 			return
 		}
-		cfgs, cfgErr = a.db.GetConfigs(r.Context(), userconfig.ID(since))
+		cfgs, cfgErr = a.db.GetConfigs(r.Context(), userconfig.ID(since), userID)
 	}
 
 	if cfgErr != nil {

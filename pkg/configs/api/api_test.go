@@ -148,8 +148,9 @@ func Test_GetAllConfigs_Empty(t *testing.T) {
 	setup(t)
 	defer cleanup(t)
 
+	userID := makeUserID()
 	for _, c := range allClients {
-		w := request(t, "GET", c.PrivateEndpoint, nil)
+		w := requestAsUser(t, userID, "GET", c.PrivateEndpoint, "", nil)
 		assert.Equal(t, http.StatusOK, w.Code)
 		var found ConfigsView
 		err := json.Unmarshal(w.Body.Bytes(), &found)
@@ -158,17 +159,32 @@ func Test_GetAllConfigs_Empty(t *testing.T) {
 	}
 }
 
-// GetAllConfigs returns all created userconfig.
+// The private endpoints return 401 to requests without authentication.
+func Test_GetAllConfigs_Anonymous(t *testing.T) {
+	setup(t)
+	defer cleanup(t)
+
+	for _, c := range allClients {
+		w := request(t, "GET", c.PrivateEndpoint, nil)
+		assert.Equal(t, http.StatusUnauthorized, w.Code)
+	}
+}
+
+// GetAllConfigs returns only the authenticated tenant's configuration,
+// never other tenants' rules or Alertmanager configs.
 func Test_GetAllConfigs(t *testing.T) {
 	setup(t)
 	defer cleanup(t)
 
 	userID := makeUserID()
+	otherUserID := makeUserID()
 	config := makeConfig()
 
 	for _, c := range allClients {
 		view := c.post(t, userID, config)
-		w := request(t, "GET", c.PrivateEndpoint, nil)
+		// Store a second tenant's config to confirm it is NOT disclosed.
+		c.post(t, otherUserID, makeConfig())
+		w := requestAsUser(t, userID, "GET", c.PrivateEndpoint, "", nil)
 		assert.Equal(t, http.StatusOK, w.Code)
 		var found ConfigsView
 		err := json.Unmarshal(w.Body.Bytes(), &found)
@@ -179,7 +195,8 @@ func Test_GetAllConfigs(t *testing.T) {
 	}
 }
 
-// GetAllConfigs returns the *newest* versions of all created userconfig.
+// GetAllConfigs returns the *newest* version of the authenticated tenant's
+// configuration.
 func Test_GetAllConfigs_Newest(t *testing.T) {
 	setup(t)
 	defer cleanup(t)
@@ -191,7 +208,7 @@ func Test_GetAllConfigs_Newest(t *testing.T) {
 		c.post(t, userID, makeConfig())
 		lastCreated := c.post(t, userID, makeConfig())
 
-		w := request(t, "GET", c.PrivateEndpoint, nil)
+		w := requestAsUser(t, userID, "GET", c.PrivateEndpoint, "", nil)
 		assert.Equal(t, http.StatusOK, w.Code)
 		var found ConfigsView
 		err := json.Unmarshal(w.Body.Bytes(), &found)
@@ -207,18 +224,19 @@ func Test_GetConfigs_IncludesNewerConfigsAndExcludesOlder(t *testing.T) {
 	defer cleanup(t)
 
 	for _, c := range allClients {
+		userID := makeUserID()
+		config1 := c.post(t, userID, makeConfig())
+		config2 := c.post(t, userID, makeConfig())
+		// Another tenant's config, which must not appear in userID's response.
 		c.post(t, makeUserID(), makeConfig())
-		config2 := c.post(t, makeUserID(), makeConfig())
-		userID3 := makeUserID()
-		config3 := c.post(t, userID3, makeConfig())
 
-		w := request(t, "GET", fmt.Sprintf("%s?since=%d", c.PrivateEndpoint, config2.ID), nil)
+		w := requestAsUser(t, userID, "GET", fmt.Sprintf("%s?since=%d", c.PrivateEndpoint, config1.ID), "", nil)
 		assert.Equal(t, http.StatusOK, w.Code)
 		var found ConfigsView
 		err := json.Unmarshal(w.Body.Bytes(), &found)
 		assert.NoError(t, err, "Could not unmarshal JSON")
 		assert.Equal(t, ConfigsView{Configs: map[string]userconfig.View{
-			userID3: config3,
+			userID: config2,
 		}}, found)
 	}
 }

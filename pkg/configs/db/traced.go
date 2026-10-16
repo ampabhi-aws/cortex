@@ -29,14 +29,14 @@ func (t traced) SetConfig(ctx context.Context, userID string, cfg userconfig.Con
 	return t.d.SetConfig(ctx, userID, cfg)
 }
 
-func (t traced) GetAllConfigs(ctx context.Context) (cfgs map[string]userconfig.View, err error) {
-	defer func() { t.trace("GetAllConfigs", cfgs, err) }()
-	return t.d.GetAllConfigs(ctx)
+func (t traced) GetAllConfigs(ctx context.Context, userID string) (cfgs map[string]userconfig.View, err error) {
+	defer func() { t.trace("GetAllConfigs", userID, cfgs, err) }()
+	return t.d.GetAllConfigs(ctx, userID)
 }
 
-func (t traced) GetConfigs(ctx context.Context, since userconfig.ID) (cfgs map[string]userconfig.View, err error) {
-	defer func() { t.trace("GetConfigs", since, cfgs, err) }()
-	return t.d.GetConfigs(ctx, since)
+func (t traced) GetConfigs(ctx context.Context, since userconfig.ID, userID string) (cfgs map[string]userconfig.View, err error) {
+	defer func() { t.trace("GetConfigs", since, userID, cfgs, err) }()
+	return t.d.GetConfigs(ctx, since, userID)
 }
 
 func (t traced) DeactivateConfig(ctx context.Context, userID string) (err error) {
