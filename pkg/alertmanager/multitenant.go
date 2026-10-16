@@ -26,6 +26,7 @@ import (
 	"github.com/weaveworks/common/user"
 	"golang.org/x/time/rate"
 
+	"github.com/cortexproject/cortex/pkg/alertmanager/alertcfg"
 	"github.com/cortexproject/cortex/pkg/alertmanager/alertmanagerpb"
 	"github.com/cortexproject/cortex/pkg/alertmanager/alertspb"
 	"github.com/cortexproject/cortex/pkg/alertmanager/alertstore"
@@ -871,6 +872,23 @@ func (am *MultitenantAlertmanager) setConfig(cfg alertspb.AlertConfigDesc) error
 			// they submit a broken one, the Manager will keep running the last known
 			// working configuration.
 			return fmt.Errorf("invalid Cortex configuration for %v: %v", cfg.User, err)
+		}
+
+		// Defence in depth: re-apply the recursive *_file validation here so
+		// that a config reaching this point through any storage backend
+		// (including the legacy configs service via configdb) cannot bypass
+		// the CVE-2021-31232 protection enforced at the write APIs.
+		// See pkg/alertmanager/alertcfg.
+		if err == nil && userAmConfig != nil {
+			if validateErr := alertcfg.Validate(userAmConfig); validateErr != nil {
+				if hasExisting {
+					return fmt.Errorf("invalid Cortex configuration for %v: %v", cfg.User, validateErr)
+				}
+				// No prior working config: refuse to start one with a config
+				// that references local files.
+				userAmConfig = nil
+				level.Warn(am.logger).Log("msg", "rejecting Alertmanager configuration with disallowed *_file reference", "user", cfg.User, "err", validateErr)
+			}
 		}
 	}
 

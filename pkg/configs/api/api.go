@@ -20,6 +20,7 @@ import (
 	amconfig "github.com/prometheus/alertmanager/config"
 	amtemplate "github.com/prometheus/alertmanager/template"
 
+	"github.com/cortexproject/cortex/pkg/alertmanager/alertcfg"
 	"github.com/cortexproject/cortex/pkg/configs/db"
 	"github.com/cortexproject/cortex/pkg/configs/userconfig"
 	"github.com/cortexproject/cortex/pkg/tenant"
@@ -41,12 +42,23 @@ type Config struct {
 type NotificationsConfig struct {
 	DisableEmail   bool `yaml:"disable_email"`
 	DisableWebHook bool `yaml:"disable_webhook"`
+
+	// MaxTemplatesCount bounds the number of template files a tenant can
+	// upload through the configs API. 0 disables the limit.
+	MaxTemplatesCount int `yaml:"max_templates_count"`
+
+	// MaxTemplateSizeBytes bounds the size (in bytes) of a single tenant-
+	// authored template file uploaded through the configs API. 0 disables
+	// the limit.
+	MaxTemplateSizeBytes int `yaml:"max_template_size_bytes"`
 }
 
 // RegisterFlags adds the flags required to configure this to the given FlagSet.
 func (cfg *Config) RegisterFlags(f *flag.FlagSet) {
 	f.BoolVar(&cfg.Notifications.DisableEmail, "configs.notifications.disable-email", false, "Disable Email notifications for Alertmanager.")
 	f.BoolVar(&cfg.Notifications.DisableWebHook, "configs.notifications.disable-webhook", false, "Disable WebHook notifications for Alertmanager.")
+	f.IntVar(&cfg.Notifications.MaxTemplatesCount, "configs.notifications.max-templates-count", 0, "Maximum number of templates in Alertmanager configuration uploaded through the configs API. 0 = no limit.")
+	f.IntVar(&cfg.Notifications.MaxTemplateSizeBytes, "configs.notifications.max-template-size-bytes", 0, "Maximum size, in bytes, of a single Alertmanager template file uploaded through the configs API. 0 = no limit.")
 }
 
 // API implements the configs api.
@@ -192,6 +204,11 @@ func (a *API) setConfig(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, fmt.Sprintf("Invalid templates: %v", err), http.StatusBadRequest)
 		return
 	}
+	if err := validateTemplateLimits(cfg, a.cfg.Notifications); err != nil {
+		level.Error(logger).Log("msg", "invalid templates", "err", err)
+		http.Error(w, fmt.Sprintf("Invalid templates: %v", err), http.StatusBadRequest)
+		return
+	}
 	if err := a.db.SetConfig(r.Context(), userID, cfg); err != nil {
 		// XXX: Untested
 		level.Error(logger).Log("msg", "error storing config", "err", err)
@@ -239,6 +256,15 @@ func validateAlertmanagerConfig(cfg string, noCfg NotificationsConfig) error {
 		}
 	}
 
+	// Reject tenant-supplied `*_file` secret references. This is the same
+	// recursive scan the object-store Alertmanager API applies
+	// (see pkg/alertmanager/api.go: validateAlertmanagerConfig); it is
+	// factored into pkg/alertmanager/alertcfg so both config write paths
+	// enforce the CVE-2021-31232 protection.
+	if err := alertcfg.Validate(amCfg); err != nil {
+		return err
+	}
+
 	return nil
 }
 
@@ -255,6 +281,20 @@ func validateTemplateFiles(c userconfig.Config) error {
 	}
 
 	return nil
+}
+
+// validateTemplateLimits enforces the per-tenant template count/size limits.
+// This mirrors pkg/alertmanager/api.go's validateUserConfig behaviour so that
+// template files uploaded through the configs API are also bounded.
+func validateTemplateLimits(c userconfig.Config, noCfg NotificationsConfig) error {
+	templates := make([]alertcfg.Template, 0, len(c.TemplateFiles))
+	for name, body := range c.TemplateFiles {
+		templates = append(templates, alertcfg.Template{Filename: name, Body: body})
+	}
+	return alertcfg.ValidateTemplates(templates, alertcfg.TemplateLimits{
+		MaxCount: noCfg.MaxTemplatesCount,
+		MaxSize:  noCfg.MaxTemplateSizeBytes,
+	})
 }
 
 // ConfigsView renders multiple configurations, mapping userID to userconfig.View.
