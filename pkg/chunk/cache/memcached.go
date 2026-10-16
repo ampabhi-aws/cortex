@@ -2,9 +2,9 @@ package cache
 
 import (
 	"context"
+	"crypto/sha256"
 	"encoding/hex"
 	"flag"
-	"hash/fnv"
 	"sync"
 	"time"
 
@@ -265,10 +265,16 @@ func (c *Memcached) Stop() {
 }
 
 // HashKey hashes key into something you can store in memcached.
+//
+// A collision-resistant SHA-256 digest is used so that a tenant cannot
+// cheaply compute a second pre-image for another tenant's cache slot in
+// the shared results cache. The result is 64 hex characters, which is
+// well within the memcached 250-byte key length limit. The full plaintext
+// key is still verified by callers (e.g. results_cache.get) as defence in
+// depth.
 func HashKey(key string) string {
-	hasher := fnv.New64a()
-	_, _ = hasher.Write([]byte(key)) // This'll never error.
+	sum := sha256.Sum256([]byte(key))
 
-	// Hex because memcache errors for the bytes produced by the hash.
-	return hex.EncodeToString(hasher.Sum(nil))
+	// Hex because memcache errors for the raw bytes produced by the hash.
+	return hex.EncodeToString(sum[:])
 }
