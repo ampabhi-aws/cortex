@@ -143,6 +143,12 @@ tenant_federation:
   # CLI flag: -tenant-federation.enabled
   [enabled: <boolean> | default = false]
 
+  # The maximum number of tenant IDs that can be specified in a federated
+  # query. Requests with more tenant IDs are rejected with HTTP 400. 0 to
+  # disable the limit (default).
+  # CLI flag: -tenant-federation.max-tenants
+  [max_tenants: <int> | default = 0]
+
 # The ruler_config configures the Cortex ruler.
 [ruler: <ruler_config>]
 
