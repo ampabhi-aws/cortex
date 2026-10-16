@@ -7,6 +7,7 @@ import (
 	"html/template"
 	"math"
 	"net/http"
+	"net/url"
 	"sort"
 	"strings"
 	"time"
@@ -25,7 +26,6 @@ const pageContent = `
 		<h1>Ring Status</h1>
 		<p>Current time: {{ .Now }}</p>
 		<form action="" method="POST">
-			<input type="hidden" name="csrf_token" value="$__CSRF_TOKEN_PLACEHOLDER__">
 			<table width="100%" border="1">
 				<thead>
 					<tr>
@@ -123,12 +123,33 @@ type httpResponse struct {
 
 func (r *Ring) ServeHTTP(w http.ResponseWriter, req *http.Request) {
 	if req.Method == http.MethodPost {
+		// The POST branch mutates shared cluster state (removes an instance from the
+		// ring). The HTTP server does not perform credential authentication on its
+		// own (that is delegated to an external reverse proxy, see
+		// docs/architecture.md), so we must at minimum prevent a cross-site POST
+		// (CSRF) from an operator's browser from evicting a healthy instance.
+		//
+		// Enforce two defences:
+		//   1. Same-origin check: Origin / Referer must match the request Host.
+		//      Browsers always set at least one of these on cross-origin POST
+		//      submissions, so this blocks the HTML-form CSRF attack vector.
+		//   2. Custom-header check: the request must carry a non-safelisted
+		//      header (X-Cortex-Ring-Forget-Confirm). Browsers forbid setting
+		//      such headers on cross-origin requests without a CORS preflight,
+		//      which this server never answers affirmatively, so a cross-site
+		//      form POST can never set it.
+		if err := checkRingForgetAllowed(req); err != nil {
+			level.Warn(r.logger).Log("msg", "rejected ring forget request", "err", err, "remote", req.RemoteAddr)
+			http.Error(w, "forbidden", http.StatusForbidden)
+			return
+		}
+
 		ingesterID := req.FormValue("forget")
 		if err := r.forget(req.Context(), ingesterID); err != nil {
 			level.Error(r.logger).Log("msg", "error forgetting instance", "err", err)
 		}
 
-		// Implement PRG pattern to prevent double-POST and work with CSRF middleware.
+		// Implement PRG pattern to prevent double-POST.
 		// https://en.wikipedia.org/wiki/Post/Redirect/Get
 
 		// http.Redirect() would convert our relative URL to absolute, which is not what we want.
@@ -186,6 +207,47 @@ func (r *Ring) ServeHTTP(w http.ResponseWriter, req *http.Request) {
 		Now:        now,
 		ShowTokens: tokensParam == "true",
 	}, pageTemplate, req)
+}
+
+// checkRingForgetAllowed enforces CSRF defences on the state-changing POST
+// branch of the ring page. It returns a non-nil error if the request should be
+// rejected. Operator tooling (curl, scripts) must set the custom header
+// X-Cortex-Ring-Forget-Confirm: true; a browser form submission from a page on
+// another origin cannot set that header without a CORS preflight. We also
+// require Origin/Referer to match the request Host, which catches
+// non-browser-form same-origin check failures.
+func checkRingForgetAllowed(req *http.Request) error {
+	if !strings.EqualFold(req.Header.Get("X-Cortex-Ring-Forget-Confirm"), "true") {
+		return fmt.Errorf("missing required header X-Cortex-Ring-Forget-Confirm: true")
+	}
+
+	host := req.Host
+	if origin := req.Header.Get("Origin"); origin != "" && origin != "null" {
+		if !sameOrigin(origin, host) {
+			return fmt.Errorf("Origin %q does not match Host %q", origin, host)
+		}
+		return nil
+	}
+	if referer := req.Header.Get("Referer"); referer != "" {
+		if !sameOrigin(referer, host) {
+			return fmt.Errorf("Referer %q does not match Host %q", referer, host)
+		}
+		return nil
+	}
+	// No Origin / Referer header: not a browser-initiated request. The custom
+	// header check above is sufficient because browsers cannot set
+	// non-safelisted request headers on cross-origin requests without a CORS
+	// preflight.
+	return nil
+}
+
+// sameOrigin reports whether the host portion of originOrReferer matches host.
+func sameOrigin(originOrReferer, host string) bool {
+	u, err := url.Parse(originOrReferer)
+	if err != nil || u.Host == "" {
+		return false
+	}
+	return strings.EqualFold(u.Host, host)
 }
 
 // RenderHTTPResponse either responds with json or a rendered html page using the passed in template
