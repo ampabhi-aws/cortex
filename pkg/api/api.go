@@ -285,9 +285,6 @@ func (a *API) RegisterRuler(r *ruler.Ruler) {
 	a.indexPage.AddLink(SectionAdminEndpoints, "/ruler/ring", "Ruler Ring Status")
 	a.RegisterRoute("/ruler/ring", r, false, "GET", "POST")
 
-	// Administrative API, uses authentication to inform which user's configuration to delete.
-	a.RegisterRoute("/ruler/delete_tenant_config", http.HandlerFunc(r.DeleteTenantConfiguration), true, "POST")
-
 	// Legacy Ring Route
 	a.RegisterRoute("/ruler_ring", r, false, "GET", "POST")
 
@@ -295,6 +292,20 @@ func (a *API) RegisterRuler(r *ruler.Ruler) {
 	a.RegisterRoute("/ruler/rule_groups", http.HandlerFunc(r.ListAllRules), false, "GET")
 
 	ruler.RegisterRulerServer(a.server.GRPC, r)
+}
+
+// RegisterRulerAdminAPI registers destructive administrative Ruler routes.
+// These routes are tenant-scoped mass-mutation endpoints, so they are only
+// registered alongside the tenant-facing rule-management API. This keeps the
+// destructive capability from being broader than the rule-management
+// capability (see -experimental.ruler.enable-api).
+func (a *API) RegisterRulerAdminAPI(r *ruler.Ruler) {
+	// Administrative API, uses authentication to inform which user's configuration to delete.
+	// This endpoint deletes every rule group belonging to the tenant identified by
+	// X-Scope-OrgID; it is intended to be reachable only from an operator-managed
+	// internal network and must be fronted by an authenticating reverse proxy that
+	// pins or rewrites X-Scope-OrgID.
+	a.RegisterRoute("/ruler/delete_tenant_config", http.HandlerFunc(r.DeleteTenantConfiguration), true, "POST")
 }
 
 // RegisterRulerAPI registers routes associated with the Ruler API

@@ -576,8 +576,12 @@ func (t *Cortex) initRuler() (serv services.Service, err error) {
 	// Expose HTTP/GRPC endpoints for the Ruler service
 	t.API.RegisterRuler(t.Ruler)
 
-	// If the API is enabled, register the Ruler API
+	// If the API is enabled, register the Ruler API and the destructive
+	// administrative Ruler routes (such as /ruler/delete_tenant_config).
+	// The admin routes are gated behind the same flag so the mass-delete
+	// capability is never broader than the rule-management capability.
 	if t.Cfg.Ruler.EnableAPI {
+		t.API.RegisterRulerAdminAPI(t.Ruler)
 		t.API.RegisterRulerAPI(ruler.NewAPI(t.Ruler, t.RulerStorage, util_log.Logger))
 	}
 

@@ -850,13 +850,42 @@ func (r *Ruler) DeleteTenantConfiguration(w http.ResponseWriter, req *http.Reque
 		return
 	}
 
+	// Record an audit event before performing the destructive operation so the
+	// attempt is captured even if the delete fails or the process is terminated
+	// mid-request. This is an administrative, tenant-wide mass-delete.
+	path := ""
+	if req.URL != nil {
+		path = req.URL.Path
+	}
+	level.Info(logger).Log(
+		"msg", "audit: ruler delete_tenant_config invoked",
+		"event", "ruler.delete_tenant_config",
+		"user", userID,
+		"method", req.Method,
+		"path", path,
+		"remote_addr", req.RemoteAddr,
+		"user_agent", req.UserAgent(),
+	)
+
 	err = r.store.DeleteNamespace(req.Context(), userID, "") // Empty namespace = delete all rule groups.
 	if err != nil && !errors.Is(err, rulestore.ErrGroupNamespaceNotFound) {
+		level.Warn(logger).Log(
+			"msg", "audit: ruler delete_tenant_config failed",
+			"event", "ruler.delete_tenant_config",
+			"user", userID,
+			"result", "error",
+			"err", err,
+		)
 		respondError(logger, w, err.Error())
 		return
 	}
 
-	level.Info(logger).Log("msg", "deleted all tenant rule groups", "user", userID)
+	level.Info(logger).Log(
+		"msg", "deleted all tenant rule groups",
+		"event", "ruler.delete_tenant_config",
+		"user", userID,
+		"result", "ok",
+	)
 	w.WriteHeader(http.StatusOK)
 }
 
