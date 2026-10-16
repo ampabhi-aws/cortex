@@ -49,14 +49,9 @@ func (tc *resolverTestCase) test(r Resolver) func(t *testing.T) {
 
 var commonResolverTestCases = []resolverTestCase{
 	{
-		name:         "no-header",
+		name:        "no-header",
 		errTenantID:  user.ErrNoOrgID,
 		errTenantIDs: user.ErrNoOrgID,
-	},
-	{
-		name:        "empty",
-		headerValue: strptr(""),
-		tenantIDs:   []string{""},
 	},
 	{
 		name:        "single-tenant",
@@ -81,6 +76,12 @@ var commonResolverTestCases = []resolverTestCase{
 func TestSingleResolver(t *testing.T) {
 	r := NewSingleResolver()
 	for _, tc := range append(commonResolverTestCases, []resolverTestCase{
+		{
+			name:         "empty",
+			headerValue:  strptr(""),
+			errTenantID:  errInvalidTenantID,
+			errTenantIDs: errInvalidTenantID,
+		},
 		{
 			name:        "multi-tenant",
 			headerValue: strptr("tenant-a|tenant-b"),
@@ -107,6 +108,24 @@ func TestSingleResolver(t *testing.T) {
 func TestMultiResolver(t *testing.T) {
 	r := NewMultiResolver()
 	for _, tc := range append(commonResolverTestCases, []resolverTestCase{
+		{
+			name:         "empty",
+			headerValue:  strptr(""),
+			errTenantID:  errTenantIDEmpty,
+			errTenantIDs: errTenantIDEmpty,
+		},
+		{
+			name:         "only-separator",
+			headerValue:  strptr("|"),
+			errTenantID:  errTenantIDEmpty,
+			errTenantIDs: errTenantIDEmpty,
+		},
+		{
+			name:         "trailing-separator",
+			headerValue:  strptr("tenant-a|"),
+			errTenantID:  errTenantIDEmpty,
+			errTenantIDs: errTenantIDEmpty,
+		},
 		{
 			name:        "multi-tenant",
 			headerValue: strptr("tenant-a|tenant-b"),

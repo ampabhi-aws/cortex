@@ -29,6 +29,10 @@ func TestValidTenantIDs(t *testing.T) {
 			name: strings.Repeat("a", 151),
 			err:  strptr("tenant ID is too long: max 150 characters"),
 		},
+		{
+			name: "",
+			err:  strptr("tenant ID is empty"),
+		},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			err := ValidTenantID(tc.name)
