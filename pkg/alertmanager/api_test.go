@@ -690,7 +690,25 @@ receivers:
 	require.Equal(t, "application/yaml", resp.Header.Get("Content-Type"))
 	body, err := io.ReadAll(resp.Body)
 	require.NoError(t, err)
-	old, err := yaml.Marshal(testCases)
+
+	// The cross-tenant ListAllConfigs endpoint streams every tenant's
+	// Alertmanager configuration and would otherwise leak receiver secrets
+	// (SMTP auth_password, Slack api_url, PagerDuty service_key, etc.) to any
+	// caller that can reach it. Each raw config is round-tripped through the
+	// Alertmanager config parser, whose Secret/SecretURL types redact to
+	// "<secret>". Build the expected body by applying the same redaction
+	// to the input so the structural comparison still verifies the shape
+	// without re-introducing the leak via the fixture.
+	expected := map[string]*UserConfig{}
+	for u, cfg := range testCases {
+		redacted, err := redactAlertmanagerConfig(cfg.AlertmanagerConfig)
+		require.NoError(t, err)
+		expected[u] = &UserConfig{
+			TemplateFiles:      cfg.TemplateFiles,
+			AlertmanagerConfig: redacted,
+		}
+	}
+	old, err := yaml.Marshal(expected)
 	require.NoError(t, err)
 	require.YAMLEq(t, string(old), string(body))
 }

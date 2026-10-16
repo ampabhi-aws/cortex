@@ -53,6 +53,19 @@ type Config struct {
 	LegacyHTTPPrefix   string               `yaml:"-"`
 	HTTPAuthMiddleware middleware.Interface `yaml:"-"`
 
+	// HTTPAdminAuthMiddleware, when set, wraps routes registered with
+	// RouteClassAdmin (i.e. cross-tenant admin/internal endpoints such as
+	// /multitenant_alertmanager/configs, /ruler/rule_groups, /runtime_config,
+	// /distributor/all_user_stats, /distributor/ha_tracker and /memberlist).
+	// The HTTPAuthMiddleware installed on tenant routes only propagates the
+	// client-supplied X-Scope-OrgID header; it is not an authentication check.
+	// Operators who want to serve these admin endpoints on the same listener
+	// as the tenant API should inject an operator-authorization middleware
+	// here. When nil the admin routes are registered without an additional
+	// gate, preserving the historical behavior where protection is delegated
+	// to the operator-provided reverse proxy.
+	HTTPAdminAuthMiddleware middleware.Interface `yaml:"-"`
+
 	// This allows downstream projects to wrap the distributor push function
 	// and access the deserialized write requests before/after they are pushed.
 	DistributorPushWrapper DistributorPushWrapper `yaml:"-"`
@@ -66,6 +79,30 @@ type Config struct {
 	// Allows and is used to configure the addition of HTTP Header fields to logs
 	HTTPRequestHeadersToLog flagext.StringSlice `yaml:"http_request_headers_to_log"`
 }
+
+// RouteClass declares the trust class of an HTTP route registered via
+// RegisterRouteWithClass / RegisterRoutesWithPrefixAndClass. Making the
+// trust class explicit prevents a caller from silently publishing a
+// cross-tenant handler on the tenant-facing listener by passing a plain
+// auth=false boolean (see pkg/api/api.go: historical RegisterRoute).
+type RouteClass int
+
+const (
+	// RouteClassUnauthenticated is intentionally open to any caller. It is
+	// appropriate for /, /config, /debug/* style endpoints that do not
+	// expose per-tenant data. It MUST NOT be used for handlers that enumerate
+	// tenants or return per-tenant data.
+	RouteClassUnauthenticated RouteClass = iota
+	// RouteClassTenant is a per-tenant handler. The tenant/orgID extraction
+	// middleware (HTTPAuthMiddleware) is applied and the handler is expected
+	// to resolve the caller's tenant via tenant.TenantID.
+	RouteClassTenant
+	// RouteClassAdmin is a cross-tenant / operator handler (admin listings,
+	// ring and KV introspection, runtime config, memberlist). It is wrapped
+	// with HTTPAdminAuthMiddleware when configured so operators can gate it
+	// without relying solely on a reverse-proxy path blocklist.
+	RouteClassAdmin
+)
 
 // RegisterFlags adds the flags required to config this to the given FlagSet.
 func (cfg *Config) RegisterFlags(f *flag.FlagSet) {
@@ -135,14 +172,29 @@ func New(cfg Config, serverCfg server.Config, s *server.Server, logger log.Logge
 
 // RegisterRoute registers a single route enforcing HTTP methods. A single
 // route is expected to be specific about which HTTP methods are supported.
+//
+// The boolean auth parameter is retained for backward compatibility and is
+// mapped to RouteClassTenant when true and RouteClassUnauthenticated when
+// false. Internal callers that need to expose a cross-tenant admin
+// endpoint MUST use RegisterRouteWithClass with RouteClassAdmin so that
+// the dedicated admin authorization middleware is applied (when
+// configured) and the exposure is explicit at the call site.
 func (a *API) RegisterRoute(path string, handler http.Handler, auth bool, method string, methods ...string) {
+	class := RouteClassUnauthenticated
+	if auth {
+		class = RouteClassTenant
+	}
+	a.RegisterRouteWithClass(path, handler, class, method, methods...)
+}
+
+// RegisterRouteWithClass registers a single route under an explicit trust
+// class, enforcing HTTP methods. See RouteClass for the per-class gates.
+func (a *API) RegisterRouteWithClass(path string, handler http.Handler, class RouteClass, method string, methods ...string) {
 	methods = append([]string{method}, methods...)
 
-	level.Debug(a.logger).Log("msg", "api: registering route", "methods", strings.Join(methods, ","), "path", path, "auth", auth)
+	level.Debug(a.logger).Log("msg", "api: registering route", "methods", strings.Join(methods, ","), "path", path, "class", routeClassName(class))
 
-	if auth {
-		handler = a.AuthMiddleware.Wrap(handler)
-	}
+	handler = a.wrapWithClass(handler, class, path)
 
 	if a.cfg.ResponseCompression {
 		handler = gziphandler.GzipHandler(handler)
@@ -159,10 +211,19 @@ func (a *API) RegisterRoute(path string, handler http.Handler, auth bool, method
 }
 
 func (a *API) RegisterRoutesWithPrefix(prefix string, handler http.Handler, auth bool, methods ...string) {
-	level.Debug(a.logger).Log("msg", "api: registering route", "methods", strings.Join(methods, ","), "prefix", prefix, "auth", auth)
+	class := RouteClassUnauthenticated
 	if auth {
-		handler = a.AuthMiddleware.Wrap(handler)
+		class = RouteClassTenant
 	}
+	a.RegisterRoutesWithPrefixAndClass(prefix, handler, class, methods...)
+}
+
+// RegisterRoutesWithPrefixAndClass registers a path-prefix handler under an
+// explicit trust class.
+func (a *API) RegisterRoutesWithPrefixAndClass(prefix string, handler http.Handler, class RouteClass, methods ...string) {
+	level.Debug(a.logger).Log("msg", "api: registering route", "methods", strings.Join(methods, ","), "prefix", prefix, "class", routeClassName(class))
+
+	handler = a.wrapWithClass(handler, class, prefix)
 
 	if a.cfg.ResponseCompression {
 		handler = gziphandler.GzipHandler(handler)
@@ -178,6 +239,40 @@ func (a *API) RegisterRoutesWithPrefix(prefix string, handler http.Handler, auth
 	a.server.HTTP.PathPrefix(prefix).Methods(methods...).Handler(handler)
 }
 
+// wrapWithClass applies the per-class middleware for a registered route.
+func (a *API) wrapWithClass(handler http.Handler, class RouteClass, path string) http.Handler {
+	switch class {
+	case RouteClassTenant:
+		return a.AuthMiddleware.Wrap(handler)
+	case RouteClassAdmin:
+		if a.cfg.HTTPAdminAuthMiddleware != nil {
+			return a.cfg.HTTPAdminAuthMiddleware.Wrap(handler)
+		}
+		level.Warn(a.logger).Log(
+			"msg", "api: cross-tenant admin route registered without an admin authorization middleware; protection is delegated to the operator-provided reverse proxy",
+			"path", path,
+		)
+		return handler
+	case RouteClassUnauthenticated:
+		return handler
+	default:
+		return handler
+	}
+}
+
+func routeClassName(class RouteClass) string {
+	switch class {
+	case RouteClassUnauthenticated:
+		return "unauthenticated"
+	case RouteClassTenant:
+		return "tenant"
+	case RouteClassAdmin:
+		return "admin"
+	default:
+		return "unknown"
+	}
+}
+
 // RegisterAlertmanager registers endpoints associated with the alertmanager. It will only
 // serve endpoints using the legacy http-prefix if it is not run as a single binary.
 func (a *API) RegisterAlertmanager(am *alertmanager.MultitenantAlertmanager, target, apiEnabled bool) {
@@ -187,8 +282,8 @@ func (a *API) RegisterAlertmanager(am *alertmanager.MultitenantAlertmanager, tar
 	a.indexPage.AddLink(SectionAdminEndpoints, "/multitenant_alertmanager/ring", "Alertmanager Ring Status")
 	// Ensure this route is registered before the prefixed AM route
 	a.RegisterRoute("/multitenant_alertmanager/status", am.GetStatusHandler(), false, "GET")
-	a.RegisterRoute("/multitenant_alertmanager/configs", http.HandlerFunc(am.ListAllConfigs), false, "GET")
-	a.RegisterRoute("/multitenant_alertmanager/ring", http.HandlerFunc(am.RingHandler), false, "GET", "POST")
+	a.RegisterRouteWithClass("/multitenant_alertmanager/configs", http.HandlerFunc(am.ListAllConfigs), RouteClassAdmin, "GET")
+	a.RegisterRouteWithClass("/multitenant_alertmanager/ring", http.HandlerFunc(am.RingHandler), RouteClassAdmin, "GET", "POST")
 	a.RegisterRoute("/multitenant_alertmanager/delete_tenant_config", http.HandlerFunc(am.DeleteUserConfig), true, "POST")
 
 	// UI components lead to a large number of routes to support, utilize a path prefix instead
@@ -227,7 +322,7 @@ func (a *API) RegisterRuntimeConfig(runtimeConfigHandler http.HandlerFunc) {
 	a.indexPage.AddLink(SectionAdminEndpoints, "/runtime_config", "Current Runtime Config (incl. Overrides)")
 	a.indexPage.AddLink(SectionAdminEndpoints, "/runtime_config?mode=diff", "Current Runtime Config (show only values that differ from the defaults)")
 
-	a.RegisterRoute("/runtime_config", runtimeConfigHandler, false, "GET")
+	a.RegisterRouteWithClass("/runtime_config", runtimeConfigHandler, RouteClassAdmin, "GET")
 }
 
 // RegisterDistributor registers the endpoints associated with the distributor.
@@ -241,13 +336,13 @@ func (a *API) RegisterDistributor(d *distributor.Distributor, pushConfig distrib
 	a.indexPage.AddLink(SectionAdminEndpoints, "/distributor/ha_tracker", "HA Tracking Status")
 
 	a.RegisterRoute("/distributor/ring", d, false, "GET", "POST")
-	a.RegisterRoute("/distributor/all_user_stats", http.HandlerFunc(d.AllUserStatsHandler), false, "GET")
-	a.RegisterRoute("/distributor/ha_tracker", d.HATracker, false, "GET")
+	a.RegisterRouteWithClass("/distributor/all_user_stats", http.HandlerFunc(d.AllUserStatsHandler), RouteClassAdmin, "GET")
+	a.RegisterRouteWithClass("/distributor/ha_tracker", d.HATracker, RouteClassAdmin, "GET")
 
 	// Legacy Routes
 	a.RegisterRoute(path.Join(a.cfg.LegacyHTTPPrefix, "/push"), push.Handler(pushConfig.MaxRecvMsgSize, a.sourceIPs, a.cfg.wrapDistributorPush(d)), true, "POST")
-	a.RegisterRoute("/all_user_stats", http.HandlerFunc(d.AllUserStatsHandler), false, "GET")
-	a.RegisterRoute("/ha-tracker", d.HATracker, false, "GET")
+	a.RegisterRouteWithClass("/all_user_stats", http.HandlerFunc(d.AllUserStatsHandler), RouteClassAdmin, "GET")
+	a.RegisterRouteWithClass("/ha-tracker", d.HATracker, RouteClassAdmin, "GET")
 }
 
 // Ingester is defined as an interface to allow for alternative implementations
@@ -292,7 +387,7 @@ func (a *API) RegisterRuler(r *ruler.Ruler) {
 	a.RegisterRoute("/ruler_ring", r, false, "GET", "POST")
 
 	// List all user rule groups
-	a.RegisterRoute("/ruler/rule_groups", http.HandlerFunc(r.ListAllRules), false, "GET")
+	a.RegisterRouteWithClass("/ruler/rule_groups", http.HandlerFunc(r.ListAllRules), RouteClassAdmin, "GET")
 
 	ruler.RegisterRulerServer(a.server.GRPC, r)
 }
@@ -416,5 +511,5 @@ func (a *API) RegisterServiceMapHandler(handler http.Handler) {
 
 func (a *API) RegisterMemberlistKV(handler http.Handler) {
 	a.indexPage.AddLink(SectionAdminEndpoints, "/memberlist", "Memberlist Status")
-	a.RegisterRoute("/memberlist", handler, false, "GET")
+	a.RegisterRouteWithClass("/memberlist", handler, RouteClassAdmin, "GET")
 }

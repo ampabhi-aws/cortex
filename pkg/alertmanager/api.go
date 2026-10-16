@@ -283,10 +283,23 @@ func (am *MultitenantAlertmanager) ListAllConfigs(w http.ResponseWriter, r *http
 		} else if err != nil {
 			return errors.Wrapf(err, "failed to fetch alertmanager config for user %s", userID)
 		}
+		// This endpoint is cross-tenant: it streams every tenant's
+		// Alertmanager configuration. Each tenant's raw YAML can carry
+		// notification receiver secrets (SMTP auth_password, Slack
+		// api_url, PagerDuty service_key, OpsGenie api_key, bearer
+		// tokens, OAuth2 client_secret, etc.). Redact them before
+		// streaming so that neither a mis-exposure nor an operator
+		// legitimately reading this endpoint can harvest other tenants'
+		// receiver credentials.
+		redacted, redactErr := redactAlertmanagerConfig(cfg.RawConfig)
+		if redactErr != nil {
+			level.Warn(logger).Log("msg", "failed to redact alertmanager config for cross-tenant listing; omitting raw config", "user", userID, "err", redactErr)
+			redacted = ""
+		}
 		data := map[string]*UserConfig{
 			userID: {
 				TemplateFiles:      alertspb.ParseTemplates(cfg),
-				AlertmanagerConfig: cfg.RawConfig,
+				AlertmanagerConfig: redacted,
 			},
 		}
 
@@ -302,6 +315,28 @@ func (am *MultitenantAlertmanager) ListAllConfigs(w http.ResponseWriter, r *http
 	}
 	close(iter)
 	<-done
+}
+
+// redactAlertmanagerConfig parses the tenant-supplied raw Alertmanager YAML
+// and re-serialises it. The Alertmanager config library marks Secret and
+// SecretURL receiver fields with custom MarshalYAML implementations that
+// emit "<secret>", so round-tripping through config.Load+yaml.Marshal
+// redacts receiver credentials without the Cortex code having to know
+// every secret-bearing field by name. If parsing fails the function
+// returns an error and the caller MUST NOT surface the raw YAML.
+func redactAlertmanagerConfig(raw string) (string, error) {
+	if raw == "" {
+		return "", nil
+	}
+	amCfg, err := config.Load(raw)
+	if err != nil {
+		return "", errors.Wrap(err, "parsing alertmanager config for secret redaction")
+	}
+	out, err := yaml.Marshal(amCfg)
+	if err != nil {
+		return "", errors.Wrap(err, "re-marshalling alertmanager config for secret redaction")
+	}
+	return string(out), nil
 }
 
 // validateAlertmanagerConfig recursively scans the input config looking for data types for which
