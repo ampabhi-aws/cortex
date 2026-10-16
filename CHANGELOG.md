@@ -3,6 +3,7 @@
 ## master / unreleased
 
   **This release removes support for chunks storage. See below for more.**
+* [CHANGE] Ruler: `/ruler/delete_tenant_config` is now only registered when the Ruler API is enabled (`-experimental.ruler.enable-api=true`). Previously the destructive mass-delete endpoint was registered unconditionally, even in deployments that deliberately disable the tenant-facing rule-management API. Each invocation is now also written as an audit event (`event=ruler.delete_tenant_config`) including the tenant, remote address and user agent.
 * [CHANGE] Remove support for chunks storage entirely. If you are using chunks storage on a previous version, you must [migrate your data](https://github.com/cortexproject/cortex/blob/v1.11.1/docs/blocks-storage/migrate-from-chunks-to-blocks.md) on version 1.12 or earlier. Before upgrading to this release, you should also remove any deprecated chunks-related configuration, as this release will no longer accept that. The following flags are gone:
   - `-dynamodb.*`
   - `-metrics.*`
