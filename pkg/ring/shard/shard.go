@@ -40,6 +40,14 @@ func ShuffleShardExpectedInstances(shardSize, numZones int) int {
 }
 
 // yoloBuf will return an unsafe pointer to a string, as the name yolo.yoloBuf implies use at your own risk.
+// The returned []byte aliases the string's immutable backing array; it is READ-ONLY and must
+// never be appended to, written through, or re-sliced beyond len. The slice header is built
+// with an explicit capacity equal to len(s) so cap(b) == len(b).
 func yoloBuf(s string) []byte {
-	return *((*[]byte)(unsafe.Pointer(&s)))
+	return *(*[]byte)(unsafe.Pointer(
+		&struct {
+			string
+			Cap int
+		}{s, len(s)},
+	))
 }
