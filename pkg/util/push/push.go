@@ -28,6 +28,13 @@ func Handler(maxRecvMsgSize int, sourceIPs *middleware.SourceIPExtractor, push F
 				logger = log.WithSourceIPs(source, logger)
 			}
 		}
+		// Bound the body actually read from the client to -distributor.max-recv-msg-size.
+		// Without this, decompressFromReader would be driven by the client-supplied
+		// Content-Length header, letting a tenant inflate the memory cost of a request
+		// well beyond the bytes it has actually sent (CWE-770).
+		if maxRecvMsgSize > 0 {
+			r.Body = http.MaxBytesReader(w, r.Body, int64(maxRecvMsgSize))
+		}
 		var req cortexpb.PreallocWriteRequest
 		err := util.ParseProtoReader(ctx, r.Body, int(r.ContentLength), maxRecvMsgSize, &req, util.RawSnappy)
 		if err != nil {
