@@ -405,6 +405,9 @@ func (c *Client) getRawPage(ctx context.Context, url string) ([]byte, error) {
 	if err != nil {
 		return nil, err
 	}
+	if c.orgID != "" {
+		req.Header.Set("X-Scope-OrgID", c.orgID)
+	}
 	resp, err := c.httpClient.Do(req.WithContext(ctx))
 	if err != nil {
 		return nil, err
