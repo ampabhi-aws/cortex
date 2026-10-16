@@ -81,12 +81,16 @@ type connectedFrontend struct {
 
 type Config struct {
 	MaxOutstandingPerTenant int               `yaml:"max_outstanding_requests_per_tenant"`
+	MaxTenantQueues         int               `yaml:"max_tenant_queues"`
+	MaxOutstandingRequests  int               `yaml:"max_outstanding_requests"`
 	QuerierForgetDelay      time.Duration     `yaml:"querier_forget_delay"`
 	GRPCClientConfig        grpcclient.Config `yaml:"grpc_client_config" doc:"description=This configures the gRPC client used to report errors back to the query-frontend."`
 }
 
 func (cfg *Config) RegisterFlags(f *flag.FlagSet) {
 	f.IntVar(&cfg.MaxOutstandingPerTenant, "query-scheduler.max-outstanding-requests-per-tenant", 100, "Maximum number of outstanding requests per tenant per query-scheduler. In-flight requests above this limit will fail with HTTP response status code 429.")
+	f.IntVar(&cfg.MaxTenantQueues, "query-scheduler.max-tenant-queues", 0, "Aggregate cap on the number of simultaneously live tenant queues. Requests whose tenant ID would create a new queue beyond this limit are rejected with HTTP 429. 0 to disable.")
+	f.IntVar(&cfg.MaxOutstandingRequests, "query-scheduler.max-outstanding-requests", 0, "Aggregate cap on the total number of outstanding (queued) requests across all tenants. Requests above this limit are rejected with HTTP 429. 0 to disable.")
 	f.DurationVar(&cfg.QuerierForgetDelay, "query-scheduler.querier-forget-delay", 0, "If a querier disconnects without sending notification about graceful shutdown, the query-scheduler will keep the querier in the tenant's shard until the forget delay has passed. This feature is useful to reduce the blast radius when shuffle-sharding is enabled.")
 	cfg.GRPCClientConfig.RegisterFlagsWithPrefix("query-scheduler.grpc-client-config", f)
 }
@@ -111,7 +115,7 @@ func NewScheduler(cfg Config, limits Limits, log log.Logger, registerer promethe
 		Name: "cortex_query_scheduler_discarded_requests_total",
 		Help: "Total number of query requests discarded.",
 	}, []string{"user"})
-	s.requestQueue = queue.NewRequestQueue(cfg.MaxOutstandingPerTenant, cfg.QuerierForgetDelay, s.queueLength, s.discardedRequests)
+	s.requestQueue = queue.NewRequestQueueWithLimits(cfg.MaxOutstandingPerTenant, cfg.QuerierForgetDelay, cfg.MaxTenantQueues, cfg.MaxOutstandingRequests, s.queueLength, s.discardedRequests)
 
 	s.queueDuration = promauto.With(registerer).NewHistogram(prometheus.HistogramOpts{
 		Name:    "cortex_query_scheduler_queue_duration_seconds",

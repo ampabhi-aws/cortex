@@ -32,6 +32,11 @@ type queues struct {
 
 	maxUserQueueSize int
 
+	// Aggregate cap on the number of simultaneously live tenant queues. 0 disables the cap.
+	// Protects the scheduler/frontend from a caller rotating the tenant string to mint an
+	// unlimited number of per-tenant channels (see CWE-770).
+	maxTenantQueues int
+
 	// How long to wait before removing a querier which has got disconnected
 	// but hasn't notified about a graceful shutdown.
 	forgetDelay time.Duration
@@ -60,10 +65,18 @@ type userQueue struct {
 }
 
 func newUserQueues(maxUserQueueSize int, forgetDelay time.Duration) *queues {
+	return newUserQueuesWithLimits(maxUserQueueSize, forgetDelay, 0)
+}
+
+func newUserQueuesWithLimits(maxUserQueueSize int, forgetDelay time.Duration, maxTenantQueues int) *queues {
+	if maxTenantQueues < 0 {
+		maxTenantQueues = 0
+	}
 	return &queues{
 		userQueues:       map[string]*userQueue{},
 		users:            nil,
 		maxUserQueueSize: maxUserQueueSize,
+		maxTenantQueues:  maxTenantQueues,
 		forgetDelay:      forgetDelay,
 		queriers:         map[string]*querier{},
 		sortedQueriers:   nil,
@@ -106,6 +119,13 @@ func (q *queues) getOrAddQueue(userID string, maxQueriers int) chan Request {
 	uq := q.userQueues[userID]
 
 	if uq == nil {
+		// Enforce the aggregate cap on the number of live tenant queues before
+		// minting a new one. This prevents an attacker-controlled tenant string
+		// (X-Scope-OrgID / FrontendLoop UserID) from creating an unbounded number
+		// of per-tenant channels and metric label values.
+		if q.maxTenantQueues > 0 && len(q.userQueues) >= q.maxTenantQueues {
+			return nil
+		}
 		uq = &userQueue{
 			ch:    make(chan Request, q.maxUserQueueSize),
 			seed:  util.ShuffleShardSeed(userID, ""),
