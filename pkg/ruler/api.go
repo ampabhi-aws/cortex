@@ -288,7 +288,40 @@ var (
 	ErrNoRuleGroups = errors.New("no rule groups found")
 	// ErrBadRuleGroup is returned when the provided rule group can not be unmarshalled
 	ErrBadRuleGroup = errors.New("unable to decoded rule group")
+	// ErrInvalidNamespace is returned when the namespace path parameter is
+	// empty, a traversal element, or otherwise contains disallowed characters.
+	ErrInvalidNamespace = errors.New("invalid namespace in the request")
+	// ErrInvalidGroupName is returned when the group name path parameter is
+	// empty, a traversal element, or otherwise contains disallowed characters.
+	ErrInvalidGroupName = errors.New("invalid group name in the request")
 )
+
+// maxRuleAPIPathSegmentLen is the maximum accepted length (in bytes, after
+// percent-decoding) of a single rules-API path segment such as namespace or
+// group name. The limit is intentionally generous for legitimate use while
+// capping pathological inputs that would be joined into filesystem paths by
+// the local rule store backend.
+const maxRuleAPIPathSegmentLen = 255
+
+// validateRuleAPIPathSegment rejects values that would be unsafe to use as a
+// single path component in a filesystem-backed rule store. It rejects empty
+// values, the traversal elements "." and "..", values containing path
+// separators or NUL, and values longer than maxRuleAPIPathSegmentLen bytes.
+func validateRuleAPIPathSegment(v string) error {
+	if v == "" {
+		return errors.New("must not be empty")
+	}
+	if len(v) > maxRuleAPIPathSegmentLen {
+		return errors.New("too long")
+	}
+	if v == "." || v == ".." {
+		return errors.New("must not be '.' or '..'")
+	}
+	if strings.ContainsAny(v, "/\\\x00") {
+		return errors.New("must not contain path separators or NUL")
+	}
+	return nil
+}
 
 func marshalAndSend(output interface{}, w http.ResponseWriter, logger log.Logger) {
 	d, err := yaml.Marshal(&output)
@@ -324,7 +357,9 @@ func respondAccepted(w http.ResponseWriter, logger log.Logger) {
 }
 
 // parseNamespace parses the namespace from the provided set of params, in this
-// api these params are derived from the url path
+// api these params are derived from the url path. It validates that the value
+// is safe to use as a single path component in filesystem-backed rule stores,
+// rejecting empty, traversal and separator-containing inputs.
 func parseNamespace(params map[string]string) (string, error) {
 	namespace, exists := params["namespace"]
 	if !exists {
@@ -336,11 +371,16 @@ func parseNamespace(params map[string]string) (string, error) {
 		return "", err
 	}
 
+	if err := validateRuleAPIPathSegment(namespace); err != nil {
+		return "", ErrInvalidNamespace
+	}
+
 	return namespace, nil
 }
 
 // parseGroupName parses the group name from the provided set of params, in this
-// api these params are derived from the url path
+// api these params are derived from the url path. It validates that the value
+// is safe to use as a single path component in filesystem-backed rule stores.
 func parseGroupName(params map[string]string) (string, error) {
 	groupName, exists := params["groupName"]
 	if !exists {
@@ -350,6 +390,10 @@ func parseGroupName(params map[string]string) (string, error) {
 	groupName, err := url.PathUnescape(groupName)
 	if err != nil {
 		return "", err
+	}
+
+	if err := validateRuleAPIPathSegment(groupName); err != nil {
+		return "", ErrInvalidGroupName
 	}
 
 	return groupName, nil
@@ -395,7 +439,8 @@ func (a *API) ListRules(w http.ResponseWriter, req *http.Request) {
 	level.Debug(logger).Log("msg", "retrieving rule groups with namespace", "userID", userID, "namespace", namespace)
 	rgs, err := a.store.ListRuleGroupsForUserAndNamespace(req.Context(), userID, namespace)
 	if err != nil {
-		http.Error(w, err.Error(), http.StatusBadRequest)
+		level.Error(logger).Log("msg", "unable to list rule groups", "userID", userID, "namespace", namespace, "err", err.Error())
+		http.Error(w, "unable to list rule groups", http.StatusBadRequest)
 		return
 	}
 
