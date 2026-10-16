@@ -65,12 +65,21 @@ type Config struct {
 
 	// Allows and is used to configure the addition of HTTP Header fields to logs
 	HTTPRequestHeadersToLog flagext.StringSlice `yaml:"http_request_headers_to_log"`
+
+	// EnableIngesterPushEndpoint controls the registration of the
+	// /ingester/push and /push HTTP routes. These routes forward directly to
+	// an ingester's Push, bypassing the distributor's ring hashing, and are
+	// intended for testing and debugging only. Left disabled by default to
+	// prevent a caller from concentrating per-tenant TSDB creation on a
+	// single chosen ingester.
+	EnableIngesterPushEndpoint bool `yaml:"enable_ingester_push_endpoint"`
 }
 
 // RegisterFlags adds the flags required to config this to the given FlagSet.
 func (cfg *Config) RegisterFlags(f *flag.FlagSet) {
 	f.BoolVar(&cfg.ResponseCompression, "api.response-compression-enabled", false, "Use GZIP compression for API responses. Some endpoints serve large YAML or JSON blobs which can benefit from compression.")
 	f.Var(&cfg.HTTPRequestHeadersToLog, "api.http-request-headers-to-log", "Which HTTP Request headers to add to logs")
+	f.BoolVar(&cfg.EnableIngesterPushEndpoint, "api.enable-ingester-push-endpoint", false, "Enable the /ingester/push and /push HTTP routes that forward directly to the ingester's Push. These bypass the distributor's ring hashing and are intended for testing and debugging only; leave disabled in production.")
 	cfg.RegisterFlagsWithPrefix("", f)
 }
 
@@ -267,12 +276,16 @@ func (a *API) RegisterIngester(i Ingester, pushConfig distributor.Config) {
 	a.indexPage.AddLink(SectionDangerous, "/ingester/shutdown", "Trigger Ingester Shutdown (Dangerous)")
 	a.RegisterRoute("/ingester/flush", http.HandlerFunc(i.FlushHandler), false, "GET", "POST")
 	a.RegisterRoute("/ingester/shutdown", http.HandlerFunc(i.ShutdownHandler), false, "GET", "POST")
-	a.RegisterRoute("/ingester/push", push.Handler(pushConfig.MaxRecvMsgSize, a.sourceIPs, i.Push), true, "POST") // For testing and debugging.
+	if a.cfg.EnableIngesterPushEndpoint {
+		a.RegisterRoute("/ingester/push", push.Handler(pushConfig.MaxRecvMsgSize, a.sourceIPs, i.Push), true, "POST") // For testing and debugging.
+	}
 
 	// Legacy Routes
 	a.RegisterRoute("/flush", http.HandlerFunc(i.FlushHandler), false, "GET", "POST")
 	a.RegisterRoute("/shutdown", http.HandlerFunc(i.ShutdownHandler), false, "GET", "POST")
-	a.RegisterRoute("/push", push.Handler(pushConfig.MaxRecvMsgSize, a.sourceIPs, i.Push), true, "POST") // For testing and debugging.
+	if a.cfg.EnableIngesterPushEndpoint {
+		a.RegisterRoute("/push", push.Handler(pushConfig.MaxRecvMsgSize, a.sourceIPs, i.Push), true, "POST") // For testing and debugging.
+	}
 }
 
 func (a *API) RegisterTenantDeletion(api *purger.TenantDeletionAPI) {
