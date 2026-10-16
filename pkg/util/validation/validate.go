@@ -129,21 +129,11 @@ func ValidateSample(cfg SampleValidationConfig, userID string, ls []cortexpb.Lab
 // ValidateExemplar returns an error if the exemplar is invalid.
 // The returned error may retain the provided series labels.
 func ValidateExemplar(userID string, ls []cortexpb.LabelAdapter, e cortexpb.Exemplar) ValidationError {
-	if len(e.Labels) <= 0 {
-		DiscardedExemplars.WithLabelValues(exemplarLabelsMissing, userID).Inc()
-		return newExemplarEmtpyLabelsError(ls, []cortexpb.LabelAdapter{}, e.TimestampMs)
-	}
-
-	if e.TimestampMs == 0 {
-		DiscardedExemplars.WithLabelValues(exemplarTimestampInvalid, userID).Inc()
-		return newExemplarMissingTimestampError(
-			ls,
-			e.Labels,
-			e.TimestampMs,
-		)
-	}
-
-	// Exemplar label length does not include chars involved in text
+	// Validate the exemplar combined label-set length first. Doing this before the
+	// empty-labels and missing-timestamp checks ensures we never build an error
+	// message that embeds an attacker-sized label set, which the sinks below
+	// (httpgrpc wrapping, push.Handler logging and response body) would otherwise
+	// amplify. Exemplar label length does not include chars involved in text
 	// rendering such as quotes, commas, etc.  See spec and const definition.
 	labelSetLen := 0
 	for _, l := range e.Labels {
@@ -154,6 +144,20 @@ func ValidateExemplar(userID string, ls []cortexpb.LabelAdapter, e cortexpb.Exem
 	if labelSetLen > ExemplarMaxLabelSetLength {
 		DiscardedExemplars.WithLabelValues(exemplarLabelsTooLong, userID).Inc()
 		return newExemplarLabelLengthError(
+			ls,
+			e.Labels,
+			e.TimestampMs,
+		)
+	}
+
+	if len(e.Labels) <= 0 {
+		DiscardedExemplars.WithLabelValues(exemplarLabelsMissing, userID).Inc()
+		return newExemplarEmtpyLabelsError(ls, []cortexpb.LabelAdapter{}, e.TimestampMs)
+	}
+
+	if e.TimestampMs == 0 {
+		DiscardedExemplars.WithLabelValues(exemplarTimestampInvalid, userID).Inc()
+		return newExemplarMissingTimestampError(
 			ls,
 			e.Labels,
 			e.TimestampMs,
