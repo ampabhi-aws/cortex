@@ -600,8 +600,24 @@ func (s resultsCache) filterRecentExtents(req tripperware.Request, maxCacheFresh
 	return extents, nil
 }
 
+// cacheHashKey derives the shared-cache slot id for a logical results-cache
+// key. The slot id is namespaced per-tenant (the tenant prefix of the
+// logical key is kept outside the hashed portion) so that a hash collision
+// in the hashed suffix cannot cross the tenant boundary and let one tenant
+// overwrite another tenant's cache entry (CWE-328).
+func cacheHashKey(key string) string {
+	// The logical key format produced by splitters is
+	// "<tenantIDs>:<query>:<step>:<interval>". Extract the tenant prefix so
+	// it namespaces the stored slot id. If no colon is present (defensive),
+	// fall back to a plain hash.
+	if i := strings.IndexByte(key, ':'); i >= 0 {
+		return key[:i] + ":" + cache.HashKey(key)
+	}
+	return cache.HashKey(key)
+}
+
 func (s resultsCache) get(ctx context.Context, key string) ([]Extent, bool) {
-	found, bufs, _ := s.cache.Fetch(ctx, []string{cache.HashKey(key)})
+	found, bufs, _ := s.cache.Fetch(ctx, []string{cacheHashKey(key)})
 	if len(found) != 1 {
 		return nil, false
 	}
@@ -642,7 +658,7 @@ func (s resultsCache) put(ctx context.Context, key string, extents []Extent) {
 		return
 	}
 
-	s.cache.Store(ctx, []string{cache.HashKey(key)}, [][]byte{buf})
+	s.cache.Store(ctx, []string{cacheHashKey(key)}, [][]byte{buf})
 }
 
 func jaegerSpanID(ctx context.Context) string {

@@ -2,9 +2,9 @@ package cache
 
 import (
 	"context"
+	"crypto/sha256"
 	"encoding/hex"
 	"flag"
-	"hash/fnv"
 	"sync"
 	"time"
 
@@ -265,10 +265,19 @@ func (c *Memcached) Stop() {
 }
 
 // HashKey hashes key into something you can store in memcached.
+//
+// A collision-resistant hash (SHA-256 truncated to 128 bits) is used so that
+// attacker-controlled inputs feeding into shared-cache slot addresses (e.g.
+// the multi-tenant results cache) cannot be collided with practical work.
+// The previous FNV-1a 64 digest was both too narrow and invertible, which
+// let one tenant craft inputs that mapped to another tenant's slot and
+// overwrite it (CWE-328). SHA-256 truncated to 128 bits keeps the stored
+// memcached key short (32 hex chars) while removing the collision primitive.
 func HashKey(key string) string {
-	hasher := fnv.New64a()
-	_, _ = hasher.Write([]byte(key)) // This'll never error.
-
+	sum := sha256.Sum256([]byte(key))
 	// Hex because memcache errors for the bytes produced by the hash.
-	return hex.EncodeToString(hasher.Sum(nil))
+	// 16 bytes (128 bits) is collision-resistant for this use and keeps the
+	// stored key length identical in character count to a 64-bit hex digest's
+	// typical operational footprint while providing a cryptographic margin.
+	return hex.EncodeToString(sum[:16])
 }
