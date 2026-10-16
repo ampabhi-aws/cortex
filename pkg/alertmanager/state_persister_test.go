@@ -19,8 +19,10 @@ import (
 type fakePersistableState struct {
 	PersistableState
 
-	position int
-	readyc   chan struct{}
+	position  int
+	inSet     bool
+	settled   bool
+	readyc    chan struct{}
 
 	getResult *clusterpb.FullState
 	getError  error
@@ -30,13 +32,23 @@ func (f *fakePersistableState) Position() int {
 	return f.position
 }
 
+func (f *fakePersistableState) PositionInReplicationSet() (int, bool) {
+	return f.position, f.inSet
+}
+
+func (f *fakePersistableState) Settled() bool {
+	return f.settled
+}
+
 func (f *fakePersistableState) GetFullState() (*clusterpb.FullState, error) {
 	return f.getResult, f.getError
 }
 
 func newFakePersistableState() *fakePersistableState {
 	return &fakePersistableState{
-		readyc: make(chan struct{}),
+		readyc:  make(chan struct{}),
+		inSet:   true,
+		settled: true,
 	}
 }
 
@@ -149,6 +161,61 @@ func TestStatePersister_Position1ShouldNotWrite(t *testing.T) {
 	}
 
 	// Should not have stored anything, having passed the interval multiple times.
+	{
+		time.Sleep(5 * time.Second)
+
+		assert.Equal(t, 0, len(store.getWrites()))
+	}
+}
+
+// TestStatePersister_NotSettledShouldNotWrite verifies that the state persister
+// refuses to overwrite durable storage when the initial state sync did not
+// complete successfully (settled=false). Without this guard, a replica that
+// started with empty in-memory state after a failed initial sync would
+// unconditionally upload empty state over the tenant's durable fullState
+// object and permanently destroy its silences and notification log.
+func TestStatePersister_NotSettledShouldNotWrite(t *testing.T) {
+	state, store, s := makeTestStatePersister(t, 0, "user-not-settled")
+	state.settled = false
+
+	// Start the persister.
+	{
+		require.Equal(t, services.Starting, s.Service.State())
+
+		state.getResult = makeTestFullState()
+		close(state.readyc)
+
+		require.NoError(t, s.AwaitRunning(context.Background()))
+		require.Equal(t, services.Running, s.Service.State())
+	}
+
+	// Should not have stored anything, even after several interval ticks.
+	{
+		time.Sleep(5 * time.Second)
+
+		assert.Equal(t, 0, len(store.getWrites()))
+	}
+}
+
+// TestStatePersister_NotInReplicationSetShouldNotWrite verifies that the state
+// persister refuses to overwrite durable storage when the instance is not in
+// the tenant's replication set. This protects against an instance whose
+// Position() defaults to 0 (ring read error or JOINING/LEAVING / not-in-set
+// instance) silently taking over writes for a tenant it does not own.
+func TestStatePersister_NotInReplicationSetShouldNotWrite(t *testing.T) {
+	state, store, s := makeTestStatePersister(t, 0, "user-not-in-set")
+	state.inSet = false
+
+	{
+		require.Equal(t, services.Starting, s.Service.State())
+
+		state.getResult = makeTestFullState()
+		close(state.readyc)
+
+		require.NoError(t, s.AwaitRunning(context.Background()))
+		require.Equal(t, services.Running, s.Service.State())
+	}
+
 	{
 		time.Sleep(5 * time.Second)
 

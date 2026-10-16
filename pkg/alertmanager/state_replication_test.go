@@ -64,6 +64,10 @@ func (f *fakeReplicator) GetPositionForUser(_ string) int {
 	return 0
 }
 
+func (f *fakeReplicator) PositionInReplicationSet(_ string) (int, bool) {
+	return 0, true
+}
+
 func (f *fakeReplicator) ReadFullStateForUser(ctx context.Context, userID string) ([]*clusterpb.FullState, error) {
 	if userID != "user-1" {
 		return nil, errors.New("Unexpected userID")
