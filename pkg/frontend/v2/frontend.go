@@ -222,11 +222,29 @@ enqueueAgain:
 	select {
 	case <-ctx.Done():
 		if cancelCh != nil {
+			// Deliver the cancellation reliably: cancelCh is buffered per
+			// scheduler worker so that the common case is a non-blocking
+			// send, but we still fall back to a bounded blocking send with
+			// timeout so a transient receiver stall does not silently drop
+			// the notification and leave an abandoned query running on the
+			// querier. The timeout keeps the caller from stalling when the
+			// workers are shutting down or otherwise unresponsive.
 			select {
 			case cancelCh <- freq.queryID:
 				// cancellation sent.
 			default:
-				// failed to cancel, ignore.
+				t := time.NewTimer(cancelSendTimeout)
+				select {
+				case cancelCh <- freq.queryID:
+					t.Stop()
+					// cancellation sent after brief wait.
+				case <-t.C:
+					level.Warn(f.log).Log(
+						"msg", "failed to send query cancellation to scheduler worker; query may continue to execute on the querier until it finishes or times out",
+						"queryID", freq.queryID,
+						"user", userID,
+					)
+				}
 			}
 		}
 		return nil, ctx.Err()
