@@ -53,13 +53,18 @@ type state struct {
 	partialStateMergesFailed *prometheus.CounterVec
 	stateReplicationTotal    *prometheus.CounterVec
 	stateReplicationFailed   *prometheus.CounterVec
+	stateReplicationDropped  *prometheus.CounterVec
 	fetchReplicaStateTotal   prometheus.Counter
 	fetchReplicaStateFailed  prometheus.Counter
 	initialSyncTotal         prometheus.Counter
 	initialSyncCompleted     *prometheus.CounterVec
 	initialSyncDuration      prometheus.Histogram
 
-	msgc chan *clusterpb.Part
+	msgc  chan *clusterpb.Part
+	// stopc is closed when the service's runningFn is about to return, so that
+	// producers blocked on msgc can unblock instead of parking forever while
+	// still holding tenant-wide mutexes (e.g. silence.Silences.mtx).
+	stopc chan struct{}
 }
 
 // newReplicatedStates creates a new state struct, which manages state to be replicated between alertmanagers.
@@ -72,8 +77,13 @@ func newReplicatedStates(userID string, rf int, re Replicator, st alertstore.Ale
 		replicator:        re,
 		store:             st,
 		states:            make(map[string]cluster.State, 2), // we use two, one for the notifications and one for silences.
-		msgc:              make(chan *clusterpb.Part),
-		reg:               r,
+		// msgc is buffered so a transient slow replicator (gRPC roundtrip to
+		// peers) does not force producers to block synchronously while they
+		// hold tenant-wide locks. If the buffer is full the broadcast drops
+		// the update and increments stateReplicationDropped.
+		msgc:  make(chan *clusterpb.Part, 16),
+		stopc: make(chan struct{}),
+		reg:   r,
 		settleReadTimeout: defaultSettleReadTimeout,
 		storeReadTimeout:  defaultStoreReadTimeout,
 		partialStateMergesTotal: promauto.With(r).NewCounterVec(prometheus.CounterOpts{
@@ -91,6 +101,10 @@ func newReplicatedStates(userID string, rf int, re Replicator, st alertstore.Ale
 		stateReplicationFailed: promauto.With(r).NewCounterVec(prometheus.CounterOpts{
 			Name: "alertmanager_state_replication_failed_total",
 			Help: "Number of times we have failed to replicate a state to other alertmanagers.",
+		}, []string{"key"}),
+		stateReplicationDropped: promauto.With(r).NewCounterVec(prometheus.CounterOpts{
+			Name: "alertmanager_state_replication_dropped_total",
+			Help: "Number of times we have dropped a state broadcast because the replication queue was full or the replication service was not running.",
 		}, []string{"key"}),
 		fetchReplicaStateTotal: promauto.With(r).NewCounter(prometheus.CounterOpts{
 			Name: "alertmanager_state_fetch_replica_state_total",
@@ -135,6 +149,7 @@ func (s *state) AddState(key string, cs cluster.State, _ prometheus.Registerer) 
 	s.partialStateMergesFailed.WithLabelValues(key)
 	s.stateReplicationTotal.WithLabelValues(key)
 	s.stateReplicationFailed.WithLabelValues(key)
+	s.stateReplicationDropped.WithLabelValues(key)
 
 	return &stateChannel{
 		s:   s,
@@ -146,9 +161,14 @@ func (s *state) AddState(key string, cs cluster.State, _ prometheus.Registerer) 
 func (s *state) MergePartialState(p *clusterpb.Part) error {
 	s.partialStateMergesTotal.WithLabelValues(p.Key).Inc()
 
+	// Look up the target state under s.mtx, but release it before calling
+	// st.Merge: Merge delegates to the vendored silence/nflog state, which
+	// takes its own mutex and then calls broadcast -> channel send. Holding
+	// s.mtx across that rendezvous would let an external gRPC caller pin
+	// the per-tenant state lock across a channel operation.
 	s.mtx.Lock()
-	defer s.mtx.Unlock()
 	st, ok := s.states[p.Key]
+	s.mtx.Unlock()
 	if !ok {
 		s.partialStateMergesFailed.WithLabelValues(p.Key).Inc()
 		return fmt.Errorf("key not found while merging")
@@ -277,6 +297,23 @@ func (s *state) mergeFullStates(fs []*clusterpb.FullState) error {
 }
 
 func (s *state) running(ctx context.Context) error {
+	// Ensure that any producer that observed Ready() == true and is parked
+	// on a send to s.msgc is released once this loop exits. Closing stopc
+	// is also what makes future broadcast() calls take the drop branch
+	// instead of blocking.
+	defer func() {
+		close(s.stopc)
+		// Drain any buffered messages so no sender that already committed
+		// to the send remains parked. Non-blocking: once drained we're done.
+		for {
+			select {
+			case <-s.msgc:
+			default:
+				return
+			}
+		}
+	}()
+
 	for {
 		select {
 		case p := <-s.msgc:
@@ -298,8 +335,30 @@ func (s *state) running(ctx context.Context) error {
 
 func (s *state) broadcast(key string, b []byte) {
 	// We should ignore the Merges into the initial state during settling.
-	if s.Ready() {
-		s.msgc <- &clusterpb.Part{Key: key, Data: b}
+	if !s.Ready() {
+		return
+	}
+	// If the replication loop has already exited, drop immediately. This also
+	// closes the Ready()/stopc race: Ready() is a check-then-act so the
+	// service can leave Running between the check and the send.
+	select {
+	case <-s.stopc:
+		s.stateReplicationDropped.WithLabelValues(key).Inc()
+		return
+	default:
+	}
+	part := &clusterpb.Part{Key: key, Data: b}
+	// Non-blocking, cancellable send. The producer may be holding a
+	// tenant-wide mutex (silence.Silences.mtx / nflog.Log.mtx), so we must
+	// never park here: a stopped replication loop would otherwise pin that
+	// lock forever and deadlock the whole multitenant sync loop.
+	select {
+	case s.msgc <- part:
+	case <-s.stopc:
+		s.stateReplicationDropped.WithLabelValues(key).Inc()
+	default:
+		s.stateReplicationDropped.WithLabelValues(key).Inc()
+		level.Warn(s.logger).Log("msg", "dropping state broadcast because replication queue is full", "user", s.userID, "key", key)
 	}
 }
 
