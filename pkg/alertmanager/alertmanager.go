@@ -352,6 +352,12 @@ func (am *Alertmanager) ApplyConfig(userID string, conf *config.Config, rawCfg s
 	// Create a firewall binded to the per-tenant config.
 	firewallDialer := util_net.NewFirewallDialer(newFirewallDialerConfigProvider(userID, am.cfg.Limits))
 
+	// Build one rate.Limiter per (tenant, integration-name) and share it across every
+	// notifier instance built for the tenant in this ApplyConfig call. Without this
+	// sharing, each `*_configs` entry in a tenant's config would get its own full-rate
+	// token bucket, letting a tenant multiply its documented per-tenant notification
+	// rate limit simply by declaring more receiver integration instances.
+	perIntegrationLimiter := make(map[string]*rate.Limiter)
 	integrationsMap, err := buildIntegrationsMap(conf.Receivers, tmpl, firewallDialer, am.logger, func(integrationName string, notifier notify.Notifier) notify.Notifier {
 		if am.cfg.Limits != nil {
 			rl := &tenantRateLimits{
@@ -360,7 +366,13 @@ func (am *Alertmanager) ApplyConfig(userID string, conf *config.Config, rawCfg s
 				integration: integrationName,
 			}
 
-			return newRateLimitedNotifier(notifier, rl, 10*time.Second, am.rateLimitedNotifications.WithLabelValues(integrationName))
+			limiter, ok := perIntegrationLimiter[integrationName]
+			if !ok {
+				limiter = rate.NewLimiter(rl.RateLimit(), rl.Burst())
+				perIntegrationLimiter[integrationName] = limiter
+			}
+
+			return newRateLimitedNotifier(notifier, rl, 10*time.Second, am.rateLimitedNotifications.WithLabelValues(integrationName), limiter)
 		}
 		return notifier
 	})

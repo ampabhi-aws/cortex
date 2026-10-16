@@ -28,12 +28,22 @@ type rateLimitedNotifier struct {
 	recheckAt       atomic.Int64 // unix nanoseconds timestamp
 }
 
-func newRateLimitedNotifier(upstream notify.Notifier, limits rateLimits, recheckInterval time.Duration, counter prometheus.Counter) *rateLimitedNotifier {
+// newRateLimitedNotifier builds a rateLimitedNotifier that shares the given
+// *rate.Limiter across every notifier instance built with it. The limiter is
+// typically owned by the Alertmanager instance (keyed by integration name)
+// so that a tenant cannot multiply its per-tenant/per-integration-name
+// notification quota by adding more *_configs entries to its own configuration.
+// If limiter is nil, a dedicated limiter is created from `limits` for backward
+// compatibility with callers that do not own a shared limiter (e.g. tests).
+func newRateLimitedNotifier(upstream notify.Notifier, limits rateLimits, recheckInterval time.Duration, counter prometheus.Counter, limiter *rate.Limiter) *rateLimitedNotifier {
+	if limiter == nil {
+		limiter = rate.NewLimiter(limits.RateLimit(), limits.Burst())
+	}
 	return &rateLimitedNotifier{
 		upstream:        upstream,
 		counter:         counter,
 		limits:          limits,
-		limiter:         rate.NewLimiter(limits.RateLimit(), limits.Burst()),
+		limiter:         limiter,
 		recheckInterval: recheckInterval,
 	}
 }
