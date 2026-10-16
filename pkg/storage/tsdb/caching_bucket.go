@@ -217,7 +217,25 @@ func (i snappyIterCodec) Encode(files []string) ([]byte, error) {
 	return snappy.Encode(nil, b), nil
 }
 
+// maxSnappyIterDecodedSize bounds the decoded length declared in a snappy
+// cache entry's varint header before any allocation happens. The iter cache
+// entries are bucket object listings produced by Cortex itself, but the
+// shared memcached/redis backend is only semi-trusted, so we refuse to
+// allocate huge buffers based on the entry's own self-reported length. 64 MiB
+// comfortably covers legitimate listings while preventing the ~4 GiB
+// allocation that an attacker-planted header could otherwise force.
+const maxSnappyIterDecodedSize = 64 * 1024 * 1024
+
 func (i snappyIterCodec) Decode(cachedData []byte) ([]string, error) {
+	// Bound the decoded size before snappy.Decode allocates it, so a corrupt
+	// or malicious cache entry cannot force a huge allocation.
+	size, err := snappy.DecodedLen(cachedData)
+	if err != nil {
+		return nil, errors.Wrap(err, "snappyIterCodec")
+	}
+	if size > maxSnappyIterDecodedSize {
+		return nil, errors.Errorf("snappyIterCodec: decoded size %d exceeds maximum %d", size, maxSnappyIterDecodedSize)
+	}
 	b, err := snappy.Decode(nil, cachedData)
 	if err != nil {
 		return nil, errors.Wrap(err, "snappyIterCodec")
