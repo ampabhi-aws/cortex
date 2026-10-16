@@ -28,6 +28,18 @@ import (
 const (
 	maxCasRetries              = 10          // max retries in CAS operation
 	noChangeDetectedRetrySleep = time.Second // how long to sleep after no change was detected in CAS
+
+	// maxGossipKeyLength caps the length of a KV key accepted from the gossip
+	// network. Legitimate ring keys are short (e.g. "collectors/ring"); the cap is
+	// a conservative upper bound used to reject obviously malformed/abusive keys
+	// before they can be used as a Prometheus label value or map key.
+	maxGossipKeyLength = 512
+
+	// maxGossipStoreEntries bounds the number of distinct keys that can be
+	// inserted into the in-memory store as a result of gossip. Even with the
+	// allowlist in place this acts as a defence-in-depth cap against unbounded
+	// growth of m.store (and of the per-key Prometheus child metrics it feeds).
+	maxGossipStoreEntries = 128
 )
 
 // Client implements kv.Client interface, by using memberlist.KV
@@ -243,6 +255,13 @@ type KV struct {
 	watchers       map[string][]chan string
 	prefixWatchers map[string][]chan string
 
+	// Set of KV keys and key-prefixes that this process actually uses locally
+	// (populated by Get/WatchKey/WatchPrefix/CAS). Gossip updates for keys that
+	// are not in this allowlist are dropped before they can allocate a store
+	// entry or a Prometheus child metric. Protected by watchersMu.
+	allowedKeys     map[string]struct{}
+	allowedPrefixes map[string]struct{}
+
 	// Buffers with sent and received messages. Used for troubleshooting only.
 	// New messages are appended, old messages (based on configured size limit) removed from the front.
 	messagesMu           sync.Mutex
@@ -344,12 +363,14 @@ func NewKV(cfg KVConfig, logger log.Logger, dnsProvider DNSProvider, registerer 
 		registerer: registerer,
 		provider:   dnsProvider,
 
-		store:          make(map[string]valueDesc),
-		codecs:         make(map[string]codec.Codec),
-		watchers:       make(map[string][]chan string),
-		prefixWatchers: make(map[string][]chan string),
-		shutdown:       make(chan struct{}),
-		maxCasRetries:  maxCasRetries,
+		store:           make(map[string]valueDesc),
+		codecs:          make(map[string]codec.Codec),
+		watchers:        make(map[string][]chan string),
+		prefixWatchers:  make(map[string][]chan string),
+		allowedKeys:     make(map[string]struct{}),
+		allowedPrefixes: make(map[string]struct{}),
+		shutdown:        make(chan struct{}),
+		maxCasRetries:   maxCasRetries,
 	}
 
 	mlkv.createAndRegisterMetrics()
@@ -652,9 +673,42 @@ func (m *KV) List(prefix string) []string {
 	return keys
 }
 
+// allowKey records that the local process uses the given KV key. Gossip updates
+// for keys that have not been recorded (and that do not match a watched
+// prefix) are rejected in NotifyMsg/MergeRemoteState.
+func (m *KV) allowKey(key string) {
+	if key == "" {
+		return
+	}
+	m.watchersMu.Lock()
+	m.allowedKeys[key] = struct{}{}
+	m.watchersMu.Unlock()
+}
+
+// isKeyAllowed reports whether the given key corresponds to something this
+// process watches, CASes or has read locally. The empty-prefix case matches
+// everything, preserving the behaviour of WatchPrefix("").
+func (m *KV) isKeyAllowed(key string) bool {
+	m.watchersMu.Lock()
+	defer m.watchersMu.Unlock()
+
+	if _, ok := m.allowedKeys[key]; ok {
+		return true
+	}
+	for p := range m.allowedPrefixes {
+		if strings.HasPrefix(key, p) {
+			return true
+		}
+	}
+	return false
+}
+
 // Get returns current value associated with given key.
 // No communication with other nodes in the cluster is done here.
 func (m *KV) Get(key string, codec codec.Codec) (interface{}, error) {
+	// Reading a key implies the local process cares about it, so admit it to
+	// the gossip allowlist for future updates.
+	m.allowKey(key)
 	val, _, err := m.get(key, codec)
 	return val, err
 }
@@ -682,9 +736,10 @@ func (m *KV) WatchKey(ctx context.Context, key string, codec codec.Codec, f func
 	// keep one extra notification, to avoid missing notification if we're busy running the function
 	w := make(chan string, 1)
 
-	// register watcher
+	// register watcher and allow this key through the gossip-update allowlist.
 	m.watchersMu.Lock()
 	m.watchers[key] = append(m.watchers[key], w)
+	m.allowedKeys[key] = struct{}{}
 	m.watchersMu.Unlock()
 
 	defer func() {
@@ -729,9 +784,10 @@ func (m *KV) WatchPrefix(ctx context.Context, prefix string, codec codec.Codec, 
 	// we use bigger buffer here, since keys are interesting and we don't want to lose them.
 	w := make(chan string, 16)
 
-	// register watcher
+	// register watcher and allow this prefix through the gossip-update allowlist.
 	m.watchersMu.Lock()
 	m.prefixWatchers[prefix] = append(m.prefixWatchers[prefix], w)
+	m.allowedPrefixes[prefix] = struct{}{}
 	m.watchersMu.Unlock()
 
 	defer func() {
@@ -825,6 +881,10 @@ func (m *KV) notifyWatchers(key string) {
 // detect removals. If Merge doesn't result in any change (returns nil), then operation fails and is retried again.
 // After too many failed retries, this method returns error.
 func (m *KV) CAS(ctx context.Context, key string, codec codec.Codec, f func(in interface{}) (out interface{}, retry bool, err error)) error {
+	// CAS-ing a key implies the local process owns/uses it: admit it to the
+	// gossip allowlist so updates for it from peers are accepted.
+	m.allowKey(key)
+
 	var lastError error
 
 outer:
@@ -974,6 +1034,22 @@ func (m *KV) NotifyMsg(msg []byte) {
 
 	if len(kvPair.Key) == 0 {
 		level.Warn(m.logger).Log("msg", "received an invalid KV Pair (empty key)")
+		m.numberOfInvalidReceivedMessages.Inc()
+		return
+	}
+
+	if len(kvPair.Key) > maxGossipKeyLength {
+		level.Warn(m.logger).Log("msg", "received an invalid KV Pair (key too long)", "key_length", len(kvPair.Key))
+		m.numberOfInvalidReceivedMessages.Inc()
+		return
+	}
+
+	if !m.isKeyAllowed(kvPair.Key) {
+		// Drop updates for keys the local process does not use. This prevents a
+		// peer from permanently growing m.store, the per-key Prometheus child
+		// metrics (kv_store_value_tombstones{key=...}) and the broadcast queue
+		// with arbitrary attacker-chosen keys.
+		level.Warn(m.logger).Log("msg", "dropping gossip update for unknown KV key", "key", kvPair.Key)
 		m.numberOfInvalidReceivedMessages.Inc()
 		return
 	}
@@ -1151,6 +1227,18 @@ func (m *KV) MergeRemoteState(data []byte, join bool) {
 
 		data = data[kvPairLength:]
 
+		if len(kvPair.Key) == 0 || len(kvPair.Key) > maxGossipKeyLength {
+			level.Warn(m.logger).Log("msg", "dropping remote state KV Pair with invalid key length", "key_length", len(kvPair.Key))
+			continue
+		}
+
+		if !m.isKeyAllowed(kvPair.Key) {
+			// See NotifyMsg: silently drop updates for keys the local process
+			// does not use so a peer cannot grow our store/metrics unbounded.
+			level.Warn(m.logger).Log("msg", "dropping remote state entry for unknown KV key", "key", kvPair.Key)
+			continue
+		}
+
 		codec := m.GetCodec(kvPair.GetCodec())
 		if codec == nil {
 			level.Error(m.logger).Log("msg", "failed to parse remote state: unknown codec for key", "codec", kvPair.GetCodec(), "key", kvPair.GetKey())
@@ -1223,6 +1311,16 @@ func (m *KV) mergeValueForKey(key string, incomingValue Mergeable, casVersion ui
 
 	// No change, don't store it.
 	if change == nil || len(change.MergeContent()) == 0 {
+		return nil, 0, nil
+	}
+
+	// Defence in depth: bound the total number of distinct keys that can live
+	// in m.store (and therefore the number of per-key Prometheus child metrics
+	// below). The allowlist already restricts which keys get here, but this
+	// guards against misconfiguration (e.g. WatchPrefix("") combined with a
+	// hostile peer) still leading to unbounded growth.
+	if _, exists := m.store[key]; !exists && len(m.store) >= maxGossipStoreEntries {
+		level.Warn(m.logger).Log("msg", "refusing to add KV key: store entry limit reached", "key", key, "limit", maxGossipStoreEntries)
 		return nil, 0, nil
 	}
 
