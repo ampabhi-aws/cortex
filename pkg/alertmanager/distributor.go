@@ -66,10 +66,19 @@ func (d *Distributor) running(ctx context.Context) error {
 }
 
 // IsPathSupported returns true if the given route is currently supported by the Distributor.
+//
+// When sharding is enabled every path under the Alertmanager HTTP prefix must
+// be forwarded through the Distributor to an owning ring replica. If a request
+// were served locally by a non-owning instance, the per-tenant Alertmanager
+// would be missing from `am.alertmanagers` and the fallback-config path could
+// destructively overwrite the tenant's stored configuration. The Distributor
+// is already scoped to the Alertmanager prefix by the HTTP router, so we
+// accept every path here and let DistributeRequest decide how to route it
+// (quorum / unary for known API routes, best-effort unary proxy for the UI
+// and unknown read routes, or a safe 404 for mutating methods on unmatched
+// routes).
 func (d *Distributor) IsPathSupported(p string) bool {
-	// API can be found at https://petstore.swagger.io/?url=https://raw.githubusercontent.com/prometheus/alertmanager/master/api/v2/openapi.yaml.
-	isQuorumReadPath, _ := d.isQuorumReadPath(p)
-	return d.isQuorumWritePath(p) || d.isUnaryWritePath(p) || d.isUnaryDeletePath(p) || d.isUnaryReadPath(p) || isQuorumReadPath
+	return true
 }
 
 func (d *Distributor) isQuorumWritePath(p string) bool {
@@ -155,6 +164,12 @@ func (d *Distributor) DistributeRequest(w http.ResponseWriter, r *http.Request) 
 			d.doUnary(userID, w, r, logger)
 			return
 		}
+		// Unknown read path (Alertmanager UI root, static assets, unmatched API
+		// routes): proxy to one of the owning replicas so the receiving
+		// instance never serves it locally. This is required to ensure that a
+		// non-owning replica cannot trigger the fallback-config write path.
+		d.doUnary(userID, w, r, logger)
+		return
 	}
 
 	http.Error(w, "route not supported by distributor", http.StatusNotFound)
