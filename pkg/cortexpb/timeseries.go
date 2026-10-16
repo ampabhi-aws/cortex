@@ -290,18 +290,23 @@ func TimeseriesFromPool() *TimeSeries {
 
 // ReuseTimeseries puts the timeseries back into a sync.Pool for reuse.
 func ReuseTimeseries(ts *TimeSeries) {
-	// Name and Value may point into a large gRPC buffer, so clear the reference to allow GC
-	for i := 0; i < len(ts.Labels); i++ {
-		ts.Labels[i].Name = ""
-		ts.Labels[i].Value = ""
+	// Name and Value may point into a large gRPC buffer, so clear the reference to allow GC.
+	// We iterate up to cap, not len, because callers (e.g. distributor removeLabel for HA
+	// replica label and drop_labels) may have shrunk ts.Labels via append(l[:i], l[i+1:]...),
+	// leaving LabelAdapter entries in [len, cap) that still alias the request buffer.
+	lbls := ts.Labels[:cap(ts.Labels)]
+	for i := range lbls {
+		lbls[i] = LabelAdapter{}
 	}
 	ts.Labels = ts.Labels[:0]
 	ts.Samples = ts.Samples[:0]
-	// Name and Value may point into a large gRPC buffer, so clear the reference in each exemplar to allow GC
-	for i := range ts.Exemplars {
-		for j := range ts.Exemplars[i].Labels {
-			ts.Exemplars[i].Labels[j].Name = ""
-			ts.Exemplars[i].Labels[j].Value = ""
+	// Name and Value may point into a large gRPC buffer, so clear the reference in each exemplar to allow GC.
+	// Also iterate up to cap for exemplar labels to clear any aliased entries past len.
+	exs := ts.Exemplars[:cap(ts.Exemplars)]
+	for i := range exs {
+		exLbls := exs[i].Labels[:cap(exs[i].Labels)]
+		for j := range exLbls {
+			exLbls[j] = LabelAdapter{}
 		}
 	}
 	ts.Exemplars = ts.Exemplars[:0]
