@@ -684,7 +684,9 @@ Displays a web page with the current status of the Alertmanager, including the A
 GET /multitenant_alertmanager/configs
 ```
 
-List all Alertmanager configurations. This endpoint is not part of alertmanager-API and is always available regardless of whether alertmanager-API is enabled or not. It should not be exposed to end users. This endpoint returns a YAML dictionary with all the Alertmanager configurations and `200` status code on success.
+List all Alertmanager configurations. This endpoint is not part of alertmanager-API and is always available regardless of whether alertmanager-API is enabled or not. It should not be exposed to end users.
+
+As of the security fix for CVE-equivalent cross-tenant disclosure, this endpoint is tenant-scoped: it requires the auth middleware to populate the tenant (via `X-Scope-OrgID` with the default middleware) and only returns the Alertmanager configuration of that tenant. It no longer returns configurations for other tenants. If a cluster-wide operator-only dump is required, bind an operator listener separately - do not expose this handler to tenant traffic.
 
 ### Alertmanager ring status
 

@@ -681,18 +681,39 @@ receivers:
 
 	router := mux.NewRouter()
 	router.Path("/multitenant_alertmanager/configs").Methods(http.MethodGet).HandlerFunc(am.ListAllConfigs)
-	req := httptest.NewRequest("GET", "https://localhost:8080/multitenant_alertmanager/configs", nil)
-	w := httptest.NewRecorder()
-	router.ServeHTTP(w, req)
 
-	resp := w.Result()
-	require.Equal(t, http.StatusOK, resp.StatusCode)
-	require.Equal(t, "application/yaml", resp.Header.Get("Content-Type"))
-	body, err := io.ReadAll(resp.Body)
-	require.NoError(t, err)
-	old, err := yaml.Marshal(testCases)
-	require.NoError(t, err)
-	require.YAMLEq(t, string(old), string(body))
+	// The handler must only return the configuration belonging to the caller
+	// (resolved via the tenant in the request context) - never any other
+	// tenant's configuration. Verify that for every tenant with a stored
+	// configuration.
+	for callerUser, callerCfg := range testCases {
+		req := httptest.NewRequest("GET", "https://localhost:8080/multitenant_alertmanager/configs", nil)
+		req = req.WithContext(user.InjectOrgID(req.Context(), callerUser))
+		w := httptest.NewRecorder()
+		router.ServeHTTP(w, req)
+
+		resp := w.Result()
+		require.Equal(t, http.StatusOK, resp.StatusCode)
+		require.Equal(t, "application/yaml", resp.Header.Get("Content-Type"))
+		body, err := io.ReadAll(resp.Body)
+		require.NoError(t, err)
+		expected, err := yaml.Marshal(map[string]*UserConfig{callerUser: callerCfg})
+		require.NoError(t, err)
+		require.YAMLEq(t, string(expected), string(body))
+		for otherUser := range testCases {
+			if otherUser == callerUser {
+				continue
+			}
+			require.NotContains(t, string(body), otherUser)
+		}
+	}
+
+	// A request without a tenant must be rejected rather than dumping every
+	// tenant's configuration (the original cross-tenant disclosure bug).
+	reqNoTenant := httptest.NewRequest("GET", "https://localhost:8080/multitenant_alertmanager/configs", nil)
+	wNoTenant := httptest.NewRecorder()
+	router.ServeHTTP(wNoTenant, reqNoTenant)
+	require.Equal(t, http.StatusUnauthorized, wNoTenant.Result().StatusCode)
 }
 
 func TestValidateAlertmanagerConfig(t *testing.T) {
