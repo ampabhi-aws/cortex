@@ -1128,6 +1128,10 @@ func (am *MultitenantAlertmanager) ReadFullStateForUser(ctx context.Context, use
 
 		switch resp.Status {
 		case alertmanagerpb.READ_OK:
+			if resp.State == nil {
+				level.Error(am.logger).Log("msg", "empty state received from replica", "addr", addr, "user", userID)
+				return nil
+			}
 			resultsMtx.Lock()
 			results = append(results, resp.State)
 			resultsMtx.Unlock()

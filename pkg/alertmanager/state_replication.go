@@ -230,6 +230,11 @@ func (s *state) starting(ctx context.Context) error {
 		return nil
 	}
 	if err == nil {
+		if fullState.State == nil {
+			level.Info(s.logger).Log("msg", "no state for user in storage; proceeding", "user", s.userID)
+			s.initialSyncCompleted.WithLabelValues(syncUserNotFound).Inc()
+			return nil
+		}
 		if err = s.mergeFullStates([]*clusterpb.FullState{fullState.State}); err == nil {
 			level.Info(s.logger).Log("msg", "state read from storage; proceeding")
 			s.initialSyncCompleted.WithLabelValues(syncFromStorage).Inc()
@@ -258,7 +263,11 @@ func (s *state) mergeFullStates(fs []*clusterpb.FullState) error {
 	defer s.mtx.Unlock()
 
 	for _, f := range fs {
-		for _, p := range f.Parts {
+		if f == nil {
+			level.Warn(s.logger).Log("msg", "skipping nil full state while merging", "user", s.userID)
+			continue
+		}
+		for _, p := range f.GetParts() {
 			level.Debug(s.logger).Log("msg", "merging full state", "user", s.userID, "key", p.Key, "bytes", len(p.Data))
 
 			st, ok := s.states[p.Key]
