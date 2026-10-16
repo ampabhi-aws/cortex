@@ -30,8 +30,8 @@ import (
 	"github.com/thanos-io/thanos/pkg/store/labelpb"
 	"github.com/thanos-io/thanos/pkg/store/storepb"
 	"github.com/weaveworks/common/logging"
+	"github.com/weaveworks/common/user"
 	"go.uber.org/atomic"
-	"google.golang.org/grpc/metadata"
 
 	"github.com/cortexproject/cortex/pkg/storage/bucket"
 	"github.com/cortexproject/cortex/pkg/storage/bucket/filesystem"
@@ -436,9 +436,10 @@ func mockLoggingLevel() logging.Level {
 }
 
 func setUserIDToGRPCContext(ctx context.Context, userID string) context.Context {
-	// We have to store it in the incoming metadata because we have to emulate the
-	// case it's coming from a gRPC request, while here we're running everything in-memory.
-	return metadata.NewIncomingContext(ctx, metadata.Pairs(cortex_tsdb.TenantIDExternalLabel, userID))
+	// Inject the tenant into the context the same way the server-side gRPC
+	// user-header interceptor would after extracting `x-scope-orgid` from
+	// request metadata, so handlers resolve the tenant via tenant.TenantID.
+	return user.InjectOrgID(ctx, userID)
 }
 
 func TestBucketStores_deleteLocalFilesForExcludedTenants(t *testing.T) {
