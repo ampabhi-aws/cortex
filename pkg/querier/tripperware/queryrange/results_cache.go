@@ -600,8 +600,22 @@ func (s resultsCache) filterRecentExtents(req tripperware.Request, maxCacheFresh
 	return extents, nil
 }
 
+// backendCacheKey returns the key that is actually written into the shared
+// results-cache backend. The tenant ID (which is the first colon-separated
+// segment of the logical key produced by constSplitter.GenerateCacheKey) is
+// kept as a literal, unambiguous prefix of the stored key so that entries
+// belonging to different tenants can never map onto the same backend key,
+// even in the (now cryptographically negligible) event of a hash collision.
+func backendCacheKey(key string) string {
+	hashed := cache.HashKey(key)
+	if i := strings.IndexByte(key, ':'); i >= 0 {
+		return key[:i] + ":" + hashed
+	}
+	return hashed
+}
+
 func (s resultsCache) get(ctx context.Context, key string) ([]Extent, bool) {
-	found, bufs, _ := s.cache.Fetch(ctx, []string{cache.HashKey(key)})
+	found, bufs, _ := s.cache.Fetch(ctx, []string{backendCacheKey(key)})
 	if len(found) != 1 {
 		return nil, false
 	}
@@ -642,7 +656,7 @@ func (s resultsCache) put(ctx context.Context, key string, extents []Extent) {
 		return
 	}
 
-	s.cache.Store(ctx, []string{cache.HashKey(key)}, [][]byte{buf})
+	s.cache.Store(ctx, []string{backendCacheKey(key)}, [][]byte{buf})
 }
 
 func jaegerSpanID(ctx context.Context) string {

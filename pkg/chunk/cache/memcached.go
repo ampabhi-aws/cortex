@@ -2,9 +2,9 @@ package cache
 
 import (
 	"context"
+	"crypto/sha256"
 	"encoding/hex"
 	"flag"
-	"hash/fnv"
 	"sync"
 	"time"
 
@@ -265,10 +265,23 @@ func (c *Memcached) Stop() {
 }
 
 // HashKey hashes key into something you can store in memcached.
+//
+// It uses a collision-resistant hash (SHA-256) truncated to 128 bits so that
+// callers which share a single cache backend across tenants cannot be made to
+// collide on the backend key by an adversary who can choose part of the
+// logical key. The 128-bit output comfortably exceeds the birthday bound for
+// any realistic cache population and is well under memcached's 250-byte key
+// length limit when hex-encoded (32 bytes).
+//
+// NOTE: HashKey is a key-shortening function only. Callers that mix data from
+// mutually distrusting principals (e.g. different tenants) in a shared cache
+// MUST additionally prefix the stored key with an unambiguous principal
+// identifier (see pkg/querier/tripperware/queryrange/results_cache.go) and
+// re-verify the full logical key inside the cached payload on read.
 func HashKey(key string) string {
-	hasher := fnv.New64a()
-	_, _ = hasher.Write([]byte(key)) // This'll never error.
-
-	// Hex because memcache errors for the bytes produced by the hash.
-	return hex.EncodeToString(hasher.Sum(nil))
+	sum := sha256.Sum256([]byte(key))
+	// Truncate to 128 bits; this preserves full collision resistance for any
+	// plausible cache size while keeping the backend key short. Hex because
+	// memcache errors for some raw-byte values.
+	return hex.EncodeToString(sum[:16])
 }
