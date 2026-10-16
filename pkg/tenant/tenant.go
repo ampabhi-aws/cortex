@@ -86,11 +86,13 @@ func isSupported(c rune) bool {
 	}
 
 	// special
+	// Note: glob metacharacters ('*', '?', '[', ']') are intentionally NOT
+	// included because the tenant ID is used as a filesystem path component
+	// and these characters would be expanded by filepath.Glob at the sink.
 	return c == '!' ||
 		c == '-' ||
 		c == '_' ||
 		c == '.' ||
-		c == '*' ||
 		c == '\'' ||
 		c == '(' ||
 		c == ')'

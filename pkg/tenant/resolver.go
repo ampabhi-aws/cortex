@@ -87,6 +87,10 @@ func (t *SingleResolver) TenantID(ctx context.Context) (string, error) {
 		return "", errInvalidTenantID
 	}
 
+	if err := ValidTenantID(id); err != nil {
+		return "", err
+	}
+
 	return id, nil
 }
 

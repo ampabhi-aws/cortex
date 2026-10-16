@@ -2,6 +2,7 @@ package tenant
 
 import (
 	"context"
+	"strings"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
@@ -82,10 +83,10 @@ func TestSingleResolver(t *testing.T) {
 	r := NewSingleResolver()
 	for _, tc := range append(commonResolverTestCases, []resolverTestCase{
 		{
-			name:        "multi-tenant",
-			headerValue: strptr("tenant-a|tenant-b"),
-			tenantID:    "tenant-a|tenant-b",
-			tenantIDs:   []string{"tenant-a|tenant-b"},
+			name:         "multi-tenant",
+			headerValue:  strptr("tenant-a|tenant-b"),
+			errTenantID:  &errTenantIDUnsupportedCharacter{pos: 8, tenantID: "tenant-a|tenant-b"},
+			errTenantIDs: &errTenantIDUnsupportedCharacter{pos: 8, tenantID: "tenant-a|tenant-b"},
 		},
 		{
 			name:         "containing-forward-slash",
@@ -98,6 +99,30 @@ func TestSingleResolver(t *testing.T) {
 			headerValue:  strptr(`backward\slash`),
 			errTenantID:  errInvalidTenantID,
 			errTenantIDs: errInvalidTenantID,
+		},
+		{
+			name:         "containing-asterisk",
+			headerValue:  strptr("*"),
+			errTenantID:  &errTenantIDUnsupportedCharacter{pos: 0, tenantID: "*"},
+			errTenantIDs: &errTenantIDUnsupportedCharacter{pos: 0, tenantID: "*"},
+		},
+		{
+			name:         "containing-question-mark",
+			headerValue:  strptr("foo?"),
+			errTenantID:  &errTenantIDUnsupportedCharacter{pos: 3, tenantID: "foo?"},
+			errTenantIDs: &errTenantIDUnsupportedCharacter{pos: 3, tenantID: "foo?"},
+		},
+		{
+			name:         "containing-open-bracket",
+			headerValue:  strptr("foo["),
+			errTenantID:  &errTenantIDUnsupportedCharacter{pos: 3, tenantID: "foo["},
+			errTenantIDs: &errTenantIDUnsupportedCharacter{pos: 3, tenantID: "foo["},
+		},
+		{
+			name:         "too-long",
+			headerValue:  strptr(strings.Repeat("a", 151)),
+			errTenantID:  errTenantIDTooLong,
+			errTenantIDs: errTenantIDTooLong,
 		},
 	}...) {
 		t.Run(tc.name, tc.test(r))
