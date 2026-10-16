@@ -14,6 +14,7 @@ import (
 	"golang.org/x/time/rate"
 	"gopkg.in/yaml.v2"
 
+	bucket_s3 "github.com/cortexproject/cortex/pkg/storage/bucket/s3"
 	"github.com/cortexproject/cortex/pkg/util/flagext"
 )
 
@@ -58,6 +59,16 @@ func TestLimits_Validate(t *testing.T) {
 		},
 		"max-global-series-per-user disabled and shard-by-all-labels=true": {
 			limits:           Limits{MaxGlobalSeriesPerUser: 1000},
+			shardByAllLabels: true,
+			expected:         nil,
+		},
+		"per-tenant SSE-KMS override with empty KMS key ID is rejected": {
+			limits:           Limits{S3SSEType: "SSE-KMS"},
+			shardByAllLabels: true,
+			expected:         bucket_s3.ErrMissingSSEKMSKeyID,
+		},
+		"per-tenant SSE-KMS override with a KMS key ID is accepted": {
+			limits:           Limits{S3SSEType: "SSE-KMS", S3SSEKMSKeyID: "test-key"},
 			shardByAllLabels: true,
 			expected:         nil,
 		},

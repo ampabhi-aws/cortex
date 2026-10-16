@@ -13,6 +13,7 @@ import (
 	"github.com/prometheus/prometheus/model/relabel"
 	"golang.org/x/time/rate"
 
+	bucket_s3 "github.com/cortexproject/cortex/pkg/storage/bucket/s3"
 	"github.com/cortexproject/cortex/pkg/util/flagext"
 )
 
@@ -97,7 +98,7 @@ type Limits struct {
 	// This config doesn't have a CLI flag registered here because they're registered in
 	// their own original config struct.
 	S3SSEType                 string `yaml:"s3_sse_type" json:"s3_sse_type" doc:"nocli|description=S3 server-side encryption type. Required to enable server-side encryption overrides for a specific tenant. If not set, the default S3 client settings are used."`
-	S3SSEKMSKeyID             string `yaml:"s3_sse_kms_key_id" json:"s3_sse_kms_key_id" doc:"nocli|description=S3 server-side encryption KMS Key ID. Ignored if the SSE type override is not set."`
+	S3SSEKMSKeyID             string `yaml:"s3_sse_kms_key_id" json:"s3_sse_kms_key_id" doc:"nocli|description=S3 server-side encryption KMS Key ID. Required when the SSE type override is set to SSE-KMS. Ignored if the SSE type override is not set."`
 	S3SSEKMSEncryptionContext string `yaml:"s3_sse_kms_encryption_context" json:"s3_sse_kms_encryption_context" doc:"nocli|description=S3 server-side encryption KMS encryption context. If unset and the key ID override is set, the encryption context will not be provided to S3. Ignored if the SSE type override is not set."`
 
 	// Alertmanager.
@@ -197,6 +198,19 @@ func (l *Limits) Validate(shardByAllLabels bool) error {
 	// if shard-by-all-labels is disabled
 	if l.MaxGlobalSeriesPerUser > 0 && !shardByAllLabels {
 		return errMaxGlobalSeriesPerUserValidation
+	}
+
+	// Validate per-tenant S3 SSE overrides so that a malformed or incomplete
+	// runtime-config override (e.g. SSE-KMS with an empty KMS key ID) is
+	// rejected at load time rather than silently falling back to the
+	// bucket/account default KMS key at upload time.
+	sseCfg := bucket_s3.SSEConfig{
+		Type:                 l.S3SSEType,
+		KMSKeyID:             l.S3SSEKMSKeyID,
+		KMSEncryptionContext: l.S3SSEKMSEncryptionContext,
+	}
+	if err := sseCfg.Validate(); err != nil {
+		return err
 	}
 
 	return nil
