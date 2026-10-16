@@ -2777,9 +2777,11 @@ The `limits_config` configures default and per-tenant limits imposed by Cortex s
 # True to block private and local addresses in Alertmanager receiver
 # integrations. It blocks private addresses defined by  RFC 1918 (IPv4
 # addresses) and RFC 4193 (IPv6 addresses), as well as loopback, local unicast
-# and local multicast addresses.
+# and local multicast addresses. Defaults to true so that tenant-controlled
+# receiver destinations fail closed; set to false for single-tenant or trusted
+# deployments.
 # CLI flag: -alertmanager.receivers-firewall-block-private-addresses
-[alertmanager_receivers_firewall_block_private_addresses: <boolean> | default = false]
+[alertmanager_receivers_firewall_block_private_addresses: <boolean> | default = true]
 
 # Per-user rate limit for sending notifications from Alertmanager in
 # notifications/sec. 0 = rate limit disabled. Negative value = no notifications
