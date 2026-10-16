@@ -285,9 +285,6 @@ func (a *API) RegisterRuler(r *ruler.Ruler) {
 	a.indexPage.AddLink(SectionAdminEndpoints, "/ruler/ring", "Ruler Ring Status")
 	a.RegisterRoute("/ruler/ring", r, false, "GET", "POST")
 
-	// Administrative API, uses authentication to inform which user's configuration to delete.
-	a.RegisterRoute("/ruler/delete_tenant_config", http.HandlerFunc(r.DeleteTenantConfiguration), true, "POST")
-
 	// Legacy Ring Route
 	a.RegisterRoute("/ruler_ring", r, false, "GET", "POST")
 
@@ -298,7 +295,14 @@ func (a *API) RegisterRuler(r *ruler.Ruler) {
 }
 
 // RegisterRulerAPI registers routes associated with the Ruler API
-func (a *API) RegisterRulerAPI(r *ruler.API) {
+func (a *API) RegisterRulerAPI(r *ruler.API, rr *ruler.Ruler) {
+	// Administrative API, uses authentication to inform which user's configuration to delete.
+	// This destructive endpoint is only registered when the ruler API (tenant rule mutation)
+	// is enabled (-experimental.ruler.enable-api). This ensures a tenant-scoped request cannot
+	// destroy a whole tenant's rule configuration in deployments where rules are operator-managed
+	// and the ruler API is intentionally disabled.
+	a.RegisterRoute("/ruler/delete_tenant_config", http.HandlerFunc(rr.DeleteTenantConfiguration), true, "POST")
+
 	// Prometheus Rule API Routes
 	a.RegisterRoute(path.Join(a.cfg.PrometheusHTTPPrefix, "/api/v1/rules"), http.HandlerFunc(r.PrometheusRules), true, "GET")
 	a.RegisterRoute(path.Join(a.cfg.PrometheusHTTPPrefix, "/api/v1/alerts"), http.HandlerFunc(r.PrometheusAlerts), true, "GET")
