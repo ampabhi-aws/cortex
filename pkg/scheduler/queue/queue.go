@@ -57,14 +57,30 @@ type RequestQueue struct {
 	queues  *queues
 	stopped bool
 
+	// Global cap on the number of in-flight queued requests across all tenants.
+	// Zero (or negative) disables the global cap and preserves the historical
+	// per-tenant-only limit. Protects the scheduler from unbounded memory use
+	// across many tenants.
+	maxTotalOutstanding int
+	totalOutstanding    int
+
 	queueLength       *prometheus.GaugeVec   // Per user and reason.
 	discardedRequests *prometheus.CounterVec // Per user.
 }
 
 func NewRequestQueue(maxOutstandingPerTenant int, forgetDelay time.Duration, queueLength *prometheus.GaugeVec, discardedRequests *prometheus.CounterVec) *RequestQueue {
+	return NewRequestQueueWithLimits(maxOutstandingPerTenant, 0, 0, forgetDelay, queueLength, discardedRequests)
+}
+
+// NewRequestQueueWithLimits creates a RequestQueue that additionally caps the
+// total number of concurrently tracked tenants (maxTenants) and the total
+// number of in-flight queued requests across all tenants (maxTotalOutstanding).
+// Zero or negative values disable the respective global cap.
+func NewRequestQueueWithLimits(maxOutstandingPerTenant, maxTenants, maxTotalOutstanding int, forgetDelay time.Duration, queueLength *prometheus.GaugeVec, discardedRequests *prometheus.CounterVec) *RequestQueue {
 	q := &RequestQueue{
-		queues:                  newUserQueues(maxOutstandingPerTenant, forgetDelay),
+		queues:                  newUserQueuesWithMax(maxOutstandingPerTenant, maxTenants, forgetDelay),
 		connectedQuerierWorkers: atomic.NewInt32(0),
+		maxTotalOutstanding:     maxTotalOutstanding,
 		queueLength:             queueLength,
 		discardedRequests:       discardedRequests,
 	}
@@ -88,7 +104,25 @@ func (q *RequestQueue) EnqueueRequest(userID string, req Request, maxQueriers in
 		return ErrStopped
 	}
 
-	queue := q.queues.getOrAddQueue(userID, maxQueriers)
+	// Enforce the global in-flight cap before allocating any new tenant queue
+	// or channel slot, so an attacker-chosen tenant key cannot bypass it.
+	if q.maxTotalOutstanding > 0 && q.totalOutstanding >= q.maxTotalOutstanding {
+		q.discardedRequests.WithLabelValues(userID).Inc()
+		return ErrTooManyRequests
+	}
+
+	queue, err := q.queues.getOrAddQueue(userID, maxQueriers)
+	if err != nil {
+		// Global tenant cap reached; treat as a 429 for the frontend and record
+		// a discard against the attempted userID so operators can observe the
+		// rejection without creating new per-tenant metric cardinality beyond
+		// what the queue itself already permits.
+		if err == ErrTooManyTenants {
+			q.discardedRequests.WithLabelValues(userID).Inc()
+			return ErrTooManyRequests
+		}
+		return err
+	}
 	if queue == nil {
 		// This can only happen if userID is "".
 		return errors.New("no queue found")
@@ -96,6 +130,7 @@ func (q *RequestQueue) EnqueueRequest(userID string, req Request, maxQueriers in
 
 	select {
 	case queue <- req:
+		q.totalOutstanding++
 		q.queueLength.WithLabelValues(userID).Inc()
 		q.cond.Broadcast()
 		// Call this function while holding a lock. This guarantees that no querier can fetch the request before function returns.
@@ -147,6 +182,9 @@ FindQueue:
 				q.queues.deleteQueue(userID)
 			}
 
+			if q.totalOutstanding > 0 {
+				q.totalOutstanding--
+			}
 			q.queueLength.WithLabelValues(userID).Dec()
 
 			// Tell close() we've processed a request.
