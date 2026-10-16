@@ -28,10 +28,19 @@ func Handler(maxRecvMsgSize int, sourceIPs *middleware.SourceIPExtractor, push F
 				logger = log.WithSourceIPs(source, logger)
 			}
 		}
+		// Wrap the request body so that reads past maxRecvMsgSize fail
+		// fast with http: request body too large, matching the pattern
+		// used in pkg/alertmanager/distributor.go. This bounds the bytes
+		// actually read from a client that lies about Content-Length.
+		r.Body = http.MaxBytesReader(w, r.Body, int64(maxRecvMsgSize))
 		var req cortexpb.PreallocWriteRequest
 		err := util.ParseProtoReader(ctx, r.Body, int(r.ContentLength), maxRecvMsgSize, &req, util.RawSnappy)
 		if err != nil {
 			level.Error(logger).Log("err", err.Error())
+			if util.IsRequestBodyTooLarge(err) {
+				http.Error(w, "Request body too large", http.StatusRequestEntityTooLarge)
+				return
+			}
 			http.Error(w, err.Error(), http.StatusBadRequest)
 			return
 		}
