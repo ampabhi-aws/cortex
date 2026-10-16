@@ -30,6 +30,7 @@ type BlocksCleanerConfig struct {
 	CleanupConcurrency                 int
 	BlockDeletionMarksMigrationEnabled bool          // TODO Discuss whether we should remove it in Cortex 1.8.0 and document that upgrading to 1.7.0 before 1.8.0 is required.
 	TenantCleanupDelay                 time.Duration // Delay before removing tenant deletion mark and "debug".
+	TenantDeletionGracePeriod          time.Duration // Delay after a tenant deletion mark is written before blocks are actually deleted. 0 preserves legacy immediate-delete behaviour.
 }
 
 type BlocksCleaner struct {
@@ -193,6 +194,35 @@ func (c *BlocksCleaner) cleanUsers(ctx context.Context, firstRun bool) error {
 func (c *BlocksCleaner) deleteUserMarkedForDeletion(ctx context.Context, userID string) error {
 	userLogger := util_log.WithUserID(userID, c.logger)
 	userBucket := bucket.NewUserBucketClient(userID, c.bucketClient, c.cfgProvider)
+
+	// Honour the configured grace period before hard-deleting any blocks.
+	// This gives operators (and the owning tenant, via POST
+	// /purger/cancel_delete_tenant) a window in which the deletion can be
+	// cancelled by removing the mark. If the mark is unreadable we fail
+	// safe and skip this tick rather than proceeding with destruction.
+	if c.cfg.TenantDeletionGracePeriod > 0 {
+		existingMark, err := cortex_tsdb.ReadTenantDeletionMark(ctx, c.bucketClient, userID)
+		if err != nil {
+			return errors.Wrap(err, "failed to read tenant deletion mark for grace period check")
+		}
+		if existingMark == nil {
+			// Mark has been removed (cancelled) between scanning and here; nothing to do.
+			level.Info(userLogger).Log("msg", "tenant deletion mark no longer present, skipping deletion")
+			return nil
+		}
+		// Only enforce the grace period before any blocks have been removed
+		// (FinishedTime is set the first time we delete blocks). This keeps
+		// multi-tick cleanups progressing once destruction has started.
+		if existingMark.FinishedTime == 0 {
+			since := time.Since(time.Unix(existingMark.DeletionTime, 0))
+			if since < c.cfg.TenantDeletionGracePeriod {
+				level.Info(userLogger).Log("msg", "tenant marked for deletion but grace period has not elapsed; skipping block deletion",
+					"grace_period", c.cfg.TenantDeletionGracePeriod.String(),
+					"elapsed", since.String())
+				return nil
+			}
+		}
+	}
 
 	level.Info(userLogger).Log("msg", "deleting blocks for tenant marked for deletion")
 

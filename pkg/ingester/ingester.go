@@ -405,6 +405,14 @@ func (u *userTSDB) blocksToDelete(blocks []*tsdb.Block) map[ulid.ULID]struct{} {
 		return deletable
 	}
 
+	// If the tenant has been marked for deletion in the bucket, local blocks
+	// will never be shipped and must still be reclaimable so the ingester
+	// volume does not grow unbounded. Return everything the default policy
+	// considers deletable without waiting for a shipped-blocks confirmation.
+	if u.deletionMarkFound.Load() {
+		return deletable
+	}
+
 	shippedBlocks := u.getCachedShippedBlocks()
 
 	result := map[ulid.ULID]struct{}{}
@@ -1138,6 +1146,15 @@ func (i *Ingester) Push(ctx context.Context, req *cortexpb.WriteRequest) (*corte
 func (u *userTSDB) acquireAppendLock() error {
 	u.stateMtx.RLock()
 	defer u.stateMtx.RUnlock()
+
+	// Reject pushes for tenants that have been marked for deletion. We check
+	// the cached flag (refreshed periodically by the shipping loop) so this
+	// stays on the hot path. Accepting data that will never be shipped and
+	// whose local blocks cannot be reclaimed causes unbounded growth of the
+	// ingester volume, degrading every other tenant on the shared infra.
+	if u.deletionMarkFound.Load() {
+		return errors.New("tenant is marked for deletion; pushes are rejected")
+	}
 
 	switch u.state {
 	case active:
@@ -2123,10 +2140,9 @@ func (i *Ingester) shipBlocks(ctx context.Context, allowed *util.AllowedTenants)
 			return nil
 		}
 
-		if userDB.deletionMarkFound.Load() {
-			return nil
-		}
-
+		// Periodically refresh the tenant deletion mark state so that we both
+		// (a) stop shipping promptly when a mark appears and
+		// (b) resume shipping if a mark is cancelled (POST /purger/cancel_delete_tenant).
 		if time.Since(time.Unix(userDB.lastDeletionMarkCheck.Load(), 0)) > cortex_tsdb.DeletionMarkCheckInterval {
 			// Even if check fails with error, we don't want to repeat it too often.
 			userDB.lastDeletionMarkCheck.Store(time.Now().Unix())
@@ -2136,12 +2152,18 @@ func (i *Ingester) shipBlocks(ctx context.Context, allowed *util.AllowedTenants)
 				// If we cannot check for deletion mark, we continue anyway, even though in production shipper will likely fail too.
 				// This however simplifies unit tests, where tenant deletion check is enabled by default, but tests don't setup bucket.
 				level.Warn(logutil.WithContext(ctx, i.logger)).Log("msg", "failed to check for tenant deletion mark before shipping blocks", "user", userID, "err", err)
-			} else if deletionMarkExists {
-				userDB.deletionMarkFound.Store(true)
-
-				level.Info(logutil.WithContext(ctx, i.logger)).Log("msg", "tenant deletion mark exists, not shipping blocks", "user", userID)
-				return nil
+			} else {
+				prev := userDB.deletionMarkFound.Swap(deletionMarkExists)
+				if deletionMarkExists && !prev {
+					level.Info(logutil.WithContext(ctx, i.logger)).Log("msg", "tenant deletion mark exists, not shipping blocks", "user", userID)
+				} else if !deletionMarkExists && prev {
+					level.Info(logutil.WithContext(ctx, i.logger)).Log("msg", "tenant deletion mark removed, resuming block shipping", "user", userID)
+				}
 			}
+		}
+
+		if userDB.deletionMarkFound.Load() {
+			return nil
 		}
 
 		// Run the shipper's Sync() to upload unshipped blocks. Make sure the TSDB state is active, in order to
