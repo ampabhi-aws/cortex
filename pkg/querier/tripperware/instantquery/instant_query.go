@@ -5,6 +5,7 @@ import (
 	"context"
 	"fmt"
 	"io"
+	"math"
 	"net/http"
 	"net/url"
 	"sort"
@@ -257,8 +258,12 @@ func (instantQueryCodec) MergeResponse(responses ...tripperware.Response) (tripp
 	// For now, we only shard queries that returns a vector.
 	switch promResponses[0].Data.ResultType {
 	case model.ValVector.String():
+		v, err := vectorMerge(promResponses)
+		if err != nil {
+			return nil, err
+		}
 		r = &PrometheusInstantQueryResult_Vector{
-			Vector: vectorMerge(promResponses),
+			Vector: v,
 		}
 	default:
 		return nil, fmt.Errorf("unexpected result type on instant query: %s", promResponses[0].Data.ResultType)
@@ -277,9 +282,16 @@ func (instantQueryCodec) MergeResponse(responses ...tripperware.Response) (tripp
 	return res, nil
 }
 
-func vectorMerge(resps []*PrometheusInstantQueryResponse) *Vector {
+func vectorMerge(resps []*PrometheusInstantQueryResponse) (*Vector, error) {
 	output := map[string]*Sample{}
-	for _, resp := range resps {
+	// Track which response index contributed each sample, so that we can
+	// detect label-set collisions across different shard responses. Instant
+	// query shards all evaluate at the same timestamp, so the TimestampMs
+	// tie-break below can never fire; without this check two different shards
+	// writing to the same label key would silently keep whichever response
+	// arrived first, yielding a non-deterministic partial result.
+	origin := map[string]int{}
+	for i, resp := range resps {
 		if resp == nil {
 			continue
 		}
@@ -294,10 +306,29 @@ func vectorMerge(resps []*PrometheusInstantQueryResponse) *Vector {
 				continue
 			}
 			metric := cortexpb.FromLabelAdaptersToLabels(sample.Labels).String()
-			if existingSample, ok := output[metric]; !ok {
+			existingSample, ok := output[metric]
+			if !ok {
 				output[metric] = s
-			} else if existingSample.GetSample().TimestampMs < s.GetSample().TimestampMs {
-				// Choose the latest sample if we see overlap.
+				origin[metric] = i
+				continue
+			}
+			if origin[metric] != i {
+				// Two different shard responses produced samples with the
+				// same label set. For a vertically-sharded instant query
+				// that is a programming error (either the query was not
+				// actually safe to shard or the shard matcher was dropped
+				// before evaluation): if we silently kept one, the caller
+				// would get a non-deterministic partial answer. Fail loudly
+				// instead so the operator sees the problem.
+				if samplesEqual(existingSample.GetSample(), s.GetSample()) {
+					// Identical samples from both shards: safe to deduplicate.
+					continue
+				}
+				return nil, fmt.Errorf("non-mergeable instant query response: label set %q appears in multiple shard responses with conflicting samples; query result is not safely shardable", metric)
+			}
+			if existingSample.GetSample().TimestampMs < s.GetSample().TimestampMs {
+				// Choose the latest sample if we see overlap within the same
+				// response (legacy behavior).
 				output[metric] = s
 			}
 		}
@@ -306,7 +337,7 @@ func vectorMerge(resps []*PrometheusInstantQueryResponse) *Vector {
 	if len(output) == 0 {
 		return &Vector{
 			Samples: make([]*Sample, 0),
-		}
+		}, nil
 	}
 
 	keys := make([]string, 0, len(output))
@@ -321,7 +352,20 @@ func vectorMerge(resps []*PrometheusInstantQueryResponse) *Vector {
 	for _, key := range keys {
 		result.Samples = append(result.Samples, output[key])
 	}
-	return result
+	return result, nil
+}
+
+// samplesEqual reports whether two samples carry the same value and timestamp,
+// treating NaN values as equal to themselves (as PromQL does for stale/missing
+// markers in merge contexts).
+func samplesEqual(a, b cortexpb.Sample) bool {
+	if a.TimestampMs != b.TimestampMs {
+		return false
+	}
+	if math.IsNaN(a.Value) && math.IsNaN(b.Value) {
+		return true
+	}
+	return a.Value == b.Value
 }
 
 // NewEmptyPrometheusInstantQueryResponse returns an empty successful Prometheus query range response.
