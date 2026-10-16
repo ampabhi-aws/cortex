@@ -794,3 +794,139 @@ func TestValidateAlertmanagerConfig(t *testing.T) {
 		})
 	}
 }
+
+func TestValidateReceiversFirewall(t *testing.T) {
+	const user = "user-1"
+
+	loadCfg := func(t *testing.T, raw string) *config.Config {
+		t.Helper()
+		cfg, err := config.Load(raw)
+		require.NoError(t, err)
+		return cfg
+	}
+
+	t.Run("firewall disabled accepts any smarthost", func(t *testing.T) {
+		cfg := loadCfg(t, `
+route:
+  receiver: email
+receivers:
+  - name: email
+    email_configs:
+      - to: a@b.c
+        from: a@b.c
+        smarthost: 127.0.0.1:25
+        require_tls: false
+`)
+		limits := &mockAlertManagerLimits{}
+		require.NoError(t, validateReceiversFirewall(cfg, limits, user))
+	})
+
+	t.Run("blocks loopback smarthost when private addresses are blocked", func(t *testing.T) {
+		cfg := loadCfg(t, `
+route:
+  receiver: email
+receivers:
+  - name: email
+    email_configs:
+      - to: a@b.c
+        from: a@b.c
+        smarthost: 127.0.0.1:25
+        require_tls: false
+`)
+		limits := &mockAlertManagerLimits{receiversBlockPrivateAddresses: true}
+		err := validateReceiversFirewall(cfg, limits, user)
+		require.Error(t, err)
+		require.ErrorIs(t, err, errEmailSmarthostBlocked)
+	})
+
+	t.Run("blocks RFC1918 smarthost when private addresses are blocked", func(t *testing.T) {
+		cfg := loadCfg(t, `
+route:
+  receiver: email
+receivers:
+  - name: email
+    email_configs:
+      - to: a@b.c
+        from: a@b.c
+        smarthost: 10.1.2.3:25
+        require_tls: false
+`)
+		limits := &mockAlertManagerLimits{receiversBlockPrivateAddresses: true}
+		err := validateReceiversFirewall(cfg, limits, user)
+		require.Error(t, err)
+		require.ErrorIs(t, err, errEmailSmarthostBlocked)
+	})
+
+	t.Run("blocks link-local metadata smarthost when private addresses are blocked", func(t *testing.T) {
+		cfg := loadCfg(t, `
+route:
+  receiver: email
+receivers:
+  - name: email
+    email_configs:
+      - to: a@b.c
+        from: a@b.c
+        smarthost: 169.254.169.254:80
+        require_tls: false
+`)
+		limits := &mockAlertManagerLimits{receiversBlockPrivateAddresses: true}
+		err := validateReceiversFirewall(cfg, limits, user)
+		require.Error(t, err)
+		require.ErrorIs(t, err, errEmailSmarthostBlocked)
+	})
+
+	t.Run("blocks smarthost in configured block CIDR", func(t *testing.T) {
+		var blocked flagext.CIDR
+		require.NoError(t, blocked.Set("8.8.8.0/24"))
+		cfg := loadCfg(t, `
+route:
+  receiver: email
+receivers:
+  - name: email
+    email_configs:
+      - to: a@b.c
+        from: a@b.c
+        smarthost: 8.8.8.8:25
+        require_tls: false
+`)
+		limits := &mockAlertManagerLimits{receiversBlockCIDRNetworks: []flagext.CIDR{blocked}}
+		err := validateReceiversFirewall(cfg, limits, user)
+		require.Error(t, err)
+		require.ErrorIs(t, err, errEmailSmarthostBlocked)
+	})
+
+	t.Run("inherits global smtp_smarthost into per-receiver email_configs", func(t *testing.T) {
+		cfg := loadCfg(t, `
+global:
+  smtp_smarthost: 127.0.0.1:25
+  smtp_from: a@b.c
+route:
+  receiver: email
+receivers:
+  - name: email
+    email_configs:
+      - to: a@b.c
+        require_tls: false
+`)
+		limits := &mockAlertManagerLimits{receiversBlockPrivateAddresses: true}
+		err := validateReceiversFirewall(cfg, limits, user)
+		require.Error(t, err)
+		require.ErrorIs(t, err, errEmailSmarthostBlocked)
+	})
+
+	t.Run("allows explicit public IP smarthost", func(t *testing.T) {
+		cfg := loadCfg(t, `
+route:
+  receiver: email
+receivers:
+  - name: email
+    email_configs:
+      - to: a@b.c
+        from: a@b.c
+        smarthost: 8.8.8.8:25
+        require_tls: false
+`)
+		limits := &mockAlertManagerLimits{receiversBlockPrivateAddresses: true}
+		require.NoError(t, validateReceiversFirewall(cfg, limits, user))
+	})
+}

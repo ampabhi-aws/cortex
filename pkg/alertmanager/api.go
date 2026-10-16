@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
 	"os"
 	"path/filepath"
@@ -22,6 +23,8 @@ import (
 	"github.com/cortexproject/cortex/pkg/util"
 	"github.com/cortexproject/cortex/pkg/util/concurrency"
 	util_log "github.com/cortexproject/cortex/pkg/util/log"
+	util_net "github.com/cortexproject/cortex/pkg/util/net"
+	"github.com/cortexproject/cortex/pkg/util/flagext"
 )
 
 const (
@@ -45,6 +48,8 @@ var (
 	errTLSFileNotAllowed             = errors.New("setting TLS ca_file, cert_file and key_file is not allowed")
 	errSlackAPIURLFileNotAllowed     = errors.New("setting Slack api_url_file and global slack_api_url_file is not allowed")
 	errVictorOpsAPIKeyFileNotAllowed = errors.New("setting VictorOps api_key_file is not allowed")
+	errEmailSmarthostBlocked         = errors.New("email_configs smarthost resolves to an address blocked by the receivers firewall")
+	errEmailSmarthostUnresolvable    = errors.New("email_configs smarthost cannot be resolved")
 )
 
 // UserConfig is used to communicate a users alertmanager configs
@@ -187,6 +192,14 @@ func validateUserConfig(logger log.Logger, cfg alertspb.AlertConfigDesc, limits 
 
 	// Validate the config recursively scanning it.
 	if err := validateAlertmanagerConfig(amCfg); err != nil {
+		return err
+	}
+
+	// The receivers firewall only covers HTTP-based integrations via the per-tenant
+	// FirewallDialer injected in buildReceiverIntegrations. The upstream email notifier
+	// has no dialer injection point, so we instead reject configurations whose
+	// email_configs[].smarthost resolves to an address blocked by the firewall policy.
+	if err := validateReceiversFirewall(amCfg, limits, cfg.User); err != nil {
 		return err
 	}
 
@@ -446,6 +459,72 @@ func validateSlackConfig(cfg config.SlackConfig) error {
 func validateVictorOpsConfig(cfg config.VictorOpsConfig) error {
 	if cfg.APIKeyFile != "" {
 		return errVictorOpsAPIKeyFileNotAllowed
+	}
+	return nil
+}
+
+// validateReceiversFirewall enforces the per-tenant receivers firewall on destinations
+// which are not covered by the FirewallDialer injected into HTTP-based integrations.
+// Specifically, email_configs[].smarthost (and the global smtp_smarthost it inherits
+// from) is dialed by the upstream email notifier with an unrestricted net.Dialer, so
+// we resolve the configured host and reject the config if any resolved address is
+// blocked by the firewall policy. Hostnames which cannot be resolved are also rejected
+// when the firewall is enabled, to prevent DNS-based bypasses of the egress control.
+func validateReceiversFirewall(amCfg *config.Config, limits Limits, user string) error {
+	if amCfg == nil {
+		return nil
+	}
+
+	blockPrivate := limits.AlertmanagerReceiversBlockPrivateAddresses(user)
+	blockCIDRs := limits.AlertmanagerReceiversBlockCIDRNetworks(user)
+
+	// If no firewall policy is configured, there is nothing to enforce; preserve
+	// the existing behaviour where tenants can configure arbitrary smarthosts.
+	if !blockPrivate && len(blockCIDRs) == 0 {
+		return nil
+	}
+
+	// At this point amCfg has been loaded via config.Load, which has already
+	// propagated the global SMTPSmarthost into any EmailConfig with an empty
+	// Smarthost. Iterating over receivers therefore covers both per-receiver and
+	// global smarthosts actually used at notification time.
+	for _, rcv := range amCfg.Receivers {
+		for _, ec := range rcv.EmailConfigs {
+			if ec == nil {
+				continue
+			}
+			host := ec.Smarthost.Host
+			if host == "" {
+				continue
+			}
+			if err := checkFirewallHost(host, blockPrivate, blockCIDRs); err != nil {
+				return errors.Wrapf(err, "receiver %q email_configs smarthost %q", rcv.Name, ec.Smarthost.String())
+			}
+		}
+	}
+
+	return nil
+}
+
+// checkFirewallHost resolves the given host (which may be a literal IP or a
+// hostname) and returns an error if any resolved address is blocked by the
+// firewall policy, or if the host cannot be resolved.
+func checkFirewallHost(host string, blockPrivate bool, blockCIDRs []flagext.CIDR) error {
+	if ip := net.ParseIP(host); ip != nil {
+		if util_net.IsIPBlocked(ip, blockPrivate, blockCIDRs) {
+			return errEmailSmarthostBlocked
+		}
+		return nil
+	}
+
+	ips, err := net.LookupIP(host)
+	if err != nil || len(ips) == 0 {
+		return errEmailSmarthostUnresolvable
+	}
+	for _, ip := range ips {
+		if util_net.IsIPBlocked(ip, blockPrivate, blockCIDRs) {
+			return errEmailSmarthostBlocked
+		}
 	}
 	return nil
 }
