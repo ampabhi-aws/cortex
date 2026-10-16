@@ -59,6 +59,15 @@ type TCPTransportConfig struct {
 
 	TLSEnabled bool                   `yaml:"tls_enabled"`
 	TLS        cortextls.ClientConfig `yaml:",inline"`
+
+	// Server-side TLS controls for the memberlist listener. These are only used
+	// when TLSEnabled is true. If TLSClientCAPath is set, inbound peers must
+	// present a client certificate chained to the configured CA
+	// (ClientAuth=RequireAndVerifyClientCert) and, when TLSAllowedCNs is
+	// non-empty, the leaf certificate's Common Name or a DNS SAN must be in the
+	// allowlist.
+	TLSClientCAPath string              `yaml:"tls_client_ca_path"`
+	TLSAllowedCNs   flagext.StringSlice `yaml:"tls_allowed_cns"`
 }
 
 func (cfg *TCPTransportConfig) RegisterFlags(f *flag.FlagSet) {
@@ -75,6 +84,8 @@ func (cfg *TCPTransportConfig) RegisterFlagsWithPrefix(f *flag.FlagSet, prefix s
 	f.BoolVar(&cfg.TransportDebug, prefix+"memberlist.transport-debug", false, "Log debug transport messages. Note: global log.level must be at debug level as well.")
 
 	f.BoolVar(&cfg.TLSEnabled, prefix+"memberlist.tls-enabled", false, "Enable TLS on the memberlist transport layer.")
+	f.StringVar(&cfg.TLSClientCAPath, prefix+"memberlist.tls-client-ca-path", "", "Path to the CA certificates file used to verify inbound gossip peers' client certificates. When set, the memberlist TLS listener requires and verifies peer client certificates (mutual TLS).")
+	f.Var(&cfg.TLSAllowedCNs, prefix+"memberlist.tls-allowed-cns", "Allowed Common Name or DNS SAN on the client certificate presented by an inbound gossip peer. Can be specified multiple times. If empty, any certificate signed by the configured client CA is accepted.")
 	cfg.TLS.RegisterFlagsWithPrefix(prefix+"memberlist", f)
 }
 
@@ -87,8 +98,9 @@ type TCPTransport struct {
 	packetCh     chan *memberlist.Packet
 	connCh       chan net.Conn
 	wg           sync.WaitGroup
-	tcpListeners []net.Listener
-	tlsConfig    *tls.Config
+	tcpListeners    []net.Listener
+	tlsConfig       *tls.Config
+	serverTLSConfig *tls.Config
 
 	shutdown atomic.Int32
 
@@ -131,6 +143,45 @@ func NewTCPTransport(config TCPTransportConfig, logger log.Logger) (*TCPTranspor
 		if err != nil {
 			return nil, errors.Wrap(err, "unable to create TLS config")
 		}
+
+		// Build a dedicated *server* TLS config for the listener. Reusing the
+		// client-side config leaves ClientAuth/ClientCAs unset, so inbound
+		// peers would not be authenticated. When a client CA is configured,
+		// mutual TLS is enforced; otherwise we fall back to server-auth-only
+		// behaviour that matches the previous code (but still as a proper
+		// server config, with no leaked client fields).
+		clientAuth := tls.NoClientCert
+		if config.TLSClientCAPath != "" {
+			clientAuth = tls.RequireAndVerifyClientCert
+		}
+		t.serverTLSConfig, err = config.TLS.GetServerTLSConfig(config.TLSClientCAPath, clientAuth)
+		if err != nil {
+			return nil, errors.Wrap(err, "unable to create memberlist server TLS config")
+		}
+		if len(config.TLSAllowedCNs) > 0 {
+			if config.TLSClientCAPath == "" {
+				return nil, errors.New("memberlist.tls-allowed-cns requires memberlist.tls-client-ca-path to be set")
+			}
+			allowed := make(map[string]struct{}, len(config.TLSAllowedCNs))
+			for _, cn := range config.TLSAllowedCNs {
+				allowed[cn] = struct{}{}
+			}
+			t.serverTLSConfig.VerifyConnection = func(cs tls.ConnectionState) error {
+				if len(cs.PeerCertificates) == 0 {
+					return errors.New("memberlist: peer did not present a client certificate")
+				}
+				leaf := cs.PeerCertificates[0]
+				if _, ok := allowed[leaf.Subject.CommonName]; ok {
+					return nil
+				}
+				for _, name := range leaf.DNSNames {
+					if _, ok := allowed[name]; ok {
+						return nil
+					}
+				}
+				return errors.Errorf("memberlist: peer certificate identity %q (DNS SANs %v) is not in the allowed list", leaf.Subject.CommonName, leaf.DNSNames)
+			}
+		}
 	}
 
 	t.registerMetrics(config.MetricsRegisterer)
@@ -151,7 +202,7 @@ func NewTCPTransport(config TCPTransportConfig, logger log.Logger) (*TCPTranspor
 
 		var tcpLn net.Listener
 		if config.TLSEnabled {
-			tcpLn, err = tls.Listen("tcp", tcpAddr.String(), t.tlsConfig)
+			tcpLn, err = tls.Listen("tcp", tcpAddr.String(), t.serverTLSConfig)
 			if err != nil {
 				return nil, errors.Wrapf(err, "failed to start TLS TCP listener on %q port %d", addr, port)
 			}
@@ -302,6 +353,9 @@ func (t *TCPTransport) handleConnection(conn net.Conn) {
 		if !bytes.Equal(receivedDigest, expectedDigest[:]) {
 			t.receivedPacketsErrors.Inc()
 			level.Warn(t.logger).Log("msg", "packet digest mismatch", "expected", fmt.Sprintf("%x", expectedDigest), "received", fmt.Sprintf("%x", receivedDigest), "data_length", len(buf), "remote", conn.RemoteAddr())
+			// Drop the packet rather than forwarding a forged/corrupt frame to
+			// memberlist's delegate (NotifyMsg).
+			return
 		}
 
 		t.debugLog().Log("msg", "Received packet", "addr", addr(addrBuf), "size", len(buf), "hash", fmt.Sprintf("%x", receivedDigest))
