@@ -1077,6 +1077,18 @@ results_cache:
   # CLI flag: -frontend.cache-queryable-samples-stats
   [cache_queryable_samples_stats: <boolean> | default = false]
 
+  # Maximum number of extents allowed in a single results-cache entry. If
+  # the number of extents to be written back exceeds this value, the oldest
+  # extents are dropped. 0 or negative disables the limit (not recommended;
+  # makes the entry vulnerable to unbounded growth from point range queries).
+  # CLI flag: -frontend.results-cache.max-extents-per-entry
+  [max_cache_extents: <int> | default = 1000]
+
+  # Maximum serialized size, in bytes, of a single results-cache entry.
+  # Entries that would exceed this size are not stored. 0 disables the check.
+  # CLI flag: -frontend.results-cache.max-entry-size-bytes
+  [max_cache_entry_size_bytes: <int> | default = 0]
+
 # Cache query results.
 # CLI flag: -querier.cache-results
 [cache_results: <boolean> | default = false]

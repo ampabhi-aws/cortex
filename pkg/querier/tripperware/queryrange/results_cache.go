@@ -47,11 +47,39 @@ type CacheGenNumberLoader interface {
 	GetResultsCacheGenNumber(tenantIDs []string) string
 }
 
+// Defaults for safety limits that bound the size and complexity of each
+// cached results-cache entry. These prevent a single cache key (and the
+// shared query-frontend process behind it) from being driven into
+// pathological memory/CPU usage by a tenant that repeatedly issues
+// requests which append new extents to the same cache entry (for example
+// range queries with start == end and a tiny step, which share a single
+// cache key per split interval; see CWE-770).
+const (
+	// defaultMaxCacheExtents caps the number of extents that may be stored
+	// in a single cache entry. When exceeded on the write path, the oldest
+	// extents (by Start timestamp) are dropped first.
+	defaultMaxCacheExtents = 1000
+	// defaultMaxCacheEntrySizeBytes caps the serialized size of a single
+	// cache entry; a value of 0 disables the check.
+	defaultMaxCacheEntrySizeBytes = 0
+)
+
 // ResultsCacheConfig is the config for the results cache.
 type ResultsCacheConfig struct {
 	CacheConfig                cache.Config `yaml:"cache"`
 	Compression                string       `yaml:"compression"`
 	CacheQueryableSamplesStats bool         `yaml:"cache_queryable_samples_stats"`
+
+	// MaxCacheExtents is the maximum number of extents allowed per cache
+	// entry. When the number of extents to be written back exceeds this
+	// value, the oldest extents are dropped. A value <= 0 falls back to
+	// defaultMaxCacheExtents.
+	MaxCacheExtents int `yaml:"max_cache_extents"`
+
+	// MaxCacheEntrySizeBytes is the maximum serialized size, in bytes, of
+	// a single cache entry. Entries that would exceed this size are not
+	// stored. A value <= 0 disables the check.
+	MaxCacheEntrySizeBytes int `yaml:"max_cache_entry_size_bytes"`
 }
 
 // RegisterFlags registers flags.
@@ -60,6 +88,8 @@ func (cfg *ResultsCacheConfig) RegisterFlags(f *flag.FlagSet) {
 
 	f.StringVar(&cfg.Compression, "frontend.compression", "", "Use compression in results cache. Supported values are: 'snappy' and '' (disable compression).")
 	f.BoolVar(&cfg.CacheQueryableSamplesStats, "frontend.cache-queryable-samples-stats", false, "Cache Statistics queryable samples on results cache.")
+	f.IntVar(&cfg.MaxCacheExtents, "frontend.results-cache.max-extents-per-entry", defaultMaxCacheExtents, "Maximum number of extents allowed in a single results-cache entry. If the number of extents to be written back exceeds this value, the oldest extents are dropped. 0 or negative disables the limit (not recommended; makes the entry vulnerable to unbounded growth from point range queries).")
+	f.IntVar(&cfg.MaxCacheEntrySizeBytes, "frontend.results-cache.max-entry-size-bytes", defaultMaxCacheEntrySizeBytes, "Maximum serialized size, in bytes, of a single results-cache entry. Entries that would exceed this size are not stored. 0 disables the check.")
 	//lint:ignore faillint Need to pass the global logger like this for warning on deprecated methods
 	flagext.DeprecatedFlag(f, "frontend.cache-split-interval", "Deprecated: The maximum interval expected for each request, results will be cached per single interval. This behavior is now determined by querier.split-queries-by-interval.", util_log.Logger)
 }
@@ -160,6 +190,8 @@ type resultsCache struct {
 
 	extractor                  Extractor
 	minCacheExtent             int64 // discard any cache extent smaller than this
+	maxCacheExtents            int   // discard oldest extents past this count on the write path
+	maxCacheEntrySizeBytes     int   // skip storing serialized entries larger than this; <= 0 disables the check
 	merger                     tripperware.Merger
 	cacheGenNumberLoader       CacheGenNumberLoader
 	shouldCache                ShouldCacheFn
@@ -195,6 +227,11 @@ func NewResultsCacheMiddleware(
 		c = cache.NewCacheGenNumMiddleware(c)
 	}
 
+	maxCacheExtents := cfg.MaxCacheExtents
+	if maxCacheExtents <= 0 {
+		maxCacheExtents = defaultMaxCacheExtents
+	}
+
 	return tripperware.MiddlewareFunc(func(next tripperware.Handler) tripperware.Handler {
 		return &resultsCache{
 			logger:                     logger,
@@ -205,6 +242,8 @@ func NewResultsCacheMiddleware(
 			merger:                     merger,
 			extractor:                  extractor,
 			minCacheExtent:             (5 * time.Minute).Milliseconds(),
+			maxCacheExtents:            maxCacheExtents,
+			maxCacheEntrySizeBytes:     cfg.MaxCacheEntrySizeBytes,
 			splitter:                   splitter,
 			cacheGenNumberLoader:       cacheGenNumberLoader,
 			shouldCache:                shouldCache,
@@ -633,6 +672,8 @@ func (s resultsCache) get(ctx context.Context, key string) ([]Extent, bool) {
 }
 
 func (s resultsCache) put(ctx context.Context, key string, extents []Extent) {
+	extents = s.boundExtentsForCache(ctx, key, extents)
+
 	buf, err := proto.Marshal(&CachedResponse{
 		Key:     key,
 		Extents: extents,
@@ -642,7 +683,77 @@ func (s resultsCache) put(ctx context.Context, key string, extents []Extent) {
 		return
 	}
 
+	// Refuse to store entries that would exceed the configured size cap.
+	// This prevents a tenant from pushing the shared query-frontend into
+	// pathological memory/CPU usage by growing one cache entry without
+	// bound (CWE-770).
+	if s.maxCacheEntrySizeBytes > 0 && len(buf) > s.maxCacheEntrySizeBytes {
+		level.Warn(util_log.WithContext(ctx, s.logger)).Log(
+			"msg", "not storing results-cache entry: serialized size exceeds max_cache_entry_size_bytes",
+			"key", key,
+			"size", len(buf),
+			"limit", s.maxCacheEntrySizeBytes,
+			"extents", len(extents),
+		)
+		return
+	}
+
 	s.cache.Store(ctx, []string{cache.HashKey(key)}, [][]byte{buf})
+}
+
+// boundExtentsForCache bounds the state about to be written back to the
+// results cache: it drops zero-length (Start == End) extents (which are
+// never pruned by the read-side minCacheExtent rule and are the primary
+// vector for unbounded entry growth via point range queries, CWE-770),
+// and caps the number of extents to maxCacheExtents by dropping the
+// oldest first. The input slice is assumed to be sorted by Start in
+// ascending order (as produced by handleHit); if a caller passes an
+// unsorted slice we still produce a safe, bounded output.
+func (s resultsCache) boundExtentsForCache(ctx context.Context, key string, extents []Extent) []Extent {
+	if len(extents) == 0 {
+		return extents
+	}
+
+	// Drop zero-length extents. These correspond to point requests
+	// (start == end) which the read-side minCacheExtent pruning
+	// explicitly skips, so they would otherwise accumulate forever on
+	// the same cache key.
+	filtered := extents[:0]
+	droppedPoints := 0
+	for _, e := range extents {
+		if e.End <= e.Start {
+			droppedPoints++
+			continue
+		}
+		filtered = append(filtered, e)
+	}
+	extents = filtered
+
+	if droppedPoints > 0 {
+		level.Debug(util_log.WithContext(ctx, s.logger)).Log(
+			"msg", "dropping zero-length extents from results-cache entry on write",
+			"key", key,
+			"dropped", droppedPoints,
+		)
+	}
+
+	// Cap the number of extents. Drop the oldest first (lowest Start)
+	// so that recent queries continue to benefit from caching. The
+	// input is sorted ascending by Start, so trimming the prefix drops
+	// the oldest extents.
+	if s.maxCacheExtents > 0 && len(extents) > s.maxCacheExtents {
+		drop := len(extents) - s.maxCacheExtents
+		level.Warn(util_log.WithContext(ctx, s.logger)).Log(
+			"msg", "capping results-cache entry extents",
+			"key", key,
+			"before", len(extents),
+			"after", s.maxCacheExtents,
+			"dropped", drop,
+		)
+		extents = extents[drop:]
+	}
+
+	return extents
 }
 
 func jaegerSpanID(ctx context.Context) string {
