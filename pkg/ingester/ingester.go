@@ -56,6 +56,14 @@ import (
 const (
 	// RingKey is the key under which we store the ingesters ring in the KVStore.
 	RingKey = "ring"
+
+	// maxCompactHeadIterations caps the number of per-block compactions compactHead will
+	// perform in a single call. The Head's MinTime advances by exactly one block duration
+	// per iteration (regardless of the actual next sample timestamp), so a Head whose
+	// MaxTime-MinTime spans more than maxCompactHeadIterations block ranges can otherwise
+	// pin a compaction worker and - via concurrency.ForEachUser - the ingester-wide
+	// compaction loop. See https://github.com/cortexproject/cortex security advisory.
+	maxCompactHeadIterations = 1000
 )
 
 const (
@@ -323,7 +331,19 @@ func (u *userTSDB) compactHead(blockDuration int64) error {
 
 	minTime, maxTime := h.MinTime(), h.MaxTime()
 
-	for (minTime/blockDuration)*blockDuration != (maxTime/blockDuration)*blockDuration {
+	// Defence in depth: cap the number of per-block iterations so a Head whose span is
+	// pathologically large (e.g. because of a sample with a far-future / far-past
+	// timestamp that bypassed boundary validation) cannot pin this worker. compactBlocks
+	// serialises on concurrency.ForEachUser's wg.Wait(), so one tenant looping here
+	// stalls head compaction and block shipping for every tenant on this ingester.
+	if blockDuration > 0 {
+		if span := maxTime - minTime; span/blockDuration > int64(maxCompactHeadIterations) {
+			return errors.Errorf("TSDB head span %d ms exceeds %d block ranges of %d ms; refusing to compact to avoid stalling other tenants",
+				span, maxCompactHeadIterations, blockDuration)
+		}
+	}
+
+	for i := 0; i < maxCompactHeadIterations && (minTime/blockDuration)*blockDuration != (maxTime/blockDuration)*blockDuration; i++ {
 		// Data in Head spans across multiple block ranges, so we break it into blocks here.
 		// Block max time is exclusive, so we do a -1 here.
 		blockMaxTime := ((minTime/blockDuration)+1)*blockDuration - 1
@@ -333,6 +353,11 @@ func (u *userTSDB) compactHead(blockDuration int64) error {
 
 		// Get current min/max times after compaction.
 		minTime, maxTime = h.MinTime(), h.MaxTime()
+	}
+
+	if (minTime/blockDuration)*blockDuration != (maxTime/blockDuration)*blockDuration {
+		return errors.Errorf("TSDB head compaction aborted after %d iterations with span %d ms still crossing block boundaries; refusing to keep looping",
+			maxCompactHeadIterations, maxTime-minTime)
 	}
 
 	return u.db.CompactHead(tsdb.NewRangeHead(h, minTime, maxTime))
@@ -971,6 +996,18 @@ func (i *Ingester) Push(ctx context.Context, req *cortexpb.WriteRequest) (*corte
 		for _, s := range ts.Samples {
 			var err error
 
+			// Validate the sample timestamp at the ingester boundary. This mirrors the
+			// per-tenant checks performed by the distributor (validation.ValidateSample):
+			// without it, callers that reach Ingester.Push directly - e.g. the
+			// cortex.Ingester/Push gRPC method or the (optional) debug HTTP routes
+			// /ingester/push and /push - could inject samples whose timestamps are far
+			// in the future, making the TSDB Head span years and wedging compaction for
+			// every tenant on this ingester (see compactHead loop below).
+			if validationErr := validation.ValidateSample(i.limits, userID, ts.Labels, s); validationErr != nil {
+				failedSamplesCount++
+				updateFirstPartial(func() error { return validationErr })
+				continue
+			}
 			// If the cached reference exists, we try to use it.
 			if ref != 0 {
 				if _, err = app.Append(ref, copiedLabels, s.TimestampMs, s.Value); err == nil {

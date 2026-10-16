@@ -48,6 +48,15 @@ type Config struct {
 	AlertmanagerHTTPPrefix string `yaml:"alertmanager_http_prefix"`
 	PrometheusHTTPPrefix   string `yaml:"prometheus_http_prefix"`
 
+	// IngesterPushRoutesEnabled controls whether the ingester-local debug push routes
+	// (POST /ingester/push and the legacy POST /push) are registered. These routes
+	// bypass the distributor and therefore all of its per-tenant sample / label
+	// validation (ingestion rate limits, sample timestamp bounds, label length and
+	// count limits, etc.). They are intended for testing/debugging only and are
+	// disabled by default to prevent tenant-authenticated callers from reaching
+	// Ingester.Push without distributor-side validation.
+	IngesterPushRoutesEnabled bool `yaml:"ingester_push_routes_enabled"`
+
 	// The following configs are injected by the upstream caller.
 	ServerPrefix       string               `yaml:"-"`
 	LegacyHTTPPrefix   string               `yaml:"-"`
@@ -71,6 +80,7 @@ type Config struct {
 func (cfg *Config) RegisterFlags(f *flag.FlagSet) {
 	f.BoolVar(&cfg.ResponseCompression, "api.response-compression-enabled", false, "Use GZIP compression for API responses. Some endpoints serve large YAML or JSON blobs which can benefit from compression.")
 	f.Var(&cfg.HTTPRequestHeadersToLog, "api.http-request-headers-to-log", "Which HTTP Request headers to add to logs")
+	f.BoolVar(&cfg.IngesterPushRoutesEnabled, "api.ingester-push-routes-enabled", false, "Register the distributor-bypassing debug HTTP routes POST /ingester/push and the legacy POST /push. These forward tenant-authenticated requests straight to Ingester.Push without any sample or label validation and are disabled by default.")
 	cfg.RegisterFlagsWithPrefix("", f)
 }
 
@@ -267,12 +277,16 @@ func (a *API) RegisterIngester(i Ingester, pushConfig distributor.Config) {
 	a.indexPage.AddLink(SectionDangerous, "/ingester/shutdown", "Trigger Ingester Shutdown (Dangerous)")
 	a.RegisterRoute("/ingester/flush", http.HandlerFunc(i.FlushHandler), false, "GET", "POST")
 	a.RegisterRoute("/ingester/shutdown", http.HandlerFunc(i.ShutdownHandler), false, "GET", "POST")
-	a.RegisterRoute("/ingester/push", push.Handler(pushConfig.MaxRecvMsgSize, a.sourceIPs, i.Push), true, "POST") // For testing and debugging.
+	if a.cfg.IngesterPushRoutesEnabled {
+		a.RegisterRoute("/ingester/push", push.Handler(pushConfig.MaxRecvMsgSize, a.sourceIPs, i.Push), true, "POST") // For testing and debugging.
+	}
 
 	// Legacy Routes
 	a.RegisterRoute("/flush", http.HandlerFunc(i.FlushHandler), false, "GET", "POST")
 	a.RegisterRoute("/shutdown", http.HandlerFunc(i.ShutdownHandler), false, "GET", "POST")
-	a.RegisterRoute("/push", push.Handler(pushConfig.MaxRecvMsgSize, a.sourceIPs, i.Push), true, "POST") // For testing and debugging.
+	if a.cfg.IngesterPushRoutesEnabled {
+		a.RegisterRoute("/push", push.Handler(pushConfig.MaxRecvMsgSize, a.sourceIPs, i.Push), true, "POST") // For testing and debugging.
+	}
 }
 
 func (a *API) RegisterTenantDeletion(api *purger.TenantDeletionAPI) {
