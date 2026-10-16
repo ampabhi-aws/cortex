@@ -64,3 +64,29 @@ func TestTimeseriesFromPool(t *testing.T) {
 		assert.Len(t, reused.Samples, 0)
 	})
 }
+
+// TestPreallocTimeseriesUnmarshalRejectsEmpty verifies that an empty encoded
+// TimeSeries entry on the wire is rejected rather than pulling a fresh pooled
+// (~930 byte) *TimeSeries. See CWE-770: without this guard a highly compressible
+// remote_write body of repeated 0x0A 0x00 pairs can allocate tens of GB of heap
+// inside the push-path unmarshal and OOM-kill the distributor before any
+// per-request or per-tenant limit runs.
+func TestPreallocTimeseriesUnmarshalRejectsEmpty(t *testing.T) {
+	p := &PreallocTimeseries{}
+	err := p.Unmarshal(nil)
+	require.Error(t, err)
+
+	err = p.Unmarshal([]byte{})
+	require.Error(t, err)
+}
+
+// TestPreallocWriteRequestRejectsEmptyTimeseries exercises the full generated
+// WriteRequest.Unmarshal path: a buffer consisting of the 2-byte sequence
+// `0x0A 0x00` (field 1, wire type 2, length 0) is the minimal exploit payload
+// (see finding 01a142c027057bedb83d91c6f1568cec); it must be rejected and must
+// not cause an allocation per element.
+func TestPreallocWriteRequestRejectsEmptyTimeseries(t *testing.T) {
+	req := &PreallocWriteRequest{}
+	err := req.Unmarshal([]byte{0x0A, 0x00})
+	require.Error(t, err)
+}

@@ -67,7 +67,23 @@ type PreallocTimeseries struct {
 }
 
 // Unmarshal implements proto.Message.
+//
+// Empty encoded TimeSeries entries (zero bytes, i.e. a `timeseries` field on
+// the wire with length 0) are rejected rather than materialised. The pooled
+// *TimeSeries pre-allocates ~930 bytes of label/sample/exemplar capacity, so
+// taking a fresh pooled object for every empty wire element would allow a
+// highly-compressible remote_write body (a few MB on the wire after snappy
+// of a repeating 0x0A 0x00 pattern) to force tens of GB of heap during
+// unmarshal and OOM the distributor before any per-request or per-tenant
+// limit runs (CWE-770). Such entries carry no labels, samples, exemplars or
+// metadata and are silently discarded by Distributor.Push anyway, so
+// rejecting them at the parse boundary preserves useful behaviour while
+// cutting the amplifier.
 func (p *PreallocTimeseries) Unmarshal(dAtA []byte) error {
+	if len(dAtA) == 0 {
+		p.TimeSeries = &TimeSeries{}
+		return fmt.Errorf("proto: empty TimeSeries entry in WriteRequest")
+	}
 	p.TimeSeries = TimeseriesFromPool()
 	return p.TimeSeries.Unmarshal(dAtA)
 }
