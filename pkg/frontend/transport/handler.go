@@ -31,6 +31,23 @@ const (
 	// StatusClientClosedRequest is the status code for when a client request cancellation of an http request
 	StatusClientClosedRequest = 499
 	ServiceTimingHeaderName   = "Server-Timing"
+
+	// maxBufferedQueryBytes caps how much of the request body is buffered for
+	// slow-query / query-stats logging. The buffer only needs to be large
+	// enough to recover the query parameters, not the full request body, so
+	// we keep this well below -frontend.max-body-size to avoid tenants being
+	// able to pin large amounts of heap on the shared frontend.
+	maxBufferedQueryBytes = 10 * 1024
+
+	// maxQueryStringParamsLogged caps the number of request parameters that
+	// are emitted into a single slow-query / query-stats log record.
+	maxQueryStringParamsLogged = 32
+
+	// maxQueryStringValueLogged caps the length of each parameter value that
+	// is emitted into a single log record. Values longer than this are
+	// truncated with a trailing marker, so a single request cannot produce
+	// an unbounded log line.
+	maxQueryStringValueLogged = 1024
 )
 
 var (
@@ -127,10 +144,19 @@ func (f *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		_ = r.Body.Close()
 	}()
 
-	// Buffer the body for later use to track slow queries.
+	// Only buffer the request body when something downstream will actually
+	// read it back (slow-query logging or query-stats logging). When neither
+	// is enabled, buffering the body just pins heap for every in-flight
+	// request without any consumer ever reading it.
+	shouldBuffer := f.cfg.LogQueriesLongerThan != 0 || f.cfg.QueryStatsEnabled
+
 	var buf bytes.Buffer
 	r.Body = http.MaxBytesReader(w, r.Body, f.cfg.MaxBodySize)
-	r.Body = io.NopCloser(io.TeeReader(r.Body, &buf))
+	if shouldBuffer {
+		// Cap the buffered copy at a small, fixed size: we only need enough
+		// to parse the query parameters for logging, not the full body.
+		r.Body = io.NopCloser(io.TeeReader(r.Body, &limitedBuffer{buf: &buf, remaining: maxBufferedQueryBytes}))
+	}
 
 	startTime := time.Now()
 	resp, err := f.roundTripper.RoundTrip(r)
@@ -159,7 +185,7 @@ func (f *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 
 	// Check whether we should parse the query string.
 	shouldReportSlowQuery := f.cfg.LogQueriesLongerThan != 0 && queryResponseTime > f.cfg.LogQueriesLongerThan
-	if shouldReportSlowQuery || f.cfg.QueryStatsEnabled {
+	if shouldBuffer && (shouldReportSlowQuery || f.cfg.QueryStatsEnabled) {
 		queryString = f.parseRequestQueryString(r, buf)
 	}
 
@@ -233,10 +259,52 @@ func (f *Handler) parseRequestQueryString(r *http.Request, bodyBuf bytes.Buffer)
 }
 
 func formatQueryString(queryString url.Values) (fields []interface{}) {
+	logged := 0
 	for k, v := range queryString {
-		fields = append(fields, fmt.Sprintf("param_%s", k), strings.Join(v, ","))
+		if logged >= maxQueryStringParamsLogged {
+			fields = append(fields, "param_truncated_count", len(queryString)-logged)
+			break
+		}
+		fields = append(fields, fmt.Sprintf("param_%s", k), truncateLogValue(strings.Join(v, ",")))
+		logged++
 	}
 	return fields
+}
+
+// truncateLogValue bounds the length of a single value emitted into a log
+// record so that a tenant cannot force an arbitrarily large single log line.
+func truncateLogValue(v string) string {
+	if len(v) <= maxQueryStringValueLogged {
+		return v
+	}
+	return v[:maxQueryStringValueLogged] + "...(truncated)"
+}
+
+// limitedBuffer is an io.Writer that appends to an underlying bytes.Buffer
+// until a fixed byte budget is exhausted, after which further writes are
+// silently discarded. It is used by Handler.ServeHTTP to tee only the first
+// few KiB of the request body for logging purposes without ever retaining
+// more than that regardless of the configured -frontend.max-body-size.
+type limitedBuffer struct {
+	buf       *bytes.Buffer
+	remaining int
+}
+
+func (l *limitedBuffer) Write(p []byte) (int, error) {
+	n := len(p)
+	if l.remaining > 0 {
+		write := p
+		if len(write) > l.remaining {
+			write = write[:l.remaining]
+		}
+		if _, err := l.buf.Write(write); err != nil {
+			return 0, err
+		}
+		l.remaining -= len(write)
+	}
+	// Report the full length as written so that the TeeReader keeps
+	// forwarding the full body downstream even after our budget runs out.
+	return n, nil
 }
 
 func writeError(w http.ResponseWriter, err error) {
