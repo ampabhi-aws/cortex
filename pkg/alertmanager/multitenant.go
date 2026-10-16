@@ -1023,8 +1023,26 @@ func (am *MultitenantAlertmanager) serveRequest(w http.ResponseWriter, req *http
 		return
 	}
 
+	// When sharding is enabled, do not instantiate (and persist a fallback
+	// configuration for) a tenant Alertmanager on an instance that does not
+	// own this tenant according to the ring. Otherwise a request landing on
+	// a non-owning replica (e.g. UI/static paths that the distributor does
+	// not forward, or a request forwarded to a replica whose sync loop has
+	// not yet loaded the tenant) would overwrite the tenant's stored
+	// configuration with an empty one.
+	if am.cfg.ShardingEnabled && !am.isUserOwned(userID) {
+		level.Debug(am.logger).Log("msg", "not serving request for tenant not owned by this instance", "user", userID, "path", req.URL.Path)
+		http.Error(w, "the Alertmanager is not configured", http.StatusNotFound)
+		return
+	}
+
 	if am.fallbackConfig != "" {
-		userAM, err = am.alertmanagerFromFallbackConfig(userID)
+		userAM, err = am.alertmanagerFromFallbackConfig(req.Context(), userID)
+		if err == errNotUploadingFallback {
+			level.Warn(am.logger).Log("msg", "not initializing Alertmanager", "user", userID, "err", err)
+			http.Error(w, "Not ready", http.StatusServiceUnavailable)
+			return
+		}
 		if err != nil {
 			level.Error(am.logger).Log("msg", "unable to initialize the Alertmanager with a fallback configuration", "user", userID, "err", err)
 			http.Error(w, "Failed to initialize the Alertmanager", http.StatusInternalServerError)
@@ -1039,17 +1057,51 @@ func (am *MultitenantAlertmanager) serveRequest(w http.ResponseWriter, req *http
 	http.Error(w, "the Alertmanager is not configured", http.StatusNotFound)
 }
 
-func (am *MultitenantAlertmanager) alertmanagerFromFallbackConfig(userID string) (*Alertmanager, error) {
-	// Upload an empty config so that the Alertmanager is no de-activated in the next poll
+// errNotUploadingFallback is returned when alertmanagerFromFallbackConfig
+// refuses to upload the empty placeholder config because an existing
+// configuration is already present in object storage. In that case the
+// caller must not pretend the tenant has no configuration.
+var errNotUploadingFallback = errors.New("not uploading fallback configuration: tenant already has a stored configuration")
+
+func (am *MultitenantAlertmanager) alertmanagerFromFallbackConfig(ctx context.Context, userID string) (*Alertmanager, error) {
+	// Check whether the tenant already has a stored configuration. If it
+	// does, we must not overwrite it with an empty placeholder: doing so
+	// would destroy the tenant's receivers, routes, and templates and silently
+	// re-route notifications to the operator-supplied fallback receiver.
+	// This situation occurs e.g. when the request lands on a replica that
+	// does not currently own the tenant (sharding ring scale-up or sync lag)
+	// or in the brief window between a config upload and the next poll.
+	existing, err := am.store.GetAlertConfig(ctx, userID)
+	switch {
+	case err == nil:
+		// A configuration already exists. Do not overwrite it. Trigger a
+		// local sync so this instance picks the tenant up if it owns it;
+		// otherwise return the sentinel so the caller returns 5xx/4xx.
+		if setErr := am.setConfig(existing); setErr != nil {
+			return nil, setErr
+		}
+		am.alertmanagersMtx.Lock()
+		userAM, ok := am.alertmanagers[userID]
+		am.alertmanagersMtx.Unlock()
+		if ok {
+			return userAM, nil
+		}
+		return nil, errNotUploadingFallback
+	case errors.Is(err, alertspb.ErrNotFound):
+		// Fall through: no existing configuration, safe to upload the
+		// empty placeholder so the next poll keeps the Alertmanager alive.
+	default:
+		return nil, errors.Wrap(err, "failed to read existing alertmanager configuration")
+	}
+
+	// Upload an empty config so that the Alertmanager is not de-activated in the next poll.
 	cfgDesc := alertspb.ToProto("", nil, userID)
-	err := am.store.SetAlertConfig(context.Background(), cfgDesc)
-	if err != nil {
+	if err := am.store.SetAlertConfig(ctx, cfgDesc); err != nil {
 		return nil, err
 	}
 
 	// Calling setConfig with an empty configuration will use the fallback config.
-	err = am.setConfig(cfgDesc)
-	if err != nil {
+	if err := am.setConfig(cfgDesc); err != nil {
 		return nil, err
 	}
 
