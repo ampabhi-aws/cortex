@@ -213,9 +213,16 @@ func (cfg *TSDBConfig) Validate() error {
 }
 
 // BlocksDir returns the directory path where TSDB blocks and wal should be
-// stored by the ingester
-func (cfg *TSDBConfig) BlocksDir(userID string) string {
-	return filepath.Join(cfg.Dir, userID)
+// stored by the ingester for the given tenant. It returns an error when the
+// userID is empty: filepath.Join silently drops empty elements, so calling
+// BlocksDir("") would otherwise collapse to cfg.Dir (the shared root that
+// contains every tenant's TSDB) and allow a caller presenting an empty
+// tenant ID to open a TSDB directly on the shared root.
+func (cfg *TSDBConfig) BlocksDir(userID string) (string, error) {
+	if userID == "" {
+		return "", errors.New("TSDB BlocksDir: empty tenant ID")
+	}
+	return filepath.Join(cfg.Dir, userID), nil
 }
 
 // IsShippingEnabled returns whether blocks shipping is enabled.
