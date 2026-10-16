@@ -19,7 +19,6 @@ import (
 	"github.com/stretchr/testify/require"
 	"github.com/thanos-io/objstore"
 	"github.com/weaveworks/common/user"
-	"gopkg.in/yaml.v2"
 
 	"github.com/cortexproject/cortex/pkg/alertmanager/alertspb"
 	"github.com/cortexproject/cortex/pkg/alertmanager/alertstore/bucketclient"
@@ -681,18 +680,121 @@ receivers:
 
 	router := mux.NewRouter()
 	router.Path("/multitenant_alertmanager/configs").Methods(http.MethodGet).HandlerFunc(am.ListAllConfigs)
+
+	// Request without an authenticated tenant must be rejected: this handler is
+	// an operator/tenant-scoped endpoint and must not stream cross-tenant data.
+	{
+		req := httptest.NewRequest("GET", "https://localhost:8080/multitenant_alertmanager/configs", nil)
+		w := httptest.NewRecorder()
+		router.ServeHTTP(w, req)
+		resp := w.Result()
+		require.Equal(t, http.StatusUnauthorized, resp.StatusCode)
+		body, err := io.ReadAll(resp.Body)
+		require.NoError(t, err)
+		require.NotContains(t, string(body), "user1")
+		require.NotContains(t, string(body), "user2")
+	}
+
+	// Request authenticated as user1 must only return user1's configuration,
+	// never user2's data.
+	{
+		req := httptest.NewRequest("GET", "https://localhost:8080/multitenant_alertmanager/configs", nil)
+		req = req.WithContext(user.InjectOrgID(context.Background(), "user1"))
+		w := httptest.NewRecorder()
+		router.ServeHTTP(w, req)
+		resp := w.Result()
+		require.Equal(t, http.StatusOK, resp.StatusCode)
+		require.Equal(t, "application/yaml", resp.Header.Get("Content-Type"))
+		body, err := io.ReadAll(resp.Body)
+		require.NoError(t, err)
+		require.Contains(t, string(body), "user1")
+		require.NotContains(t, string(body), "user2")
+		// Webhook URLs are redacted as defence in depth.
+		require.NotContains(t, string(body), "orgId=1&rrid=7")
+		require.Contains(t, string(body), redactedSecretPlaceholder)
+	}
+}
+
+func TestAMConfigListUserConfig_RedactsSecrets(t *testing.T) {
+	const rawCfg = `
+global:
+  smtp_auth_password: super-secret-smtp
+  slack_api_url: https://hooks.slack.com/services/T0/B0/XXXXXXXXXXXXXXXXXXXXXXXX
+route:
+  receiver: ops
+receivers:
+- name: ops
+  slack_configs:
+  - api_url: https://hooks.slack.com/services/T1/B1/YYYYYYYYYYYYYYYYYYYYYYYY
+    channel: '#alerts'
+  pagerduty_configs:
+  - service_key: pd-service-key
+    routing_key: pd-routing-key
+  opsgenie_configs:
+  - api_key: opsgenie-key
+  victorops_configs:
+  - api_key: victorops-key
+    routing_key: vo-routing
+  pushover_configs:
+  - token: pushover-token
+    user_key: pushover-user
+  webhook_configs:
+  - url: https://webhook.example/path?token=secret-token
+    http_config:
+      basic_auth:
+        username: admin
+        password: admin-pass
+      bearer_token: bearer-xyz
+      oauth2:
+        client_id: client
+        client_secret: client-secret-value
+`
+
+	storage := objstore.NewInMemBucket()
+	alertStore := bucketclient.NewBucketAlertStore(storage, nil, log.NewNopLogger())
+	require.NoError(t, alertStore.SetAlertConfig(context.Background(), alertspb.AlertConfigDesc{
+		User:      "tenant-a",
+		RawConfig: rawCfg,
+	}))
+
+	am := &MultitenantAlertmanager{
+		store:  alertStore,
+		logger: util_log.Logger,
+	}
+
+	router := mux.NewRouter()
+	router.Path("/multitenant_alertmanager/configs").Methods(http.MethodGet).HandlerFunc(am.ListAllConfigs)
+
 	req := httptest.NewRequest("GET", "https://localhost:8080/multitenant_alertmanager/configs", nil)
+	req = req.WithContext(user.InjectOrgID(context.Background(), "tenant-a"))
 	w := httptest.NewRecorder()
 	router.ServeHTTP(w, req)
-
 	resp := w.Result()
 	require.Equal(t, http.StatusOK, resp.StatusCode)
-	require.Equal(t, "application/yaml", resp.Header.Get("Content-Type"))
 	body, err := io.ReadAll(resp.Body)
 	require.NoError(t, err)
-	old, err := yaml.Marshal(testCases)
-	require.NoError(t, err)
-	require.YAMLEq(t, string(old), string(body))
+
+	s := string(body)
+	for _, secret := range []string{
+		"super-secret-smtp",
+		"T0/B0/XXXXXXXXXXXXXXXXXXXXXXXX",
+		"T1/B1/YYYYYYYYYYYYYYYYYYYYYYYY",
+		"pd-service-key",
+		"pd-routing-key",
+		"opsgenie-key",
+		"victorops-key",
+		"vo-routing",
+		"pushover-token",
+		"pushover-user",
+		"token=secret-token",
+		"admin-pass",
+		"bearer-xyz",
+		"client-secret-value",
+	} {
+		require.NotContainsf(t, s, secret, "secret %q leaked in response", secret)
+	}
+	require.Contains(t, s, "tenant-a")
+	require.Contains(t, s, redactedSecretPlaceholder)
 }
 
 func TestValidateAlertmanagerConfig(t *testing.T) {
