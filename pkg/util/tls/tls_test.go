@@ -184,3 +184,27 @@ func TestGetTLSConfig_ServerName(t *testing.T) {
 	assert.NoError(t, err)
 	assert.Equal(t, "myserver.com", tlsConfig.ServerName)
 }
+
+func TestClientConfig_Validate(t *testing.T) {
+	// Empty config is always valid, regardless of enabled.
+	assert.NoError(t, (&ClientConfig{}).Validate(false))
+	assert.NoError(t, (&ClientConfig{}).Validate(true))
+
+	// When enabled is true, any TLS material is accepted.
+	assert.NoError(t, (&ClientConfig{CertPath: "c", KeyPath: "k", CAPath: "ca", ServerName: "s", InsecureSkipVerify: true}).Validate(true))
+
+	// When enabled is false, every TLS field must trigger an error
+	// to prevent silently falling back to plain text.
+	for name, cfg := range map[string]*ClientConfig{
+		"cert-path":            {CertPath: "c"},
+		"key-path":             {KeyPath: "k"},
+		"ca-path":              {CAPath: "ca"},
+		"server-name":          {ServerName: "srv"},
+		"insecure-skip-verify": {InsecureSkipVerify: true},
+	} {
+		t.Run(name, func(t *testing.T) {
+			err := cfg.Validate(false)
+			assert.Error(t, err)
+		})
+	}
+}

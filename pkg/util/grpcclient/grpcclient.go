@@ -58,6 +58,9 @@ func (cfg *Config) Validate(log log.Logger) error {
 	default:
 		return errors.Errorf("unsupported compression type: %s", cfg.GRPCCompression)
 	}
+	if err := cfg.TLS.Validate(cfg.TLSEnabled); err != nil {
+		return err
+	}
 	return nil
 }
 

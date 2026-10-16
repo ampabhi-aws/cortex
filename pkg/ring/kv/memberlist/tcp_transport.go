@@ -126,6 +126,9 @@ func NewTCPTransport(config TCPTransportConfig, logger log.Logger) (*TCPTranspor
 	}
 
 	var err error
+	if err = config.TLS.Validate(config.TLSEnabled); err != nil {
+		return nil, err
+	}
 	if config.TLSEnabled {
 		t.tlsConfig, err = config.TLS.GetTLSConfig()
 		if err != nil {

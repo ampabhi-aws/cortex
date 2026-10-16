@@ -22,9 +22,28 @@ type ClientConfig struct {
 }
 
 var (
-	errKeyMissing  = errors.New("certificate given but no key configured")
-	errCertMissing = errors.New("key given but no certificate configured")
+	errKeyMissing               = errors.New("certificate given but no key configured")
+	errCertMissing              = errors.New("key given but no certificate configured")
+	errTLSMaterialButNotEnabled = errors.New("TLS cert/key/CA/server-name/insecure-skip-verify configured but TLS is not enabled; set the companion tls-enabled flag to true or remove the TLS material")
 )
+
+// Validate checks that the ClientConfig is internally consistent given the
+// owner's TLS-enabled flag. If any TLS material (cert/key/CA/server-name or
+// InsecureSkipVerify) is configured while the owner reports TLS disabled, this
+// returns an error so the misconfiguration fails closed rather than silently
+// falling back to a plain-text, unauthenticated connection. It is the
+// caller's responsibility to pass whether TLS has been explicitly enabled by
+// the owning config (e.g. grpcclient.Config.TLSEnabled, tracing.Otel.TLSEnabled
+// or memberlist.TCPTransportConfig.TLSEnabled).
+func (cfg *ClientConfig) Validate(enabled bool) error {
+	if enabled {
+		return nil
+	}
+	if cfg.CertPath != "" || cfg.KeyPath != "" || cfg.CAPath != "" || cfg.ServerName != "" || cfg.InsecureSkipVerify {
+		return errTLSMaterialButNotEnabled
+	}
+	return nil
+}
 
 // RegisterFlagsWithPrefix registers flags with prefix.
 func (cfg *ClientConfig) RegisterFlagsWithPrefix(prefix string, f *flag.FlagSet) {
