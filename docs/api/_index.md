@@ -684,7 +684,11 @@ Displays a web page with the current status of the Alertmanager, including the A
 GET /multitenant_alertmanager/configs
 ```
 
-List all Alertmanager configurations. This endpoint is not part of alertmanager-API and is always available regardless of whether alertmanager-API is enabled or not. It should not be exposed to end users. This endpoint returns a YAML dictionary with all the Alertmanager configurations and `200` status code on success.
+List all Alertmanager configurations. This endpoint is not part of alertmanager-API and is always available regardless of whether alertmanager-API is enabled or not. It should not be exposed to end users: the response contains every tenant's raw Alertmanager configuration YAML, which embeds notifier credentials (SMTP passwords, Slack/PagerDuty/OpsGenie/VictorOps/SNS API keys and webhook URLs) in cleartext.
+
+Operators MUST deny tenant access to the entire `/multitenant_alertmanager/*` path prefix at their authenticating gateway/reverse-proxy, and only forward it from trusted operator networks. The endpoint is registered with auth=true (so the AuthMiddleware is applied), but note that Cortex's AuthMiddleware only extracts the caller-supplied `X-Scope-OrgID` header and does not itself authenticate the caller; see [Authentication and Authorisation](../guides/authentication-and-authorisation.md). The admin prefix must therefore be blocked externally rather than relied on being authenticated by Cortex itself.
+
+This endpoint returns a YAML dictionary with all the Alertmanager configurations and `200` status code on success.
 
 ### Alertmanager ring status
 
