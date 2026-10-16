@@ -3181,8 +3181,10 @@ func Test_Ingester_AllUserStats(t *testing.T) {
 		db.ingestedRuleSamples.Tick()
 	}
 
-	// Get label names
-	res, err := i.AllUserStats(context.Background(), &client.UserStatsRequest{})
+	// Get label names. Use the reserved operator sentinel so AllUserStats
+	// returns the cross-tenant aggregation; a regular tenant caller is now
+	// scoped to its own stats.
+	res, err := i.AllUserStats(user.InjectOrgID(context.Background(), client.OperatorOrgID), &client.UserStatsRequest{})
 	require.NoError(t, err)
 
 	expect := []*client.UserIDStatsResponse{

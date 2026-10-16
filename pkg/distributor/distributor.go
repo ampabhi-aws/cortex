@@ -1206,7 +1206,11 @@ func (d *Distributor) AllUserStats(ctx context.Context) ([]UserIDStats, error) {
 	perUserTotals := make(map[string]UserStats)
 
 	req := &ingester_client.UserStatsRequest{}
-	ctx = user.InjectOrgID(ctx, "1") // fake: ingester insists on having an org ID
+	// Present the reserved operator sentinel: the ingester gates the cross-
+	// tenant fan-out behind this value so a tenant that could set its own
+	// X-Scope-OrgID cannot enumerate co-tenants. Operators remain responsible
+	// for restricting the admin endpoints that reach this call path.
+	ctx = user.InjectOrgID(ctx, ingester_client.OperatorOrgID)
 	// Not using d.ForReplicationSet(), so we can fail after first error.
 	replicationSet, err := d.ingestersRing.GetAllHealthy(ring.Read)
 	if err != nil {

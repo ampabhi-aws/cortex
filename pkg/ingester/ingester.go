@@ -1556,9 +1556,18 @@ func (i *Ingester) UserStats(ctx context.Context, req *client.UserStatsRequest) 
 	return createUserStats(db), nil
 }
 
-// AllUserStats returns ingestion statistics for all users known to this ingester.
-func (i *Ingester) AllUserStats(_ context.Context, _ *client.UserStatsRequest) (*client.UsersStatsResponse, error) {
+// AllUserStats returns ingestion statistics for all users known to this
+// ingester when invoked by an operator (X-Scope-OrgID == client.OperatorOrgID),
+// or only the stats for the calling tenant otherwise. The historical
+// behaviour of returning every tenant's stats to any caller leaked tenant
+// IDs and ingestion volumes across the multi-tenant boundary.
+func (i *Ingester) AllUserStats(ctx context.Context, _ *client.UserStatsRequest) (*client.UsersStatsResponse, error) {
 	if err := i.checkRunning(); err != nil {
+		return nil, err
+	}
+
+	userID, err := tenant.TenantID(ctx)
+	if err != nil {
 		return nil, err
 	}
 
@@ -1566,6 +1575,21 @@ func (i *Ingester) AllUserStats(_ context.Context, _ *client.UserStatsRequest) (
 	defer i.stoppedMtx.RUnlock()
 
 	users := i.TSDBState.dbs
+
+	// Non-operator callers only see their own stats, preserving the response
+	// shape ([]*UserIDStatsResponse) that existing clients expect.
+	if userID != client.OperatorOrgID {
+		response := &client.UsersStatsResponse{
+			Stats: make([]*client.UserIDStatsResponse, 0, 1),
+		}
+		if db, ok := users[userID]; ok {
+			response.Stats = append(response.Stats, &client.UserIDStatsResponse{
+				UserId: userID,
+				Data:   createUserStats(db),
+			})
+		}
+		return response, nil
+	}
 
 	response := &client.UsersStatsResponse{
 		Stats: make([]*client.UserIDStatsResponse, 0, len(users)),
