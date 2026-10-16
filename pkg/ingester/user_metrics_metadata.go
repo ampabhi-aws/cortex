@@ -85,10 +85,19 @@ func (mm *userMetricsMetadata) purge(deadline time.Time) {
 func (mm *userMetricsMetadata) toClientMetadata() []*cortexpb.MetricMetadata {
 	mm.mtx.RLock()
 	defer mm.mtx.RUnlock()
-	r := make([]*cortexpb.MetricMetadata, 0, len(mm.metricToMetadata))
+	total := 0
+	for _, set := range mm.metricToMetadata {
+		total += len(set)
+	}
+	r := make([]*cortexpb.MetricMetadata, 0, total)
 	for _, set := range mm.metricToMetadata {
 		for m := range set {
-			r = append(r, &m)
+			// Take a per-iteration copy of the map key. Pre-Go-1.22 range
+			// semantics reuse the same loop variable across iterations, so
+			// appending &m directly would make every pointer in this inner
+			// loop alias the last-iterated record.
+			md := m
+			r = append(r, &md)
 		}
 	}
 	return r
