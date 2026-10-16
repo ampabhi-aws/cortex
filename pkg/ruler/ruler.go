@@ -860,13 +860,30 @@ func (r *Ruler) DeleteTenantConfiguration(w http.ResponseWriter, req *http.Reque
 	w.WriteHeader(http.StatusOK)
 }
 
+// ListAllRules returns the rule groups owned by the tenant resolved from the
+// request context. The handler used to enumerate every tenant in the rule
+// store and stream their rule groups back without any authentication, which
+// disclosed cross-tenant data when the route was reachable from the shared
+// tenant-facing listener. The endpoint is now tenant-scoped: it requires
+// X-Scope-OrgID (enforced by the auth middleware registered on the route)
+// and only returns the caller's own rule groups, preserving the historical
+// `map[userID]map[namespace][]rulefmt.RuleGroup` response shape with a
+// single top-level key.
 func (r *Ruler) ListAllRules(w http.ResponseWriter, req *http.Request) {
 	logger := util_log.WithContext(req.Context(), r.logger)
 
-	userIDs, err := r.store.ListAllUsers(req.Context())
+	userID, err := tenant.TenantID(req.Context())
 	if err != nil {
-		level.Error(logger).Log("msg", errListAllUser, "err", err)
-		http.Error(w, fmt.Sprintf("%s: %s", errListAllUser, err.Error()), http.StatusInternalServerError)
+		// Mirror DeleteTenantConfiguration: the auth middleware already returns
+		// 401 when X-Scope-OrgID is missing; we respond the same way for
+		// consistency if the handler is reached without a tenant in context.
+		http.Error(w, err.Error(), http.StatusUnauthorized)
+		return
+	}
+
+	if !r.allowedTenants.IsAllowed(userID) {
+		level.Warn(logger).Log("msg", "ListAllRules: tenant is not allowed", "user", userID)
+		http.Error(w, "tenant is not allowed", http.StatusForbidden)
 		return
 	}
 
@@ -878,7 +895,7 @@ func (r *Ruler) ListAllRules(w http.ResponseWriter, req *http.Request) {
 		close(done)
 	}()
 
-	err = concurrency.ForEachUser(req.Context(), userIDs, fetchRulesConcurrency, func(ctx context.Context, userID string) error {
+	err = concurrency.ForEachUser(req.Context(), []string{userID}, fetchRulesConcurrency, func(ctx context.Context, userID string) error {
 		rg, err := r.store.ListRuleGroupsForUserAndNamespace(ctx, userID, "")
 		if err != nil {
 			return errors.Wrapf(err, "failed to fetch ruler config for user %s", userID)
@@ -897,7 +914,7 @@ func (r *Ruler) ListAllRules(w http.ResponseWriter, req *http.Request) {
 		return nil
 	})
 	if err != nil {
-		level.Error(logger).Log("msg", "failed to list all ruler configs", "err", err)
+		level.Error(logger).Log("msg", "failed to list tenant ruler configs", "user", userID, "err", err)
 	}
 	close(iter)
 	<-done
