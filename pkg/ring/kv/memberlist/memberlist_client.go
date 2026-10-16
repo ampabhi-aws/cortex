@@ -28,6 +28,16 @@ import (
 const (
 	maxCasRetries              = 10          // max retries in CAS operation
 	noChangeDetectedRetrySleep = time.Second // how long to sleep after no change was detected in CAS
+
+	// maxKVPayloadSize bounds the size of a single KV value we are willing to
+	// accept from a gossip peer before handing it to the codec. The gossip
+	// transport is unauthenticated by default and feeds attacker-controlled
+	// bytes straight into a snappy/proto decoder; without this bound a tiny
+	// crafted message can drive an arbitrarily large heap allocation inside
+	// the codec (CWE-770 "decompression bomb"). The value is intentionally
+	// larger than any legitimate ring descriptor but well below the
+	// attacker-reachable ~4 GiB snappy limit, and matches codec.MaxDecodedSize.
+	maxKVPayloadSize = codec.MaxDecodedSize
 )
 
 // Client implements kv.Client interface, by using memberlist.KV
@@ -1137,6 +1147,11 @@ func (m *KV) MergeRemoteState(data []byte, join bool) {
 
 		data = data[4:]
 
+		if kvPairLength > maxKVPayloadSize {
+			err = fmt.Errorf("KV Pair length %d exceeds maximum accepted size %d", kvPairLength, maxKVPayloadSize)
+			break
+		}
+
 		if len(data) < int(kvPairLength) {
 			err = fmt.Errorf("not enough data left for next KV Pair, expected %d, remaining %d bytes", kvPairLength, len(data))
 			break
@@ -1187,6 +1202,15 @@ func (m *KV) MergeRemoteState(data []byte, join bool) {
 }
 
 func (m *KV) mergeBytesValueForKey(key string, incomingData []byte, codec codec.Codec) (Mergeable, uint, error) {
+	// Cap the per-pair payload we are willing to decode. The gossip path
+	// (NotifyMsg / MergeRemoteState) hands us bytes that originate from a
+	// peer and are fed straight into the codec. Without this bound a single
+	// peer can request an arbitrarily large allocation inside the codec
+	// (CWE-770). The cap is intentionally larger than any legitimate ring
+	// descriptor but well below the attacker-reachable ~4 GiB snappy limit.
+	if len(incomingData) > maxKVPayloadSize {
+		return nil, 0, fmt.Errorf("received KV value for key %q is too large: %d bytes (max %d)", key, len(incomingData), maxKVPayloadSize)
+	}
 	decodedValue, err := codec.Decode(incomingData)
 	if err != nil {
 		return nil, 0, fmt.Errorf("failed to decode value: %v", err)
