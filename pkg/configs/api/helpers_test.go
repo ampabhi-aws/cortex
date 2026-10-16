@@ -24,6 +24,8 @@ var (
 	counter  int
 )
 
+const testPrivateAuthToken = "test-private-token"
+
 // setup sets up the environment for the tests.
 func setup(t *testing.T) {
 	database = dbtest.Setup(t)
@@ -31,6 +33,7 @@ func setup(t *testing.T) {
 		Notifications: NotificationsConfig{
 			DisableEmail: true,
 		},
+		PrivateAuthToken: testPrivateAuthToken,
 	})
 	counter = 0
 }
@@ -42,6 +45,7 @@ func setupWithEmailEnabled(t *testing.T) {
 		Notifications: NotificationsConfig{
 			DisableEmail: false,
 		},
+		PrivateAuthToken: testPrivateAuthToken,
 	})
 	counter = 0
 }
@@ -56,6 +60,17 @@ func request(t *testing.T, method, urlStr string, body io.Reader) *httptest.Resp
 	w := httptest.NewRecorder()
 	r, err := http.NewRequest(method, urlStr, body)
 	require.NoError(t, err)
+	app.ServeHTTP(w, r)
+	return w
+}
+
+// requestPrivate makes a request to the configs API attaching the shared
+// service credential required by the cross-tenant `/private/...` endpoints.
+func requestPrivate(t *testing.T, method, urlStr string, body io.Reader) *httptest.ResponseRecorder {
+	w := httptest.NewRecorder()
+	r, err := http.NewRequest(method, urlStr, body)
+	require.NoError(t, err)
+	r.Header.Set("Authorization", "Bearer "+testPrivateAuthToken)
 	app.ServeHTTP(w, r)
 	return w
 }
