@@ -72,7 +72,10 @@ func newReplicatedStates(userID string, rf int, re Replicator, st alertstore.Ale
 		replicator:        re,
 		store:             st,
 		states:            make(map[string]cluster.State, 2), // we use two, one for the notifications and one for silences.
-		msgc:              make(chan *clusterpb.Part),
+		// msgc is buffered so that broadcast() cannot block the Alertmanager's
+		// silence or notification-log mutex when the running loop is slow,
+		// stopping, or has already exited.
+		msgc:              make(chan *clusterpb.Part, 128),
 		reg:               r,
 		settleReadTimeout: defaultSettleReadTimeout,
 		storeReadTimeout:  defaultStoreReadTimeout,
@@ -244,12 +247,39 @@ func (s *state) starting(ctx context.Context) error {
 }
 
 // WaitReady is needed for the pipeline builder to know whenever we've settled and the state is up to date.
+//
+// When the replication factor is <= 1 there is no replication to wait for, so
+// a replication service that has already left Running (for example because it
+// was stopped) is treated as "ready enough" to keep the notification pipeline
+// functioning. For replication factors > 1 we still require the service to
+// actually reach Running so that peer state has been settled before
+// notifications are dispatched.
 func (s *state) WaitReady(ctx context.Context) error {
-	return s.Service.AwaitRunning(ctx)
+	err := s.Service.AwaitRunning(ctx)
+	if err != nil && s.replicationFactor <= 1 && isTerminalState(s.Service.State()) {
+		return nil
+	}
+	return err
 }
 
 func (s *state) Ready() bool {
-	return s.Service.State() == services.Running
+	st := s.Service.State()
+	if st == services.Running {
+		return true
+	}
+	// When the replication factor is <= 1, a service that has already left
+	// Running (Stopping/Terminated) is still "ready enough" for the
+	// notification pipeline, since nothing needs to be replicated anyway.
+	if s.replicationFactor <= 1 && (st == services.Stopping || st == services.Terminated) {
+		return true
+	}
+	return false
+}
+
+// isTerminalState reports whether the service has transitioned past Running
+// into a non-recoverable state.
+func isTerminalState(st services.State) bool {
+	return st == services.Stopping || st == services.Terminated || st == services.Failed
 }
 
 // mergeFullStates attempts to merge all full states received from peers during settling.
@@ -280,9 +310,14 @@ func (s *state) running(ctx context.Context) error {
 	for {
 		select {
 		case p := <-s.msgc:
-			// If the replication factor is <= 1, we don't need to replicate any state anywhere else.
+			// If the replication factor is <= 1, we don't need to replicate any
+			// state anywhere else. We must keep draining the channel (rather
+			// than terminating this service) so that:
+			//   1. broadcast() senders are never left blocked, and
+			//   2. the service stays Running, so WaitReady on the notification
+			//      pipeline's cluster peer keeps succeeding.
 			if s.replicationFactor <= 1 {
-				return nil
+				continue
 			}
 
 			s.stateReplicationTotal.WithLabelValues(p.Key).Inc()
@@ -297,9 +332,30 @@ func (s *state) running(ctx context.Context) error {
 }
 
 func (s *state) broadcast(key string, b []byte) {
+	// There is nothing to replicate when the replication factor is <= 1, so
+	// avoid even enqueueing the message. This also guarantees we never block
+	// the Alertmanager's silence or notification-log mutex on a channel send
+	// in the single-replica configuration.
+	if s.replicationFactor <= 1 {
+		return
+	}
+
 	// We should ignore the Merges into the initial state during settling.
-	if s.Ready() {
-		s.msgc <- &clusterpb.Part{Key: key, Data: b}
+	if !s.Ready() {
+		return
+	}
+
+	// Perform a non-blocking send: broadcast is called while the
+	// Alertmanager silence/notification-log mutex is held, so a blocking send
+	// on msgc would wedge every tenant request that touches those mutexes if
+	// the running loop is slow or stopped. Drop the message rather than
+	// block.
+	part := &clusterpb.Part{Key: key, Data: b}
+	select {
+	case s.msgc <- part:
+	default:
+		s.stateReplicationFailed.WithLabelValues(key).Inc()
+		level.Warn(s.logger).Log("msg", "dropping state broadcast; replication channel full or stopped", "user", s.userID, "key", key)
 	}
 }
 
