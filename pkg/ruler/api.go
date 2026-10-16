@@ -2,6 +2,7 @@ package ruler
 
 import (
 	"encoding/json"
+	"fmt"
 	io "io"
 	"net/http"
 	"net/url"
@@ -447,14 +448,33 @@ func (a *API) CreateRuleGroup(w http.ResponseWriter, req *http.Request) {
 		return
 	}
 
-	payload, err := io.ReadAll(req.Body)
+	// Bound the rule-group payload before buffering it in memory, so that a tenant
+	// cannot drive the shared ruler process into memory exhaustion by posting an
+	// arbitrarily large YAML document. This mirrors the sibling Alertmanager
+	// config-upload path (pkg/alertmanager/api.go).
+	var input io.Reader = req.Body
+	maxRuleGroupSize := a.ruler.limits.RulerMaxRuleGroupSizeBytes(userID)
+	if maxRuleGroupSize > 0 {
+		// LimitReader will return EOF after reading specified number of bytes. To check if
+		// we have read too many bytes, allow one extra byte.
+		input = io.LimitReader(req.Body, int64(maxRuleGroupSize)+1)
+	}
+
+	payload, err := io.ReadAll(input)
 	if err != nil {
 		level.Error(logger).Log("msg", "unable to read rule group payload", "err", err.Error())
 		http.Error(w, err.Error(), http.StatusBadRequest)
 		return
 	}
 
-	level.Debug(logger).Log("msg", "attempting to unmarshal rulegroup", "userID", userID, "group", string(payload))
+	if maxRuleGroupSize > 0 && len(payload) > maxRuleGroupSize {
+		msg := fmt.Sprintf("rule group too big: payload size exceeds limit of %d bytes", maxRuleGroupSize)
+		level.Warn(logger).Log("msg", msg, "user", userID)
+		http.Error(w, msg, http.StatusBadRequest)
+		return
+	}
+
+	level.Debug(logger).Log("msg", "attempting to unmarshal rulegroup", "userID", userID, "payload_bytes", len(payload))
 
 	rg := rulefmt.RuleGroup{}
 	err = yaml.Unmarshal(payload, &rg)
