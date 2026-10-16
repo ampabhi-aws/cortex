@@ -288,7 +288,22 @@ var (
 	ErrNoRuleGroups = errors.New("no rule groups found")
 	// ErrBadRuleGroup is returned when the provided rule group can not be unmarshalled
 	ErrBadRuleGroup = errors.New("unable to decoded rule group")
+	// ErrInvalidNamespace signals that the namespace in the request is invalid (e.g. '.', '..', or contains a path separator).
+	ErrInvalidNamespace = errors.New("invalid namespace: must not be '.', '..', or contain a path separator")
+	// ErrInvalidGroupName signals that the group name in the request is invalid (e.g. '.', '..', or contains a path separator).
+	ErrInvalidGroupName = errors.New("invalid group name: must not be '.', '..', or contain a path separator")
 )
+
+// containsUnsafePathSegments returns true if the given string is a directory
+// reference like `.` or `..`, or if it contains any path separator character
+// like `/` or `\`. It is used to reject rule namespaces and group names that
+// could escape (or alias) the per-tenant rule directory on disk.
+func containsUnsafePathSegments(id string) bool {
+	if id == "." || id == ".." {
+		return true
+	}
+	return strings.ContainsAny(id, "\\/")
+}
 
 func marshalAndSend(output interface{}, w http.ResponseWriter, logger log.Logger) {
 	d, err := yaml.Marshal(&output)
@@ -336,6 +351,10 @@ func parseNamespace(params map[string]string) (string, error) {
 		return "", err
 	}
 
+	if containsUnsafePathSegments(namespace) {
+		return "", ErrInvalidNamespace
+	}
+
 	return namespace, nil
 }
 
@@ -350,6 +369,10 @@ func parseGroupName(params map[string]string) (string, error) {
 	groupName, err := url.PathUnescape(groupName)
 	if err != nil {
 		return "", err
+	}
+
+	if containsUnsafePathSegments(groupName) {
+		return "", ErrInvalidGroupName
 	}
 
 	return groupName, nil
