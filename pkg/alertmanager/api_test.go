@@ -5,8 +5,14 @@ import (
 	"context"
 	"fmt"
 	"io"
+	"io/fs"
 	"net/http"
 	"net/http/httptest"
+	"os"
+	"path/filepath"
+	"regexp"
+	"sort"
+	"strings"
 	"testing"
 
 	"github.com/go-kit/log"
@@ -419,6 +425,33 @@ alertmanager_config: |
 			err: errors.Wrap(errVictorOpsAPIKeyFileNotAllowed, "error validating Alertmanager config"),
 		},
 		{
+			name: "Should return error if OpsGenie receiver api_key_file is set",
+			cfg: `
+alertmanager_config: |
+  receivers:
+    - name: default-receiver
+      opsgenie_configs:
+        - api_key_file: /var/run/secrets/kubernetes.io/serviceaccount/token
+
+  route:
+    receiver: 'default-receiver'
+`,
+			err: errors.Wrap(errOpsGenieAPIKeyFileNotAllowed, "error validating Alertmanager config"),
+		},
+		{
+			name: "Should return error if global opsgenie_api_key_file is set",
+			cfg: `
+alertmanager_config: |
+  global:
+    opsgenie_api_key_file: /var/run/secrets/kubernetes.io/serviceaccount/token
+  receivers:
+    - name: default-receiver
+  route:
+    receiver: 'default-receiver'
+`,
+			err: errors.Wrap(errOpsGenieAPIKeyFileNotAllowed, "error validating Alertmanager config"),
+		},
+		{
 			name: "should return error if template is wrong",
 			cfg: `
 alertmanager_config: |
@@ -793,4 +826,123 @@ func TestValidateAlertmanagerConfig(t *testing.T) {
 			assert.ErrorIs(t, err, testData.expected)
 		})
 	}
+}
+
+// knownVendorFileYAMLTags enumerates the set of YAML tag base names (the part
+// before the first comma) for every struct field in the vendored
+// prometheus/alertmanager and prometheus/common config packages whose YAML tag
+// ends with "_file". It is kept in sync by TestVendorFileYAMLTagsEnumeration
+// below: adding a new *_file field in a vendored upgrade without also updating
+// this list -- and the specific validators / allowlist in api.go -- will fail
+// the build, which is the whole point: a hand-maintained denylist silently
+// fails open on every upstream Alertmanager upgrade, so this test converts
+// "you forgot to block this" into "the build is red".
+var knownVendorFileYAMLTags = []string{
+	// prometheus/common HTTPClientConfig & TLSConfig
+	"bearer_token_file",
+	"ca_file",
+	"cert_file",
+	"client_secret_file",
+	"credentials_file",
+	"key_file",
+	"password_file",
+	// prometheus/alertmanager Global, Slack, OpsGenie, VictorOps
+	"api_key_file",     // OpsGenieConfig.APIKeyFile and VictorOpsConfig.APIKeyFile
+	"api_url_file",     // SlackConfig.APIURLFile
+	"opsgenie_api_key_file",
+	"slack_api_url_file",
+}
+
+// TestVendorFileYAMLTagsEnumeration enumerates every struct-field YAML tag
+// ending in "_file" declared under the vendored prometheus/alertmanager and
+// prometheus/common config packages and asserts the set exactly matches
+// knownVendorFileYAMLTags. If this test fails after a vendor refresh, the
+// upstream has added a new *_file field: review it, extend the specific
+// validators (or allowedFileYAMLTags in api.go) accordingly, and only then
+// update knownVendorFileYAMLTags. The deny-by-default fallback in
+// validateAlertmanagerConfig means an un-enumerated field is already rejected
+// at runtime -- this test exists so the regression is caught at build time.
+func TestVendorFileYAMLTagsEnumeration(t *testing.T) {
+	roots := []string{
+		filepath.FromSlash("../../vendor/github.com/prometheus/alertmanager/config"),
+		filepath.FromSlash("../../vendor/github.com/prometheus/common/config"),
+	}
+
+	// Match a struct-tag YAML entry of the form `yaml:"<name>[,opts]"` whose
+	// base name ends with "_file". We intentionally use a simple regex over
+	// the raw source rather than go/parser so this test does not depend on
+	// a specific Go toolchain or build tags.
+	tagRE := regexp.MustCompile("yaml:\"([A-Za-z0-9_]*_file)(?:,[^\"]*)?\"")
+
+	found := map[string]struct{}{}
+	for _, root := range roots {
+		err := filepath.WalkDir(root, func(path string, d fs.DirEntry, err error) error {
+			if err != nil {
+				return err
+			}
+			if d.IsDir() || !strings.HasSuffix(path, ".go") || strings.HasSuffix(path, "_test.go") {
+				return nil
+			}
+			data, err := readFileLimited(path)
+			if err != nil {
+				return err
+			}
+			for _, m := range tagRE.FindAllStringSubmatch(data, -1) {
+				found[m[1]] = struct{}{}
+			}
+			return nil
+		})
+		require.NoErrorf(t, err, "walking vendor root %q", root)
+	}
+
+	foundList := make([]string, 0, len(found))
+	for name := range found {
+		foundList = append(foundList, name)
+	}
+	sort.Strings(foundList)
+
+	expected := append([]string(nil), knownVendorFileYAMLTags...)
+	sort.Strings(expected)
+	// Dedup: knownVendorFileYAMLTags intentionally lists api_key_file once
+	// even though two upstream types share it.
+	dedup := expected[:0]
+	for i, v := range expected {
+		if i == 0 || v != expected[i-1] {
+			dedup = append(dedup, v)
+		}
+	}
+
+	assert.Equal(t, dedup, foundList,
+		"vendored *_file YAML tags changed. Review every new tag: either reject "+
+			"it with a specific validator (preferred) or add it to "+
+			"allowedFileYAMLTags with a justification, then update "+
+			"knownVendorFileYAMLTags.")
+
+	// Additionally verify the deny-by-default fallback actually rejects a
+	// synthetic struct that uses an un-allowlisted *_file YAML tag. This
+	// guards against someone accidentally emptying allowedFileYAMLTags of
+	// its deny semantics.
+	type syntheticConfig struct {
+		CustomSecretFile string `yaml:"custom_secret_file"`
+	}
+	err := validateAlertmanagerConfig(syntheticConfig{CustomSecretFile: "/etc/shadow"})
+	require.Error(t, err, "deny-by-default must reject un-allowlisted *_file fields")
+	assert.ErrorIs(t, err, errFileFieldNotAllowed)
+}
+
+// readFileLimited reads a file, bounded at a generous size to keep this test
+// well-behaved against unexpectedly large vendored sources.
+func readFileLimited(path string) (string, error) {
+	f, err := os.Open(path)
+	if err != nil {
+		return "", err
+	}
+	defer f.Close()
+	const maxBytes = 4 << 20
+	var buf bytes.Buffer
+	_, err = io.Copy(&buf, io.LimitReader(f, maxBytes))
+	if err != nil {
+		return "", err
+	}
+	return buf.String(), nil
 }
