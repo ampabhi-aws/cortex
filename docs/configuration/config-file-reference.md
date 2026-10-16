@@ -1041,9 +1041,11 @@ results_cache:
     # CLI flag: -frontend.cache.enable-fifocache
     [enable_fifocache: <boolean> | default = false]
 
-    # The default validity of entries for caches unless overridden.
+    # The default validity of entries for caches unless overridden. Set to 0
+    # to disable the default TTL (not recommended, since cached tenant data
+    # would then only be evicted by LRU and would outlive tenant deletions).
     # CLI flag: -frontend.default-validity
-    [default_validity: <duration> | default = 0s]
+    [default_validity: <duration> | default = 24h]
 
     background:
       # At what concurrency to write back to cache.

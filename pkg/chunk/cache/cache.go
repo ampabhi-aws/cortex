@@ -51,7 +51,11 @@ func (cfg *Config) RegisterFlagsWithPrefix(prefix string, description string, f 
 	cfg.Fifocache.RegisterFlagsWithPrefix(prefix, description, f)
 
 	f.BoolVar(&cfg.EnableFifoCache, prefix+"cache.enable-fifocache", false, description+"Enable in-memory cache.")
-	f.DurationVar(&cfg.DefaultValidity, prefix+"default-validity", 0, description+"The default validity of entries for caches unless overridden.")
+	// Default to a bounded TTL so that tenant data cached by the query-frontend
+	// results cache cannot outlive a tenant deletion indefinitely (no gen-number
+	// invalidation path exists for the blocks storage results cache). Operators
+	// can still opt out explicitly by setting this flag to 0.
+	f.DurationVar(&cfg.DefaultValidity, prefix+"default-validity", 24*time.Hour, description+"The default validity of entries for caches unless overridden. Set to 0 to disable the default TTL (not recommended, since cached tenant data would then only be evicted by LRU and would outlive tenant deletions).")
 
 	cfg.Prefix = prefix
 }
