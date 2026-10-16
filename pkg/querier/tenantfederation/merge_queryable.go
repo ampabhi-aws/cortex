@@ -322,8 +322,17 @@ func (m *mergeQuerier) Select(sortSeries bool, hints *storage.SelectHints, match
 		if !ok {
 			return fmt.Errorf("unexpected type %T", jobIntf)
 		}
+		// Give each per-tenant querier its own copy of the SelectHints so that
+		// per-tenant clamping (e.g. max_query_lookback / max_query_into_future)
+		// does not race with, or leak into, other tenants' queries sharing the
+		// same hints pointer handed to us by the PromQL engine.
+		var jobHints *storage.SelectHints
+		if hints != nil {
+			h := *hints
+			jobHints = &h
+		}
 		seriesSets[job.pos] = &addLabelsSeriesSet{
-			upstream: job.querier.Select(sortSeries, hints, filteredMatchers...),
+			upstream: job.querier.Select(sortSeries, jobHints, filteredMatchers...),
 			labels: labels.Labels{
 				{
 					Name:  m.idLabelName,

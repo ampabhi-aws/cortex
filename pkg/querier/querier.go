@@ -308,6 +308,13 @@ func (q querier) Select(sortSeries bool, sp *storage.SelectHints, matchers ...*l
 		// In this case, the query time range has already been validated when the querier has been
 		// created.
 		return q.metadataQuerier.Select(true, sp, matchers...)
+	} else {
+		// Work on a local copy of the caller-provided hints so that per-tenant
+		// clamping below does not mutate state shared with other callers (for
+		// example the single *storage.SelectHints that tenant-federation's
+		// mergeQuerier may fan out across concurrent per-tenant queriers).
+		spCopy := *sp
+		sp = &spCopy
 	}
 
 	userID, err := tenant.TenantID(ctx)
@@ -326,7 +333,7 @@ func (q querier) Select(sortSeries bool, sp *storage.SelectHints, matchers ...*l
 	}
 
 	// The time range may have been manipulated during the validation,
-	// so we make sure changes are reflected back to hints.
+	// so we make sure changes are reflected back to hints (local copy).
 	sp.Start = startMs
 	sp.End = endMs
 
