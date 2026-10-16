@@ -797,6 +797,8 @@ POST /purger/delete_tenant
 
 Request deletion of ALL tenant data. Only works with blocks storage. Experimental.
 
+Tenant deletion is destructive and irreversible. By default (`-purger.enable-tenant-deletion=false`) this endpoint refuses to delete the caller's own tenant: an operator must either enable the flag deliberately or expose the endpoint on an admin-scoped path that supplies the target tenant via the `tenant` request parameter (so the identity of the caller is distinct from the tenant being destroyed). The caller principal is captured in the audit log in addition to the target tenant.
+
 _Requires [authentication](#authentication)._
 
 ### Tenant Delete Status
