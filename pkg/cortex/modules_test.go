@@ -4,6 +4,7 @@ import (
 	"context"
 	"net/http/httptest"
 	"os"
+	"strings"
 	"testing"
 
 	"github.com/gorilla/mux"
@@ -11,8 +12,10 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	"github.com/weaveworks/common/server"
+	yaml "gopkg.in/yaml.v2"
 
 	"github.com/cortexproject/cortex/pkg/cortexpb"
+	"github.com/cortexproject/cortex/pkg/util/flagext"
 )
 
 func changeTargetConfig(c *Config) {
@@ -231,4 +234,39 @@ func Test_setupModuleManager(t *testing.T) {
 			}
 		}
 	}
+}
+
+// TestConfigYAMLSecretsRedacted verifies that credential-bearing fields are
+// masked by yaml.Marshal (as served by GET /config). Any secret flag added to
+// the config must use flagext.Secret so its MarshalYAML emits "********"
+// rather than the plaintext value.
+func TestConfigYAMLSecretsRedacted(t *testing.T) {
+	const (
+		swiftPwd        = "swift-plain-text-password"
+		etcdPwd         = "etcd-plain-text-password"
+		basicAuthPwd    = "ruler-am-plain-text-password"
+		configsURI      = "postgres://user:configs-uri-plain-text-password@db/configs"
+		configsPwdFile  = "/etc/configs/db-password-file"
+	)
+
+	cfg := newDefaultConfig()
+	// Blocks storage uses bucket.Config, which embeds swift.Config.
+	cfg.BlocksStorage.Bucket.Swift.Password = flagext.Secret{Value: swiftPwd}
+	// The ingester ring uses kv.Config, which embeds etcd.Config.
+	cfg.Ingester.LifecyclerConfig.RingConfig.KVStore.Etcd.Password = flagext.Secret{Value: etcdPwd}
+	// Ruler Alertmanager notifier basic auth, via util.BasicAuth.
+	cfg.Ruler.Notifier.BasicAuth.Password = flagext.Secret{Value: basicAuthPwd}
+	// Configs database DSN and password file.
+	cfg.Configs.DB.URI = flagext.Secret{Value: configsURI}
+	cfg.Configs.DB.PasswordFile = flagext.Secret{Value: configsPwdFile}
+
+	out, err := yaml.Marshal(cfg)
+	require.NoError(t, err)
+	body := string(out)
+
+	for _, plaintext := range []string{swiftPwd, etcdPwd, basicAuthPwd, configsURI, configsPwdFile} {
+		assert.NotContainsf(t, body, plaintext, "plaintext secret leaked in marshalled config: %q", plaintext)
+	}
+	// Must see the masked marker at least once.
+	assert.True(t, strings.Contains(body, "********"), "expected redacted marker in marshalled config")
 }
