@@ -25,12 +25,11 @@ The following character sets are generally **safe for use in the tenant ID**:
   - Hyphen (`-`)
   - Underscore (`_`)
   - Single Period (`.`), but the tenant IDs `.` and `..` is considered invalid
-  - Asterisk (`*`)
   - Single quote (`'`)
   - Open parenthesis (`(`)
   - Close parenthesis (`)`)
 
-All other characters are not safe to use. In particular, slashes `/` and whitespaces (` `) are **not supported**.
+All other characters are not safe to use. In particular, slashes `/` and whitespaces (` `) are **not supported**. The glob metacharacters (`*`, `?`, `[`, `]`) are also **not supported** because tenant IDs are used as filesystem path components and would otherwise be expanded by `filepath.Glob` at the Alertmanager template layer.
 
 ### Length
 

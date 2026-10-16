@@ -310,14 +310,26 @@ func clusterWait(position func() int, timeout time.Duration) func() time.Duratio
 
 // ApplyConfig applies a new configuration to an Alertmanager.
 func (am *Alertmanager) ApplyConfig(userID string, conf *config.Config, rawCfg string) error {
+	// The per-tenant template directory is derived from the tenant ID and may
+	// in principle contain filesystem glob metacharacters. We MUST NOT let
+	// template.FromGlobs expand the directory component as a glob pattern
+	// (that would allow one tenant's Alertmanager to parse template files
+	// belonging to other tenants). We escape the directory component with
+	// filepath.QuoteMeta so that only literal matches are returned by
+	// filepath.Glob.
+	tenantTemplateDir := filepath.Join(am.cfg.TenantDataDir, templatesDir)
+	quotedTenantTemplateDir := filepath.QuoteMeta(tenantTemplateDir)
+
 	templateFiles := make([]string, len(conf.Templates))
 	for i, t := range conf.Templates {
-		templateFilepath, err := safeTemplateFilepath(filepath.Join(am.cfg.TenantDataDir, templatesDir), t)
-		if err != nil {
+		// safeTemplateFilepath enforces that t is a bare filename and does not
+		// contain glob metacharacters, so appending it to the quoted directory
+		// produces a literal filesystem path.
+		if _, err := safeTemplateFilepath(tenantTemplateDir, t); err != nil {
 			return err
 		}
 
-		templateFiles[i] = templateFilepath
+		templateFiles[i] = quotedTenantTemplateDir + string(filepath.Separator) + t
 	}
 
 	tmpl, err := template.FromGlobs(templateFiles...)

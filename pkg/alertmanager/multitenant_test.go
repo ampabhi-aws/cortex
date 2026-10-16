@@ -1968,6 +1968,26 @@ func TestSafeTemplateFilepath(t *testing.T) {
 			template:    "../test.tmpl",
 			expectedErr: errors.New(`invalid template name "../test.tmpl": the template filepath is escaping the per-tenant local directory`),
 		},
+		"should fail if the provided template is a glob pattern": {
+			dir:         "/data/tenant",
+			template:    "*.tmpl",
+			expectedErr: errors.New(`invalid template name "*.tmpl": the template name cannot contain glob metacharacters`),
+		},
+		"should fail if the provided template contains a question mark": {
+			dir:         "/data/tenant",
+			template:    "foo?.tmpl",
+			expectedErr: errors.New(`invalid template name "foo?.tmpl": the template name cannot contain glob metacharacters`),
+		},
+		"should fail if the provided template contains a character class": {
+			dir:         "/data/tenant",
+			template:    "foo[a].tmpl",
+			expectedErr: errors.New(`invalid template name "foo[a].tmpl": the template name cannot contain glob metacharacters`),
+		},
+		"should fail if the dir is a prefix of a sibling directory": {
+			dir:         "/data/tenant",
+			template:    "../tenant-evil/x.tmpl",
+			expectedErr: errors.New(`invalid template name "../tenant-evil/x.tmpl": the template filepath is escaping the per-tenant local directory`),
+		},
 	}
 
 	for testName, testData := range tests {

@@ -1304,6 +1304,14 @@ func validateTemplateFilename(filename string) error {
 		return fmt.Errorf("invalid template name %q: the template name cannot contain any path", filename)
 	}
 
+	// Reject filesystem glob metacharacters in the template name. The template
+	// path is passed to template.FromGlobs which runs filepath.Glob, so any
+	// metacharacter in the final path would be expanded and could match files
+	// belonging to other tenants.
+	if strings.ContainsAny(filename, "*?[]") {
+		return fmt.Errorf("invalid template name %q: the template name cannot contain glob metacharacters", filename)
+	}
+
 	return nil
 }
 
@@ -1311,6 +1319,14 @@ func validateTemplateFilename(filename string) error {
 // This function also performs a security check to make sure the provided templateName
 // doesn't contain a relative path escaping the provided dir.
 func safeTemplateFilepath(dir, templateName string) (string, error) {
+	// Reject any glob metacharacter in the template name. The returned path is
+	// ultimately handed to filepath.Glob (via template.FromGlobs); even if a
+	// metacharacter would stay inside the containing directory, it must not be
+	// interpreted as a pattern.
+	if strings.ContainsAny(templateName, "*?[]") {
+		return "", fmt.Errorf("invalid template name %q: the template name cannot contain glob metacharacters", templateName)
+	}
+
 	// We expect all template files to be stored and referenced within the provided directory.
 	containerDir, err := filepath.Abs(dir)
 	if err != nil {
@@ -1323,10 +1339,12 @@ func safeTemplateFilepath(dir, templateName string) (string, error) {
 		return "", err
 	}
 
-	// Ensure the actual path of the template is within the expected directory.
-	// This check is a counter-measure to make sure the tenant is not trying to
-	// escape its own directory on disk.
-	if !strings.HasPrefix(actualPath, containerDir) {
+	// Ensure the actual path of the template is strictly within the expected
+	// directory. We compare against containerDir + os.PathSeparator so that a
+	// sibling directory sharing a common prefix (e.g. "/data/tenant" vs
+	// "/data/tenant-evil") is not accepted.
+	containerDirWithSep := containerDir + string(os.PathSeparator)
+	if !strings.HasPrefix(actualPath, containerDirWithSep) {
 		return "", fmt.Errorf("invalid template name %q: the template filepath is escaping the per-tenant local directory", templateName)
 	}
 
