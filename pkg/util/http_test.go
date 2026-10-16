@@ -17,6 +17,7 @@ import (
 
 	"github.com/cortexproject/cortex/pkg/cortexpb"
 	"github.com/cortexproject/cortex/pkg/util"
+	"github.com/cortexproject/cortex/pkg/util/flagext"
 	util_log "github.com/cortexproject/cortex/pkg/util/log"
 )
 
@@ -218,4 +219,25 @@ func (b bytesBuffered) BytesBuffer() *bytes.Buffer {
 func TestIsRequestBodyTooLargeRegression(t *testing.T) {
 	_, err := io.ReadAll(http.MaxBytesReader(httptest.NewRecorder(), io.NopCloser(bytes.NewReader([]byte{1, 2, 3, 4})), 1))
 	assert.True(t, util.IsRequestBodyTooLarge(err))
+}
+
+// TestBasicAuthPasswordRedactedInYAML is a regression test for CWE-497: the
+// basic_auth_password field (used by the ruler Alertmanager client and other
+// HTTP clients) must not appear as plaintext in YAML-marshalled output, which
+// is served by the unauthenticated GET /config endpoint.
+func TestBasicAuthPasswordRedactedInYAML(t *testing.T) {
+	auth := util.BasicAuth{
+		Username: "user",
+		Password: flagext.Secret{Value: "super-secret-password"},
+	}
+
+	data, err := yaml.Marshal(auth)
+	require.NoError(t, err)
+
+	assert.NotContains(t, string(data), "super-secret-password", "basic_auth_password must be redacted in YAML output")
+	assert.Contains(t, string(data), "********", "basic_auth_password must be masked")
+	assert.Contains(t, string(data), "user", "basic_auth_username should be preserved")
+	// IsEnabled must still work correctly with the Secret type.
+	assert.True(t, auth.IsEnabled())
+	assert.False(t, util.BasicAuth{}.IsEnabled())
 }
