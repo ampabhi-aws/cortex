@@ -419,6 +419,60 @@ alertmanager_config: |
 			err: errors.Wrap(errVictorOpsAPIKeyFileNotAllowed, "error validating Alertmanager config"),
 		},
 		{
+			name: "Should return error if SNS sigv4 credentials are missing",
+			cfg: `
+alertmanager_config: |
+  receivers:
+    - name: default-receiver
+      sns_configs:
+        - sigv4:
+            region: us-east-1
+          topic_arn: arn:aws:sns:us-east-1:123456789012:test
+
+  route:
+    receiver: 'default-receiver'
+`,
+			err: errors.Wrap(errSNSCredentialsRequired, "error validating Alertmanager config"),
+		},
+		{
+			name: "Should return error if SNS sigv4.profile is set",
+			cfg: `
+alertmanager_config: |
+  receivers:
+    - name: default-receiver
+      sns_configs:
+        - sigv4:
+            region: us-east-1
+            access_key: a
+            secret_key: b
+            profile: tenant-profile
+          topic_arn: arn:aws:sns:us-east-1:123456789012:test
+
+  route:
+    receiver: 'default-receiver'
+`,
+			err: errors.Wrap(errSNSProfileNotAllowed, "error validating Alertmanager config"),
+		},
+		{
+			name: "Should return error if SNS sigv4.role_arn is set",
+			cfg: `
+alertmanager_config: |
+  receivers:
+    - name: default-receiver
+      sns_configs:
+        - sigv4:
+            region: us-east-1
+            access_key: a
+            secret_key: b
+            role_arn: arn:aws:iam::123456789012:role/tenant
+          topic_arn: arn:aws:sns:us-east-1:123456789012:test
+
+  route:
+    receiver: 'default-receiver'
+`,
+			err: errors.Wrap(errSNSRoleARNNotAllowed, "error validating Alertmanager config"),
+		},
+		{
 			name: "should return error if template is wrong",
 			cfg: `
 alertmanager_config: |

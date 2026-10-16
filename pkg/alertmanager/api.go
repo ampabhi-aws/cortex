@@ -45,6 +45,9 @@ var (
 	errTLSFileNotAllowed             = errors.New("setting TLS ca_file, cert_file and key_file is not allowed")
 	errSlackAPIURLFileNotAllowed     = errors.New("setting Slack api_url_file and global slack_api_url_file is not allowed")
 	errVictorOpsAPIKeyFileNotAllowed = errors.New("setting VictorOps api_key_file is not allowed")
+	errSNSCredentialsRequired        = errors.New("setting SNS sigv4.access_key and sigv4.secret_key is required; the Cortex process's AWS credentials cannot be used for tenant SNS receivers")
+	errSNSProfileNotAllowed          = errors.New("setting SNS sigv4.profile is not allowed")
+	errSNSRoleARNNotAllowed          = errors.New("setting SNS sigv4.role_arn is not allowed")
 )
 
 // UserConfig is used to communicate a users alertmanager configs
@@ -350,6 +353,11 @@ func validateAlertmanagerConfig(cfg interface{}) error {
 		if err := validateVictorOpsConfig(v.Interface().(config.VictorOpsConfig)); err != nil {
 			return err
 		}
+
+	case reflect.TypeOf(config.SNSConfig{}):
+		if err := validateSNSConfig(v.Interface().(config.SNSConfig)); err != nil {
+			return err
+		}
 	}
 
 	// If the input config is a struct, recursively iterate on all fields.
@@ -446,6 +454,30 @@ func validateSlackConfig(cfg config.SlackConfig) error {
 func validateVictorOpsConfig(cfg config.VictorOpsConfig) error {
 	if cfg.APIKeyFile != "" {
 		return errVictorOpsAPIKeyFileNotAllowed
+	}
+	return nil
+}
+
+// validateSNSConfig validates the SNS config and returns an error if it would
+// let the tenant piggy-back on the Cortex process's AWS credentials.
+//
+// The vendored SNS notifier falls back to the AWS default credential chain
+// (env vars, shared credentials file, EC2/ECS/IRSA role) whenever both
+// sigv4.access_key and sigv4.secret_key are empty, and it also honours a
+// tenant-supplied sigv4.profile / sigv4.role_arn against that ambient
+// identity. In a multi-tenant Cortex deployment those credentials typically
+// belong to the shared object-storage identity, so we must require the
+// tenant to supply its own SigV4 credentials explicitly and reject the
+// knobs that would otherwise redirect which identity signs the request.
+func validateSNSConfig(cfg config.SNSConfig) error {
+	if cfg.Sigv4.Profile != "" {
+		return errSNSProfileNotAllowed
+	}
+	if cfg.Sigv4.RoleARN != "" {
+		return errSNSRoleARNNotAllowed
+	}
+	if cfg.Sigv4.AccessKey == "" || cfg.Sigv4.SecretKey == "" {
+		return errSNSCredentialsRequired
 	}
 	return nil
 }
