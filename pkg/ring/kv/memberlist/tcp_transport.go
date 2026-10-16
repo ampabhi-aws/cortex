@@ -35,6 +35,15 @@ const (
 
 const zeroZeroZeroZero = "0.0.0.0"
 
+// maxGossipPacketSize caps the size of a single memberlist "packet" frame
+// (address + payload + md5 digest) accepted by handleConnection. Together
+// with the per-pair cap in MergeRemoteState and the decoded-size cap inside
+// codec.Proto.Decode this prevents an unauthenticated gossip peer from
+// driving an arbitrary allocation (CWE-770). The limit is chosen well above
+// any legitimate memberlist UDP buffer (currently 10 MiB) but far below
+// values that would let a crafted snappy header materialise multiple GiB.
+const maxGossipPacketSize = 128 * 1024 * 1024
+
 // TCPTransportConfig is a configuration structure for creating new TCPTransport.
 type TCPTransportConfig struct {
 	// BindAddrs is a list of addresses to bind to.
@@ -280,11 +289,20 @@ func (t *TCPTransport) handleConnection(conn net.Conn) {
 			return
 		}
 
-		// read the rest to buffer -- this is the "packet" itself
-		buf, err := io.ReadAll(conn)
+		// read the rest to buffer -- this is the "packet" itself.
+		// Bound the amount we are willing to read from an unauthenticated peer
+		// so one connection cannot push an arbitrarily large allocation into
+		// the gossip delegate (NotifyMsg/MergeRemoteState).
+		buf, err := io.ReadAll(io.LimitReader(conn, maxGossipPacketSize+1))
 		if err != nil {
 			t.receivedPacketsErrors.Inc()
 			level.Warn(t.logger).Log("msg", "error while reading packet data", "err", err, "remote", conn.RemoteAddr())
+			return
+		}
+
+		if len(buf) > maxGossipPacketSize {
+			t.receivedPacketsErrors.Inc()
+			level.Warn(t.logger).Log("msg", "gossip packet exceeds maximum accepted size", "max", maxGossipPacketSize, "remote", conn.RemoteAddr())
 			return
 		}
 
