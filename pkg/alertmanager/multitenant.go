@@ -997,6 +997,23 @@ func (am *MultitenantAlertmanager) ServeHTTP(w http.ResponseWriter, req *http.Re
 		return
 	}
 
+	// If sharding is enabled but the Distributor does not support this path (e.g. the
+	// Alertmanager UI root or static assets), only serve the request locally when this
+	// instance actually owns the tenant. Otherwise, a non-owning instance would fall
+	// through to serveRequest, create a fallback Alertmanager for a tenant it does not
+	// own, and risk overwriting the tenant's stored configuration with an empty one.
+	if am.cfg.ShardingEnabled {
+		userID, err := tenant.TenantID(req.Context())
+		if err != nil {
+			http.Error(w, err.Error(), http.StatusUnauthorized)
+			return
+		}
+		if !am.isUserOwned(userID) {
+			http.Error(w, "the Alertmanager is not configured", http.StatusNotFound)
+			return
+		}
+	}
+
 	// If sharding is not enabled or Distributor does not support this path,
 	// it is served by this instance.
 	am.serveRequest(w, req)
@@ -1040,16 +1057,28 @@ func (am *MultitenantAlertmanager) serveRequest(w http.ResponseWriter, req *http
 }
 
 func (am *MultitenantAlertmanager) alertmanagerFromFallbackConfig(userID string) (*Alertmanager, error) {
-	// Upload an empty config so that the Alertmanager is no de-activated in the next poll
-	cfgDesc := alertspb.ToProto("", nil, userID)
-	err := am.store.SetAlertConfig(context.Background(), cfgDesc)
-	if err != nil {
+	ctx := context.Background()
+
+	// Only store an empty marker config when the tenant has no existing configuration
+	// in storage. Otherwise an unconditional upload here would overwrite (and destroy)
+	// the tenant's real Alertmanager configuration - including routes, receivers,
+	// embedded notification credentials and templates - replacing it with the
+	// operator's fallback at the next sync.
+	cfgDesc, err := am.store.GetAlertConfig(ctx, userID)
+	switch {
+	case errors.Is(err, alertspb.ErrNotFound):
+		// No existing configuration: safe to upload an empty marker config so that the
+		// Alertmanager is not de-activated in the next poll.
+		cfgDesc = alertspb.ToProto("", nil, userID)
+		if err := am.store.SetAlertConfig(ctx, cfgDesc); err != nil {
+			return nil, err
+		}
+	case err != nil:
 		return nil, err
 	}
 
 	// Calling setConfig with an empty configuration will use the fallback config.
-	err = am.setConfig(cfgDesc)
-	if err != nil {
+	if err := am.setConfig(cfgDesc); err != nil {
 		return nil, err
 	}
 
