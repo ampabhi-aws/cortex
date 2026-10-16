@@ -24,6 +24,12 @@ import (
 	"github.com/cortexproject/cortex/pkg/util/services"
 )
 
+// deletionMarkRecheckInterval is the number of blocks between re-reads of the
+// tenant deletion mark during a long deletion run. Re-checking periodically
+// ensures that a removed/cancelled marker aborts the destructive operation
+// rather than being noticed only after everything has been destroyed.
+const deletionMarkRecheckInterval = 128
+
 type BlocksCleanerConfig struct {
 	DeletionDelay                      time.Duration
 	CleanupInterval                    time.Duration
@@ -196,6 +202,17 @@ func (c *BlocksCleaner) deleteUserMarkedForDeletion(ctx context.Context, userID 
 
 	level.Info(userLogger).Log("msg", "deleting blocks for tenant marked for deletion")
 
+	// Re-read and validate the tenant deletion mark BEFORE performing any destructive
+	// operation (bucket index deletion / block hard-deletes). If the mark has
+	// disappeared between the users scan and now (another compactor replica performing
+	// the final cleanup, cached-bucket inconsistency, or an operator cancelling the
+	// deletion request by removing the marker), abort the destructive operation and
+	// surface the condition as a real error so it is logged and counted in
+	// cortex_compactor_block_cleanup_failed_total.
+	if err := c.checkTenantDeletionMarkStillExists(ctx, userID); err != nil {
+		return err
+	}
+
 	// We immediately delete the bucket index, to signal to its consumers that
 	// the tenant has "no blocks" in the storage.
 	if err := bucketindex.DeleteIndex(ctx, c.bucketClient, userID, c.cfgProvider); err != nil {
@@ -212,6 +229,15 @@ func (c *BlocksCleaner) deleteUserMarkedForDeletion(ctx context.Context, userID 
 		id, ok := block.IsBlockDir(name)
 		if !ok {
 			return nil
+		}
+
+		// Periodically re-check the tenant deletion mark during a long deletion run so
+		// that a removed/cancelled marker aborts the destructive operation instead of
+		// being noticed only after everything has been destroyed.
+		if deletedBlocks > 0 && deletedBlocks%deletionMarkRecheckInterval == 0 {
+			if err := c.checkTenantDeletionMarkStillExists(ctx, userID); err != nil {
+				return err
+			}
 		}
 
 		err := block.Delete(ctx, userLogger, userBucket, id)
@@ -258,7 +284,7 @@ func (c *BlocksCleaner) deleteUserMarkedForDeletion(ctx context.Context, userID 
 		return errors.Wrap(err, "failed to read tenant deletion mark")
 	}
 	if mark == nil {
-		return errors.Wrap(err, "cannot find tenant deletion mark anymore")
+		return errors.Errorf("cannot find tenant deletion mark anymore for user %s", userID)
 	}
 
 	// If we have just deleted some blocks, update "finished" time. Also update "finished" time if it wasn't set yet, but there are no blocks.
@@ -436,6 +462,21 @@ func (c *BlocksCleaner) applyUserRetentionPeriod(ctx context.Context, idx *bucke
 			level.Warn(userLogger).Log("msg", "failed to mark block for deletion", "block", b.ID, "err", err)
 		}
 	}
+}
+
+// checkTenantDeletionMarkStillExists re-reads the tenant deletion mark from the
+// bucket and returns a non-nil error if it is missing or cannot be read. The
+// caller must treat the error as a signal to abort any destructive operation on
+// the tenant, since the marker is the authorising artefact for the deletion.
+func (c *BlocksCleaner) checkTenantDeletionMarkStillExists(ctx context.Context, userID string) error {
+	mark, err := cortex_tsdb.ReadTenantDeletionMark(ctx, c.bucketClient, userID)
+	if err != nil {
+		return errors.Wrap(err, "failed to read tenant deletion mark")
+	}
+	if mark == nil {
+		return errors.Errorf("cannot find tenant deletion mark anymore for user %s", userID)
+	}
+	return nil
 }
 
 // listBlocksOutsideRetentionPeriod determines the blocks which have aged past
