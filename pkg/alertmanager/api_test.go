@@ -794,3 +794,117 @@ func TestValidateAlertmanagerConfig(t *testing.T) {
 		})
 	}
 }
+
+func TestValidateReceiversFirewall_EmailBlockedByCIDR(t *testing.T) {
+	cidr := flagext.CIDR{}
+	require.NoError(t, cidr.Set("127.0.0.0/8"))
+
+	limits := &mockAlertManagerLimits{
+		receiversBlockCIDRNetworks: []flagext.CIDR{cidr},
+	}
+
+	am := &MultitenantAlertmanager{
+		store:  prepareInMemoryAlertStore(),
+		logger: util_log.Logger,
+		limits: limits,
+	}
+
+	// Config with an email_configs receiver pointed at a blocked loopback CIDR.
+	cfg := `
+alertmanager_config: |
+  route:
+    receiver: probe
+    group_wait: 0s
+    group_interval: 1s
+  receivers:
+    - name: probe
+      email_configs:
+        - to: a@example.invalid
+          from: b@example.invalid
+          smarthost: 127.0.0.1:25
+          require_tls: false
+`
+
+	req := httptest.NewRequest(http.MethodPost, "http://alertmanager/api/v1/alerts", bytes.NewReader([]byte(cfg)))
+	ctx := user.InjectOrgID(req.Context(), "test-user")
+	w := httptest.NewRecorder()
+	am.SetUserConfig(w, req.WithContext(ctx))
+	resp := w.Result()
+
+	body, err := io.ReadAll(resp.Body)
+	require.NoError(t, err)
+
+	require.Equal(t, http.StatusBadRequest, resp.StatusCode, "expected blocked smarthost to be rejected at upload time; body=%s", string(body))
+	require.Contains(t, string(body), "blocked address")
+}
+
+func TestValidateReceiversFirewall_GlobalSMTPSmarthostBlocked(t *testing.T) {
+	limits := &mockAlertManagerLimits{
+		receiversBlockPrivateAddresses: true,
+	}
+
+	am := &MultitenantAlertmanager{
+		store:  prepareInMemoryAlertStore(),
+		logger: util_log.Logger,
+		limits: limits,
+	}
+
+	// Config with a receiver inheriting a blocked global.smtp_smarthost.
+	cfg := `
+alertmanager_config: |
+  global:
+    smtp_smarthost: 10.0.0.1:25
+    smtp_from: b@example.invalid
+    smtp_require_tls: false
+  route:
+    receiver: probe
+  receivers:
+    - name: probe
+      email_configs:
+        - to: a@example.invalid
+`
+
+	req := httptest.NewRequest(http.MethodPost, "http://alertmanager/api/v1/alerts", bytes.NewReader([]byte(cfg)))
+	ctx := user.InjectOrgID(req.Context(), "test-user")
+	w := httptest.NewRecorder()
+	am.SetUserConfig(w, req.WithContext(ctx))
+	resp := w.Result()
+
+	body, err := io.ReadAll(resp.Body)
+	require.NoError(t, err)
+
+	require.Equal(t, http.StatusBadRequest, resp.StatusCode, "expected private smtp_smarthost to be rejected; body=%s", string(body))
+	require.Contains(t, string(body), "blocked address")
+}
+
+func TestValidateReceiversFirewall_AllowedWhenFirewallDisabled(t *testing.T) {
+	limits := &mockAlertManagerLimits{} // Firewall disabled.
+
+	am := &MultitenantAlertmanager{
+		store:  prepareInMemoryAlertStore(),
+		logger: util_log.Logger,
+		limits: limits,
+	}
+
+	// Same config that would be blocked when the firewall is on.
+	cfg := `
+alertmanager_config: |
+  route:
+    receiver: probe
+  receivers:
+    - name: probe
+      email_configs:
+        - to: a@example.invalid
+          from: b@example.invalid
+          smarthost: 127.0.0.1:25
+          require_tls: false
+`
+
+	req := httptest.NewRequest(http.MethodPost, "http://alertmanager/api/v1/alerts", bytes.NewReader([]byte(cfg)))
+	ctx := user.InjectOrgID(req.Context(), "test-user")
+	w := httptest.NewRecorder()
+	am.SetUserConfig(w, req.WithContext(ctx))
+	resp := w.Result()
+
+	require.Equal(t, http.StatusCreated, resp.StatusCode)
+}

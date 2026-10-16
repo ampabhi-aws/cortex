@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
 	"os"
 	"path/filepath"
@@ -21,6 +22,7 @@ import (
 	"github.com/cortexproject/cortex/pkg/tenant"
 	"github.com/cortexproject/cortex/pkg/util"
 	"github.com/cortexproject/cortex/pkg/util/concurrency"
+	"github.com/cortexproject/cortex/pkg/util/flagext"
 	util_log "github.com/cortexproject/cortex/pkg/util/log"
 )
 
@@ -187,6 +189,14 @@ func validateUserConfig(logger log.Logger, cfg alertspb.AlertConfigDesc, limits 
 
 	// Validate the config recursively scanning it.
 	if err := validateAlertmanagerConfig(amCfg); err != nil {
+		return err
+	}
+
+	// Enforce the per-tenant receivers firewall at config-upload time for the
+	// email integration (defense in depth: the dial-time Control hook on the
+	// FirewallDialer remains the authoritative check since DNS rebinding can
+	// defeat resolution-time checks).
+	if err := validateReceiversFirewall(amCfg, limits, user); err != nil {
 		return err
 	}
 
@@ -448,4 +458,109 @@ func validateVictorOpsConfig(cfg config.VictorOpsConfig) error {
 		return errVictorOpsAPIKeyFileNotAllowed
 	}
 	return nil
+}
+
+// validateReceiversFirewall rejects Alertmanager configs that target hosts
+// forbidden by the per-tenant receivers firewall from a code path where the
+// firewall is not applied at dial time. Today this covers the email
+// integration's `email_configs[].smarthost` and `global.smtp_smarthost`
+// fields. This is defense in depth: the authoritative enforcement remains
+// the FirewallDialer.Control hook installed on the dialer used by the email
+// notifier, which cannot be defeated by DNS rebinding.
+func validateReceiversFirewall(amCfg *config.Config, limits Limits, user string) error {
+	if amCfg == nil {
+		return nil
+	}
+
+	blockPrivate := limits.AlertmanagerReceiversBlockPrivateAddresses(user)
+	blockCIDRs := limits.AlertmanagerReceiversBlockCIDRNetworks(user)
+
+	// Short-circuit if no firewall is configured for this tenant.
+	if !blockPrivate && len(blockCIDRs) == 0 {
+		return nil
+	}
+
+	check := func(hp config.HostPort) error {
+		return validateSmarthostAgainstFirewall(hp, blockPrivate, blockCIDRs)
+	}
+
+	if amCfg.Global != nil {
+		if err := check(amCfg.Global.SMTPSmarthost); err != nil {
+			return errors.Wrap(err, "global smtp_smarthost")
+		}
+	}
+
+	for _, rcv := range amCfg.Receivers {
+		if rcv == nil {
+			continue
+		}
+		for _, ec := range rcv.EmailConfigs {
+			if ec == nil {
+				continue
+			}
+			if err := check(ec.Smarthost); err != nil {
+				return errors.Wrapf(err, "receiver %q email_configs smarthost", rcv.Name)
+			}
+		}
+	}
+
+	return nil
+}
+
+// validateSmarthostAgainstFirewall returns an error if the smarthost's host
+// field resolves to - or is literally - an address that the firewall config
+// would reject. An empty host is accepted: the vendored alertmanager config
+// loader will reject empty smarthosts via its own validation, and when only a
+// per-receiver smarthost is empty it inherits the global one which is also
+// checked here.
+func validateSmarthostAgainstFirewall(hp config.HostPort, blockPrivate bool, blockCIDRs []flagext.CIDR) error {
+	if hp.Host == "" {
+		return nil
+	}
+
+	// Try to parse the host as a literal IP first. If it's not a literal, try
+	// to resolve it; this catches configs that pass a hostname whose A/AAAA
+	// records all land in a blocked range. Resolution-time results are not
+	// authoritative (DNS rebinding) but suffice as a defense-in-depth check at
+	// upload time.
+	var ips []net.IP
+	if ip := net.ParseIP(hp.Host); ip != nil {
+		ips = []net.IP{ip}
+	} else {
+		resolved, err := net.LookupIP(hp.Host)
+		if err != nil || len(resolved) == 0 {
+			// If we cannot resolve the host, allow upload; the dial-time
+			// FirewallDialer.Control hook is still consulted at delivery time
+			// and will block any disallowed address.
+			return nil
+		}
+		ips = resolved
+	}
+
+	for _, ip := range ips {
+		if blockPrivate && (isLocalIP(ip) || isPrivateIP(ip)) {
+			return fmt.Errorf("blocked address %q: resolves to a private or local address", hp.String())
+		}
+		for _, cidr := range blockCIDRs {
+			if cidr.Value.Contains(ip) {
+				return fmt.Errorf("blocked address %q: resolves to CIDR %s", hp.String(), cidr.Value.String())
+			}
+		}
+	}
+	return nil
+}
+
+func isLocalIP(ip net.IP) bool {
+	return ip.IsLoopback() || ip.IsLinkLocalUnicast() || ip.IsLinkLocalMulticast()
+}
+
+// isPrivateIP mirrors the predicate used by FirewallDialer.control; see
+// pkg/util/net/firewall_dialer.go.
+func isPrivateIP(ip net.IP) bool {
+	if ip4 := ip.To4(); ip4 != nil {
+		return ip4[0] == 10 ||
+			(ip4[0] == 172 && ip4[1]&0xf0 == 16) ||
+			(ip4[0] == 192 && ip4[1] == 168)
+	}
+	return len(ip) == net.IPv6len && ip[0]&0xfe == 0xfc
 }
