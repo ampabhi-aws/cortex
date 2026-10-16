@@ -35,6 +35,51 @@ func (cfg *ClientConfig) RegisterFlagsWithPrefix(prefix string, f *flag.FlagSet)
 	f.BoolVar(&cfg.InsecureSkipVerify, prefix+".tls-insecure-skip-verify", false, "Skip validating server certificate.")
 }
 
+// GetServerTLSConfig initialises a server-side tls.Config from the same options.
+// Unlike GetTLSConfig (which is intended for outbound/client connections and
+// populates RootCAs for verifying remote server certificates), this method is
+// intended to be consumed only by listeners: it requires a server certificate/key
+// pair and, when a CA bundle is configured, enables mutual TLS by setting
+// ClientCAs and ClientAuth=RequireAndVerifyClientCert so the listener
+// authenticates its peers.
+//
+// InsecureSkipVerify and ServerName are deliberately not applied here: they are
+// client-side concerns and must not weaken a listener's identity requirements.
+func (cfg *ClientConfig) GetServerTLSConfig() (*tls.Config, error) {
+	if cfg.CertPath == "" || cfg.KeyPath == "" {
+		return nil, errors.New("server TLS requires both a certificate and a key")
+	}
+
+	serverCert, err := tls.LoadX509KeyPair(cfg.CertPath, cfg.KeyPath)
+	if err != nil {
+		return nil, errors.Wrapf(err, "failed to load TLS certificate %s,%s", cfg.CertPath, cfg.KeyPath)
+	}
+
+	config := &tls.Config{
+		Certificates: []tls.Certificate{serverCert},
+	}
+
+	// If a CA bundle is configured, require and verify client certificates
+	// issued by it. This closes the gap where a client-only TLS config was
+	// previously used as the listener config: Go's zero value for ClientAuth is
+	// NoClientCert, which lets any TLS peer complete the handshake
+	// unauthenticated.
+	if cfg.CAPath != "" {
+		caCert, err := os.ReadFile(cfg.CAPath)
+		if err != nil {
+			return nil, errors.Wrapf(err, "error loading ca cert: %s", cfg.CAPath)
+		}
+		caCertPool := x509.NewCertPool()
+		if !caCertPool.AppendCertsFromPEM(caCert) {
+			return nil, errors.Errorf("failed to parse any CA certificates from %s", cfg.CAPath)
+		}
+		config.ClientCAs = caCertPool
+		config.ClientAuth = tls.RequireAndVerifyClientCert
+	}
+
+	return config, nil
+}
+
 // GetTLSConfig initialises tls.Config from config options
 func (cfg *ClientConfig) GetTLSConfig() (*tls.Config, error) {
 	config := &tls.Config{

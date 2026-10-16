@@ -89,6 +89,10 @@ type TCPTransport struct {
 	wg           sync.WaitGroup
 	tcpListeners []net.Listener
 	tlsConfig    *tls.Config
+	// tlsServerConfig is used for the inbound listener and, when a CA bundle
+	// is configured, enforces mutual TLS against gossip peers. tlsConfig is
+	// retained for outbound/client use in getConnection.
+	tlsServerConfig *tls.Config
 
 	shutdown atomic.Int32
 
@@ -131,6 +135,16 @@ func NewTCPTransport(config TCPTransportConfig, logger log.Logger) (*TCPTranspor
 		if err != nil {
 			return nil, errors.Wrap(err, "unable to create TLS config")
 		}
+		// Build a dedicated server-side TLS config for the listener. Using the
+		// client config here (as was previously done) leaves ClientAuth at its
+		// zero value (NoClientCert), so the listener would accept any TLS peer
+		// without requesting or validating a client certificate -- making
+		// gossip membership effectively unauthenticated. With a CA bundle
+		// configured the server config enforces mutual TLS.
+		t.tlsServerConfig, err = config.TLS.GetServerTLSConfig()
+		if err != nil {
+			return nil, errors.Wrap(err, "unable to create server TLS config")
+		}
 	}
 
 	t.registerMetrics(config.MetricsRegisterer)
@@ -151,7 +165,7 @@ func NewTCPTransport(config TCPTransportConfig, logger log.Logger) (*TCPTranspor
 
 		var tcpLn net.Listener
 		if config.TLSEnabled {
-			tcpLn, err = tls.Listen("tcp", tcpAddr.String(), t.tlsConfig)
+			tcpLn, err = tls.Listen("tcp", tcpAddr.String(), t.tlsServerConfig)
 			if err != nil {
 				return nil, errors.Wrapf(err, "failed to start TLS TCP listener on %q port %d", addr, port)
 			}
