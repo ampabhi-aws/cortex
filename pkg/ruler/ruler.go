@@ -63,9 +63,6 @@ const (
 	// Limit errors
 	errMaxRuleGroupsPerUserLimitExceeded        = "per-user rule groups limit (limit: %d actual: %d) exceeded"
 	errMaxRulesPerRuleGroupPerUserLimitExceeded = "per-user rules per rule group limit (limit: %d actual: %d) exceeded"
-
-	// errors
-	errListAllUser = "unable to list the ruler users"
 )
 
 // Config is the configuration for the recording rules server.
@@ -863,12 +860,20 @@ func (r *Ruler) DeleteTenantConfiguration(w http.ResponseWriter, req *http.Reque
 func (r *Ruler) ListAllRules(w http.ResponseWriter, req *http.Request) {
 	logger := util_log.WithContext(req.Context(), r.logger)
 
-	userIDs, err := r.store.ListAllUsers(req.Context())
+	// Resolve the caller's tenant from the request context. This endpoint is
+	// registered with authentication enabled (see pkg/api/api.go) and must
+	// only return the caller's own rule groups to avoid cross-tenant
+	// disclosure.
+	userID, err := tenant.TenantID(req.Context())
 	if err != nil {
-		level.Error(logger).Log("msg", errListAllUser, "err", err)
-		http.Error(w, fmt.Sprintf("%s: %s", errListAllUser, err.Error()), http.StatusInternalServerError)
+		// When Cortex is running, the Auth Middleware checks X-Scope-OrgID and
+		// injects the tenant into the context. Return 401 for consistency with
+		// other tenant-scoped endpoints (e.g. DeleteTenantConfiguration).
+		http.Error(w, err.Error(), http.StatusUnauthorized)
 		return
 	}
+
+	userIDs := []string{userID}
 
 	done := make(chan struct{})
 	iter := make(chan interface{})
@@ -897,7 +902,7 @@ func (r *Ruler) ListAllRules(w http.ResponseWriter, req *http.Request) {
 		return nil
 	})
 	if err != nil {
-		level.Error(logger).Log("msg", "failed to list all ruler configs", "err", err)
+		level.Error(logger).Log("msg", "failed to list ruler configs", "err", err, "user", userID)
 	}
 	close(iter)
 	<-done
