@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"net/http"
 	"sync"
+	"time"
 
 	"github.com/go-kit/log"
 	"github.com/go-kit/log/level"
@@ -12,6 +13,7 @@ import (
 	"github.com/pkg/errors"
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/promauto"
+	"github.com/prometheus/common/model"
 	"github.com/prometheus/prometheus/config"
 	"github.com/prometheus/prometheus/model/rulefmt"
 	"github.com/prometheus/prometheus/notifier"
@@ -26,6 +28,7 @@ type DefaultMultiTenantManager struct {
 	cfg            Config
 	notifierCfg    *config.Config
 	managerFactory ManagerFactory
+	limits         RulesLimits
 
 	mapper *mapper
 
@@ -47,7 +50,7 @@ type DefaultMultiTenantManager struct {
 	logger                        log.Logger
 }
 
-func NewDefaultMultiTenantManager(cfg Config, managerFactory ManagerFactory, reg prometheus.Registerer, logger log.Logger) (*DefaultMultiTenantManager, error) {
+func NewDefaultMultiTenantManager(cfg Config, managerFactory ManagerFactory, limits RulesLimits, reg prometheus.Registerer, logger log.Logger) (*DefaultMultiTenantManager, error) {
 	ncfg, err := buildNotifierConfig(&cfg)
 	if err != nil {
 		return nil, err
@@ -62,6 +65,7 @@ func NewDefaultMultiTenantManager(cfg Config, managerFactory ManagerFactory, reg
 		cfg:                cfg,
 		notifierCfg:        ncfg,
 		managerFactory:     managerFactory,
+		limits:             limits,
 		notifiers:          map[string]*rulerNotifier{},
 		mapper:             newMapper(cfg.RulePath, logger),
 		userManagers:       map[string]RulesManager{},
@@ -125,7 +129,9 @@ func (r *DefaultMultiTenantManager) SyncRuleGroups(ctx context.Context, ruleGrou
 func (r *DefaultMultiTenantManager) syncRulesToManager(ctx context.Context, user string, groups rulespb.RuleGroupList) {
 	// Map the files to disk and return the file names to be passed to the users manager if they
 	// have been updated
-	update, files, err := r.mapper.MapRules(user, groups.Formatted())
+	formatted := groups.Formatted()
+	r.clampRuleGroupIntervals(user, formatted)
+	update, files, err := r.mapper.MapRules(user, formatted)
 	if err != nil {
 		r.lastReloadSuccessful.WithLabelValues(user).Set(0)
 		level.Error(r.logger).Log("msg", "unable to map rule files", "user", user, "err", err)
@@ -298,4 +304,37 @@ func (*DefaultMultiTenantManager) ValidateRuleGroup(g rulefmt.RuleGroup) []error
 	}
 
 	return errs
+}
+
+// clampRuleGroupIntervals walks the per-namespace rule groups and silently
+// raises any non-zero evaluation interval below the per-tenant minimum
+// (RulerMinRuleEvaluationInterval) to that minimum. An interval of 0 is left
+// untouched, so Prometheus' loader falls back to the operator-configured
+// `-ruler.evaluation-interval`. This is a defence-in-depth clamp applied on
+// every sync so that rule groups that were persisted to the rule store before
+// the API check was in place cannot bypass the limit.
+func (r *DefaultMultiTenantManager) clampRuleGroupIntervals(userID string, ruleConfigs map[string][]rulefmt.RuleGroup) {
+	if r.limits == nil {
+		return
+	}
+	min := r.limits.RulerMinRuleEvaluationInterval(userID)
+	if min <= 0 {
+		return
+	}
+	for ns, groups := range ruleConfigs {
+		for i := range groups {
+			iv := time.Duration(groups[i].Interval)
+			if iv != 0 && iv < min {
+				level.Warn(r.logger).Log(
+					"msg", "raising rule group evaluation interval to configured per-tenant minimum",
+					"user", userID,
+					"namespace", ns,
+					"group", groups[i].Name,
+					"configured", iv,
+					"min", min,
+				)
+				groups[i].Interval = model.Duration(min)
+			}
+		}
+	}
 }
