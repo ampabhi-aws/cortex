@@ -2,6 +2,7 @@ package cache
 
 import (
 	"context"
+	"fmt"
 )
 
 type contextKey int
@@ -58,7 +59,9 @@ func ExtractCacheGenNumber(ctx context.Context) string {
 	return cacheGenNumber
 }
 
-// addCacheGenNumToCacheKeys adds gen number to keys as prefix.
+// addCacheGenNumToCacheKeys adds gen number to keys as a length-prefixed prefix.
+// The length prefix guards against collisions when the gen number has variable
+// length (e.g. gen "1" + key "0foo" vs gen "10" + key "foo").
 func addCacheGenNumToCacheKeys(ctx context.Context, keys []string) []string {
 	cacheGen := ExtractCacheGenNumber(ctx)
 	if cacheGen == "" {
@@ -66,15 +69,16 @@ func addCacheGenNumToCacheKeys(ctx context.Context, keys []string) []string {
 	}
 
 	prefixedKeys := make([]string, len(keys))
+	prefix := fmt.Sprintf("%d:%s:", len(cacheGen), cacheGen)
 
 	for i := range keys {
-		prefixedKeys[i] = cacheGen + keys[i]
+		prefixedKeys[i] = prefix + keys[i]
 	}
 
 	return prefixedKeys
 }
 
-// removeCacheGenNumFromKeys removes prefixed gen number from keys.
+// removeCacheGenNumFromKeys removes the length-prefixed gen number from keys.
 func removeCacheGenNumFromKeys(ctx context.Context, keys []string) []string {
 	cacheGen := ExtractCacheGenNumber(ctx)
 	if cacheGen == "" {
@@ -82,7 +86,8 @@ func removeCacheGenNumFromKeys(ctx context.Context, keys []string) []string {
 	}
 
 	unprefixedKeys := make([]string, len(keys))
-	cacheGenPrefixLen := len(cacheGen)
+	prefix := fmt.Sprintf("%d:%s:", len(cacheGen), cacheGen)
+	cacheGenPrefixLen := len(prefix)
 
 	for i := range keys {
 		unprefixedKeys[i] = keys[i][cacheGenPrefixLen:]

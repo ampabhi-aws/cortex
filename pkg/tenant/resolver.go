@@ -74,6 +74,16 @@ func containsUnsafePathSegments(id string) bool {
 	return strings.ContainsAny(id, "\\/")
 }
 
+// containsReservedDelimiters returns true if the tenant ID contains characters
+// that are used as structural delimiters by other components (notably the
+// query-frontend results cache key and the multi-tenant separator). These
+// characters are documented as unsafe for tenant IDs; rejecting them in the
+// SingleResolver is a defence-in-depth measure that prevents delimiter
+// injection even when callers fail to escape or length-prefix the tenant ID.
+func containsReservedDelimiters(id string) bool {
+	return strings.ContainsAny(id, ":|")
+}
+
 var errInvalidTenantID = errors.New("invalid tenant ID")
 
 func (t *SingleResolver) TenantID(ctx context.Context) (string, error) {
@@ -83,7 +93,7 @@ func (t *SingleResolver) TenantID(ctx context.Context) (string, error) {
 		return "", err
 	}
 
-	if containsUnsafePathSegments(id) {
+	if containsUnsafePathSegments(id) || containsReservedDelimiters(id) {
 		return "", errInvalidTenantID
 	}
 
