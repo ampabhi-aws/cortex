@@ -1556,21 +1556,35 @@ func (i *Ingester) UserStats(ctx context.Context, req *client.UserStatsRequest) 
 	return createUserStats(db), nil
 }
 
-// AllUserStats returns ingestion statistics for all users known to this ingester.
-func (i *Ingester) AllUserStats(_ context.Context, _ *client.UserStatsRequest) (*client.UsersStatsResponse, error) {
+// AllUserStats returns ingestion statistics scoped to the caller's tenant.
+//
+// Historically this RPC iterated every tenant hosted by the ingester, which
+// — combined with the unauthenticated HTTP route that fronts it and the
+// hard-coded fake org-ID the distributor injects to satisfy the gRPC
+// interceptor — meant any caller able to reach a Cortex port could enumerate
+// all tenant IDs and per-tenant usage. That is a cross-tenant information
+// disclosure (CWE-1220): tenant IDs are the only credential the rest of the
+// Cortex API requires. We now resolve the caller's tenant from the context
+// and return only that tenant's stats, mirroring UserStats above. Admin
+// aggregation across all tenants must come from an operator-only path with
+// an explicit authorization check, not from this RPC.
+func (i *Ingester) AllUserStats(ctx context.Context, _ *client.UserStatsRequest) (*client.UsersStatsResponse, error) {
 	if err := i.checkRunning(); err != nil {
+		return nil, err
+	}
+
+	userID, err := tenant.TenantID(ctx)
+	if err != nil {
 		return nil, err
 	}
 
 	i.stoppedMtx.RLock()
 	defer i.stoppedMtx.RUnlock()
 
-	users := i.TSDBState.dbs
-
 	response := &client.UsersStatsResponse{
-		Stats: make([]*client.UserIDStatsResponse, 0, len(users)),
+		Stats: make([]*client.UserIDStatsResponse, 0, 1),
 	}
-	for userID, db := range users {
+	if db := i.getTSDB(userID); db != nil {
 		response.Stats = append(response.Stats, &client.UserIDStatsResponse{
 			UserId: userID,
 			Data:   createUserStats(db),
