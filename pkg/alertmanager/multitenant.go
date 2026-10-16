@@ -814,6 +814,18 @@ func (am *MultitenantAlertmanager) setConfig(cfg alertspb.AlertConfigDesc) error
 	var userTemplateDir = filepath.Join(am.getTenantDirectory(cfg.User), templatesDir)
 	var pathsToRemove = make(map[string]struct{})
 
+	// Enforce the same template count/size and aggregate budget we apply on the
+	// write path (SetUserConfig). This closes the gap where a configuration
+	// reached the alertmanager store by some other route (eg. direct bucket
+	// writes, replicated state, legacy entries predating the limits) and would
+	// otherwise be materialised to the shared replica's data directory without
+	// any bound.
+	if am.limits != nil {
+		if err := validateTemplateLimits(cfg, am.limits, cfg.User); err != nil {
+			return err
+		}
+	}
+
 	// List existing files to keep track the ones to be removed
 	if oldTemplateFiles, err := os.ReadDir(userTemplateDir); err == nil {
 		for _, file := range oldTemplateFiles {

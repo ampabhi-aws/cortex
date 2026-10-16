@@ -35,8 +35,18 @@ const (
 	errConfigurationTooBig   = "Alertmanager configuration is too big, limit: %d bytes"
 	errTooManyTemplates      = "too many templates in the configuration: %d (limit: %d)"
 	errTemplateTooBig        = "template %s is too big: %d bytes (limit: %d bytes)"
+	errTemplatesTotalTooBig  = "total size of templates is too big: %d bytes (limit: %d bytes)"
 
 	fetchConcurrency = 16
+
+	// alertmanagerMaxConfigSizeHardLimit is an unconditional ceiling applied to
+	// request bodies received by SetUserConfig and to configs stored by setConfig.
+	// It is enforced regardless of per-tenant overrides so that a tenant whose
+	// AlertmanagerMaxConfigSize override has been set to 0 ("no limit") cannot
+	// force unbounded heap allocations or write unbounded data to the shared
+	// Alertmanager replica. 100 MiB is well above any realistic Alertmanager
+	// configuration size.
+	alertmanagerMaxConfigSizeHardLimit = 100 * 1024 * 1024
 )
 
 var (
@@ -100,18 +110,28 @@ func (am *MultitenantAlertmanager) SetUserConfig(w http.ResponseWriter, r *http.
 		return
 	}
 
-	var input io.Reader
+	// Always bound the request body with an unconditional hard ceiling, even if
+	// the tenant override AlertmanagerMaxConfigSize is 0 ("no limit") or larger
+	// than the hard ceiling. This matches the pattern used by the Alertmanager
+	// distributor (pkg/alertmanager/distributor.go) and the query frontend
+	// (pkg/frontend/transport/handler.go) and prevents a single tenant from
+	// forcing unbounded heap allocation in the shared Alertmanager process.
 	maxConfigSize := am.limits.AlertmanagerMaxConfigSize(userID)
-	if maxConfigSize > 0 {
-		// LimitReader will return EOF after reading specified number of bytes. To check if
-		// we have read too many bytes, allow one extra byte.
-		input = io.LimitReader(r.Body, int64(maxConfigSize)+1)
-	} else {
-		input = r.Body
+	readLimit := int64(alertmanagerMaxConfigSizeHardLimit)
+	if maxConfigSize > 0 && int64(maxConfigSize) < readLimit {
+		readLimit = int64(maxConfigSize)
 	}
+	// Allow one extra byte so we can detect bodies that exceed the configured limit.
+	r.Body = http.MaxBytesReader(w, r.Body, readLimit+1)
 
-	payload, err := io.ReadAll(input)
+	payload, err := io.ReadAll(r.Body)
 	if err != nil {
+		if util.IsRequestBodyTooLarge(err) {
+			msg := fmt.Sprintf(errConfigurationTooBig, readLimit)
+			level.Warn(logger).Log("msg", msg)
+			http.Error(w, msg, http.StatusRequestEntityTooLarge)
+			return
+		}
 		level.Error(logger).Log("msg", errReadingConfiguration, "err", err.Error())
 		http.Error(w, fmt.Sprintf("%s: %s", errReadingConfiguration, err.Error()), http.StatusBadRequest)
 		return
@@ -120,7 +140,7 @@ func (am *MultitenantAlertmanager) SetUserConfig(w http.ResponseWriter, r *http.
 	if maxConfigSize > 0 && len(payload) > maxConfigSize {
 		msg := fmt.Sprintf(errConfigurationTooBig, maxConfigSize)
 		level.Warn(logger).Log("msg", msg)
-		http.Error(w, msg, http.StatusBadRequest)
+		http.Error(w, msg, http.StatusRequestEntityTooLarge)
 		return
 	}
 
@@ -170,6 +190,44 @@ func (am *MultitenantAlertmanager) DeleteUserConfig(w http.ResponseWriter, r *ht
 	w.WriteHeader(http.StatusOK)
 }
 
+// validateTemplateLimits enforces the per-tenant template count and template
+// size bounds, plus an aggregate (count x size) template-storage budget. It is
+// invoked both when a config is uploaded via SetUserConfig and when a config
+// pulled from the alertmanager store is applied by setConfig, so that configs
+// written to the store by another path (eg. direct bucket writes, replicated
+// state, legacy entries predating the limits) still cannot exhaust the shared
+// Alertmanager replica's disk or heap when they are materialised on disk.
+func validateTemplateLimits(cfg alertspb.AlertConfigDesc, limits Limits, user string) error {
+	if l := limits.AlertmanagerMaxTemplatesCount(user); l > 0 && len(cfg.Templates) > l {
+		return fmt.Errorf(errTooManyTemplates, len(cfg.Templates), l)
+	}
+
+	maxSize := limits.AlertmanagerMaxTemplateSize(user)
+	maxCount := limits.AlertmanagerMaxTemplatesCount(user)
+	totalSize := 0
+	for _, tmpl := range cfg.Templates {
+		size := len(tmpl.GetBody())
+		if maxSize > 0 && size > maxSize {
+			return fmt.Errorf(errTemplateTooBig, tmpl.GetFilename(), size, maxSize)
+		}
+		totalSize += size
+	}
+
+	// Enforce an aggregate (count x size) budget. This closes the gap where a
+	// tenant stays under the per-template size limit but uploads enough
+	// templates to still fill the replica's data directory. The budget is
+	// derived from the per-template limits so operators only need to tune the
+	// two existing knobs; if either is unset we skip the aggregate check for
+	// backward compatibility.
+	if maxSize > 0 && maxCount > 0 {
+		budget := maxSize * maxCount
+		if totalSize > budget {
+			return fmt.Errorf(errTemplatesTotalTooBig, totalSize, budget)
+		}
+	}
+	return nil
+}
+
 // Partially copied from: https://github.com/prometheus/alertmanager/blob/8e861c646bf67599a1704fc843c6a94d519ce312/cli/check_config.go#L65-L96
 func validateUserConfig(logger log.Logger, cfg alertspb.AlertConfigDesc, limits Limits, user string) error {
 	// We don't have a valid use case for empty configurations. If a tenant does not have a
@@ -198,16 +256,8 @@ func validateUserConfig(logger log.Logger, cfg alertspb.AlertConfigDesc, limits 
 	}
 
 	// Check template limits.
-	if l := limits.AlertmanagerMaxTemplatesCount(user); l > 0 && len(cfg.Templates) > l {
-		return fmt.Errorf(errTooManyTemplates, len(cfg.Templates), l)
-	}
-
-	if maxSize := limits.AlertmanagerMaxTemplateSize(user); maxSize > 0 {
-		for _, tmpl := range cfg.Templates {
-			if size := len(tmpl.GetBody()); size > maxSize {
-				return fmt.Errorf(errTemplateTooBig, tmpl.GetFilename(), size, maxSize)
-			}
-		}
+	if err := validateTemplateLimits(cfg, limits, user); err != nil {
+		return err
 	}
 
 	// Validate template files.
