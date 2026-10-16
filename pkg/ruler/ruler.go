@@ -110,6 +110,12 @@ type Config struct {
 	// Enable sharding rule groups.
 	EnableSharding   bool          `yaml:"enable_sharding"`
 	ShardingStrategy string        `yaml:"sharding_strategy"`
+	// ShardingHashSeed is a cluster-wide secret mixed into the ring-token hash
+	// used to decide which ruler instance owns a given rule group. Because
+	// rule-group namespace and name are tenant-controlled, an unkeyed hash
+	// lets tenants steer evaluation onto a chosen instance. All ruler
+	// instances in the same cluster must be configured with the same seed.
+	ShardingHashSeed string        `yaml:"sharding_hash_seed"`
 	SearchPendingFor time.Duration `yaml:"search_pending_for"`
 	Ring             RingConfig    `yaml:"ring"`
 	FlushCheckPeriod time.Duration `yaml:"flush_period"`
@@ -171,6 +177,7 @@ func (cfg *Config) RegisterFlags(f *flag.FlagSet) {
 	f.DurationVar(&cfg.SearchPendingFor, "ruler.search-pending-for", 5*time.Minute, "Time to spend searching for a pending ruler when shutting down.")
 	f.BoolVar(&cfg.EnableSharding, "ruler.enable-sharding", false, "Distribute rule evaluation using ring backend")
 	f.StringVar(&cfg.ShardingStrategy, "ruler.sharding-strategy", util.ShardingStrategyDefault, fmt.Sprintf("The sharding strategy to use. Supported values are: %s.", strings.Join(supportedShardingStrategies, ", ")))
+	f.StringVar(&cfg.ShardingHashSeed, "ruler.sharding-hash-seed", "", "Cluster-wide secret mixed into the ring-token hash that decides which ruler owns each rule group. Set to the same non-empty value on every ruler so that tenants cannot predict (and therefore cannot steer) ownership using the tenant-controlled namespace/group name. If left empty when sharding is enabled, a warning is logged at startup.")
 	f.DurationVar(&cfg.FlushCheckPeriod, "ruler.flush-period", 1*time.Minute, "Period with which to attempt to flush rule groups.")
 	f.StringVar(&cfg.RulePath, "ruler.rule-path", "/rules", "file path to store temporary rule files for the prometheus rule managers")
 	f.BoolVar(&cfg.EnableAPI, "experimental.ruler.enable-api", false, "Enable the ruler api")
@@ -237,6 +244,11 @@ type Ruler struct {
 	manager    MultiTenantManager
 	limits     RulesLimits
 
+	// shardingHashSeed is the cached byte form of cfg.ShardingHashSeed; it is
+	// mixed into tokenForGroup so that tenants cannot predict a group's
+	// owning ruler instance from its Namespace/Name.
+	shardingHashSeed []byte
+
 	subservices        *services.Manager
 	subservicesWatcher *services.FailureWatcher
 
@@ -259,14 +271,15 @@ func NewRuler(cfg Config, manager MultiTenantManager, reg prometheus.Registerer,
 
 func newRuler(cfg Config, manager MultiTenantManager, reg prometheus.Registerer, logger log.Logger, ruleStore rulestore.RuleStore, limits RulesLimits, clientPool ClientsPool) (*Ruler, error) {
 	ruler := &Ruler{
-		cfg:            cfg,
-		store:          ruleStore,
-		manager:        manager,
-		registry:       reg,
-		logger:         logger,
-		limits:         limits,
-		clientsPool:    clientPool,
-		allowedTenants: util.NewAllowedTenants(cfg.EnabledTenants, cfg.DisabledTenants),
+		cfg:              cfg,
+		store:            ruleStore,
+		manager:          manager,
+		registry:         reg,
+		logger:           logger,
+		limits:           limits,
+		clientsPool:      clientPool,
+		allowedTenants:   util.NewAllowedTenants(cfg.EnabledTenants, cfg.DisabledTenants),
+		shardingHashSeed: []byte(cfg.ShardingHashSeed),
 
 		ringCheckErrors: promauto.With(reg).NewCounter(prometheus.CounterOpts{
 			Name: "cortex_ruler_ring_check_errors_total",
@@ -277,6 +290,10 @@ func newRuler(cfg Config, manager MultiTenantManager, reg prometheus.Registerer,
 			Name: "cortex_ruler_sync_rules_total",
 			Help: "Total number of times the ruler sync operation triggered.",
 		}, []string{"reason"}),
+	}
+
+	if cfg.EnableSharding && cfg.ShardingHashSeed == "" {
+		level.Warn(ruler.logger).Log("msg", "ruler sharding is enabled but -ruler.sharding-hash-seed is empty; the ring token for a rule group is derived from tenant-controlled namespace/group name, so tenants can predict and steer rule-group ownership. Set a cluster-wide secret on every ruler to prevent this.")
 	}
 
 	if len(cfg.EnabledTenants) > 0 {
@@ -399,10 +416,21 @@ func SendAlerts(n sender, externalURL string) promRules.NotifyFunc {
 
 var sep = []byte("/")
 
-func tokenForGroup(g *rulespb.RuleGroupDesc) uint32 {
+// tokenForGroup returns the ring token used to decide which ruler instance
+// owns the given rule group. The optional seed is a per-cluster secret that
+// is mixed into the hash so that tenants - who control the Namespace and
+// Name fields - cannot predict (and therefore cannot steer) the token to a
+// chosen ruler instance. All ruler instances in the same cluster MUST be
+// configured with the same seed so that ownership computation is
+// deterministic and coordination-free.
+func tokenForGroup(g *rulespb.RuleGroupDesc, seed []byte) uint32 {
 	ringHasher := fnv.New32a()
 
 	// Hasher never returns err.
+	if len(seed) > 0 {
+		_, _ = ringHasher.Write(seed)
+		_, _ = ringHasher.Write(sep)
+	}
 	_, _ = ringHasher.Write([]byte(g.User))
 	_, _ = ringHasher.Write(sep)
 	_, _ = ringHasher.Write([]byte(g.Namespace))
@@ -412,8 +440,8 @@ func tokenForGroup(g *rulespb.RuleGroupDesc) uint32 {
 	return ringHasher.Sum32()
 }
 
-func instanceOwnsRuleGroup(r ring.ReadRing, g *rulespb.RuleGroupDesc, instanceAddr string) (bool, error) {
-	hash := tokenForGroup(g)
+func instanceOwnsRuleGroup(r ring.ReadRing, g *rulespb.RuleGroupDesc, instanceAddr string, seed []byte) (bool, error) {
+	hash := tokenForGroup(g, seed)
 
 	rlrs, err := r.Get(hash, RingOp, nil, nil, nil)
 	if err != nil {
@@ -541,7 +569,7 @@ func (r *Ruler) listRulesShardingDefault(ctx context.Context) (map[string]rulesp
 
 	filteredConfigs := make(map[string]rulespb.RuleGroupList)
 	for userID, groups := range configs {
-		filtered := filterRuleGroups(userID, groups, r.ring, r.lifecycler.GetInstanceAddr(), r.logger, r.ringCheckErrors)
+		filtered := filterRuleGroups(userID, groups, r.ring, r.lifecycler.GetInstanceAddr(), r.shardingHashSeed, r.logger, r.ringCheckErrors)
 		if len(filtered) > 0 {
 			filteredConfigs[userID] = filtered
 		}
@@ -599,7 +627,7 @@ func (r *Ruler) listRulesShuffleSharding(ctx context.Context) (map[string]rulesp
 					return errors.Wrapf(err, "failed to fetch rule groups for user %s", userID)
 				}
 
-				filtered := filterRuleGroups(userID, groups, userRings[userID], r.lifecycler.GetInstanceAddr(), r.logger, r.ringCheckErrors)
+				filtered := filterRuleGroups(userID, groups, userRings[userID], r.lifecycler.GetInstanceAddr(), r.shardingHashSeed, r.logger, r.ringCheckErrors)
 				if len(filtered) == 0 {
 					continue
 				}
@@ -621,11 +649,11 @@ func (r *Ruler) listRulesShuffleSharding(ctx context.Context) (map[string]rulesp
 //
 // Reason why this function is not a method on Ruler is to make sure we don't accidentally use r.ring,
 // but only ring passed as parameter.
-func filterRuleGroups(userID string, ruleGroups []*rulespb.RuleGroupDesc, ring ring.ReadRing, instanceAddr string, log log.Logger, ringCheckErrors prometheus.Counter) []*rulespb.RuleGroupDesc {
+func filterRuleGroups(userID string, ruleGroups []*rulespb.RuleGroupDesc, ring ring.ReadRing, instanceAddr string, seed []byte, log log.Logger, ringCheckErrors prometheus.Counter) []*rulespb.RuleGroupDesc {
 	// Prune the rule group to only contain rules that this ruler is responsible for, based on ring.
 	var result []*rulespb.RuleGroupDesc
 	for _, g := range ruleGroups {
-		owned, err := instanceOwnsRuleGroup(ring, g, instanceAddr)
+		owned, err := instanceOwnsRuleGroup(ring, g, instanceAddr, seed)
 		if err != nil {
 			ringCheckErrors.Inc()
 			level.Error(log).Log("msg", "failed to check if the ruler replica owns the rule group", "user", userID, "namespace", g.Namespace, "group", g.Name, "err", err)
