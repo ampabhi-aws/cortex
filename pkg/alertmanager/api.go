@@ -259,6 +259,26 @@ func validateUserConfig(logger log.Logger, cfg alertspb.AlertConfigDesc, limits 
 	return nil
 }
 
+// redactAlertmanagerConfig parses an Alertmanager YAML config and re-marshals
+// it so that secret-bearing fields (Secret, SecretURL) are rendered as the
+// "<secret>" placeholder by their respective MarshalYAML implementations.
+// It returns the redacted YAML; on parse failure it returns the error and no
+// output so callers can decide to fail closed instead of leaking the raw input.
+func redactAlertmanagerConfig(raw string) (string, error) {
+	if raw == "" {
+		return "", nil
+	}
+	cfg, err := config.Load(raw)
+	if err != nil {
+		return "", err
+	}
+	b, err := yaml.Marshal(cfg)
+	if err != nil {
+		return "", err
+	}
+	return string(b), nil
+}
+
 func (am *MultitenantAlertmanager) ListAllConfigs(w http.ResponseWriter, r *http.Request) {
 	logger := util_log.WithContext(r.Context(), am.logger)
 	userIDs, err := am.store.ListAllUsers(r.Context())
@@ -283,10 +303,23 @@ func (am *MultitenantAlertmanager) ListAllConfigs(w http.ResponseWriter, r *http
 		} else if err != nil {
 			return errors.Wrapf(err, "failed to fetch alertmanager config for user %s", userID)
 		}
+		// This endpoint is a cross-tenant operator view. Scrub tenant-provided
+		// secrets (e.g. slack_api_url, smtp_auth_password, PagerDuty routing_key,
+		// basic_auth passwords, bearer tokens, ...) before streaming so a dump
+		// cannot leak tenant notification credentials. We do this by round-tripping
+		// the raw YAML through the Alertmanager config schema, whose Secret /
+		// SecretURL types replace their values with "<secret>" on MarshalYAML.
+		redactedConfig, redactErr := redactAlertmanagerConfig(cfg.RawConfig)
+		if redactErr != nil {
+			level.Warn(logger).Log("msg", "failed to redact alertmanager config for listing; omitting config body", "user", userID, "err", redactErr)
+			// Fail closed: never emit the raw YAML on this unauthenticated
+			// cross-tenant endpoint, even if the config is unparseable.
+			redactedConfig = ""
+		}
 		data := map[string]*UserConfig{
 			userID: {
 				TemplateFiles:      alertspb.ParseTemplates(cfg),
-				AlertmanagerConfig: cfg.RawConfig,
+				AlertmanagerConfig: redactedConfig,
 			},
 		}
 
