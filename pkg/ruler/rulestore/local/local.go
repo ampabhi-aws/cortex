@@ -5,6 +5,7 @@ import (
 	"flag"
 	"os"
 	"path/filepath"
+	"strings"
 
 	"github.com/pkg/errors"
 	promRules "github.com/prometheus/prometheus/rules"
@@ -168,7 +169,16 @@ func (l *Client) loadAllRulesGroupsForUser(ctx context.Context, userID string) (
 }
 
 func (l *Client) loadAllRulesGroupsForUserAndNamespace(_ context.Context, userID string, namespace string) (rulespb.RuleGroupList, error) {
-	filename := filepath.Join(l.cfg.Directory, userID, namespace)
+	// Defense in depth: ensure the resolved file path stays within
+	// <directory>/<userID>. The API layer (pkg/ruler/api.go parseNamespace)
+	// already rejects namespaces that contain path separators, ".." or NUL
+	// bytes, but any other caller of this store must not be able to escape
+	// the per-tenant directory either.
+	userDir := filepath.Clean(filepath.Join(l.cfg.Directory, userID))
+	filename := filepath.Join(userDir, namespace)
+	if rel, err := filepath.Rel(userDir, filename); err != nil || rel == "." || rel == ".." || strings.HasPrefix(rel, ".."+string(filepath.Separator)) || filepath.IsAbs(rel) {
+		return nil, errors.Errorf("invalid namespace %q", namespace)
+	}
 
 	rulegroups, allErrors := l.loader.Load(filename)
 	if len(allErrors) > 0 {
