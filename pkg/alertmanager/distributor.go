@@ -176,51 +176,74 @@ func (d *Distributor) doQuorum(userID string, w http.ResponseWriter, r *http.Req
 		}
 	}
 
-	var responses []*httpgrpc.HTTPResponse
-	var responsesMtx sync.Mutex
+	// Resolve the replication set for this tenant from the ring. We then override MaxErrors
+	// so this read/write path enforces the documented quorum semantics (floor(RF/2)+1
+	// replicas must contribute) instead of inheriting MaxErrors = len(instances)-1 from the
+	// ignore-unhealthy replication strategy that the Alertmanager ring uses for state-sync
+	// and ownership operations. Without this, DoBatch would return after a single replica
+	// replied and the merged response could silently omit alerts/silences held by the
+	// other replicas.
+	replicationSet, err := d.alertmanagerRing.Get(shardByUser(userID), RingOp, nil, nil, nil)
+	if err != nil {
+		level.Error(logger).Log("msg", "failed to get replication set from the ring", "err", err)
+		w.WriteHeader(http.StatusInternalServerError)
+		return
+	}
+
+	minSuccess := (d.alertmanagerRing.ReplicationFactor() / 2) + 1
+	if len(replicationSet.Instances) < minSuccess {
+		level.Error(logger).Log("msg", "not enough alertmanager replicas to reach quorum",
+			"replicas", len(replicationSet.Instances), "required", minSuccess)
+		http.Error(w, "not enough alertmanager replicas available to reach quorum", http.StatusInternalServerError)
+		return
+	}
+	replicationSet.MaxErrors = len(replicationSet.Instances) - minSuccess
+
 	grpcHeaders := httpToHttpgrpcHeaders(r.Header)
-	err = ring.DoBatch(r.Context(), RingOp, d.alertmanagerRing, []uint32{shardByUser(userID)}, func(am ring.InstanceDesc, _ []int) error {
+	results, err := replicationSet.Do(r.Context(), 0, func(_ context.Context, am *ring.InstanceDesc) (interface{}, error) {
 		// Use a background context to make sure all alertmanagers get the request even if we return early.
 		localCtx := opentracing.ContextWithSpan(user.InjectOrgID(context.Background(), userID), opentracing.SpanFromContext(r.Context()))
 		sp, localCtx := opentracing.StartSpanFromContext(localCtx, "Distributor.doQuorum")
 		defer sp.Finish()
 
-		resp, err := d.doRequest(localCtx, am, &httpgrpc.HTTPRequest{
+		resp, err := d.doRequest(localCtx, *am, &httpgrpc.HTTPRequest{
 			Method:  r.Method,
 			Url:     r.RequestURI,
 			Body:    body,
 			Headers: grpcHeaders,
 		})
 		if err != nil {
-			return err
+			return nil, err
 		}
 
 		if resp.Code/100 != 2 {
-			return httpgrpc.ErrorFromHTTPResponse(resp)
+			return nil, httpgrpc.ErrorFromHTTPResponse(resp)
 		}
 
-		responsesMtx.Lock()
-		responses = append(responses, resp)
-		responsesMtx.Unlock()
-
-		return nil
-	}, func() {})
+		return resp, nil
+	})
 
 	if err != nil {
 		respondFromError(err, w, logger)
 		return
 	}
 
-	responsesMtx.Lock() // Another request might be ongoing after quorum.
-	resps := responses
-	responsesMtx.Unlock()
+	resps := make([]*httpgrpc.HTTPResponse, 0, len(results))
+	for _, res := range results {
+		if resp, ok := res.(*httpgrpc.HTTPResponse); ok && resp != nil {
+			resps = append(resps, resp)
+		}
+	}
 
-	if len(resps) > 0 {
+	if len(resps) >= minSuccess {
 		respondFromMultipleHTTPGRPCResponses(w, logger, resps, m)
 	} else {
-		// This should not happen.
-		level.Error(logger).Log("msg", "distributor did not receive any response from alertmanagers, but there were no errors")
-		w.WriteHeader(http.StatusInternalServerError)
+		// ReplicationSet.Do only returns success once MaxErrors is not exceeded, i.e. once at
+		// least minSuccess responses have been collected. Reaching this branch would indicate
+		// a quorum-tracking bug; fail safely rather than merge a sub-quorum response.
+		level.Error(logger).Log("msg", "distributor received fewer alertmanager responses than required for a quorum",
+			"received", len(resps), "required", minSuccess)
+		http.Error(w, "alertmanager quorum not reached", http.StatusInternalServerError)
 	}
 }
 
