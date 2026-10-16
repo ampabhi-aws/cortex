@@ -83,6 +83,25 @@ func (t *SingleResolver) TenantID(ctx context.Context) (string, error) {
 		return "", err
 	}
 
+	// Explicitly reject the multi-tenant separator so the ingress path signals
+	// an error instead of silently treating a multi-tenant header as one
+	// opaque tenant ID. See docs/proposals/cross-tenant-query-federation.md:
+	// "Components which are not expecting multiple tenant ids (e.g. the
+	// ingress path) must signal an error if multiple are used."
+	if strings.Contains(id, tenantIDsLabelSeparator) {
+		return "", user.ErrTooManyOrgIDs
+	}
+
+	// Enforce the documented tenant ID character set and 150-byte length limit
+	// (https://cortexmetrics.io/docs/guides/limitations/#tenant-id-naming).
+	if err := ValidTenantID(id); err != nil {
+		return "", err
+	}
+
+	// Defence in depth: also reject anything that could escape a per-tenant
+	// filesystem path or bucket prefix. ValidTenantID already forbids the
+	// relevant characters, but keep this check in case the allowed set is
+	// widened in the future.
 	if containsUnsafePathSegments(id) {
 		return "", errInvalidTenantID
 	}
