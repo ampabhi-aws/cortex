@@ -20,6 +20,7 @@ import (
 	amconfig "github.com/prometheus/alertmanager/config"
 	amtemplate "github.com/prometheus/alertmanager/template"
 
+	"github.com/cortexproject/cortex/pkg/alertmanager"
 	"github.com/cortexproject/cortex/pkg/configs/db"
 	"github.com/cortexproject/cortex/pkg/configs/userconfig"
 	"github.com/cortexproject/cortex/pkg/tenant"
@@ -230,6 +231,18 @@ func validateAlertmanagerConfig(cfg string, noCfg NotificationsConfig) error {
 		return err
 	}
 
+	// Enforce the Cortex *_file blocklist and template-name policy on configs
+	// stored via the legacy configs service. Without this check, a tenant can
+	// POST a configuration that references password_file/bearer_token_file/
+	// credentials_file/ca_file/cert_file/key_file/api_url_file/api_key_file
+	// and have the Alertmanager read those files at notify time. The same
+	// policy must apply here as in the user-facing alertmanager API handler
+	// (SetUserConfig), and it is also re-enforced inside
+	// MultitenantAlertmanager.setConfig at the point of use.
+	if err := alertmanager.ValidateAlertmanagerConfigPolicy(amCfg); err != nil {
+		return err
+	}
+
 	for _, recv := range amCfg.Receivers {
 		if noCfg.DisableEmail && len(recv.EmailConfigs) > 0 {
 			return ErrEmailNotificationsAreDisabled
@@ -249,6 +262,12 @@ func validateRulesFiles(c userconfig.Config) error {
 
 func validateTemplateFiles(c userconfig.Config) error {
 	for fn, content := range c.TemplateFiles {
+		// Reject template filenames with path components so that an entry in
+		// template_files cannot be used to control where the Alertmanager
+		// writes the template on disk when the config is later applied.
+		if err := alertmanager.ValidateTemplateFilename(fn); err != nil {
+			return err
+		}
 		if _, err := template.New(fn).Funcs(template.FuncMap(amtemplate.DefaultFuncs)).Parse(content); err != nil {
 			return err
 		}
