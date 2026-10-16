@@ -29,6 +29,7 @@ import (
 	"github.com/cortexproject/cortex/pkg/cortexpb"
 	ingester_client "github.com/cortexproject/cortex/pkg/ingester/client"
 	"github.com/cortexproject/cortex/pkg/prom1/storage/metric"
+	"github.com/cortexproject/cortex/pkg/querier"
 	"github.com/cortexproject/cortex/pkg/ring"
 	ring_client "github.com/cortexproject/cortex/pkg/ring/client"
 	"github.com/cortexproject/cortex/pkg/tenant"
@@ -1120,17 +1121,50 @@ func (d *Distributor) metricsForLabelMatchersCommon(ctx context.Context, from, t
 	return result, nil
 }
 
-// MetricsMetadata returns all metric metadata of a user.
-func (d *Distributor) MetricsMetadata(ctx context.Context) ([]scrape.MetricMetadata, error) {
+// MetricsMetadata returns metric metadata for a user, honouring the
+// optional per-request limit and metric-family filter in req and the
+// per-tenant maximum metadata query limit configured in the overrides.
+//
+// The function stops accumulating entries as soon as the effective cap is
+// reached and returns a limit error instead of a truncated full set when
+// the per-tenant maximum would be exceeded. This is intentional: callers
+// that need to page should pass a smaller Limit explicitly.
+func (d *Distributor) MetricsMetadata(ctx context.Context, req *querier.MetricsMetadataRequest) ([]scrape.MetricMetadata, error) {
+	if req == nil {
+		req = &querier.MetricsMetadataRequest{Limit: -1}
+	}
+
+	// Fast path: caller explicitly asked for zero entries. No need to
+	// resolve the ring or talk to any ingester.
+	if req.Limit == 0 {
+		return []scrape.MetricMetadata{}, nil
+	}
+
+	userID, err := tenant.TenantID(ctx)
+	if err != nil {
+		return nil, err
+	}
+
 	replicationSet, err := d.GetIngestersForMetadata(ctx)
 	if err != nil {
 		return nil, err
 	}
 
-	req := &ingester_client.MetricsMetadataRequest{}
+	// serverCap is the per-tenant hard ceiling on the number of entries
+	// this handler will accumulate when the caller did not supply its own
+	// limit. 0 disables the cap.
+	serverCap := d.limits.MaxMetadataQueryLimit(userID)
+
+	// callerLimited is true when the caller explicitly supplied a limit.
+	// In that case the limit is a normal early-exit and we never return
+	// errMaxMetadataLimit; callers that need to page past the server cap
+	// must do so with explicit limits.
+	callerLimited := req.Limit >= 0
+
+	ingesterReq := &ingester_client.MetricsMetadataRequest{}
 	// TODO(gotjosh): We only need to look in all the ingesters if shardByAllLabels is enabled.
 	resps, err := d.ForReplicationSet(ctx, replicationSet, func(ctx context.Context, client ingester_client.IngesterClient) (interface{}, error) {
-		return client.MetricsMetadata(ctx, req)
+		return client.MetricsMetadata(ctx, ingesterReq)
 	})
 	if err != nil {
 		return nil, err
@@ -1141,9 +1175,14 @@ func (d *Distributor) MetricsMetadata(ctx context.Context) ([]scrape.MetricMetad
 	for _, resp := range resps {
 		r := resp.(*ingester_client.MetricsMetadataResponse)
 		for _, m := range r.Metadata {
+			// Apply the optional metric-family filter before deduplicating
+			// so we do not pay for building a dedup entry we will discard.
+			if req.Metric != "" && m.MetricFamilyName != req.Metric {
+				continue
+			}
+
 			// Given we look across all ingesters - dedup the metadata.
-			_, ok := dedupTracker[*m]
-			if ok {
+			if _, ok := dedupTracker[*m]; ok {
 				continue
 			}
 			dedupTracker[*m] = struct{}{}
@@ -1154,11 +1193,28 @@ func (d *Distributor) MetricsMetadata(ctx context.Context) ([]scrape.MetricMetad
 				Unit:   m.Unit,
 				Type:   cortexpb.MetricMetadataMetricTypeToMetricType(m.GetType()),
 			})
+
+			// If the caller did not supply its own limit and the result
+			// set exceeds the server cap, refuse the request rather than
+			// silently returning a truncated result. We accumulate one
+			// past serverCap so we can detect the overrun deterministically.
+			if !callerLimited && serverCap > 0 && len(result) > serverCap {
+				return nil, errMaxMetadataLimit
+			}
+
+			// Honour the caller-supplied limit as a normal early-exit.
+			if callerLimited && len(result) >= req.Limit {
+				return result, nil
+			}
 		}
 	}
 
 	return result, nil
 }
+
+// errMaxMetadataLimit is returned when a tenant's metric metadata set
+// exceeds the configured per-tenant maximum metadata query limit.
+var errMaxMetadataLimit = errors.New("the number of metric metadata entries exceeds the per-tenant maximum metadata query limit")
 
 // UserStats returns statistics about the current user.
 func (d *Distributor) UserStats(ctx context.Context) (*UserStats, error) {

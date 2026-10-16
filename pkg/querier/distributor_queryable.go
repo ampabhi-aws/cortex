@@ -34,7 +34,20 @@ type Distributor interface {
 	LabelNamesStream(context.Context, model.Time, model.Time) ([]string, error)
 	MetricsForLabelMatchers(ctx context.Context, from, through model.Time, matchers ...*labels.Matcher) ([]metric.Metric, error)
 	MetricsForLabelMatchersStream(ctx context.Context, from, through model.Time, matchers ...*labels.Matcher) ([]metric.Metric, error)
-	MetricsMetadata(ctx context.Context) ([]scrape.MetricMetadata, error)
+	MetricsMetadata(ctx context.Context, req *MetricsMetadataRequest) ([]scrape.MetricMetadata, error)
+}
+
+// MetricsMetadataRequest describes the parameters accepted by the
+// MetricsMetadata read path. It mirrors the subset of Prometheus's
+// /api/v1/metadata query parameters that Cortex honours.
+//
+// A Limit of -1 means the caller did not supply a limit, so the response
+// is bounded only by the per-tenant server-side maximum. A Limit of 0 is a
+// valid caller-supplied value and means "zero entries". Metric, if
+// non-empty, restricts the response to the given metric family name.
+type MetricsMetadataRequest struct {
+	Limit  int
+	Metric string
 }
 
 func newDistributorQueryable(distributor Distributor, streaming bool, streamingMetdata bool, iteratorFn chunkIteratorFunc, queryIngestersWithin time.Duration) QueryableWithFilter {

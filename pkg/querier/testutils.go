@@ -55,8 +55,8 @@ func (m *MockDistributor) MetricsForLabelMatchersStream(ctx context.Context, fro
 	return args.Get(0).([]metric.Metric), args.Error(1)
 }
 
-func (m *MockDistributor) MetricsMetadata(ctx context.Context) ([]scrape.MetricMetadata, error) {
-	args := m.Called(ctx)
+func (m *MockDistributor) MetricsMetadata(ctx context.Context, req *MetricsMetadataRequest) ([]scrape.MetricMetadata, error) {
+	args := m.Called(ctx, req)
 	return args.Get(0).([]scrape.MetricMetadata), args.Error(1)
 }
 

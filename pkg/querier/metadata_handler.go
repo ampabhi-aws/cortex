@@ -1,9 +1,10 @@
 package querier
 
 import (
+	"encoding/json"
+	"errors"
 	"net/http"
-
-	"github.com/cortexproject/cortex/pkg/util"
+	"strconv"
 )
 
 type metricMetadata struct {
@@ -15,6 +16,8 @@ type metricMetadata struct {
 const (
 	statusSuccess = "success"
 	statusError   = "error"
+
+	contentTypeJSON = "application/json"
 )
 
 type metadataResult struct {
@@ -23,29 +26,71 @@ type metadataResult struct {
 	Error  string                      `json:"error,omitempty"`
 }
 
+var errInvalidMetadataLimit = errors.New("limit must be a non-negative integer")
+
 // MetadataHandler returns metric metadata held by Cortex for a given tenant.
-// It is kept and returned as a set.
+// It honours the ``limit`` and ``metric`` query parameters of the Prometheus
+// /api/v1/metadata API; the per-tenant maximum metadata query cap is
+// applied by the distributor. The successful response is streamed with a
+// json.Encoder so the handler does not have to buffer the fully marshalled
+// JSON output in memory before writing to the client.
 func MetadataHandler(d Distributor) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		resp, err := d.MetricsMetadata(r.Context())
+		req, err := parseMetadataRequest(r)
 		if err != nil {
-			w.WriteHeader(http.StatusBadRequest)
-			util.WriteJSONResponse(w, metadataResult{Status: statusError, Error: err.Error()})
+			writeMetadataError(w, http.StatusBadRequest, err.Error())
 			return
 		}
 
-		// Put all the elements of the pseudo-set into a map of slices for marshalling.
-		metrics := map[string][]metricMetadata{}
-		for _, m := range resp {
-			ms, ok := metrics[m.Metric]
-			if !ok {
-				// Most metrics will only hold 1 copy of the same metadata.
-				ms = make([]metricMetadata, 0, 1)
-				metrics[m.Metric] = ms
-			}
-			metrics[m.Metric] = append(ms, metricMetadata{Type: string(m.Type), Help: m.Help, Unit: m.Unit})
+		resp, err := d.MetricsMetadata(r.Context(), req)
+		if err != nil {
+			// Return a generic error to the client; the internal error is
+			// already available in the server logs.
+			writeMetadataError(w, http.StatusBadRequest, "failed to fetch metric metadata")
+			return
 		}
 
-		util.WriteJSONResponse(w, metadataResult{Status: statusSuccess, Data: metrics})
+		// Group the already-deduplicated and already-capped slice by metric
+		// family name for the response. This is the only in-handler copy.
+		metrics := make(map[string][]metricMetadata, len(resp))
+		for _, m := range resp {
+			metrics[m.Metric] = append(metrics[m.Metric], metricMetadata{
+				Type: string(m.Type),
+				Help: m.Help,
+				Unit: m.Unit,
+			})
+		}
+
+		w.Header().Set("Content-Type", contentTypeJSON)
+		w.WriteHeader(http.StatusOK)
+		_ = json.NewEncoder(w).Encode(metadataResult{Status: statusSuccess, Data: metrics})
 	})
+}
+
+// parseMetadataRequest extracts the ``limit`` and ``metric`` query
+// parameters from the request. A missing ``limit`` is reported as -1 to
+// signal "no caller-supplied limit".
+func parseMetadataRequest(r *http.Request) (*MetricsMetadataRequest, error) {
+	req := &MetricsMetadataRequest{
+		Limit:  -1,
+		Metric: r.FormValue("metric"),
+	}
+	if v := r.FormValue("limit"); v != "" {
+		n, err := strconv.Atoi(v)
+		if err != nil || n < 0 {
+			return nil, errInvalidMetadataLimit
+		}
+		req.Limit = n
+	}
+	return req, nil
+}
+
+// writeMetadataError emits a JSON error payload. The Content-Type is set
+// before WriteHeader so the response always carries the JSON media type
+// (net/http silently drops header writes after WriteHeader has been
+// called).
+func writeMetadataError(w http.ResponseWriter, status int, msg string) {
+	w.Header().Set("Content-Type", contentTypeJSON)
+	w.WriteHeader(status)
+	_ = json.NewEncoder(w).Encode(metadataResult{Status: statusError, Error: msg})
 }

@@ -36,6 +36,7 @@ import (
 	"github.com/cortexproject/cortex/pkg/ingester"
 	"github.com/cortexproject/cortex/pkg/ingester/client"
 	"github.com/cortexproject/cortex/pkg/prom1/storage/metric"
+	"github.com/cortexproject/cortex/pkg/querier"
 	"github.com/cortexproject/cortex/pkg/ring"
 	ring_client "github.com/cortexproject/cortex/pkg/ring/client"
 	"github.com/cortexproject/cortex/pkg/ring/kv"
@@ -2295,7 +2296,7 @@ func TestDistributor_MetricsMetadata(t *testing.T) {
 			require.NoError(t, err)
 
 			// Assert on metric metadata
-			metadata, err := ds[0].MetricsMetadata(ctx)
+			metadata, err := ds[0].MetricsMetadata(ctx, &querier.MetricsMetadataRequest{Limit: -1})
 			require.NoError(t, err)
 			assert.Equal(t, 10, len(metadata))
 
