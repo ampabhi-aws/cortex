@@ -2,6 +2,7 @@ package cortex
 
 import (
 	"errors"
+	"fmt"
 	"io"
 	"net/http"
 
@@ -9,6 +10,7 @@ import (
 
 	"github.com/cortexproject/cortex/pkg/ingester"
 	"github.com/cortexproject/cortex/pkg/ring/kv"
+	"github.com/cortexproject/cortex/pkg/tenant"
 	"github.com/cortexproject/cortex/pkg/util"
 	"github.com/cortexproject/cortex/pkg/util/runtimeconfig"
 	"github.com/cortexproject/cortex/pkg/util/validation"
@@ -126,20 +128,41 @@ func runtimeConfigHandler(runtimeCfgManager *runtimeconfig.Manager, defaultLimit
 			return
 		}
 
+		// Resolve the caller's tenant and restrict the response to the caller's
+		// overrides only. The route is registered with auth=true, so the
+		// AuthenticateUser middleware has already placed the tenant ID on the
+		// request context before this handler runs.
+		userID, err := tenant.TenantID(r.Context())
+		if err != nil {
+			http.Error(w, fmt.Sprintf("no org id: %s", err.Error()), http.StatusUnauthorized)
+			return
+		}
+
+		// Build a per-tenant view of the runtime config so that no other
+		// tenant's identity or overrides are disclosed.
+		scopedCfg := &runtimeConfigValues{
+			Multi:                  cfg.Multi,
+			IngesterChunkStreaming: cfg.IngesterChunkStreaming,
+			IngesterLimits:         cfg.IngesterLimits,
+		}
+		if tl, ok := cfg.TenantLimits[userID]; ok && tl != nil {
+			scopedCfg.TenantLimits = map[string]*validation.Limits{userID: tl}
+		}
+
 		var output interface{}
 		switch r.URL.Query().Get("mode") {
 		case "diff":
 			// Default runtime config is just empty struct, but to make diff work,
-			// we set defaultLimits for every tenant that exists in runtime config.
+			// we set defaultLimits for every tenant that exists in the scoped config.
 			defaultCfg := runtimeConfigValues{}
 			defaultCfg.TenantLimits = map[string]*validation.Limits{}
-			for k, v := range cfg.TenantLimits {
+			for k, v := range scopedCfg.TenantLimits {
 				if v != nil {
 					defaultCfg.TenantLimits[k] = &defaultLimits
 				}
 			}
 
-			cfgYaml, err := util.YAMLMarshalUnmarshal(cfg)
+			cfgYaml, err := util.YAMLMarshalUnmarshal(scopedCfg)
 			if err != nil {
 				http.Error(w, err.Error(), http.StatusInternalServerError)
 				return
@@ -158,7 +181,7 @@ func runtimeConfigHandler(runtimeCfgManager *runtimeconfig.Manager, defaultLimit
 			}
 
 		default:
-			output = cfg
+			output = scopedCfg
 		}
 		util.WriteYAMLResponse(w, output)
 	}
