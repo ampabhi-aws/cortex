@@ -15,6 +15,7 @@ import (
 	"github.com/go-kit/log/level"
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/common/model"
+	"github.com/prometheus/prometheus/model/exemplar"
 	"github.com/prometheus/prometheus/model/labels"
 	"github.com/prometheus/prometheus/promql"
 	"github.com/prometheus/prometheus/storage"
@@ -153,6 +154,7 @@ func New(cfg Config, limits *validation.Overrides, distributor Distributor, stor
 	}
 	queryable := NewQueryable(distributorQueryable, ns, iteratorFunc, cfg, limits, tombstonesLoader)
 	exemplarQueryable := newDistributorExemplarQueryable(distributor)
+	exemplarQueryable = NewExemplarQueryable(exemplarQueryable, cfg, limits)
 
 	lazyQueryable := storage.QueryableFunc(func(ctx context.Context, mint int64, maxt int64) (storage.Querier, error) {
 		querier, err := queryable.Querier(ctx, mint, maxt)
@@ -267,6 +269,68 @@ func NewQueryable(distributor QueryableWithFilter, stores []QueryableWithFilter,
 
 		return q, nil
 	})
+}
+
+// NewExemplarQueryable returns a storage.ExemplarQueryable that wraps the
+// provided ExemplarQueryable, applying the same per-tenant time range
+// validation (max query lookback, max query into future, max query length)
+// as the sample queryable so that /api/v1/query_exemplars is subject to the
+// same operator-configured limits.
+func NewExemplarQueryable(exemplarQueryable storage.ExemplarQueryable, cfg Config, limits *validation.Overrides) storage.ExemplarQueryable {
+	return &validatedExemplarQueryable{
+		wrapped:            exemplarQueryable,
+		limits:             limits,
+		maxQueryIntoFuture: cfg.MaxQueryIntoFuture,
+	}
+}
+
+type validatedExemplarQueryable struct {
+	wrapped            storage.ExemplarQueryable
+	limits             *validation.Overrides
+	maxQueryIntoFuture time.Duration
+}
+
+func (q *validatedExemplarQueryable) ExemplarQuerier(ctx context.Context) (storage.ExemplarQuerier, error) {
+	inner, err := q.wrapped.ExemplarQuerier(ctx)
+	if err != nil {
+		return nil, err
+	}
+	return &validatedExemplarQuerier{
+		ctx:                ctx,
+		wrapped:            inner,
+		limits:             q.limits,
+		maxQueryIntoFuture: q.maxQueryIntoFuture,
+	}, nil
+}
+
+type validatedExemplarQuerier struct {
+	ctx                context.Context
+	wrapped            storage.ExemplarQuerier
+	limits             *validation.Overrides
+	maxQueryIntoFuture time.Duration
+}
+
+func (q *validatedExemplarQuerier) Select(start, end int64, matchers ...[]*labels.Matcher) ([]exemplar.QueryResult, error) {
+	userID, err := tenant.TenantID(q.ctx)
+	if err != nil {
+		return nil, err
+	}
+
+	startMs, endMs, err := validateQueryTimeRange(q.ctx, userID, start, end, q.limits, q.maxQueryIntoFuture)
+	if err == errEmptyTimeRange {
+		return nil, nil
+	} else if err != nil {
+		return nil, err
+	}
+
+	startTime := model.Time(startMs)
+	endTime := model.Time(endMs)
+
+	if maxQueryLength := q.limits.MaxQueryLength(userID); maxQueryLength > 0 && endTime.Sub(startTime) > maxQueryLength {
+		return nil, validation.LimitError(fmt.Sprintf(validation.ErrQueryTooLong, endTime.Sub(startTime), maxQueryLength))
+	}
+
+	return q.wrapped.Select(startMs, endMs, matchers...)
 }
 
 type querier struct {
