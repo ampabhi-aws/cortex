@@ -2,6 +2,7 @@ package ruler
 
 import (
 	"crypto/md5"
+	"fmt"
 	"net/url"
 	"path/filepath"
 	"sort"
@@ -84,7 +85,26 @@ func (m *mapper) MapRules(user string, ruleConfigs map[string][]rulefmt.RuleGrou
 	for filename, groups := range ruleConfigs {
 		// Store the encoded file name to better handle `/` characters
 		encodedFileName := url.PathEscape(filename)
+
+		// url.PathEscape does not escape `.`, so a namespace of "", "." or ".."
+		// would collapse through filepath.Join onto the tenant's rules directory
+		// (or the shared rules root) and the subsequent read/write would fail with
+		// EISDIR, aborting the whole MapRules call before manager.Update is
+		// reached. Skip these namespaces (log loudly) rather than let a single
+		// malformed group permanently break the tenant's rule sync.
+		if encodedFileName == "" || encodedFileName == "." || encodedFileName == ".." {
+			level.Warn(m.logger).Log("msg", "skipping rule group with invalid namespace", "user", user, "namespace", filename)
+			continue
+		}
 		fullFileName := filepath.Join(path, encodedFileName)
+		// Defence in depth: make sure the computed target is a direct child of the
+		// tenant directory. Any name that canonicalises away through filepath.Join
+		// (e.g. embedded separators that slip past PathEscape in a future stdlib
+		// change) is rejected here instead of silently rewriting the parent.
+		if filepath.Dir(fullFileName) != path {
+			level.Warn(m.logger).Log("msg", "skipping rule group whose encoded namespace is not a safe single path segment", "user", user, "namespace", filename, "encoded", encodedFileName)
+			continue
+		}
 
 		fileUpdated, err := m.writeRuleGroupsIfNewer(groups, fullFileName)
 		if err != nil {
@@ -136,8 +156,15 @@ func (m *mapper) writeRuleGroupsIfNewer(groups []rulefmt.RuleGroup, filename str
 		return false, err
 	}
 
-	_, err = m.FS.Stat(filename)
+	info, err := m.FS.Stat(filename)
 	if err == nil {
+		// Ensure the existing path really is a regular file. If something has
+		// placed a directory (or other non-regular entry) at the target path we
+		// must not try to ReadFile/WriteFile it -- that would fail with EISDIR on
+		// every poll and abort the whole MapRules run.
+		if !info.Mode().IsRegular() {
+			return false, fmt.Errorf("rule file target %q is not a regular file", filename)
+		}
 		current, err := afero.ReadFile(m.FS, filename)
 		if err != nil {
 			return false, err

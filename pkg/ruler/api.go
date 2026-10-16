@@ -282,6 +282,10 @@ func (a *API) PrometheusAlerts(w http.ResponseWriter, req *http.Request) {
 var (
 	// ErrNoNamespace signals that no namespace was specified in the request
 	ErrNoNamespace = errors.New("a namespace must be provided in the request")
+	// ErrInvalidNamespace signals that the namespace is not a valid single path
+	// segment (empty, ".", or "..") and would collide with a directory path when
+	// used by the on-disk rule mapper.
+	ErrInvalidNamespace = errors.New("invalid namespace: must not be empty, \".\", or \"..\"")
 	// ErrNoGroupName signals a group name url parameter was not found
 	ErrNoGroupName = errors.New("a matching group name must be provided in the request")
 	// ErrNoRuleGroups signals the rule group requested does not exist
@@ -336,6 +340,14 @@ func parseNamespace(params map[string]string) (string, error) {
 		return "", err
 	}
 
+	// Reject namespaces that would collapse to a directory path (empty, ".", or
+	// "..") when used as a file name by the on-disk rule mapper. Without this
+	// check a tenant could store a rule group whose namespace is accepted by the
+	// API but then permanently breaks that tenant's rule sync in the ruler.
+	if namespace == "" || namespace == "." || namespace == ".." {
+		return "", ErrInvalidNamespace
+	}
+
 	return namespace, nil
 }
 
@@ -368,7 +380,9 @@ func parseRequest(req *http.Request, requireNamespace, requireGroup bool) (strin
 
 	namespace, err := parseNamespace(vars)
 	if err != nil {
-		if err != ErrNoNamespace || requireNamespace {
+		if err == ErrNoNamespace && !requireNamespace {
+			// Namespace is optional for this request; swallow the "missing" error.
+		} else {
 			return "", "", "", err
 		}
 	}
