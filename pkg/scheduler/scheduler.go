@@ -3,8 +3,11 @@ package scheduler
 import (
 	"context"
 	"flag"
+	"fmt"
 	"io"
+	"net"
 	"net/http"
+	"strings"
 	"sync"
 	"time"
 
@@ -19,6 +22,7 @@ import (
 	"github.com/weaveworks/common/middleware"
 	"github.com/weaveworks/common/user"
 	"google.golang.org/grpc"
+	"google.golang.org/grpc/peer"
 
 	"github.com/cortexproject/cortex/pkg/frontend/v2/frontendv2pb"
 	"github.com/cortexproject/cortex/pkg/scheduler/queue"
@@ -236,6 +240,23 @@ func (s *Scheduler) frontendConnected(frontend schedulerpb.SchedulerForFrontend_
 		return "", nil, errors.New("no frontend address")
 	}
 
+	// Defence against attacker-chosen dial targets reaching the scheduler and
+	// querier via FrontendToScheduler{INIT}. We reject obviously dangerous
+	// forms up front (gRPC resolver schemes, paths, control characters); and
+	// when the gRPC peer's host is known and the advertised address is a
+	// well-formed host:port, we log a warning on mismatch so operators can
+	// detect address spoofing. See CWE-918.
+	if err := checkFrontendAddressSyntax(msg.FrontendAddress); err != nil {
+		return "", nil, err
+	}
+	if p, ok := peer.FromContext(frontend.Context()); ok && p != nil && p.Addr != nil {
+		if advertisedHost, _, hpErr := net.SplitHostPort(msg.FrontendAddress); hpErr == nil {
+			if peerHost, _, pErr := net.SplitHostPort(p.Addr.String()); pErr == nil && !hostsMatch(advertisedHost, peerHost) {
+				level.Warn(s.log).Log("msg", "frontend advertised an address whose host differs from the gRPC peer address", "advertised", msg.FrontendAddress, "peer", p.Addr.String())
+			}
+		}
+	}
+
 	s.connectedFrontendsMu.Lock()
 	defer s.connectedFrontendsMu.Unlock()
 
@@ -250,6 +271,69 @@ func (s *Scheduler) frontendConnected(frontend schedulerpb.SchedulerForFrontend_
 
 	cf.connections++
 	return msg.FrontendAddress, cf.ctx, nil
+}
+
+// checkFrontendAddressSyntax rejects FrontendAddress values that would steer a
+// subsequent grpc.Dial to an attacker-chosen target through a gRPC resolver
+// scheme (e.g. "dns:///internal:9095", "unix:/var/run/foo", "xds:///svc") or
+// through path/newline injection. It is intentionally lenient about plain
+// host or host:port forms so that already-deployed configurations keep
+// working; the strict host:port requirement is enforced at the dial sites
+// (scheduler.forwardErrorToFrontend and querier worker.createFrontendClient).
+func checkFrontendAddressSyntax(addr string) error {
+	if addr == "" {
+		return errors.New("empty frontend address")
+	}
+	if strings.ContainsAny(addr, "/\\\x00 \t\r\n") {
+		return fmt.Errorf("frontend address %q contains disallowed characters", addr)
+	}
+	// Reject gRPC resolver schemes of the form "<scheme>:<rest>" where
+	// <scheme> is not a numeric port and <rest> does not look like one
+	// either. A bare hostname ("frontend-12345") and a host:port
+	// ("10.0.0.1:9095", "[::1]:9095") both remain acceptable here.
+	if idx := strings.Index(addr, ":"); idx >= 0 {
+		// Could be IPv6 literal; SplitHostPort will validate it.
+		if _, port, err := net.SplitHostPort(addr); err == nil {
+			if _, perr := net.LookupPort("tcp", port); perr != nil {
+				return fmt.Errorf("frontend address %q has invalid port: %w", addr, perr)
+			}
+		} else {
+			// Not host:port form; could be "scheme:something". Reject known
+			// gRPC schemes and anything that doesn't look like a bare colon-less
+			// hostname.
+			scheme := strings.ToLower(addr[:idx])
+			switch scheme {
+			case "dns", "unix", "unix-abstract", "passthrough", "xds", "http", "https":
+				return fmt.Errorf("frontend address %q uses disallowed scheme %q", addr, scheme)
+			}
+			// Any other ':'-containing non-host:port is also suspicious.
+			return fmt.Errorf("frontend address %q is not a valid host[:port] form", addr)
+		}
+	}
+	return nil
+}
+
+func hostsMatch(a, b string) bool {
+	return strings.EqualFold(strings.TrimSuffix(a, "."), strings.TrimSuffix(b, "."))
+}
+
+// strictFrontendDialAddress enforces host:port form before passing an address
+// to grpc.DialContext.
+func strictFrontendDialAddress(addr string) error {
+	if err := checkFrontendAddressSyntax(addr); err != nil {
+		return err
+	}
+	host, port, err := net.SplitHostPort(addr)
+	if err != nil {
+		return fmt.Errorf("frontend address %q is not a valid host:port: %w", addr, err)
+	}
+	if host == "" {
+		return fmt.Errorf("frontend address %q has empty host", addr)
+	}
+	if _, err := net.LookupPort("tcp", port); err != nil {
+		return fmt.Errorf("frontend address %q has invalid port: %w", addr, err)
+	}
+	return nil
 }
 
 func (s *Scheduler) frontendDisconnected(frontendAddress string) {
@@ -442,6 +526,16 @@ func (s *Scheduler) forwardRequestToQuerier(querier schedulerpb.SchedulerForQuer
 }
 
 func (s *Scheduler) forwardErrorToFrontend(ctx context.Context, req *schedulerRequest, requestErr error) {
+	// Only dial addresses that look like a plain host:port. The original
+	// FrontendAddress value flows in from an unauthenticated gRPC peer and
+	// is interpreted by grpc.DialContext as a resolver target string, which
+	// could otherwise steer the connection via dns:///, unix:/..., xds:///
+	// or similar (CWE-918).
+	if err := strictFrontendDialAddress(req.frontendAddress); err != nil {
+		level.Warn(s.log).Log("msg", "refusing to dial frontend to report error: invalid frontend address", "frontend", req.frontendAddress, "err", err, "requestErr", requestErr)
+		return
+	}
+
 	opts, err := s.cfg.GRPCClientConfig.DialOption([]grpc.UnaryClientInterceptor{
 		otgrpc.OpenTracingClientInterceptor(opentracing.GlobalTracer()),
 		middleware.ClientUserHeaderInterceptor},

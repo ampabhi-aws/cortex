@@ -38,6 +38,11 @@ type PoolConfig struct {
 	CheckInterval      time.Duration
 	HealthCheckEnabled bool
 	HealthCheckTimeout time.Duration
+
+	// MaxClients, if > 0, caps the number of concurrently cached clients in the
+	// pool. GetClientFor returns an error for new addresses once the cap is
+	// reached. 0 (the default) means unlimited (unchanged behaviour).
+	MaxClients int
 }
 
 // Pool holds a cache of grpc_health_v1 clients.
@@ -102,6 +107,12 @@ func (p *Pool) GetClientFor(addr string) (PoolClient, error) {
 	client, ok = p.clients[addr]
 	if ok {
 		return client, nil
+	}
+
+	// Bound the number of cached clients to prevent unbounded growth when
+	// callers feed the pool with attacker-influenced addresses (CWE-918).
+	if p.cfg.MaxClients > 0 && len(p.clients) >= p.cfg.MaxClients {
+		return nil, fmt.Errorf("%s client pool full (max %d entries): refusing new client for %q", p.clientName, p.cfg.MaxClients, addr)
 	}
 
 	client, err := p.factory(addr)

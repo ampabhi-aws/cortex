@@ -2,8 +2,11 @@ package worker
 
 import (
 	"context"
+	"errors"
 	"fmt"
+	"net"
 	"net/http"
+	"strings"
 	"time"
 
 	"github.com/go-kit/log"
@@ -30,6 +33,13 @@ import (
 	"github.com/cortexproject/cortex/pkg/util/services"
 )
 
+// maxFrontendClientsPerQuerier caps the number of query-frontend gRPC clients
+// the querier's pool caches at once. The address of the frontend to which the
+// querier reports a query result is supplied by the scheduler (originally by
+// the frontend over the unauthenticated FrontendLoop), so the pool must not
+// grow without bound in response to attacker-chosen addresses (CWE-918).
+const maxFrontendClientsPerQuerier = 256
+
 func newSchedulerProcessor(cfg Config, handler RequestHandler, log log.Logger, reg prometheus.Registerer) (*schedulerProcessor, []services.Service) {
 	p := &schedulerProcessor{
 		log:            log,
@@ -54,6 +64,7 @@ func newSchedulerProcessor(cfg Config, handler RequestHandler, log log.Logger, r
 		CheckInterval:      5 * time.Second,
 		HealthCheckEnabled: true,
 		HealthCheckTimeout: 1 * time.Second,
+		MaxClients:         maxFrontendClientsPerQuerier,
 	}
 
 	p.frontendPool = client.NewPool("frontend", poolConfig, nil, p.createFrontendClient, frontendClientsGauge, log)
@@ -194,7 +205,39 @@ func (sp *schedulerProcessor) runRequest(ctx context.Context, logger log.Logger,
 	}
 }
 
+// validateFrontendAddress rejects FrontendAddress values that could redirect
+// the querier's outbound gRPC dial to arbitrary targets (CWE-918). We refuse
+// addresses that look like gRPC resolver targets (scheme://..., unix:/..., or
+// anything containing '/'), as well as empty strings, and require a plain
+// host:port form that `net.SplitHostPort` can parse with a numeric port.
+func validateFrontendAddress(addr string) error {
+	if addr == "" {
+		return errors.New("empty frontend address")
+	}
+	if strings.ContainsAny(addr, "/\\\x00 \t\r\n") {
+		return fmt.Errorf("frontend address %q contains disallowed characters", addr)
+	}
+	// gRPC resolver schemes such as "dns:", "unix:", "passthrough:", "xds:" use
+	// a leading "<scheme>:" (optionally followed by "//"). A valid host:port
+	// contains exactly one ':' and the segment after it must be a numeric port.
+	host, port, err := net.SplitHostPort(addr)
+	if err != nil {
+		return fmt.Errorf("frontend address %q is not a valid host:port: %w", addr, err)
+	}
+	if host == "" {
+		return fmt.Errorf("frontend address %q has empty host", addr)
+	}
+	if _, err := net.LookupPort("tcp", port); err != nil {
+		return fmt.Errorf("frontend address %q has invalid port: %w", addr, err)
+	}
+	return nil
+}
+
 func (sp *schedulerProcessor) createFrontendClient(addr string) (client.PoolClient, error) {
+	if err := validateFrontendAddress(addr); err != nil {
+		return nil, err
+	}
+
 	opts, err := sp.grpcConfig.DialOption([]grpc.UnaryClientInterceptor{
 		otgrpc.OpenTracingClientInterceptor(opentracing.GlobalTracer()),
 		middleware.ClientUserHeaderInterceptor,
