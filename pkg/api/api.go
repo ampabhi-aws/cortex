@@ -18,6 +18,7 @@ import (
 	"github.com/cortexproject/cortex/pkg/alertmanager"
 	"github.com/cortexproject/cortex/pkg/alertmanager/alertmanagerpb"
 	"github.com/cortexproject/cortex/pkg/compactor"
+	configAPI "github.com/cortexproject/cortex/pkg/configs/api"
 	"github.com/cortexproject/cortex/pkg/cortexpb"
 	"github.com/cortexproject/cortex/pkg/distributor"
 	"github.com/cortexproject/cortex/pkg/distributor/distributorpb"
@@ -278,6 +279,40 @@ func (a *API) RegisterIngester(i Ingester, pushConfig distributor.Config) {
 func (a *API) RegisterTenantDeletion(api *purger.TenantDeletionAPI) {
 	a.RegisterRoute("/purger/delete_tenant", http.HandlerFunc(api.DeleteTenant), true, "POST")
 	a.RegisterRoute("/purger/delete_tenant_status", http.HandlerFunc(api.DeleteTenantStatus), true, "GET")
+}
+
+// RegisterConfigAPI registers the legacy configs service HTTP routes through
+// the central auth matrix so that every route is visible to operators and
+// consistently wrapped with the standard middlewares. Tenant-facing routes are
+// registered with auth=true (the handlers themselves also enforce an
+// X-Scope-OrgID header, so this preserves existing behaviour). The two
+// /private/api/prom/configs/* routes are service-to-service sync endpoints
+// consumed by the in-tree configs client without a tenant header, and are
+// therefore registered with auth=false - matching the upstream pattern used
+// for other cross-tenant internal endpoints such as
+// /multitenant_alertmanager/configs - so they appear in the auth matrix but
+// do not reject the internal client.
+func (a *API) RegisterConfigAPI(c *configAPI.API) {
+	a.RegisterRoute("/", c, false, "GET")
+
+	// Tenant-facing configuration APIs. The handlers extract the tenant from
+	// X-Scope-OrgID themselves; registering them with auth=true routes them
+	// through the standard AuthenticateUser middleware as well.
+	a.RegisterRoute("/api/prom/configs/rules", c, true, "GET", "POST")
+	a.RegisterRoute("/api/prom/configs/templates", c, true, "GET", "POST")
+	a.RegisterRoute("/api/prom/configs/alertmanager", c, true, "GET", "POST")
+	a.RegisterRoute("/api/prom/configs/alertmanager/validate", c, true, "POST")
+	a.RegisterRoute("/api/prom/configs/deactivate", c, true, "DELETE")
+	a.RegisterRoute("/api/prom/configs/restore", c, true, "POST")
+
+	// Internal service-to-service sync endpoints. These are intentionally
+	// tenant-less (consumed by pkg/configs/client without an X-Scope-OrgID
+	// header) and are therefore registered with auth=false. They SHOULD NOT be
+	// exposed to end users: operators must restrict access to these paths at
+	// the external authentication/authorization layer (e.g. a reverse proxy)
+	// or bind the configs service to a dedicated internal listener.
+	a.RegisterRoute("/private/api/prom/configs/rules", c, false, "GET")
+	a.RegisterRoute("/private/api/prom/configs/alertmanager", c, false, "GET")
 }
 
 // RegisterRuler registers routes associated with the Ruler service.
