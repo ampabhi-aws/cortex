@@ -125,6 +125,43 @@ type Config struct {
 	DisableRuleGroupLabel bool `yaml:"disable_rule_group_label"`
 }
 
+// MarshalYAML implements yaml.Marshaler. It masks the password in the
+// userinfo of any URL contained in AlertmanagerURL (which is a comma-
+// separated list of URLs) before marshalling. This prevents credentials
+// embedded in -ruler.alertmanager-url from leaking via the unauthenticated
+// GET /config endpoint. All other fields are marshalled using the default
+// yaml rules.
+func (cfg Config) MarshalYAML() (interface{}, error) {
+	// Shadow type to avoid infinite recursion through MarshalYAML.
+	type plain Config
+	out := plain(cfg)
+	out.AlertmanagerURL = maskCredentialsInURLList(cfg.AlertmanagerURL)
+	return out, nil
+}
+
+// maskCredentialsInURLList masks the password in the userinfo of every URL
+// in the given comma-separated list, mirroring the behaviour of
+// flagext.URLValue.MarshalYAML. Non-URL entries and entries without
+// userinfo passwords are preserved verbatim.
+func maskCredentialsInURLList(urls string) string {
+	if urls == "" {
+		return urls
+	}
+	parts := strings.Split(urls, ",")
+	for i, p := range parts {
+		u, err := url.Parse(p)
+		if err != nil || u.User == nil {
+			continue
+		}
+		if _, set := u.User.Password(); !set {
+			continue
+		}
+		u.User = url.UserPassword(u.User.Username(), "********")
+		parts[i] = u.String()
+	}
+	return strings.Join(parts, ",")
+}
+
 // Validate config and returns error on failure
 func (cfg *Config) Validate(limits validation.Limits, log log.Logger) error {
 	if !util.StringsContain(supportedShardingStrategies, cfg.ShardingStrategy) {
