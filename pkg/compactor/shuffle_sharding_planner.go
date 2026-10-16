@@ -51,7 +51,7 @@ func NewShuffleShardingPlanner(
 	}
 }
 
-func (p *ShuffleShardingPlanner) Plan(_ context.Context, metasByMinTime []*metadata.Meta) ([]*metadata.Meta, error) {
+func (p *ShuffleShardingPlanner) Plan(ctx context.Context, metasByMinTime []*metadata.Meta) ([]*metadata.Meta, error) {
 	// Ensure all blocks fits within the largest range. This is a double check
 	// to ensure there's no bug in the previous blocks grouping, given this Plan()
 	// is just a pass-through.
@@ -89,7 +89,11 @@ func (p *ShuffleShardingPlanner) Plan(_ context.Context, metasByMinTime []*metad
 		return nil, nil
 	}
 
-	go markBlocksVisitedHeartBeat(p.ctx, p.bkt, p.logger, resultMetas, p.ringLifecyclerID, p.blockVisitMarkerFileUpdateInterval, p.blockVisitMarkerWriteFailed)
+	// Scope the heartbeat goroutine to the per-job context passed by Thanos.
+	// Using p.ctx here would bind the heartbeat to the per-tenant-run context
+	// instead, leaking one goroutine (and continuous visit-mark.json object
+	// writes) per compaction job for the lifetime of the whole run.
+	go markBlocksVisitedHeartBeat(ctx, p.bkt, p.logger, resultMetas, p.ringLifecyclerID, p.blockVisitMarkerFileUpdateInterval, p.blockVisitMarkerWriteFailed)
 
 	return resultMetas, nil
 }
