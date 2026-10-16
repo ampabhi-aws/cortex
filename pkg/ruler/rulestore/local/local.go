@@ -5,6 +5,7 @@ import (
 	"flag"
 	"os"
 	"path/filepath"
+	"strings"
 
 	"github.com/pkg/errors"
 	promRules "github.com/prometheus/prometheus/rules"
@@ -168,11 +169,32 @@ func (l *Client) loadAllRulesGroupsForUser(ctx context.Context, userID string) (
 }
 
 func (l *Client) loadAllRulesGroupsForUserAndNamespace(_ context.Context, userID string, namespace string) (rulespb.RuleGroupList, error) {
-	filename := filepath.Join(l.cfg.Directory, userID, namespace)
+	userDir := filepath.Join(l.cfg.Directory, userID)
+	filename := filepath.Join(userDir, namespace)
+
+	// Containment check: ensure the resolved file path is still located inside
+	// the per-user directory. This prevents a caller from supplying a namespace
+	// that contains path separators or `..` segments to escape the per-tenant
+	// rules directory and read arbitrary files (CWE-22).
+	absUserDir, err := filepath.Abs(userDir)
+	if err != nil {
+		return nil, errors.New("invalid rules directory")
+	}
+	absFilename, err := filepath.Abs(filename)
+	if err != nil {
+		return nil, errors.New("invalid namespace")
+	}
+	rel, err := filepath.Rel(absUserDir, absFilename)
+	if err != nil || rel == ".." || strings.HasPrefix(rel, ".."+string(filepath.Separator)) || filepath.IsAbs(rel) {
+		return nil, errors.New("invalid namespace")
+	}
 
 	rulegroups, allErrors := l.loader.Load(filename)
 	if len(allErrors) > 0 {
-		return nil, errors.Wrapf(allErrors[0], "error parsing %s", filename)
+		// Do not leak the absolute filesystem path or raw loader error back to
+		// callers; such errors can embed file contents or act as an existence
+		// oracle for arbitrary paths.
+		return nil, errors.Wrapf(allErrors[0], "error parsing namespace %q for user %q", namespace, userID)
 	}
 
 	var list rulespb.RuleGroupList
