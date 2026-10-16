@@ -34,6 +34,64 @@ func (d *FirewallDialer) DialContext(ctx context.Context, network, address strin
 	return d.parent.DialContext(ctx, network, address)
 }
 
+// ValidateAddress returns nil if the given host:port is allowed by the firewall
+// configuration (BlockPrivateAddresses / BlockCIDRNetworks). The host is
+// resolved and every resolved IP is checked, mirroring what the standard net
+// resolver would feed into the dialer's Control callback. This is useful for
+// integrations that do not accept a custom dialer (for example the vendored
+// Alertmanager email notifier) and therefore need an explicit pre-check.
+//
+// If no firewall rules are configured the check is a no-op. Hostnames that
+// resolve to no addresses are rejected, as are literal addresses that fail to
+// parse.
+func (d *FirewallDialer) ValidateAddress(ctx context.Context, address string) error {
+	blockPrivateAddresses := d.cfgProvider.BlockPrivateAddresses()
+	blockCIDRNetworks := d.cfgProvider.BlockCIDRNetworks()
+
+	// Skip any control if no firewall has been configured.
+	if !blockPrivateAddresses && len(blockCIDRNetworks) == 0 {
+		return nil
+	}
+
+	host, _, err := net.SplitHostPort(address)
+	if err != nil {
+		return errInvalidAddress
+	}
+
+	var ips []net.IP
+	if ip := net.ParseIP(host); ip != nil {
+		ips = []net.IP{ip}
+	} else {
+		resolver := d.parent.Resolver
+		if resolver == nil {
+			resolver = net.DefaultResolver
+		}
+		addrs, resolveErr := resolver.LookupIPAddr(ctx, host)
+		if resolveErr != nil {
+			return errBlockedAddress
+		}
+		if len(addrs) == 0 {
+			return errBlockedAddress
+		}
+		for _, a := range addrs {
+			ips = append(ips, a.IP)
+		}
+	}
+
+	for _, ip := range ips {
+		if blockPrivateAddresses && (isPrivate(ip) || isLocal(ip)) {
+			return errBlockedAddress
+		}
+		for _, cidr := range blockCIDRNetworks {
+			if cidr.Value.Contains(ip) {
+				return errBlockedAddress
+			}
+		}
+	}
+
+	return nil
+}
+
 func (d *FirewallDialer) control(_, address string, _ syscall.RawConn) error {
 	blockPrivateAddresses := d.cfgProvider.BlockPrivateAddresses()
 	blockCIDRNetworks := d.cfgProvider.BlockCIDRNetworks()
