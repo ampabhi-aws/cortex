@@ -40,6 +40,7 @@ var (
 	errUnsupportedSignatureVersion = errors.New("unsupported signature version")
 	errUnsupportedSSEType          = errors.New("unsupported S3 SSE type")
 	errInvalidSSEContext           = errors.New("invalid S3 SSE encryption context")
+	errKMSKeyIDRequired            = errors.New("kms_key_id must be set if sse.type is set to 'SSE-KMS'")
 	errInvalidBucketLookupType     = errors.New("invalid bucket lookup type")
 )
 
@@ -143,6 +144,10 @@ func (cfg *SSEConfig) Validate() error {
 		return errUnsupportedSSEType
 	}
 
+	if cfg.Type == SSEKMS && cfg.KMSKeyID == "" {
+		return errKMSKeyIDRequired
+	}
+
 	if _, err := parseKMSEncryptionContext(cfg.KMSEncryptionContext); err != nil {
 		return errInvalidSSEContext
 	}
@@ -156,6 +161,10 @@ func (cfg *SSEConfig) BuildThanosConfig() (s3.SSEConfig, error) {
 	case "":
 		return s3.SSEConfig{}, nil
 	case SSEKMS:
+		if cfg.KMSKeyID == "" {
+			return s3.SSEConfig{}, errKMSKeyIDRequired
+		}
+
 		encryptionCtx, err := parseKMSEncryptionContext(cfg.KMSEncryptionContext)
 		if err != nil {
 			return s3.SSEConfig{}, err
@@ -181,6 +190,10 @@ func (cfg *SSEConfig) BuildMinioConfig() (encrypt.ServerSide, error) {
 	case "":
 		return nil, nil
 	case SSEKMS:
+		if cfg.KMSKeyID == "" {
+			return nil, errKMSKeyIDRequired
+		}
+
 		encryptionCtx, err := parseKMSEncryptionContext(cfg.KMSEncryptionContext)
 		if err != nil {
 			return nil, err

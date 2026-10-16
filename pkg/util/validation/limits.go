@@ -13,6 +13,7 @@ import (
 	"github.com/prometheus/prometheus/model/relabel"
 	"golang.org/x/time/rate"
 
+	"github.com/cortexproject/cortex/pkg/storage/bucket/s3"
 	"github.com/cortexproject/cortex/pkg/util/flagext"
 )
 
@@ -197,6 +198,20 @@ func (l *Limits) Validate(shardByAllLabels bool) error {
 	// if shard-by-all-labels is disabled
 	if l.MaxGlobalSeriesPerUser > 0 && !shardByAllLabels {
 		return errMaxGlobalSeriesPerUserValidation
+	}
+
+	// Validate per-tenant S3 SSE overrides at load time rather than at first
+	// upload, so an invalid override fails fast and never silently falls back
+	// to a non-tenant-specific key.
+	if l.S3SSEType != "" {
+		sseCfg := s3.SSEConfig{
+			Type:                 l.S3SSEType,
+			KMSKeyID:             l.S3SSEKMSKeyID,
+			KMSEncryptionContext: l.S3SSEKMSEncryptionContext,
+		}
+		if err := sseCfg.Validate(); err != nil {
+			return err
+		}
 	}
 
 	return nil
