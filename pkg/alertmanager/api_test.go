@@ -7,6 +7,8 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"reflect"
+	"strings"
 	"testing"
 
 	"github.com/go-kit/log"
@@ -419,6 +421,37 @@ alertmanager_config: |
 			err: errors.Wrap(errVictorOpsAPIKeyFileNotAllowed, "error validating Alertmanager config"),
 		},
 		{
+			name: "Should return error if global opsgenie_api_key_file is set",
+			cfg: `
+alertmanager_config: |
+  global:
+    opsgenie_api_key_file: /var/run/secrets/kubernetes.io/serviceaccount/token
+
+  receivers:
+    - name: default-receiver
+      webhook_configs:
+        - url: http://localhost
+
+  route:
+    receiver: 'default-receiver'
+`,
+			err: errors.Wrap(errOpsGenieAPIKeyFileNotAllowed, "error validating Alertmanager config"),
+		},
+		{
+			name: "Should return error if OpsGenie api_key_file is set",
+			cfg: `
+alertmanager_config: |
+  receivers:
+    - name: default-receiver
+      opsgenie_configs:
+        - api_key_file: /secrets
+
+  route:
+    receiver: 'default-receiver'
+`,
+			err: errors.Wrap(errOpsGenieAPIKeyFileNotAllowed, "error validating Alertmanager config"),
+		},
+		{
 			name: "should return error if template is wrong",
 			cfg: `
 alertmanager_config: |
@@ -793,4 +826,64 @@ func TestValidateAlertmanagerConfig(t *testing.T) {
 			assert.ErrorIs(t, err, testData.expected)
 		})
 	}
+}
+
+// TestNoUnhandledFileFieldInVendoredAlertmanagerConfig walks the vendored
+// Alertmanager/common config structs and asserts that every string field whose
+// yaml tag ends in "_file" is covered by validateAlertmanagerConfig. If upstream
+// adds a new *_file field (which could become an arbitrary-file-read primitive),
+// this test fails until it is explicitly allow-listed here after being wired
+// into validateAlertmanagerConfig.
+func TestNoUnhandledFileFieldInVendoredAlertmanagerConfig(t *testing.T) {
+	// Known file fields and the yaml tag at which they live. Each one must be
+	// rejected by validateAlertmanagerConfig when set on a user-supplied config.
+	known := map[string]bool{
+		// github.com/prometheus/common/config.HTTPClientConfig
+		"password_file":     true, // BasicAuth.PasswordFile
+		"credentials_file":  true, // Authorization.CredentialsFile
+		"bearer_token_file": true, // HTTPClientConfig.BearerTokenFile
+		"client_secret_file": true, // OAuth2.ClientSecretFile
+		// github.com/prometheus/common/config.TLSConfig
+		"ca_file":   true,
+		"cert_file": true,
+		"key_file":  true,
+		// github.com/prometheus/alertmanager/config.GlobalConfig / SlackConfig
+		"slack_api_url_file": true,
+		"api_url_file":       true,
+		// github.com/prometheus/alertmanager/config.GlobalConfig / OpsGenieConfig / VictorOpsConfig
+		"opsgenie_api_key_file": true,
+		"api_key_file":          true,
+	}
+
+	visited := map[reflect.Type]bool{}
+	var walk func(t reflect.Type)
+	walk = func(rt reflect.Type) {
+		if rt == nil || visited[rt] {
+			return
+		}
+		visited[rt] = true
+
+		switch rt.Kind() {
+		case reflect.Ptr, reflect.Slice, reflect.Array, reflect.Chan:
+			walk(rt.Elem())
+		case reflect.Map:
+			walk(rt.Key())
+			walk(rt.Elem())
+		case reflect.Struct:
+			for i := 0; i < rt.NumField(); i++ {
+				f := rt.Field(i)
+				yamlTag := strings.Split(f.Tag.Get("yaml"), ",")[0]
+				if strings.HasSuffix(yamlTag, "_file") {
+					if !known[yamlTag] {
+						t.Errorf("unhandled file-reference field %q (yaml:%q) in %s: "+
+							"add explicit validation in validateAlertmanagerConfig and allow-list it in this test",
+							f.Name, yamlTag, rt.String())
+					}
+				}
+				walk(f.Type)
+			}
+		}
+	}
+
+	walk(reflect.TypeOf(config.Config{}))
 }
