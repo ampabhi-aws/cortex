@@ -72,6 +72,18 @@ type Config struct {
 	StoreGatewayClient    ClientConfig `yaml:"store_gateway_client"`
 
 	ShuffleShardingIngestersLookbackPeriod time.Duration `yaml:"shuffle_sharding_ingesters_lookback_period"`
+
+	// MaxRemoteReadQueries is the maximum number of sub-queries that can be
+	// carried in a single Prometheus remote-read request. A single HTTP body
+	// may legally contain many QueryRequest entries; without a cap each
+	// becomes a parallel fan-out to every ingester and store-gateway and
+	// multiplies the per-query limits. 0 disables the check.
+	MaxRemoteReadQueries int `yaml:"max_remote_read_queries"`
+
+	// RemoteReadConcurrency is the number of sub-queries that are executed
+	// in parallel for a single remote-read HTTP request. The remaining
+	// sub-queries are processed sequentially by the worker pool.
+	RemoteReadConcurrency int `yaml:"remote_read_concurrency"`
 }
 
 var (
@@ -101,6 +113,8 @@ func (cfg *Config) RegisterFlags(f *flag.FlagSet) {
 	f.StringVar(&cfg.StoreGatewayAddresses, "querier.store-gateway-addresses", "", "Comma separated list of store-gateway addresses in DNS Service Discovery format. This option should be set when using the blocks storage and the store-gateway sharding is disabled (when enabled, the store-gateway instances form a ring and addresses are picked from the ring).")
 	f.DurationVar(&cfg.LookbackDelta, "querier.lookback-delta", 5*time.Minute, "Time since the last sample after which a time series is considered stale and ignored by expression evaluations.")
 	f.DurationVar(&cfg.ShuffleShardingIngestersLookbackPeriod, "querier.shuffle-sharding-ingesters-lookback-period", 0, "When distributor's sharding strategy is shuffle-sharding and this setting is > 0, queriers fetch in-memory series from the minimum set of required ingesters, selecting only ingesters which may have received series since 'now - lookback period'. The lookback period should be greater or equal than the configured 'query store after' and 'query ingesters within'. If this setting is 0, queriers always query all ingesters (ingesters shuffle sharding on read path is disabled).")
+	f.IntVar(&cfg.MaxRemoteReadQueries, "querier.max-remote-read-queries", 100, "The maximum number of sub-queries allowed in a single Prometheus remote-read request body. 0 to disable the check.")
+	f.IntVar(&cfg.RemoteReadConcurrency, "querier.remote-read-concurrency", 10, "The number of remote-read sub-queries executed in parallel for a single HTTP request.")
 }
 
 // Validate the config
@@ -221,7 +235,15 @@ func NewQueryable(distributor QueryableWithFilter, stores []QueryableWithFilter,
 			return nil, err
 		}
 
-		ctx = limiter.AddQueryLimiterToContext(ctx, limiter.NewQueryLimiter(limits.MaxFetchedSeriesPerQuery(userID), limits.MaxFetchedChunkBytesPerQuery(userID), limits.MaxChunksPerQuery(userID), limits.MaxFetchedDataBytesPerQuery(userID)))
+		// Only install a new per-query limiter when the caller has not already
+		// attached one to the context. Request-level handlers (e.g. the
+		// remote-read handler) install a single limiter per HTTP request so
+		// that max_fetched_chunks_per_query / max_fetched_series_per_query /
+		// max_fetched_data_bytes_per_query bound the whole request rather
+		// than each sub-query.
+		if limiter.QueryLimiterFromContext(ctx) == nil {
+			ctx = limiter.AddQueryLimiterToContext(ctx, limiter.NewQueryLimiter(limits.MaxFetchedSeriesPerQuery(userID), limits.MaxFetchedChunkBytesPerQuery(userID), limits.MaxChunksPerQuery(userID), limits.MaxFetchedDataBytesPerQuery(userID)))
+		}
 
 		mint, maxt, err = validateQueryTimeRange(ctx, userID, mint, maxt, limits, cfg.MaxQueryIntoFuture)
 		if err == errEmptyTimeRange {
