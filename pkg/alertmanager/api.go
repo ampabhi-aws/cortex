@@ -8,6 +8,7 @@ import (
 	"os"
 	"path/filepath"
 	"reflect"
+	"strings"
 
 	"github.com/go-kit/log"
 	"github.com/go-kit/log/level"
@@ -45,7 +46,25 @@ var (
 	errTLSFileNotAllowed             = errors.New("setting TLS ca_file, cert_file and key_file is not allowed")
 	errSlackAPIURLFileNotAllowed     = errors.New("setting Slack api_url_file and global slack_api_url_file is not allowed")
 	errVictorOpsAPIKeyFileNotAllowed = errors.New("setting VictorOps api_key_file is not allowed")
+	errOpsGenieAPIKeyFileNotAllowed  = errors.New("setting OpsGenie api_key_file and global opsgenie_api_key_file is not allowed")
+	// errFileFieldNotAllowed is the deny-by-default error returned when the
+	// reflective config walk encounters a non-empty string field whose YAML tag
+	// ends with "_file" (or whose Go field name ends with "File") that has not
+	// been explicitly allowlisted. This is a safety net so a newly introduced
+	// upstream *_file field becomes a build/validation failure instead of a
+	// silent file-read primitive.
+	errFileFieldNotAllowed = errors.New("setting a *_file configuration field that references a server-side file is not allowed")
 )
+
+// allowedFileYAMLTags lists YAML tag base names (the part before the first
+// comma) for fields whose names look like *_file but which must still be
+// permitted. It is intentionally empty: every *_file field currently defined
+// in the vendored prometheus/alertmanager and prometheus/common config
+// packages references a server-side filesystem path and must not be
+// tenant-controllable. If upstream later introduces a legitimate exception
+// (e.g. a template file list that is sandboxed elsewhere) add its YAML tag
+// here together with a comment explaining why.
+var allowedFileYAMLTags = map[string]struct{}{}
 
 // UserConfig is used to communicate a users alertmanager configs
 type UserConfig struct {
@@ -350,6 +369,11 @@ func validateAlertmanagerConfig(cfg interface{}) error {
 		if err := validateVictorOpsConfig(v.Interface().(config.VictorOpsConfig)); err != nil {
 			return err
 		}
+
+	case reflect.TypeOf(config.OpsGenieConfig{}):
+		if err := validateOpsGenieConfig(v.Interface().(config.OpsGenieConfig)); err != nil {
+			return err
+		}
 	}
 
 	// If the input config is a struct, recursively iterate on all fields.
@@ -357,6 +381,16 @@ func validateAlertmanagerConfig(cfg interface{}) error {
 		for i := 0; i < t.NumField(); i++ {
 			field := t.Field(i)
 			fieldValue := v.FieldByIndex(field.Index)
+
+			// Deny-by-default: reject any non-empty string field whose YAML
+			// tag ends with "_file" or whose Go field name ends with "File",
+			// unless explicitly allowlisted. This catches new upstream
+			// *_file fields that the specific validators above do not yet
+			// know about, so an upstream Alertmanager upgrade cannot
+			// silently reintroduce a file-read primitive.
+			if err := checkFileField(field, fieldValue); err != nil {
+				return err
+			}
 
 			// Skip any field value which can't be converted to interface (eg. primitive types).
 			if fieldValue.CanInterface() {
@@ -429,6 +463,9 @@ func validateGlobalConfig(cfg config.GlobalConfig) error {
 	if cfg.SlackAPIURLFile != "" {
 		return errSlackAPIURLFileNotAllowed
 	}
+	if cfg.OpsGenieAPIKeyFile != "" {
+		return errOpsGenieAPIKeyFileNotAllowed
+	}
 	return nil
 }
 
@@ -448,4 +485,53 @@ func validateVictorOpsConfig(cfg config.VictorOpsConfig) error {
 		return errVictorOpsAPIKeyFileNotAllowed
 	}
 	return nil
+}
+
+// validateOpsGenieConfig validates the OpsGenie config and returns an error if
+// it contains settings not allowed by Cortex. An attacker-controlled
+// api_key_file would otherwise be read by the OpsGenie notifier and emitted in
+// the Authorization: GenieKey header to the configured api_url, giving the
+// tenant arbitrary file read on the Alertmanager server.
+func validateOpsGenieConfig(cfg config.OpsGenieConfig) error {
+	if cfg.APIKeyFile != "" {
+		return errOpsGenieAPIKeyFileNotAllowed
+	}
+	return nil
+}
+
+// checkFileField implements the deny-by-default fallback used by
+// validateAlertmanagerConfig while walking a struct's fields. It rejects any
+// non-empty string-valued (including `type Secret string`-style named-string)
+// field whose YAML tag's base name ends with "_file", or whose Go field name
+// ends with "File", unless the YAML tag is in allowedFileYAMLTags. Non-string
+// fields and unexported fields are left to the recursive walk / specific
+// validators.
+func checkFileField(field reflect.StructField, fieldValue reflect.Value) error {
+	if !fieldValue.IsValid() || !fieldValue.CanInterface() {
+		return nil
+	}
+	if fieldValue.Kind() != reflect.String {
+		return nil
+	}
+
+	yamlTag := field.Tag.Get("yaml")
+	yamlName := yamlTag
+	if i := strings.IndexByte(yamlTag, ','); i >= 0 {
+		yamlName = yamlTag[:i]
+	}
+
+	looksLikeFile := strings.HasSuffix(yamlName, "_file") || strings.HasSuffix(field.Name, "File")
+	if !looksLikeFile {
+		return nil
+	}
+
+	if _, ok := allowedFileYAMLTags[yamlName]; ok {
+		return nil
+	}
+
+	if fieldValue.String() == "" {
+		return nil
+	}
+
+	return fmt.Errorf("%w: field %q (yaml %q)", errFileFieldNotAllowed, field.Name, yamlName)
 }
