@@ -2,6 +2,7 @@ package ruler
 
 import (
 	"encoding/json"
+	"fmt"
 	io "io"
 	"net/http"
 	"net/url"
@@ -26,6 +27,55 @@ import (
 	"github.com/cortexproject/cortex/pkg/tenant"
 	util_log "github.com/cortexproject/cortex/pkg/util/log"
 )
+
+// maxRuleGroupYAMLDepth caps the nesting depth of a YAML rule-group payload
+// accepted by the ruler config API. It is deliberately small: a legitimate
+// rulefmt.RuleGroup document never exceeds a handful of levels, and the cap
+// prevents a bounded-size body from consuming large amounts of goroutine
+// stack through yaml.v3's mutually recursive node builder.
+const maxRuleGroupYAMLDepth = 100
+
+// maxLoggedPayloadBytes bounds the size of the rule-group payload copy that
+// is forwarded to the debug logger. Without this cap the logger would make a
+// full `string(payload)` copy on every request regardless of whether debug
+// logging is enabled, doubling the per-request heap cost.
+const maxLoggedPayloadBytes = 1024
+
+// truncatedPayload returns a fmt.Stringer that renders at most
+// maxLoggedPayloadBytes bytes of payload. The copy is only materialised when
+// the logger actually formats the value.
+type truncatedPayload []byte
+
+func (p truncatedPayload) String() string {
+	if len(p) <= maxLoggedPayloadBytes {
+		return string(p)
+	}
+	return string(p[:maxLoggedPayloadBytes]) + fmt.Sprintf("...(%d bytes truncated)", len(p)-maxLoggedPayloadBytes)
+}
+
+// yamlNodeDepth returns the maximum nesting depth of the given yaml.Node tree,
+// stopping early (and returning a value strictly greater than limit) as soon
+// as the depth exceeds the configured limit. The walk itself recurses, but is
+// bounded by `limit`, so it cannot be used to overflow the goroutine stack.
+func yamlNodeDepth(n *yaml.Node, current, limit int) int {
+	if n == nil {
+		return current
+	}
+	if current > limit {
+		return current
+	}
+	max := current
+	for _, child := range n.Content {
+		d := yamlNodeDepth(child, current+1, limit)
+		if d > max {
+			max = d
+		}
+		if max > limit {
+			return max
+		}
+	}
+	return max
+}
 
 // In order to reimplement the prometheus rules API, a large amount of code was copied over
 // This is required because the prometheus api implementation does not allow us to return errors
@@ -447,18 +497,53 @@ func (a *API) CreateRuleGroup(w http.ResponseWriter, req *http.Request) {
 		return
 	}
 
-	payload, err := io.ReadAll(req.Body)
+	// Bound the request body before buffering it to prevent a single tenant
+	// from exhausting the shared ruler process's memory. The limit is applied
+	// per-tenant via the ruler.max-rule-group-size-bytes override; 0 disables.
+	var input io.Reader = req.Body
+	maxRuleGroupSize := a.ruler.limits.RulerMaxRuleGroupSizeBytes(userID)
+	if maxRuleGroupSize > 0 {
+		// LimitReader returns EOF after reading the configured number of bytes.
+		// Allow one extra byte so we can detect oversize payloads.
+		input = io.LimitReader(req.Body, int64(maxRuleGroupSize)+1)
+	}
+
+	payload, err := io.ReadAll(input)
 	if err != nil {
 		level.Error(logger).Log("msg", "unable to read rule group payload", "err", err.Error())
 		http.Error(w, err.Error(), http.StatusBadRequest)
 		return
 	}
 
-	level.Debug(logger).Log("msg", "attempting to unmarshal rulegroup", "userID", userID, "group", string(payload))
+	if maxRuleGroupSize > 0 && len(payload) > maxRuleGroupSize {
+		msg := fmt.Sprintf("rule group too large: limit %d bytes", maxRuleGroupSize)
+		level.Warn(logger).Log("msg", msg, "user", userID)
+		http.Error(w, msg, http.StatusBadRequest)
+		return
+	}
+
+	level.Debug(logger).Log("msg", "attempting to unmarshal rulegroup", "userID", userID, "group", truncatedPayload(payload))
+
+	// Decode first into a yaml.Node tree so we can enforce a nesting-depth
+	// cap before building typed Go structures. yaml.v3's parser caps flow
+	// nesting at ~10000 levels (see vendor/gopkg.in/yaml.v3/scannerc.go),
+	// but we apply a much tighter bound here so a bounded-size body cannot
+	// still consume several MB of goroutine stack through the mutually
+	// recursive node builder in vendor/gopkg.in/yaml.v3/decode.go.
+	var root yaml.Node
+	if err = yaml.Unmarshal(payload, &root); err != nil {
+		level.Error(logger).Log("msg", "unable to unmarshal rule group payload", "err", err.Error())
+		http.Error(w, ErrBadRuleGroup.Error(), http.StatusBadRequest)
+		return
+	}
+	if depth := yamlNodeDepth(&root, 0, maxRuleGroupYAMLDepth); depth > maxRuleGroupYAMLDepth {
+		level.Warn(logger).Log("msg", "rule group payload nesting too deep", "user", userID, "max_depth", maxRuleGroupYAMLDepth)
+		http.Error(w, ErrBadRuleGroup.Error(), http.StatusBadRequest)
+		return
+	}
 
 	rg := rulefmt.RuleGroup{}
-	err = yaml.Unmarshal(payload, &rg)
-	if err != nil {
+	if err = root.Decode(&rg); err != nil {
 		level.Error(logger).Log("msg", "unable to unmarshal rule group payload", "err", err.Error())
 		http.Error(w, ErrBadRuleGroup.Error(), http.StatusBadRequest)
 		return

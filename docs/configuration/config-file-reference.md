@@ -2737,6 +2737,11 @@ The `limits_config` configures default and per-tenant limits imposed by Cortex s
 # CLI flag: -ruler.max-rule-groups-per-tenant
 [ruler_max_rule_groups_per_tenant: <int> | default = 0]
 
+# Maximum size (in bytes) of the request body accepted by the ruler API when
+# creating or updating a rule group. 0 to disable.
+# CLI flag: -ruler.max-rule-group-size-bytes
+[ruler_max_rule_group_size_bytes: <int> | default = 0]
+
 # The default tenant's shard size when the shuffle-sharding strategy is used.
 # Must be set when the store-gateway sharding is enabled with the
 # shuffle-sharding strategy. When this setting is specified in the per-tenant
