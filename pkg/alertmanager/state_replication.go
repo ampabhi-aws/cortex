@@ -60,6 +60,11 @@ type state struct {
 	initialSyncDuration      prometheus.Histogram
 
 	msgc chan *clusterpb.Part
+	// stopc is closed when running() returns, signalling broadcasters that no
+	// reader will ever consume msgc again. This prevents a goroutine from
+	// blocking forever on `s.msgc <- part` while holding a caller's mutex
+	// (e.g. the Silences or notification-log write mutex).
+	stopc chan struct{}
 }
 
 // newReplicatedStates creates a new state struct, which manages state to be replicated between alertmanagers.
@@ -73,6 +78,7 @@ func newReplicatedStates(userID string, rf int, re Replicator, st alertstore.Ale
 		store:             st,
 		states:            make(map[string]cluster.State, 2), // we use two, one for the notifications and one for silences.
 		msgc:              make(chan *clusterpb.Part),
+		stopc:             make(chan struct{}),
 		reg:               r,
 		settleReadTimeout: defaultSettleReadTimeout,
 		storeReadTimeout:  defaultStoreReadTimeout,
@@ -277,12 +283,29 @@ func (s *state) mergeFullStates(fs []*clusterpb.FullState) error {
 }
 
 func (s *state) running(ctx context.Context) error {
+	// Ensure that once running() exits, any goroutine blocked on sending to
+	// msgc is unblocked by closing stopc, and that any messages already in
+	// msgc are drained so that pending sends can complete.
+	defer func() {
+		close(s.stopc)
+		// Drain msgc of any buffered or pending messages so a sender that
+		// already selected the send branch doesn't block forever.
+		for {
+			select {
+			case <-s.msgc:
+			default:
+				return
+			}
+		}
+	}()
 	for {
 		select {
 		case p := <-s.msgc:
-			// If the replication factor is <= 1, we don't need to replicate any state anywhere else.
+			// If the replication factor is <= 1, we don't need to replicate any
+			// state anywhere else; just drop the message and keep draining the
+			// channel so broadcasters never block.
 			if s.replicationFactor <= 1 {
-				return nil
+				continue
 			}
 
 			s.stateReplicationTotal.WithLabelValues(p.Key).Inc()
@@ -298,8 +321,16 @@ func (s *state) running(ctx context.Context) error {
 
 func (s *state) broadcast(key string, b []byte) {
 	// We should ignore the Merges into the initial state during settling.
-	if s.Ready() {
-		s.msgc <- &clusterpb.Part{Key: key, Data: b}
+	if !s.Ready() {
+		return
+	}
+	// Perform a cancellable send so a stopped/terminated state service can
+	// never block a caller that holds the silences or notification-log write
+	// mutex. If running() has already returned, stopc is closed and we drop
+	// the update rather than wedging the caller.
+	select {
+	case s.msgc <- &clusterpb.Part{Key: key, Data: b}:
+	case <-s.stopc:
 	}
 }
 
