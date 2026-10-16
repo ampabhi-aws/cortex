@@ -45,6 +45,14 @@ var (
 	errTLSFileNotAllowed             = errors.New("setting TLS ca_file, cert_file and key_file is not allowed")
 	errSlackAPIURLFileNotAllowed     = errors.New("setting Slack api_url_file and global slack_api_url_file is not allowed")
 	errVictorOpsAPIKeyFileNotAllowed = errors.New("setting VictorOps api_key_file is not allowed")
+	// errEmailNotAllowedWithFirewall is returned when a tenant tries to configure an email
+	// receiver (or a global SMTP smarthost) while the per-tenant receivers firewall is enabled.
+	// The firewall is only enforced on the HTTP-based receiver integrations; the vendored
+	// Alertmanager email notifier dials the smarthost itself with a bare net.Dialer, so leaving
+	// email_configs enabled would silently bypass -alertmanager.receivers-firewall-block-* for
+	// SMTP destinations. We fail closed until the upstream email notifier accepts a dial-context
+	// override. See CWE-918.
+	errEmailNotAllowedWithFirewall = errors.New("setting email_configs or global.smtp_smarthost is not allowed when the receivers firewall is enabled for the tenant (alertmanager.receivers-firewall-block-private-addresses / block-cidr-networks): the firewall does not cover SMTP")
 )
 
 // UserConfig is used to communicate a users alertmanager configs
@@ -188,6 +196,15 @@ func validateUserConfig(logger log.Logger, cfg alertspb.AlertConfigDesc, limits 
 	// Validate the config recursively scanning it.
 	if err := validateAlertmanagerConfig(amCfg); err != nil {
 		return err
+	}
+
+	// Fail closed: if the operator has enabled the per-tenant receivers firewall, reject
+	// configurations that would use the email integration, because the FirewallDialer is
+	// only wired into the HTTP-based receiver integrations (see buildReceiverIntegrations).
+	if tenantFirewallEnabled(limits, user) {
+		if err := rejectEmailWhenFirewallEnabled(amCfg); err != nil {
+			return err
+		}
 	}
 
 	// Validate templates referenced in the alertmanager config.
@@ -446,6 +463,40 @@ func validateSlackConfig(cfg config.SlackConfig) error {
 func validateVictorOpsConfig(cfg config.VictorOpsConfig) error {
 	if cfg.APIKeyFile != "" {
 		return errVictorOpsAPIKeyFileNotAllowed
+	}
+	return nil
+}
+
+// tenantFirewallEnabled reports whether the per-tenant receivers firewall is enabled for user,
+// i.e. whether BlockPrivateAddresses is on or there is at least one blocked CIDR network.
+func tenantFirewallEnabled(limits Limits, user string) bool {
+	if limits == nil {
+		return false
+	}
+	if limits.AlertmanagerReceiversBlockPrivateAddresses(user) {
+		return true
+	}
+	if len(limits.AlertmanagerReceiversBlockCIDRNetworks(user)) > 0 {
+		return true
+	}
+	return false
+}
+
+// rejectEmailWhenFirewallEnabled returns errEmailNotAllowedWithFirewall if the loaded Alertmanager
+// config references any email receiver or a global SMTP smarthost. This is used to fail closed
+// when the receivers firewall is enabled, because the email integration dials its tenant-chosen
+// smarthost without going through the FirewallDialer.
+func rejectEmailWhenFirewallEnabled(amCfg *config.Config) error {
+	if amCfg == nil {
+		return nil
+	}
+	if amCfg.Global != nil && amCfg.Global.SMTPSmarthost.String() != "" {
+		return errEmailNotAllowedWithFirewall
+	}
+	for _, rcv := range amCfg.Receivers {
+		if len(rcv.EmailConfigs) > 0 {
+			return errEmailNotAllowedWithFirewall
+		}
 	}
 	return nil
 }

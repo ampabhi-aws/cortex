@@ -34,6 +34,22 @@ func (d *FirewallDialer) DialContext(ctx context.Context, network, address strin
 	return d.parent.DialContext(ctx, network, address)
 }
 
+// Enabled reports whether this dialer has any blocking configured. If it does not, control()
+// is effectively a no-op. Callers can use this to decide whether an integration that does not
+// honor the dialer (e.g. SMTP) should be allowed to run.
+func (d *FirewallDialer) Enabled() bool {
+	if d == nil || d.cfgProvider == nil {
+		return false
+	}
+	if d.cfgProvider.BlockPrivateAddresses() {
+		return true
+	}
+	if len(d.cfgProvider.BlockCIDRNetworks()) > 0 {
+		return true
+	}
+	return false
+}
+
 func (d *FirewallDialer) control(_, address string, _ syscall.RawConn) error {
 	blockPrivateAddresses := d.cfgProvider.BlockPrivateAddresses()
 	blockCIDRNetworks := d.cfgProvider.BlockCIDRNetworks()

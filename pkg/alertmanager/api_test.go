@@ -794,3 +794,77 @@ func TestValidateAlertmanagerConfig(t *testing.T) {
 		})
 	}
 }
+
+// TestValidateUserConfig_EmailFirewall verifies the fail-closed behavior for the email
+// integration when the per-tenant receivers firewall is enabled: configurations referencing
+// email_configs or global.smtp_smarthost must be rejected, because the FirewallDialer is not
+// plumbed into the vendored SMTP notifier.
+func TestValidateUserConfig_EmailFirewall(t *testing.T) {
+	const user = "user-1"
+
+	configs := map[string]string{
+		"email_configs": `
+route:
+  receiver: mail
+receivers:
+  - name: mail
+    email_configs:
+      - to: victim@internal
+        from: cortex@internal
+        smarthost: 10.0.0.5:25
+        require_tls: false
+`,
+		"global smtp_smarthost": `
+global:
+  smtp_smarthost: 10.0.0.5:25
+  smtp_from: cortex@internal
+route:
+  receiver: webhook
+receivers:
+  - name: webhook
+    webhook_configs:
+      - url: http://example.com
+`,
+		"no email": `
+route:
+  receiver: webhook
+receivers:
+  - name: webhook
+    webhook_configs:
+      - url: http://example.com
+`,
+	}
+
+	type testCase struct {
+		cfgKey       string
+		firewall     bool
+		wantRejected bool
+	}
+	cases := []testCase{
+		{"email_configs", true, true},
+		{"email_configs", false, false},
+		{"global smtp_smarthost", true, true},
+		{"global smtp_smarthost", false, false},
+		{"no email", true, false},
+		{"no email", false, false},
+	}
+
+	for _, tc := range cases {
+		name := fmt.Sprintf("%s/firewall=%v", tc.cfgKey, tc.firewall)
+		t.Run(name, func(t *testing.T) {
+			limits := &mockAlertManagerLimits{
+				receiversBlockPrivateAddresses: tc.firewall,
+			}
+			err := validateUserConfig(log.NewNopLogger(), alertspb.AlertConfigDesc{
+				User:      user,
+				RawConfig: configs[tc.cfgKey],
+			}, limits, user)
+			if tc.wantRejected {
+				require.Error(t, err)
+				assert.ErrorIs(t, err, errEmailNotAllowedWithFirewall)
+			} else {
+				assert.NoError(t, err)
+			}
+		})
+	}
+}
