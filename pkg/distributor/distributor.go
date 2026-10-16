@@ -489,6 +489,19 @@ func (d *Distributor) checkSample(ctx context.Context, userID, cluster, replica 
 		return false, nil
 	}
 
+	// Validate the cluster label before using it: it ends up as a KV store key,
+	// as a key in process-global maps, and as a Prometheus metric label value on
+	// several metric vectors. An unbounded or invalid value here would otherwise
+	// drive unbounded KV writes and metric cardinality on every distributor.
+	// Reject (rather than silently accept) so that a crafted cluster label never
+	// reaches the HA tracker state-mutating path.
+	if maxLen := d.limits.MaxLabelValueLength(userID); len(cluster) > maxLen {
+		return false, httpgrpc.Errorf(http.StatusBadRequest, "HA cluster label value too long: %d bytes (limit: %d)", len(cluster), maxLen)
+	}
+	if !model.LabelValue(cluster).IsValid() {
+		return false, httpgrpc.Errorf(http.StatusBadRequest, "HA cluster label value is not a valid UTF-8 string")
+	}
+
 	// At this point we know we have both HA labels, we should lookup
 	// the cluster/instance here to see if we want to accept this sample.
 	err := d.HATracker.checkReplica(ctx, userID, cluster, replica, time.Now())
@@ -597,8 +610,26 @@ func (d *Distributor) Push(ctx context.Context, req *cortexpb.WriteRequest) (*co
 	seriesKeys := make([]uint32, 0, len(req.Timeseries))
 	validatedSamples := 0
 	validatedExemplars := 0
+	// Set to true if the per-tenant ingestion rate limit has already been consumed
+	// by the HA-tracker pre-check below, so we do not double-charge the tenant.
+	rateLimitPrechecked := false
 
 	if d.limits.AcceptHASamples(userID) && len(req.Timeseries) > 0 {
+		// Cheap pre-check of the per-tenant ingestion rate limit before any
+		// HA-tracker state-mutating work (KV CAS, metric children allocation).
+		// This prevents a throttled tenant from writing new keys into the shared
+		// KV store or allocating per-cluster metric series on every push.
+		if !d.ingestionRateLimiter.AllowN(now, userID, numSamples+numExemplars+len(req.Metadata)) {
+			// Ensure the request slice is reused if the request is rate limited.
+			cortexpb.ReuseSlice(req.Timeseries)
+
+			validation.DiscardedSamples.WithLabelValues(validation.RateLimited, userID).Add(float64(numSamples))
+			validation.DiscardedExemplars.WithLabelValues(validation.RateLimited, userID).Add(float64(numExemplars))
+			validation.DiscardedMetadata.WithLabelValues(validation.RateLimited, userID).Add(float64(len(req.Metadata)))
+			return nil, httpgrpc.Errorf(http.StatusTooManyRequests, "ingestion rate limit (%v) exceeded while adding %d samples and %d metadata", d.ingestionRateLimiter.Limit(now, userID), numSamples, len(req.Metadata))
+		}
+		rateLimitPrechecked = true
+
 		cluster, replica := findHALabels(d.limits.HAReplicaLabel(userID), d.limits.HAClusterLabel(userID), req.Timeseries[0].Labels)
 		removeReplica, err = d.checkSample(ctx, userID, cluster, replica)
 		if err != nil {
@@ -736,7 +767,9 @@ func (d *Distributor) Push(ctx context.Context, req *cortexpb.WriteRequest) (*co
 	}
 
 	totalN := validatedSamples + validatedExemplars + len(validatedMetadata)
-	if !d.ingestionRateLimiter.AllowN(now, userID, totalN) {
+	// Skip the per-tenant rate limit if we already consumed tokens in the HA-tracker
+	// pre-check above (based on the incoming, pre-validation sample counts).
+	if !rateLimitPrechecked && !d.ingestionRateLimiter.AllowN(now, userID, totalN) {
 		// Ensure the request slice is reused if the request is rate limited.
 		cortexpb.ReuseSlice(req.Timeseries)
 
