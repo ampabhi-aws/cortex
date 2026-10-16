@@ -125,6 +125,46 @@ type Config struct {
 	DisableRuleGroupLabel bool `yaml:"disable_rule_group_label"`
 }
 
+// MarshalYAML implements yaml.Marshaler. It strips any userinfo (basic-auth
+// credentials embedded as `user:password@`) from AlertmanagerURL before
+// serialization so that the config endpoint does not leak credentials passed
+// via the URL. Credentials provided through the dedicated
+// `-ruler.alertmanager-client.basic-auth-*` flags are redacted independently
+// via the flagext.Secret type on NotifierConfig.BasicAuth.
+func (cfg Config) MarshalYAML() (interface{}, error) {
+	// Alias type sheds the MarshalYAML method so we can rely on the default
+	// yaml encoding for every other field.
+	type plain Config
+	redacted := plain(cfg)
+	redacted.AlertmanagerURL = redactAlertmanagerURLUserInfo(cfg.AlertmanagerURL)
+	return redacted, nil
+}
+
+// redactAlertmanagerURLUserInfo takes the comma-separated list of Alertmanager
+// URLs and returns the same list with any userinfo component stripped. If a
+// value is not a valid URL it is passed through unchanged so YAML output stays
+// representative of what was configured.
+func redactAlertmanagerURLUserInfo(raw string) string {
+	if raw == "" {
+		return raw
+	}
+	parts := strings.Split(raw, ",")
+	changed := false
+	for i, p := range parts {
+		parsed, err := url.Parse(p)
+		if err != nil || parsed.User == nil {
+			continue
+		}
+		parsed.User = nil
+		parts[i] = parsed.String()
+		changed = true
+	}
+	if !changed {
+		return raw
+	}
+	return strings.Join(parts, ",")
+}
+
 // Validate config and returns error on failure
 func (cfg *Config) Validate(limits validation.Limits, log log.Logger) error {
 	if !util.StringsContain(supportedShardingStrategies, cfg.ShardingStrategy) {
