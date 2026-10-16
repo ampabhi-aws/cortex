@@ -193,14 +193,30 @@ func decompressRequest(reader io.Reader, expectedSize, maxSize int, compression 
 	return
 }
 
+// decompressFromReaderInitialGrowMax caps the initial buffer pre-allocation
+// performed from the client-supplied Content-Length hint. The buffer still
+// grows on demand via buf.ReadFrom as actual body bytes arrive, so this only
+// bounds the memory a single stalled request can tie up before any payload
+// has been received or validated.
+const decompressFromReaderInitialGrowMax = 1 << 20 // 1 MiB
+
 func decompressFromReader(reader io.Reader, expectedSize, maxSize int, compression CompressionType, sp opentracing.Span) ([]byte, error) {
 	var (
 		buf  bytes.Buffer
 		body []byte
 		err  error
 	)
+	// Clamp the pre-growth to a small constant. expectedSize comes from the
+	// client's Content-Length header and is not a measured byte count, so
+	// trusting it would let a request with a tiny body force a large heap
+	// allocation before any bytes have been read. buf.ReadFrom below will
+	// grow the buffer further as data actually arrives.
 	if expectedSize > 0 {
-		buf.Grow(expectedSize + bytes.MinRead) // extra space guarantees no reallocation
+		grow := expectedSize + bytes.MinRead
+		if grow > decompressFromReaderInitialGrowMax {
+			grow = decompressFromReaderInitialGrowMax
+		}
+		buf.Grow(grow)
 	}
 	// Read from LimitReader with limit max+1. So if the underlying
 	// reader is over limit, the result will be bigger than max.
