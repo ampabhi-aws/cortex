@@ -2,6 +2,9 @@ package ring
 
 import (
 	"context"
+	"crypto/rand"
+	"crypto/subtle"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"html/template"
@@ -9,10 +12,70 @@ import (
 	"net/http"
 	"sort"
 	"strings"
+	"sync/atomic"
 	"time"
 
 	"github.com/go-kit/log/level"
 )
+
+// EnableDangerousAdminEndpoints controls whether the destructive POST actions
+// on the ring status pages (currently: unregister/forget an instance from the
+// hash ring) are accepted. It is disabled by default because any client that
+// can reach the Cortex HTTP port can otherwise mutate the shared ring, which
+// can cause write failures and data loss. Operators who intentionally expose
+// these pages behind an authenticated reverse proxy can opt back in by
+// calling SetDangerousAdminEndpointsEnabled(true) (for example from a
+// command-line flag).
+var enableDangerousAdminEndpoints int32
+
+// SetDangerousAdminEndpointsEnabled toggles acceptance of destructive POST
+// actions on the ring pages. See enableDangerousAdminEndpoints for the
+// rationale behind defaulting to disabled.
+func SetDangerousAdminEndpointsEnabled(enabled bool) {
+	var v int32
+	if enabled {
+		v = 1
+	}
+	atomic.StoreInt32(&enableDangerousAdminEndpoints, v)
+}
+
+// DangerousAdminEndpointsEnabled reports the current setting.
+func DangerousAdminEndpointsEnabled() bool {
+	return atomic.LoadInt32(&enableDangerousAdminEndpoints) == 1
+}
+
+// csrfTokenCookieName is the cookie that pins the per-session CSRF token used
+// by the double-submit check on the ring forget form.
+const csrfTokenCookieName = "cortex_ring_csrf"
+
+// csrfTokenPlaceholder is the sentinel the HTML template emits in place of a
+// real CSRF token. renderHTTPResponse replaces it with a freshly minted token
+// (and sets the matching cookie) just before writing the response, so each GET
+// of the page issues a usable token without changing the template contract.
+const csrfTokenPlaceholder = "$__CSRF_TOKEN_PLACEHOLDER__"
+
+func newCSRFToken() (string, error) {
+	var buf [32]byte
+	if _, err := rand.Read(buf[:]); err != nil {
+		return "", err
+	}
+	return hex.EncodeToString(buf[:]), nil
+}
+
+func verifyCSRF(req *http.Request) error {
+	cookie, err := req.Cookie(csrfTokenCookieName)
+	if err != nil || cookie.Value == "" {
+		return fmt.Errorf("missing CSRF cookie")
+	}
+	formToken := req.FormValue("csrf_token")
+	if formToken == "" {
+		return fmt.Errorf("missing csrf_token form field")
+	}
+	if subtle.ConstantTimeCompare([]byte(formToken), []byte(cookie.Value)) != 1 {
+		return fmt.Errorf("CSRF token mismatch")
+	}
+	return nil
+}
 
 const pageContent = `
 <!DOCTYPE html>
@@ -123,7 +186,31 @@ type httpResponse struct {
 
 func (r *Ring) ServeHTTP(w http.ResponseWriter, req *http.Request) {
 	if req.Method == http.MethodPost {
+		// Reject the destructive mutation unless the operator has explicitly
+		// opted in by enabling the dangerous admin endpoints. Without this
+		// gate any unauthenticated caller that can reach the Cortex HTTP
+		// port could remove instances from the shared hash ring, breaking
+		// writes/reads and risking data loss.
+		if !DangerousAdminEndpointsEnabled() {
+			level.Warn(r.logger).Log("msg", "rejecting ring forget request: dangerous admin endpoints are disabled")
+			http.Error(w, "ring forget is disabled; enable dangerous admin endpoints to use this action", http.StatusForbidden)
+			return
+		}
+
+		// Even when the endpoint is enabled, require a valid CSRF double-submit
+		// token so a cross-origin form POST from a browser that can reach the
+		// admin port cannot trigger the mutation on its own.
+		if err := verifyCSRF(req); err != nil {
+			level.Warn(r.logger).Log("msg", "rejecting ring forget request: CSRF validation failed", "err", err)
+			http.Error(w, "invalid or missing CSRF token", http.StatusForbidden)
+			return
+		}
+
 		ingesterID := req.FormValue("forget")
+		if ingesterID == "" {
+			http.Error(w, "missing forget instance id", http.StatusBadRequest)
+			return
+		}
 		if err := r.forget(req.Context(), ingesterID); err != nil {
 			level.Error(r.logger).Log("msg", "error forgetting instance", "err", err)
 		}
@@ -197,10 +284,30 @@ func renderHTTPResponse(w http.ResponseWriter, v httpResponse, t *template.Templ
 		return
 	}
 
-	err := t.Execute(w, v)
+	// Mint a per-request CSRF token, pin it with a cookie and substitute it
+	// for the placeholder emitted by the template so the Forget form posts a
+	// token that matches the cookie.
+	token, err := newCSRFToken()
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
 	}
+	http.SetCookie(w, &http.Cookie{
+		Name:     csrfTokenCookieName,
+		Value:    token,
+		Path:     "/",
+		HttpOnly: true,
+		SameSite: http.SameSiteStrictMode,
+		Secure:   r.TLS != nil,
+	})
+
+	var buf strings.Builder
+	if err := t.Execute(&buf, v); err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	rendered := strings.ReplaceAll(buf.String(), csrfTokenPlaceholder, template.HTMLEscapeString(token))
+	_, _ = w.Write([]byte(rendered))
 }
 
 // WriteJSONResponse writes some JSON as a HTTP response.

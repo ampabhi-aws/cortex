@@ -65,12 +65,20 @@ type Config struct {
 
 	// Allows and is used to configure the addition of HTTP Header fields to logs
 	HTTPRequestHeadersToLog flagext.StringSlice `yaml:"http_request_headers_to_log"`
+
+	// EnableDangerousAdminEndpoints enables destructive admin POST actions
+	// such as the ring 'forget' button. It defaults to false because the
+	// ring pages are registered without authentication middleware (Cortex
+	// delegates authn/authz to an external gateway) and so would otherwise
+	// be callable by anyone who can reach the HTTP port.
+	EnableDangerousAdminEndpoints bool `yaml:"enable_dangerous_admin_endpoints"`
 }
 
 // RegisterFlags adds the flags required to config this to the given FlagSet.
 func (cfg *Config) RegisterFlags(f *flag.FlagSet) {
 	f.BoolVar(&cfg.ResponseCompression, "api.response-compression-enabled", false, "Use GZIP compression for API responses. Some endpoints serve large YAML or JSON blobs which can benefit from compression.")
 	f.Var(&cfg.HTTPRequestHeadersToLog, "api.http-request-headers-to-log", "Which HTTP Request headers to add to logs")
+	f.BoolVar(&cfg.EnableDangerousAdminEndpoints, "api.enable-dangerous-admin-endpoints", false, "Enable destructive admin HTTP actions such as the ring 'forget' POST button. Disabled by default because the ring pages are not covered by any authentication middleware; only enable this when the admin HTTP port is restricted to trusted operators.")
 	cfg.RegisterFlagsWithPrefix("", f)
 }
 
@@ -126,6 +134,10 @@ func New(cfg Config, serverCfg server.Config, s *server.Server, logger log.Logge
 	if cfg.HTTPAuthMiddleware == nil {
 		api.AuthMiddleware = middleware.AuthenticateUser
 	}
+	// Propagate the dangerous admin toggle to the ring package so that
+	// unauthenticated POSTs to ring pages are rejected unless the operator
+	// has explicitly opted in.
+	ring.SetDangerousAdminEndpointsEnabled(cfg.EnableDangerousAdminEndpoints)
 	if len(cfg.HTTPRequestHeadersToLog) > 0 {
 		api.HTTPHeaderMiddleware = &HTTPHeaderMiddleware{TargetHeaders: cfg.HTTPRequestHeadersToLog}
 	}
