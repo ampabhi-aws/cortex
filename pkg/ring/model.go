@@ -210,11 +210,19 @@ func (d *Desc) mergeWithTime(mergeable memberlist.Mergeable, localCAS bool, now 
 	tokensChanged := false
 
 	maxFutureLimit := now.Add(30 * time.Minute).Unix()
+	// Pre-pass: validate all incoming entries before mutating the live local ring
+	// state. mergeWithTime is reached via memberlist's merge path, which merges in
+	// place into the stored value (see KV.mergeValueForKey). Returning an error
+	// mid-loop would leave an arbitrary subset of entries applied, without a
+	// version bump, watcher notification, re-broadcast, or conflict resolution,
+	// so sanity checks must happen before any writes.
 	for name, oing := range otherIngesterMap {
 		if oing.Timestamp > maxFutureLimit {
 			return nil, fmt.Errorf("ingester %s timestamp in the future, expected max of %d, got %d", name, maxFutureLimit, oing.Timestamp)
 		}
+	}
 
+	for name, oing := range otherIngesterMap {
 		ting := thisIngesterMap[name]
 		// ting.Timestamp will be 0, if there was no such ingester in our version
 		if oing.Timestamp > ting.Timestamp {
