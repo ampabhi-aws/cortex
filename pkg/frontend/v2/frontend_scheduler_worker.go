@@ -3,6 +3,7 @@ package v2
 import (
 	"context"
 	"net/http"
+	"runtime/debug"
 	"sync"
 	"time"
 
@@ -184,6 +185,19 @@ func (w *frontendSchedulerWorker) start() {
 		w.wg.Add(1)
 		go func() {
 			defer w.wg.Done()
+			// Guard the worker goroutine with recover() so that a bug in response
+			// handling (for example an unexpected nil in a scheduler reply) cannot
+			// take down the whole query-frontend process.
+			defer func() {
+				if r := recover(); r != nil {
+					level.Error(w.log).Log(
+						"msg", "recovered from panic in frontend scheduler worker",
+						"panic", r,
+						"addr", w.schedulerAddr,
+						"stack", string(debug.Stack()),
+					)
+				}
+			}()
 			w.runOne(w.ctx, client)
 		}()
 	}
@@ -288,10 +302,13 @@ func (w *frontendSchedulerWorker) schedulerLoop(loop schedulerpb.SchedulerForFro
 
 			case schedulerpb.ERROR:
 				req.enqueue <- enqueueResult{status: waitForResponse}
+				// Use the error text the scheduler actually sent in resp.Error.
+				// Calling err.Error() here would panic: err is provably nil at this
+				// point (the preceding `if err != nil` returned).
 				req.response <- &frontendv2pb.QueryResultRequest{
 					HttpResponse: &httpgrpc.HTTPResponse{
 						Code: http.StatusInternalServerError,
-						Body: []byte(err.Error()),
+						Body: []byte(resp.Error),
 					},
 				}
 
