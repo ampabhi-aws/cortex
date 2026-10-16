@@ -26,6 +26,7 @@ import (
 	"github.com/cortexproject/cortex/pkg/querier"
 	"github.com/cortexproject/cortex/pkg/querier/stats"
 	"github.com/cortexproject/cortex/pkg/util"
+	"github.com/cortexproject/cortex/pkg/util/validation"
 )
 
 const (
@@ -156,11 +157,13 @@ func DefaultConfigHandler(actualCfg interface{}, defaultCfg interface{}) http.Ha
 // server to fulfill the Prometheus query API.
 func NewQuerierHandler(
 	cfg Config,
+	querierCfg querier.Config,
 	queryable storage.SampleAndChunkQueryable,
 	exemplarQueryable storage.ExemplarQueryable,
 	engine *promql.Engine,
 	distributor Distributor,
 	tombstonesLoader purger.TombstonesLoader,
+	limits *validation.Overrides,
 	reg prometheus.Registerer,
 	logger log.Logger,
 ) http.Handler {
@@ -247,7 +250,7 @@ func NewQuerierHandler(
 	// TODO(gotjosh): This custom handler is temporary until we're able to vendor the changes in:
 	// https://github.com/prometheus/prometheus/pull/7125/files
 	router.Path(path.Join(prefix, "/api/v1/metadata")).Handler(querier.MetadataHandler(distributor))
-	router.Path(path.Join(prefix, "/api/v1/read")).Handler(querier.RemoteReadHandler(queryable, logger))
+	router.Path(path.Join(prefix, "/api/v1/read")).Handler(querier.RemoteReadHandler(querierCfg, queryable, limits, logger))
 	router.Path(path.Join(prefix, "/api/v1/read")).Methods("POST").Handler(promRouter)
 	router.Path(path.Join(prefix, "/api/v1/query")).Methods("GET", "POST").Handler(promRouter)
 	router.Path(path.Join(prefix, "/api/v1/query_range")).Methods("GET", "POST").Handler(promRouter)
@@ -260,7 +263,7 @@ func NewQuerierHandler(
 	// TODO(gotjosh): This custom handler is temporary until we're able to vendor the changes in:
 	// https://github.com/prometheus/prometheus/pull/7125/files
 	router.Path(path.Join(legacyPrefix, "/api/v1/metadata")).Handler(querier.MetadataHandler(distributor))
-	router.Path(path.Join(legacyPrefix, "/api/v1/read")).Handler(querier.RemoteReadHandler(queryable, logger))
+	router.Path(path.Join(legacyPrefix, "/api/v1/read")).Handler(querier.RemoteReadHandler(querierCfg, queryable, limits, logger))
 	router.Path(path.Join(legacyPrefix, "/api/v1/read")).Methods("POST").Handler(legacyPromRouter)
 	router.Path(path.Join(legacyPrefix, "/api/v1/query")).Methods("GET", "POST").Handler(legacyPromRouter)
 	router.Path(path.Join(legacyPrefix, "/api/v1/query_range")).Methods("GET", "POST").Handler(legacyPromRouter)

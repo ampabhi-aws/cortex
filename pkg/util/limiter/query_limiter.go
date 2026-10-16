@@ -65,6 +65,19 @@ func QueryLimiterFromContextWithFallback(ctx context.Context) *QueryLimiter {
 	return ql
 }
 
+// QueryLimiterFromContext returns the QueryLimiter attached to the context, if
+// one has been installed. It returns nil when no limiter is present (as opposed
+// to QueryLimiterFromContextWithFallback, which returns a fresh no-op limiter).
+// This lets callers decide whether to install a new, request-scoped limiter or
+// reuse an existing one so that per-query limits bound a whole request rather
+// than each sub-query independently.
+func QueryLimiterFromContext(ctx context.Context) *QueryLimiter {
+	if ql, ok := ctx.Value(ctxKey).(*QueryLimiter); ok {
+		return ql
+	}
+	return nil
+}
+
 // AddSeries adds the input series and returns an error if the limit is reached.
 func (ql *QueryLimiter) AddSeries(seriesLabels []cortexpb.LabelAdapter) error {
 	// If the max series is unlimited just return without managing map

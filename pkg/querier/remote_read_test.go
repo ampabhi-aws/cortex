@@ -38,7 +38,7 @@ func TestRemoteReadHandler(t *testing.T) {
 			},
 		}, nil
 	})
-	handler := RemoteReadHandler(q, log.NewNopLogger())
+	handler := RemoteReadHandler(Config{}, q, nil, log.NewNopLogger())
 
 	requestBody, err := proto.Marshal(&client.ReadRequest{
 		Queries: []*client.QueryRequest{
